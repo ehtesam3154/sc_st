@@ -6,7 +6,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 import os
 import numpy as np
 import time
-from .utils import *
+from utils import *
 import scipy
 
 class STData(Dataset):
@@ -43,7 +43,7 @@ class FeatureNet(nn.Module):
         
         self.dp = nn.Dropout(dp)
         
-    def forward(self, x,isdp = False):
+    def forward(self, x, isdp = False):
         if isdp:
             x = self.dp(x)
         x = F.relu(self.bn1(self.fc1(x)))

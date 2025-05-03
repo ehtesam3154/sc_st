@@ -9,8 +9,8 @@ import pandas as pd
 import torch
 import scipy
 import time
-from STEM.model import *
-from STEM.utils import *
+from model import *
+from utils import *
 
 scdata = pd.read_csv('./data/mousedata_2020/E1z2/simu_sc_counts.csv',index_col=0)
 scdata = scdata.T
