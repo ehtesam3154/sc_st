@@ -72,6 +72,129 @@ class GraphVAEEncoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+class SlideAdversarialHead(nn.Module):
+    """
+    Adversarial head that tries to predict slide ID from latent z.
+    The main model tries to fool this head (slide-invariant representations).
+    """
+    def __init__(self, latent_dim, num_slides, hidden_dim=128):
+        super().__init__()
+        self.discriminator = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, num_slides),
+            nn.LogSoftmax(dim=-1)
+        )
+        
+    def forward(self, z):
+        return self.discriminator(z)
+
+
+class CrossSlideConsistencyLoss(nn.Module):
+    """
+    Ensures global structure is the same across slides.
+    Uses descriptors like radial histograms and angular power spectra.
+    """
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, coords_list, slide_labels):
+        """
+        coords_list: list of coordinate tensors from different slides
+        slide_labels: which slide each coordinate set comes from
+        """
+        if len(coords_list) < 2:
+            return torch.tensor(0.0, device=coords_list[0].device)
+        
+        # Compute descriptors for each coordinate set
+        descriptors = []
+        for coords in coords_list:
+            desc = self._compute_descriptors(coords)
+            descriptors.append(desc)
+        
+        # Penalize variance across slides
+        descriptors_tensor = torch.stack(descriptors, dim=0)
+        variance = torch.var(descriptors_tensor, dim=0).mean()
+        
+        return variance
+        
+    # def _compute_descriptors(self, coords):
+    #     """
+    #     Compute slide-level descriptors (radial histogram, etc.)
+    #     """
+    #     with torch.no_grad():
+    #         center = coords.mean(dim=0)
+    #         centered_coords = coords - center
+            
+    #         # Radial distances
+    #         radii = torch.norm(centered_coords, dim=1)
+            
+    #         # Simple descriptors
+    #         descriptors = torch.tensor([
+    #             radii.mean(),           # average radius
+    #             radii.std(),            # radius spread
+    #             torch.max(radii),       # max radius
+    #             (radii < radii.median()).float().mean(),  # proportion in inner half
+    #         ], device=coords.device)
+            
+    #     return descriptors 
+
+    def _compute_descriptors(self, coords):
+        """
+        Compute slide-level descriptors that should be invariant across slides.
+        """
+        with torch.no_grad():
+            center = coords.mean(dim=0)
+            centered_coords = coords - center
+            
+            # 1. Radial histogram (20 bins)
+            radii = torch.norm(centered_coords, dim=1)
+            max_r = radii.max() + 1e-8
+            radii_norm = radii / max_r
+            
+            # Create histogram
+            n_bins = 20
+            hist = torch.zeros(n_bins, device=coords.device)
+            bin_edges = torch.linspace(0, 1, n_bins + 1, device=coords.device)
+            for i in range(n_bins):
+                mask = (radii_norm >= bin_edges[i]) & (radii_norm < bin_edges[i+1])
+                hist[i] = mask.float().mean()
+            
+            # 2. Angular power spectrum (first 5 frequencies)
+            angles = torch.atan2(centered_coords[:, 1], centered_coords[:, 0])
+            n_angular_bins = 72  # 5-degree bins
+            angle_hist = torch.zeros(n_angular_bins, device=coords.device)
+            angle_edges = torch.linspace(-torch.pi, torch.pi, n_angular_bins + 1, device=coords.device)
+            for i in range(n_angular_bins):
+                mask = (angles >= angle_edges[i]) & (angles < angle_edges[i+1])
+                angle_hist[i] = mask.float().sum()
+            
+            # FFT of angular histogram (take first 5 frequencies magnitude)
+            angle_hist = angle_hist - angle_hist.mean()  # Center
+            fft = torch.fft.fft(angle_hist)
+            power_spectrum = torch.abs(fft[:5])
+            
+            # 3. Collision rate (fraction of cells too close)
+            if coords.shape[0] > 1:
+                distances = torch.cdist(coords, coords)
+                distances.fill_diagonal_(float('inf'))
+                min_distances = distances.min(dim=1).values
+                collision_rate = (min_distances < 0.01).float().mean().unsqueeze(0)
+            else:
+                collision_rate = torch.zeros(1, device=coords.device)
+            
+            # Combine all descriptors
+            descriptors = torch.cat([
+                hist,                    # 20 values
+                power_spectrum,          # 5 values
+                collision_rate,          # 1 value
+            ])
+            
+        return descriptors 
 
 class GraphVAEDecoder(nn.Module):
     """
@@ -178,42 +301,119 @@ class LatentDenoiser(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim)
         )
+
+        #FiLM head
+        self.film = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2)
+        )
         
     
     def forward(self, z_noisy, t, condition):
         """
-        z_noisy: noisy latent vectors (batch_size, latent_dim)
-        t: timestep (batch_size,) - NOW 1D instead of 2D
-        condition: aligned embeddings E(X) (batch_size, condition_dim)
+        z_noisy: noisy latent vectors (batch_size, latent_dim) 
+        t: timestep (batch_size, 1) - normalized
+        condition: dict with conditioning information OR legacy tensor
         """
-        batch_size = z_noisy.size(0)
-        # ENSURE inputs are 2D
-        if z_noisy.dim() > 2:
-            z_noisy = z_noisy.squeeze()
-        if condition.dim() > 2:
-            condition = condition.squeeze()
+        if isinstance(condition, dict):
+            # New structured masking mode
+            batch_size = z_noisy.size(0)
             
-        # Handle 1D timestep input
-        if t.dim() == 1:
-            t = t.unsqueeze(1)  # Make it (batch_size, 1)
+            # Ensure inputs are 2D
+            if z_noisy.dim() > 2:
+                z_noisy = z_noisy.squeeze()
+            if t.dim() == 1:
+                t = t.unsqueeze(1)
+            
+            # Extract conditioning components
+            h_shared = condition['h_shared']
+            z_clean = condition['z_clean'] 
+            eps_prev = condition.get('eps_prev', torch.zeros_like(z_noisy))
+            mask_vec = condition.get('mask_vec')
+            
+            # Get dimensions
+            hidden_dim = self.latent_encoder[0].out_features  # 256
+            h_shared_dim = h_shared.shape[-1]  # embedding dim
+            z_clean_dim = z_clean.shape[-1]    # K (clean dimensions)
+            eps_prev_dim = eps_prev.shape[-1]  # latent_dim
+            
+            # Create conditioning MLPs with explicit dimensions
+            if not hasattr(self, 'cond_h_mlp'):
+                self.cond_h_mlp = nn.Sequential(
+                    nn.Linear(h_shared_dim, hidden_dim),
+                    nn.ReLU()
+                ).to(z_noisy.device)
+                
+            if not hasattr(self, 'cond_zc_mlp'):
+                self.cond_zc_mlp = nn.Sequential(
+                    nn.Linear(z_clean_dim, hidden_dim), 
+                    nn.ReLU()
+                ).to(z_noisy.device)
+                
+            if not hasattr(self, 'cond_ep_mlp'):
+                self.cond_ep_mlp = nn.Sequential(
+                    nn.Linear(eps_prev_dim, hidden_dim),
+                    nn.ReLU()
+                ).to(z_noisy.device)
+            
+            # Apply conditioning MLPs
+            c_h = self.cond_h_mlp(h_shared)      
+            c_zc = self.cond_zc_mlp(z_clean)       
+            c_ep = self.cond_ep_mlp(eps_prev)    
+            c_m = 0
+            
+            if mask_vec is not None:
+                mask_vec_dim = mask_vec.shape[-1]
+                if not hasattr(self, 'cond_m_mlp'):
+                    self.cond_m_mlp = nn.Sequential(
+                        nn.Linear(mask_vec_dim, hidden_dim),
+                        nn.ReLU()
+                    ).to(z_noisy.device)
+                c_m = self.cond_m_mlp(mask_vec)
+            
+            # Encode latent input
+            z_enc = self.latent_encoder(z_noisy)  
+            t_enc = self.time_embed(t)            
+            
+            # Combine features 
+            h = z_enc + t_enc + c_h + c_zc + c_ep + c_m
+            
+        else:
+            # Legacy mode - keep backward compatibility
+            batch_size = z_noisy.size(0)
+            # ENSURE inputs are 2D
+            if z_noisy.dim() > 2:
+                z_noisy = z_noisy.squeeze()
+            if condition.dim() > 2:
+                condition = condition.squeeze()
+                
+            # Handle 1D timestep input
+            if t.dim() == 1:
+                t = t.unsqueeze(1)  # Make it (batch_size, 1)
 
-        t = t.view(batch_size, 1)
-        
-        # Encode inputs
-        z_enc = self.latent_encoder(z_noisy)
-        t_enc = self.time_embed(t)
-        c_enc = self.condition_encoder(condition)
-        
-        # Combine features
-        h = z_enc + t_enc + c_enc
-        
-        # Apply denoising blocks
-        for block in self.denoising_blocks:
-            h = h + block(h)  # Residual connections
+            t = t.view(batch_size, 1)
             
-        # Output predicted noise
-        noise_pred = self.output_head(h)
-        return noise_pred
+            # Encode inputs
+            z_enc = self.latent_encoder(z_noisy)
+            t_enc = self.time_embed(t)
+            c_enc = self.condition_encoder(condition)
+            
+            # Combine features
+            # h = z_enc + t_enc + c_enc
+
+            h = z_enc + t_enc 
+            gamma_beta = self.film(c_enc)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            for block in self.denoising_blocks:
+                h = h + block(h)
+                h = gamma * h + beta
+            
+            # # Apply denoising blocks
+            # for block in self.denoising_blocks:
+            #     h = h + block(h)  # Residual connections
+                
+            # Output predicted noise
+            noise_pred = self.output_head(h)
+            return noise_pred
 
 # =====================================================
 # PART 1: Advanced Network Components
@@ -633,3 +833,195 @@ def calculate_D_st_euclidean(spatial_coords):
         D_euclid = D_euclid / max_dist
     
     return D_euclid.astype(np.float32)
+
+import torch
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+
+class STDensityPrior:
+    """
+    Smooth density over pooled ST coordinates using Gaussian KDE.
+    E_ST(y) = -log p_ST(y) up to a constant. Autograd will flow through y.
+    """
+    def __init__(self, st_coords_np, device="cuda", bandwidth=None):
+        # st_coords_np: (N,2) numpy
+        self.device = device
+        self.X = torch.as_tensor(st_coords_np, dtype=torch.float32, device=device)  # (N,2)
+        # bandwidth from median 2-NN distance if not provided
+        if bandwidth is None:
+            nbrs = NearestNeighbors(n_neighbors=2).fit(st_coords_np)
+            d2, _ = nbrs.kneighbors(st_coords_np)
+            spot_pitch = np.median(d2[:, 1])
+            bandwidth = 1.5 * spot_pitch
+        self.h2 = float(bandwidth)**2
+
+    def energy(self, y):
+        """
+        y: (B,2) tensor requiring grad on same device
+        returns scalar E_ST(y) = - mean log density
+        """
+        # pairwise distances to all ST spots (N~4k; B<=512 → 2M distances, OK on GPU)
+        diff = y.unsqueeze(1) - self.X.unsqueeze(0)       # (B,N,2)
+        d2   = (diff*diff).sum(-1)                        # (B,N)
+        w    = torch.exp(-0.5 * d2 / self.h2)             # (B,N)
+        rho  = w.sum(dim=1) + 1e-12                       # (B,)
+        E    = (-torch.log(rho)).mean()                   # scalar
+        return E
+
+
+# ---------- (A) Minimal convex-hull + half-space penalty (pure Torch) ----------
+import torch
+import numpy as np
+
+def _convex_hull_monotone_chain(xy_np):
+    """Return hull vertices (CCW) using Andrew's monotone chain. xy_np: (N,2) float32."""
+    P = np.asarray(xy_np, dtype=np.float32)
+    P = P[np.lexsort((P[:,1], P[:,0]))]  # sort by x, then y
+    def cross(o,a,b): return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lower=[]
+    for p in P:
+        while len(lower)>=2 and cross(lower[-2], lower[-1], p) <= 0: lower.pop()
+        lower.append(tuple(p))
+    upper=[]
+    for p in P[::-1]:
+        while len(upper)>=2 and cross(upper[-2], upper[-1], p) <= 0: upper.pop()
+        upper.append(tuple(p))
+    hull = np.array(lower[:-1] + upper[:-1], dtype=np.float32)  # CCW, no repeat
+    return hull
+
+def _hull_normals_ccw(hull_np):
+    """
+    For a CCW convex polygon with vertices v_i (M,2), return outward unit normals N (M,2)
+    and offsets b (M,) such that inside satisfies (N_i · y) - b_i <= 0 for all i.
+    """
+    V = hull_np
+    M = V.shape[0]
+    N = np.zeros_like(V)
+    b = np.zeros((M,), dtype=np.float32)
+    for i in range(M):
+        v0 = V[i]
+        v1 = V[(i+1)%M]
+        e  = v1 - v0                      # edge direction
+        n  = np.array([ e[1], -e[0] ])    # outward normal for CCW (rotate -90°)
+        n  = n / (np.linalg.norm(n) + 1e-12)
+        N[i] = n
+        b[i] = (n * v0).sum()
+    return N, b
+
+def make_hull_penalty(st_coords_np, device):
+    """Precompute convex hull planes; return a Torch function E_hull(y)->scalar."""
+    hull = _convex_hull_monotone_chain(st_coords_np)       # (M,2)
+    N, b = _hull_normals_ccw(hull)                         # (M,2), (M,)
+    N_t = torch.as_tensor(N, dtype=torch.float32, device=device)  # (M,2)
+    b_t = torch.as_tensor(b, dtype=torch.float32, device=device)  # (M,)
+    def E_hull(y):
+        """
+        y: (B,2) tensor with grad. For convex hull, signed violation per edge:
+        s_i(y) = (n_i · y) - b_i ; inside → all s_i<=0. Penalty = (max_i ReLU(s_i))^2 mean.
+        """
+        S = y @ N_t.T - b_t[None, :]          # (B,M)
+        viol = torch.relu(S).max(dim=1).values  # (B,)
+        return (viol ** 2).mean()
+    return E_hull
+
+
+class ConditionAdapter(nn.Module):
+    '''maps whitened embeddings to vae latent space (mu like hint)'''
+    def __init__(self, in_dim, out_dim, hidden=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, out_dim)
+        )
+    
+    def forward(self, c):
+        return self.mlp(c)
+    
+
+# utils.py
+import numpy as np
+import torch
+from sklearn.neighbors import NearestNeighbors
+
+def precompute_knn_edges_from_features(
+    X,
+    k: int = 30,
+    device: str = "cuda",
+    mode: str = "connectivity",   # "connectivity" or "distance"
+    metric: str = "cosine",       # "cosine" or "euclidean"
+    weight: str = "binary",       # "binary" | "inv" | "gaussian"
+    symmetrize: bool = True,
+    include_self: bool = False,
+    sigma: float = None,          # for gaussian weighting; if None, auto from kth dist median
+    eps: float = 1e-8,
+):
+    """
+    Build kNN edges from *expression* features (torch or numpy) and return PyG-style (edge_index, edge_weight).
+    - mode="connectivity": unweighted kNN (edge_weight=1) unless 'weight' overrides
+    - mode="distance": we still return an edge list + weights; distances only used to compute weights
+
+    Recommended defaults for expression: metric="cosine", mode="connectivity", weight="binary"
+    """
+    # to numpy
+    if isinstance(X, torch.Tensor):
+        X_np = X.detach().cpu().numpy()
+    else:
+        X_np = np.asarray(X)
+    N = X_np.shape[0]
+
+    # fit kNN (k+1 if include_self to drop self later)
+    n_neighbors = k + 1 if include_self else k
+    nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric=metric, algorithm="auto")
+    nbrs.fit(X_np)
+    dists, idxs = nbrs.kneighbors(X_np)  # shapes (N, n_neighbors)
+
+    # drop self if requested
+    if include_self:
+        idxs = idxs[:, 1:]
+        dists = dists[:, 1:]
+
+    # build edge list
+    src = np.repeat(np.arange(N), k)
+    dst = idxs.reshape(-1)
+    dist_flat = dists.reshape(-1)
+
+    # weights
+    if weight == "binary":
+        w = np.ones_like(dist_flat, dtype=np.float32)
+    elif weight == "inv":
+        w = (1.0 / (dist_flat + eps)).astype(np.float32)
+    elif weight == "gaussian":
+        if sigma is None:
+            # robust sigma from median k-th neighbor distance per node
+            kth = dists[:, -1]
+            sigma = float(np.median(kth) + 1e-8)
+        w = np.exp(-(dist_flat**2) / (2.0 * sigma**2)).astype(np.float32)
+    else:
+        raise ValueError(f"Unknown weight='{weight}'")
+
+    # symmetrize (mutual kNN) if requested
+    if symmetrize:
+        # add reverse edges and max weights
+        src_sym = np.concatenate([src, dst], axis=0)
+        dst_sym = np.concatenate([dst, src], axis=0)
+        w_sym = np.concatenate([w, w], axis=0)
+        # coalesce duplicates by taking max weight
+        # build a dict key=(i,j)
+        key = src_sym.astype(np.int64) * N + dst_sym.astype(np.int64)
+        order = np.argsort(key)
+        key_sorted = key[order]; src_sorted = src_sym[order]; dst_sorted = dst_sym[order]; w_sorted = w_sym[order]
+        uniq_idx = np.concatenate([[0], np.where(np.diff(key_sorted) != 0)[0] + 1, [len(key_sorted)]])
+        src_co, dst_co, w_co = [], [], []
+        for a, b in zip(uniq_idx[:-1], uniq_idx[1:]):
+            src_co.append(src_sorted[a])
+            dst_co.append(dst_sorted[a])
+            w_co.append(float(w_sorted[a:b].max()))
+        src = np.array(src_co, dtype=np.int64)
+        dst = np.array(dst_co, dtype=np.int64)
+        w = np.array(w_co, dtype=np.float32)
+
+    # to torch (PyG style)
+    edge_index = torch.tensor(np.vstack([src, dst]), dtype=torch.long, device=device)
+    edge_weight = torch.tensor(w, dtype=torch.float32, device=device)
+    return edge_index, edge_weight
