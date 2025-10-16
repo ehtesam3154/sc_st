@@ -383,9 +383,14 @@ def classical_mds(B: torch.Tensor, d_out: int = 2, eps: float = 1e-6) -> torch.T
     Returns:
         coords: (n, d_out) embedded coordinates
     """
-    # Regularize B for numerical stability
-    B_reg = B + eps * torch.eye(B.shape[0], device=B.device)
-    # Eigendecomposition
+    # Adaptive regularization based on matrix scale
+    B_scale = torch.abs(B).max()
+    if B_scale < 1e-6:
+        B_scale = torch.tensor(1.0, device=B.device)
+    
+    eps_adaptive = max(eps, 1e-4 * B_scale)  # Scale eps with matrix magnitude
+    B_reg = B + eps_adaptive * torch.eye(B.shape[0], device=B.device)
+    
     eigvals, eigvecs = torch.linalg.eigh(B_reg)
     eigvals = eigvals.flip(0).clamp(min=0)
     eigvecs = eigvecs.flip(1)
