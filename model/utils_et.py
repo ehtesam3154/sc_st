@@ -372,7 +372,7 @@ def edm_project(D: torch.Tensor) -> torch.Tensor:
     return D_proj
 
 
-def classical_mds(B: torch.Tensor, d_out: int = 2) -> torch.Tensor:
+def classical_mds(B: torch.Tensor, d_out: int = 2, eps: float = 1e-6) -> torch.Tensor:
     """
     Classical multidimensional scaling from Gram matrix.
     
@@ -383,8 +383,10 @@ def classical_mds(B: torch.Tensor, d_out: int = 2) -> torch.Tensor:
     Returns:
         coords: (n, d_out) embedded coordinates
     """
+    # Regularize B for numerical stability
+    B_reg = B + eps * torch.eye(B.shape[0], device=B.device)
     # Eigendecomposition
-    eigvals, eigvecs = torch.linalg.eigh(B)
+    eigvals, eigvecs = torch.linalg.eigh(B_reg)
     eigvals = eigvals.flip(0).clamp(min=0)
     eigvecs = eigvecs.flip(1)
     

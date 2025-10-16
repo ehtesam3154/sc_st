@@ -451,7 +451,7 @@ def train_stageC_diffusion_generator(
                 if n_valid > 10:
                     D_valid = D_hat[i, :n_valid, :n_valid]
                     d_95 = torch.quantile(D_valid[torch.triu(torch.ones_like(D_valid), diagonal=1).bool()], 0.95)
-                    bins = torch.linspace(0, d_95, H_target.shape[1], device=device)
+                    bins = torch.linspace(0, d_95, H_target.shape[1] + 1, device=device)
                     H_hat = uet.compute_distance_hist(D_valid, bins)
                     L_sw += loss_sw(H_hat, H_target[i])
             L_sw = L_sw / batch_size_real
