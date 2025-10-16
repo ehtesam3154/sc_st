@@ -433,11 +433,17 @@ def train_stageC_diffusion_generator(
                     if n_valid > 10:
                         # Build Laplacian from D_hat
                         D_valid = D_hat[i, :n_valid, :n_valid]
-                        y_hat_reconstructed = uet.classical_mds(
-                            -0.5 * (torch.eye(n_valid, device=device) - 1/n_valid) @ (D_valid**2) @ 
-                            (torch.eye(n_valid, device=device) - 1/n_valid),
-                            d_out=2
-                        )
+                        # y_hat_reconstructed = uet.classical_mds(
+                        #     -0.5 * (torch.eye(n_valid, device=device) - 1/n_valid) @ (D_valid**2) @ 
+                        #     (torch.eye(n_valid, device=device) - 1/n_valid),
+                        #     d_out=2
+                        # )
+
+                        J = torch.eye(n_valid, device=device) - torch.ones(n_valid, n_valid, device=device) / n_valid
+                        B = -0.5 * J @ (D_valid ** 2) @ J
+                        
+                        # Classical MDS to get coordinates
+                        y_hat_reconstructed = uet.classical_mds(B, d_out=2)
                         edge_index, edge_weight = uet.build_knn_graph(y_hat_reconstructed, k=20, device=device)
                         L_hat = uet.compute_graph_laplacian(edge_index, edge_weight, n_valid)
                         
