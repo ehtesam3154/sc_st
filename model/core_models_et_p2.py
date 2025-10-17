@@ -72,14 +72,20 @@ class SetEncoderContext(nn.Module):
         H = self.input_proj(Z_set)  # (batch, n, c_dim)
         
         # Apply ISAB blocks
-        for isab in self.isab_blocks:
-            # Reshape for ISAB: (batch*n, c_dim) → process → (batch, n, c_dim)
-            H_flat = H.view(batch_size * n, self.c_dim)
-            H_flat = isab(H_flat.unsqueeze(1)).squeeze(1)  # ISAB expects (B, 1, D)
-            H = H_flat.view(batch_size, n, self.c_dim)
+        # for isab in self.isab_blocks:
+        #     # Reshape for ISAB: (batch*n, c_dim) → process → (batch, n, c_dim)
+        #     H_flat = H.view(batch_size * n, self.c_dim)
+        #     H_flat = isab(H_flat.unsqueeze(1)).squeeze(1)  # ISAB expects (B, 1, D)
+        #     H = H_flat.view(batch_size, n, self.c_dim)
             
-            # Apply mask
+        #     # Apply mask
+        #     H = H * mask.unsqueeze(-1).float()
+
+        for isab in self.isab_blocks:
+            # ISAB expects (batch, n, dim); keep the set intact
+            H = isab(H)
             H = H * mask.unsqueeze(-1).float()
+
         
         return H
 
@@ -144,10 +150,14 @@ class MetricSetGenerator(nn.Module):
         
         # Apply ISAB blocks
         X = H
+        # for isab in self.isab_blocks:
+        #     X_flat = X.view(batch_size * n, self.c_dim)
+        #     X_flat = isab(X_flat.unsqueeze(1)).squeeze(1)
+        #     X = X_flat.view(batch_size, n, self.c_dim)
+        #     X = X * mask.unsqueeze(-1).float()
+
         for isab in self.isab_blocks:
-            X_flat = X.view(batch_size * n, self.c_dim)
-            X_flat = isab(X_flat.unsqueeze(1)).squeeze(1)
-            X = X_flat.view(batch_size, n, self.c_dim)
+            X = isab(X)
             X = X * mask.unsqueeze(-1).float()
         
         # MLP head
@@ -271,10 +281,14 @@ class DiffusionScoreNet(nn.Module):
         X = X + t_emb
         
         # Apply denoising blocks
+        # for block in self.denoise_blocks:
+        #     X_flat = X.view(batch_size * n, self.c_dim)
+        #     X_flat = block(X_flat.unsqueeze(1)).squeeze(1)
+        #     X = X_flat.view(batch_size, n, self.c_dim)
+        #     X = X * mask.unsqueeze(-1).float()
+
         for block in self.denoise_blocks:
-            X_flat = X.view(batch_size * n, self.c_dim)
-            X_flat = block(X_flat.unsqueeze(1)).squeeze(1)
-            X = X_flat.view(batch_size, n, self.c_dim)
+            X = block(X)
             X = X * mask.unsqueeze(-1).float()
         
         # Predict noise
@@ -430,7 +444,7 @@ def train_stageC_diffusion_generator(
             if epoch % 5 == 0:  # Compute every 5 epochs to save time
                 for i in range(min(1, batch_size_real)):
                     n_valid = mask[i].sum().item()
-                    if n_valid > 10:
+                    if n_valid > 10 and torch.isfinite(D_hat[i, :n_valid, :n_valid]).all():
                         # Build Laplacian from D_hat
                         D_valid = D_hat[i, :n_valid, :n_valid]
                         # y_hat_reconstructed = uet.classical_mds(
@@ -439,12 +453,15 @@ def train_stageC_diffusion_generator(
                         #     d_out=2
                         # )
 
-                        J = torch.eye(n_valid, device=device) - torch.ones(n_valid, n_valid, device=device) / n_valid
-                        B = -0.5 * J @ (D_valid ** 2) @ J
-                        
-                        # Classical MDS to get coordinates
-                        y_hat_reconstructed = uet.classical_mds(B, d_out=2)
-                        edge_index, edge_weight = uet.build_knn_graph(y_hat_reconstructed, k=20, device=device)
+                        # D_valid_edm = uet.edm_project(D_valid)
+                        # J = torch.eye(n_valid, device=device) - torch.ones(n_valid, n_valid, device=device) / n_valid
+                        # B = -0.5 * J @ (D_valid_edm ** 2) @ J
+                        # y_hat_reconstructed = uet.classical_mds(B, d_out=2)
+                        # edge_index, edge_weight = uet.build_knn_graph(y_hat_reconstructed, k=20, device=device)
+
+                        # Project to EDM and build kNN directly from distances
+                        D_valid_edm = uet.edm_project(D_valid)
+                        edge_index, edge_weight = uet.build_knn_graph_from_distance(D_valid_edm, k=20, device=device)
                         L_hat = uet.compute_graph_laplacian(edge_index, edge_weight, n_valid)
                         
                         L_target_i = batch['L_info'][i]['L']

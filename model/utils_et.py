@@ -211,6 +211,54 @@ def compute_spectral_targets(
 # PART 4: DISTANCE & GEOMETRY FUNCTIONS
 # ==============================================================================
 
+
+    
+def _symmetrize(A: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (A + A.mT)
+
+def safe_eigh(A: torch.Tensor, return_vecs: bool = True, cpu: bool = True):
+    """
+    Robust Hermitian eigensolver:
+    - symmetrize
+    - adaptive jitter
+    - float64 on CPU
+    - numpy fallback
+    """
+
+    A = _symmetrize(A)
+    n = A.shape[0]
+    dev, dtype = A.device, A.dtype
+
+    #adaptive jitter scaled to matrix magnitude
+    scale = torch.nan_to_num(A.abs().max(), nan=1.0, posinf=1.0, neginf=1.0)
+    jitter = (1e-8 + 1e-6 * float(scale)) * torch.eye(n, device=dev, dtype=dtype)
+    A = A + jitter 
+
+    A64 = A.double().cpu() if cpu else A.double()
+    try:
+        if return_vecs:
+            w, V = torch.linalg.eigh(A64)
+        else:
+            w = torch.linalg.eigvalsh(A64)
+            V = None
+    except Exception:
+        import numpy as np
+        a_np = A64.numpy()
+        if return_vecs:
+            w_np, V_np = np.linalg.eigh(a_np)
+            w = torch.from_numpy(w_np)
+            V = torch.from_numpy(V_np)
+        else:
+            w_np = np.linalg.eigvalsh(a_np)
+            w = torch.from_numpy(w_np)
+            V = None
+
+    if cpu:
+        w = w.to(dev=dev, dtype=dtype)
+        if V is not None:
+            V = V.to(dev=dev, dtype=dtype)
+    return (w, V) if return_vecs else (w, None)
+
 def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
     """
     Compute histogram of pairwise distances (upper triangle).
@@ -229,6 +277,17 @@ def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
     # Compute histogram
     hist = torch.histc(dists, bins=len(bins)-1, min=bins[0].item(), max=bins[-1].item())
     hist = hist / hist.sum()  # Normalize
+
+    minv, maxv = bins[0].item(), bins[-1].item()
+    if not (maxv > minv + 1e-12):
+        # put all mass in the first bin
+        hist = torch.zeros(len(bins)-1, device=D.device, dtype=D.dtype)
+        hist[0] = 1.0
+        return hist
+    
+    hist = torch.histc(dists, bins=len(bins)-1, min=minv, max=maxv)
+    s = hist.sum()
+    hist = hist / (s + 1e-12)
     return hist
 
 
@@ -315,7 +374,8 @@ def factor_from_gram(G: torch.Tensor, D_latent: int) -> torch.Tensor:
         V: (n, D_latent) factor matrix
     """
     # Eigendecomposition
-    eigvals, eigvecs = torch.linalg.eigh(G)  # Ascending order
+    # eigvals, eigvecs = torch.linalg.eigh(G)  # Ascending order
+    eigvals, eigvecs = safe_eigh(G, return_vecs=True)
     eigvals = eigvals.flip(0).clamp(min=0)  # Descending, non-negative
     eigvecs = eigvecs.flip(1)
     
@@ -357,7 +417,8 @@ def edm_project(D: torch.Tensor) -> torch.Tensor:
     B = -0.5 * J @ (D ** 2) @ J
     
     # Eigendecomposition
-    eigvals, eigvecs = torch.linalg.eigh(B)
+    # eigvals, eigvecs = torch.linalg.eigh(B)
+    eigvals, eigvecs = safe_eigh(B, return_vecs=True)
     
     # Threshold negative eigenvalues
     eigvals_pos = eigvals.clamp(min=0)
@@ -389,11 +450,19 @@ def classical_mds(B: torch.Tensor, d_out: int = 2, eps: float = 1e-6) -> torch.T
         B_scale = torch.tensor(1.0, device=B.device)
     
     eps_adaptive = max(eps, 1e-4 * B_scale)  # Scale eps with matrix magnitude
-    B_reg = B + eps_adaptive * torch.eye(B.shape[0], device=B.device)
-    
-    eigvals, eigvecs = torch.linalg.eigh(B_reg)
+
+    # B_reg = B + eps_adaptive * torch.eye(B.shape[0], device=B.device) 
+    # eigvals, eigvecs = torch.linalg.eigh(B_reg)
+
+    B_reg = _symmetrize(B) + eps_adaptive * torch.eye(B.shape[0], device=B.device)
+    eigvals, eigvecs = safe_eigh(B_reg, return_vecs=True)
+
     eigvals = eigvals.flip(0).clamp(min=0)
     eigvecs = eigvecs.flip(1)
+
+    if eigvals.max() < 1e-12:
+        # utterly degenerate; return zeros to avoid crashes
+        return torch.zeros(B.shape[0], d_out, device=B.device, dtype=B.dtype)
     
     # Take top d_out eigenpairs
     D = min(d_out, eigvals.shape[0])
@@ -558,8 +627,13 @@ class HeatKernelLoss(nn.Module):
             L_target = L_target[valid_idx][:, valid_idx]
         
         # Eigendecomposition
-        eigvals_pred = torch.linalg.eigvalsh(L_pred).clamp(min=0)
-        eigvals_target = torch.linalg.eigvalsh(L_target).clamp(min=0)
+        # eigvals_pred = torch.linalg.eigvalsh(L_pred).clamp(min=0)
+        # eigvals_target = torch.linalg.eigvalsh(L_target).clamp(min=0)
+
+        eigvals_pred, _ = safe_eigh(L_pred, return_vecs=False)
+        eigvals_target, _ = safe_eigh(L_target, return_vecs=False)
+        eigvals_pred = eigvals_pred.clamp(min=0)
+        eigvals_target = eigvals_target.clamp(min=0)
         
         # Compute traces for each t
         loss = 0.0
@@ -668,3 +742,23 @@ class FrobeniusGramLoss(nn.Module):
         diff = G_pred - G_target
         loss = torch.mean(diff ** 2)
         return loss
+
+def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):
+    """
+    kNN graph from a distance matrix (no coordinates needed).
+    D: (n, n) with zeros on diag, symmetric.
+    """
+    n = D.shape[0]
+    D = _symmetrize(D)
+    D = D + torch.eye(n, device=D.device, dtype=D.dtype) * 1e10  # mask self
+    knn_dists, knn_idx = torch.topk(D, k, dim=1, largest=False)
+    src = torch.arange(n, device=D.device).unsqueeze(1).expand(-1, k).reshape(-1)
+    dst = knn_idx.reshape(-1)
+    edge_index = torch.stack([src, dst], dim=0)
+
+    # Adaptive sigma from knn distances
+    sigma = torch.median(knn_dists).item()
+    if sigma < 1e-8:
+        sigma = 1.0
+    edge_weight = torch.exp(-(knn_dists.reshape(-1) ** 2) / (2 * sigma ** 2))
+    return edge_index.long(), edge_weight.float()
