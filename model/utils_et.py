@@ -254,9 +254,9 @@ def safe_eigh(A: torch.Tensor, return_vecs: bool = True, cpu: bool = True):
             V = None
 
     if cpu:
-        w = w.to(dev=dev, dtype=dtype)
+        w = w.to(device=dev, dtype=dtype)
         if V is not None:
-            V = V.to(dev=dev, dtype=dtype)
+            V = V.to(device=dev, dtype=dtype)
     return (w, V) if return_vecs else (w, None)
 
 def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
@@ -762,3 +762,87 @@ def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'c
         sigma = 1.0
     edge_weight = torch.exp(-(knn_dists.reshape(-1) ** 2) / (2 * sigma ** 2))
     return edge_index.long(), edge_weight.float()
+
+import math 
+import torch
+import torch.nn as nn
+
+#fast heat trace via strochastic lanczos quadratur (dense L)
+@torch.no_grad()
+
+def lanczos_dense(A, v0, m, tol=1e-6):
+    '''run m-step lanczos on dense symmetric A with start vector v0
+    returns symmetric tridiagonal T (j * j), where j < =m if eraly stop
+    '''
+
+    device , dtype = A.device, A.dtype
+    n = v0.numel()
+    Q = torch.zeros(n, m, device=device, dtype=dtype)
+    alpha = torch.zeros(m, device=device, dtype=dtype)
+    beta = torch.zeros(m-1, device=device, dtype=dtype)
+
+    v = v0 / (v0.norm() + 1e-12)
+    w = A @ v
+    alpha[0] = torch.dot(v, w)
+    Q[:, 0] = v
+    w = w - alpha[0] * v
+
+    j = 1
+    for j in range(1, m):
+        beta[j-1] = w.norm()
+        if beta[j-1] <= tol:
+            #truncate 
+            alpha = alpha[:j]
+            beta = beta[:j-1]
+            Q = Q[:, :j]
+            break 
+        v_next = w / beta[j-1]
+        Q[:, j] = v_next
+        w = A @ v_next - beta[j-1] * v
+        alpha[j] = torch.dot(v_next, w)
+        w = w - alpha[j] * v_next
+        v = v_next 
+
+    T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
+    return T
+
+@torch.no_grad()
+def _quad_form_exp_from_T(T, t):
+    """
+    Compute e1^T exp(-t T) e1 for small symmetric T (j x j).
+    """
+    # j is small (<= m ~ 25-40), so dense eig is cheap
+    evals, evecs = torch.linalg.eigh(T)          # on current device
+    weights = (evecs[0, :] ** 2)                 # (j,)
+    return (weights * torch.exp(-t * evals)).sum()
+
+
+@torch.no_grad()
+def heat_trace_slq_dense(L, t_list, num_probe=6, m=25):
+    """
+    Approximate Tr(exp(-t L)) for each t in t_list using SLQ on dense symmetric PSD L.
+    Returns tensor of shape [len(t_list)] on L.device.
+
+    Args:
+        L: (n, n) symmetric PSD (float32/float64), typically a Laplacian
+        t_list: list/tuple of float
+        num_probe: number of Hutchinson probe vectors
+        m: Lanczos steps per probe
+    """
+    device = L.device
+    dtype  = L.dtype
+    n      = L.size(0)
+
+    # Rademacher probes
+    traces = torch.zeros(len(t_list), device=device, dtype=dtype)
+    for _ in range(num_probe):
+        v = torch.empty(n, device=device, dtype=dtype).uniform_(-1.0, 1.0).sign()
+        v = v / math.sqrt(n)
+        T = lanczos_dense(L, v, m)
+        # eval f(T) once per t
+        for j, t in enumerate(t_list):
+            traces[j] += _quad_form_exp_from_T(T, float(t))
+
+    traces /= float(num_probe)
+    # Hutchinson is unbiased for trace, so multiply by n
+    return traces * n

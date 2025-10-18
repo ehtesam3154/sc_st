@@ -14,6 +14,8 @@ from typing import Dict, List, Tuple, Optional
 from modules import MAB, SAB, ISAB, PMA
 import utils_et as uet
 
+from tqdm import tqdm
+
 # ==============================================================================
 # STAGE C: SET-EQUIVARIANT CONTEXT ENCODER
 # ==============================================================================
@@ -369,7 +371,8 @@ def train_stageC_diffusion_generator(
     for epoch in range(n_epochs):
         epoch_losses = {'score': [], 'gram': [], 'heat': [], 'sw': [], 'triplet': [], 'total': []}
         
-        for batch in dataloader:
+        # for batch in dataloader:
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch}")):
             Z_set = batch['Z_set'].to(device)
             V_target = batch['V_target'].to(device)
             G_target = batch['G_target'].to(device)
@@ -396,86 +399,156 @@ def train_stageC_diffusion_generator(
             
             # Center V_t (important!)
             V_t = V_t - V_t.mean(dim=1, keepdim=True)
-            
+            V_t = torch.nan_to_num(V_t, nan=0.0, posinf=0.0, neginf=0.0)
+        
             # 4. Predict noise
             eps_pred = score_net(V_t, t_norm, H, mask)
             
             # 5. Score loss (masked MSE)
-            mask_expanded = mask.unsqueeze(-1).float()
-            L_score = ((eps - eps_pred) ** 2 * mask_expanded).sum() / mask_expanded.sum()
+            # mask_expanded = mask.unsqueeze(-1).float()
+            # L_score = ((eps - eps_pred) ** 2 * mask_expanded).sum() / mask_expanded.sum()
+
+            # Ensure padded rows are hard-zeroed and remove NaNs
+            mask_exp = mask.unsqueeze(-1)            # (B, n, 1)
+            eps_pred = eps_pred.masked_fill(~mask_exp, 0.0)
+            eps_pred = torch.nan_to_num(eps_pred, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Also zero and sanitize the target noise on padded rows
+            eps      = eps.masked_fill(~mask_exp, 0.0)
+            eps      = torch.nan_to_num(eps, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Compute masked MSE by boolean indexing (avoids 0 * NaN)
+            valid = mask_exp.expand_as(eps).bool()   # (B, n, D)
+            L_score = F.mse_loss(eps_pred[valid], eps[valid])
+
             
             # 6. Predict clean sample for auxiliary losses
             V_hat = V_t - sigma_t * eps_pred
             V_hat = V_hat - V_hat.mean(dim=1, keepdim=True)  # Recenter
+            V_hat = torch.nan_to_num(V_hat, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Compute G_hat, D_hat
-            G_hat_list = []
-            D_hat_list = []
-            for i in range(batch_size_real):
-                n_valid = mask[i].sum().item()
-                V_valid = V_hat[i, :n_valid]
-                G_valid = V_valid @ V_valid.t()
+            # G_hat_list = []
+            # D_hat_list = []
+            # for i in range(batch_size_real):
+            #     n_valid = mask[i].sum().item()
+            #     V_valid = V_hat[i, :n_valid]
+            #     G_valid = V_valid @ V_valid.t()
                 
-                # Distances from Gram
-                diag = torch.diag(G_valid).unsqueeze(1)
-                D_valid = torch.sqrt(torch.clamp(diag + diag.t() - 2 * G_valid, min=0))
+            #     # Distances from Gram
+            #     diag = torch.diag(G_valid).unsqueeze(1)
+            #     D_valid = torch.sqrt(torch.clamp(diag + diag.t() - 2 * G_valid, min=0))
                 
-                # Pad back to n_max
-                G_padded = torch.zeros(n_max, n_max, device=device)
-                D_padded = torch.zeros(n_max, n_max, device=device)
-                G_padded[:n_valid, :n_valid] = G_valid
-                D_padded[:n_valid, :n_valid] = D_valid
+            #     # Pad back to n_max
+            #     G_padded = torch.zeros(n_max, n_max, device=device)
+            #     D_padded = torch.zeros(n_max, n_max, device=device)
+            #     G_padded[:n_valid, :n_valid] = G_valid
+            #     D_padded[:n_valid, :n_valid] = D_valid
                 
-                G_hat_list.append(G_padded)
-                D_hat_list.append(D_padded)
+            #     G_hat_list.append(G_padded)
+            #     D_hat_list.append(D_padded)
             
-            G_hat = torch.stack(G_hat_list, dim=0)
-            D_hat = torch.stack(D_hat_list, dim=0)
+            # G_hat = torch.stack(G_hat_list, dim=0)
+            # D_hat = torch.stack(D_hat_list, dim=0)
+
+
+            # (B, n, n) Gram for entire batch
+            G_hat = V_hat @ V_hat.transpose(1, 2)
+
+            # Build a (B, n, n) mask for valid pairs
+            pair_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+
+            # Zero out padded rows/cols to keep numerics clean
+            G_hat = G_hat.masked_fill(~pair_mask, 0.0)
+
+            # Distances from Gram (batched)
+            diag = torch.diagonal(G_hat, dim1=-2, dim2=-1)             # (B, n)
+            D2_hat = diag.unsqueeze(2) + diag.unsqueeze(1) - 2.0 * G_hat
+            D2_hat = torch.clamp(D2_hat, min=0.0)
+            D_hat  = torch.sqrt(D2_hat + 1e-9).masked_fill(~pair_mask, 0.0)
+
             
             # 7. Auxiliary losses
             # a) Frobenius Gram
-            L_gram = 0
-            for i in range(batch_size_real):
-                L_gram += loss_gram(G_hat[i], G_target[i], mask[i])
-            L_gram = L_gram / batch_size_real
+            # L_gram = 0
+            # for i in range(batch_size_real):
+            #     L_gram += loss_gram(G_hat[i], G_target[i], mask[i])
+            # L_gram = L_gram / batch_size_real
+
+            diff = (G_hat - G_target).masked_fill(~pair_mask, 0.0)
+            L_gram = (diff ** 2).sum() / pair_mask.float().sum().clamp_min(1.0)
+
             
             # b) Heat kernel (simplified: just on first batch item for speed)
+            # L_heat = torch.tensor(0.0, device=device)
+            # if epoch % 50 == 0:
+            #     for i in range(min(1, batch_size_real)):
+            #         n_valid = int(mask[i].sum().item())
+            #         if n_valid > 10:
+            #             Dp = D_hat[i, :n_valid, :n_valid]
+            #             Dt = D_target[i, :n_valid, :n_valid]
+            #             if torch.isfinite(Dp).all() and torch.isfinite(Dt).all():
+            #                 # kNN from distance (utils_et.build_knn_graph_from_distance)
+            #                 ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=20, device=device)
+            #                 Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)
+            #                 ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=20, device=device)
+            #                 Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)
+            #                 L_heat = uet.HeatKernelLoss()(
+            #                     Lp, Lt, mask=None
+            #                 ).float()
+            # --- Heat-kernel (trace) loss: guarded and sparse schedule ---
             L_heat = torch.tensor(0.0, device=device)
-            if epoch % 5 == 0:  # Compute every 5 epochs to save time
-                for i in range(min(1, batch_size_real)):
-                    n_valid = mask[i].sum().item()
-                    if n_valid > 10 and torch.isfinite(D_hat[i, :n_valid, :n_valid]).all():
-                        # Build Laplacian from D_hat
-                        D_valid = D_hat[i, :n_valid, :n_valid]
-                        # y_hat_reconstructed = uet.classical_mds(
-                        #     -0.5 * (torch.eye(n_valid, device=device) - 1/n_valid) @ (D_valid**2) @ 
-                        #     (torch.eye(n_valid, device=device) - 1/n_valid),
-                        #     d_out=2
-                        # )
 
-                        # D_valid_edm = uet.edm_project(D_valid)
-                        # J = torch.eye(n_valid, device=device) - torch.ones(n_valid, n_valid, device=device) / n_valid
-                        # B = -0.5 * J @ (D_valid_edm ** 2) @ J
-                        # y_hat_reconstructed = uet.classical_mds(B, d_out=2)
-                        # edge_index, edge_weight = uet.build_knn_graph(y_hat_reconstructed, k=20, device=device)
+            # Compute on a single item per epoch and only every 50 epochs
+            if (epoch % 50 == 0) and (batch_idx == 0):  # batch_idx from the for-loop
+                i = 0  # first item in the batch
+                n_valid = int(mask[i].sum().item())
+                if n_valid > 10:
+                    Dp = D_hat[i, :n_valid, :n_valid].contiguous()
+                    Dt = D_target[i, :n_valid, :n_valid].contiguous()
 
-                        # Project to EDM and build kNN directly from distances
-                        D_valid_edm = uet.edm_project(D_valid)
-                        edge_index, edge_weight = uet.build_knn_graph_from_distance(D_valid_edm, k=20, device=device)
-                        L_hat = uet.compute_graph_laplacian(edge_index, edge_weight, n_valid)
-                        
-                        L_target_i = batch['L_info'][i]['L']
-                        L_heat += loss_heat(L_hat, L_target_i, None)
+                    # Build kNN graphs (smaller k, faster)
+                    ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=10, device=device)
+                    Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)
+
+                    ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=10, device=device)
+                    Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)
+
+                    # Use the fast SLQ-based heat trace (added below in utils_et.py)
+                    traces_p = uet.heat_trace_slq_dense(Lp, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
+                    traces_t = uet.heat_trace_slq_dense(Lt, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
+                    L_heat = ((traces_p - traces_t) ** 2).mean()
+
+
             
             # c) Distance histogram SW
+            # L_sw = 0
+            # for i in range(batch_size_real):
+            #     n_valid = mask[i].sum().item()
+            #     if n_valid > 10:
+            #         D_valid = D_hat[i, :n_valid, :n_valid]
+            #         d_95 = torch.quantile(D_valid[torch.triu(torch.ones_like(D_valid), diagonal=1).bool()], 0.95)
+            #         bins = torch.linspace(0, d_95, H_target.shape[1] + 1, device=device)
+            #         H_hat = uet.compute_distance_hist(D_valid, bins)
+            #         L_sw += loss_sw(H_hat, H_target[i])
+            # L_sw = L_sw / batch_size_real
+
+            # c) Distance histogram SW  ──> bins must come from ST target distances (pose‑free)
             L_sw = 0
+            num_bins = H_target.shape[1]
             for i in range(batch_size_real):
-                n_valid = mask[i].sum().item()
+                n_valid = int(mask[i].sum().item())
                 if n_valid > 10:
-                    D_valid = D_hat[i, :n_valid, :n_valid]
-                    d_95 = torch.quantile(D_valid[torch.triu(torch.ones_like(D_valid), diagonal=1).bool()], 0.95)
-                    bins = torch.linspace(0, d_95, H_target.shape[1] + 1, device=device)
-                    H_hat = uet.compute_distance_hist(D_valid, bins)
+                    # Predicted distances for this mini-set
+                    D_pred = D_hat[i, :n_valid, :n_valid]
+                    # Reference (target) distances from Stage B for the same mini-set
+                    D_ref  = D_target[i, :n_valid, :n_valid]
+                    # Build bin edges from the target 95th percentile (as specified in Stage B)
+                    tri = torch.triu(torch.ones(n_valid, n_valid, device=device, dtype=torch.bool), diagonal=1)
+                    d_95_ref = torch.quantile(D_ref[tri], 0.95)
+                    bins = torch.linspace(0.0, d_95_ref, num_bins + 1, device=device)
+                    # Histogram of predicted distances evaluated on target-derived bins
+                    H_hat = uet.compute_distance_hist(D_pred, bins)
                     L_sw += loss_sw(H_hat, H_target[i])
             L_sw = L_sw / batch_size_real
             
@@ -511,6 +584,9 @@ def train_stageC_diffusion_generator(
             epoch_losses['sw'].append(L_sw.item())
             epoch_losses['triplet'].append(L_ord.item())
             epoch_losses['total'].append(L_total.item())
+            
+            if batch_idx % 50 == 0:
+                tqdm.write(f"Batch {batch_idx} | Total: {L_total.item():.4f} | Score: {L_score.item():.4f} | Gram: {L_gram.item():.4f}")
         
         scheduler.step()
         
