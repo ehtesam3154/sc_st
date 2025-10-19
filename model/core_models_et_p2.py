@@ -16,6 +16,10 @@ import utils_et as uet
 
 from tqdm import tqdm
 
+import matplotlib.pyplot as plt
+import json
+from datetime import datetime
+
 # ==============================================================================
 # STAGE C: SET-EQUIVARIANT CONTEXT ENCODER
 # ==============================================================================
@@ -305,6 +309,63 @@ class DiffusionScoreNet(nn.Module):
 # STAGE C: TRAINING FUNCTION
 # ==============================================================================
 
+def plot_losses(history, plot_dir, current_epoch):
+    """
+    Plot and save loss curves.
+    
+    Args:
+        history: dict with 'epoch' and 'epoch_avg' keys
+        plot_dir: directory to save plots
+        current_epoch: current epoch number
+    """
+    epochs = history['epoch']
+    avg = history['epoch_avg']
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'Stage C Training Losses (Epoch {current_epoch})', fontsize=16, fontweight='bold')
+    
+    # Plot each loss component
+    loss_names = ['total', 'score', 'gram', 'heat', 'sw', 'triplet']
+    colors = ['black', 'blue', 'red', 'green', 'orange', 'purple']
+    
+    for idx, (name, color) in enumerate(zip(loss_names, colors)):
+        ax = axes[idx // 3, idx % 3]
+        ax.plot(epochs, avg[name], color=color, linewidth=2, label=name.capitalize())
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_title(f'{name.capitalize()} Loss', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        
+        # Add smoothed trend line if enough data
+        if len(epochs) > 10:
+            from scipy.ndimage import gaussian_filter1d
+            smoothed = gaussian_filter1d(avg[name], sigma=2)
+            ax.plot(epochs, smoothed, '--', color=color, alpha=0.5, linewidth=1.5, label='Trend')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, f'losses_epoch_{current_epoch:04d}.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Also save a combined plot showing all losses on same axes (log scale)
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    for name, color in zip(loss_names[1:], colors[1:]):  # Skip 'total'
+        ax.plot(epochs, avg[name], color=color, linewidth=2, label=name.capitalize(), marker='o', markersize=3, markevery=max(1, len(epochs)//20))
+    
+    ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Loss', fontsize=14, fontweight='bold')
+    ax.set_title('All Loss Components (Epoch-Averaged)', fontsize=16, fontweight='bold')
+    ax.set_yscale('log')  # Log scale to see all components
+    ax.grid(True, alpha=0.3, which='both')
+    ax.legend(fontsize=12)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, f'combined_losses_epoch_{current_epoch:04d}.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Plots saved to {plot_dir}/")
+
 def train_stageC_diffusion_generator(
     context_encoder: SetEncoderContext,
     generator: MetricSetGenerator,
@@ -367,9 +428,31 @@ def train_stageC_diffusion_generator(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                            collate_fn=collate_minisets, num_workers=0)
     
+    # Initialize logging
+    os.makedirs(outf, exist_ok=True)
+    log_file = os.path.join(outf, 'training_log.json')
+    plot_dir = os.path.join(outf, 'plots')
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Training history
+    history = {
+        'epoch': [],
+        'batch_losses': [],  # List of dicts per epoch
+        'epoch_avg': {'total': [], 'score': [], 'gram': [], 'heat': [], 'sw': [], 'triplet': []}
+    }
+    
+    # Annealing schedule for SW weight
+    gamma_base = 1.0
+    def get_gamma_annealed(epoch, n_epochs):
+        """Cosine annealing: starts at 0, reaches gamma_base at end."""
+        return gamma_base * (1 - np.cos(np.pi * epoch / n_epochs)) / 2
+
     print(f"Training Stage C for {n_epochs} epochs...")
+
     for epoch in range(n_epochs):
         epoch_losses = {'score': [], 'gram': [], 'heat': [], 'sw': [], 'triplet': [], 'total': []}
+        batch_losses_this_epoch = []
+    
         
         # for batch in dataloader:
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch}")):
@@ -427,31 +510,6 @@ def train_stageC_diffusion_generator(
             V_hat = V_hat - V_hat.mean(dim=1, keepdim=True)  # Recenter
             V_hat = torch.nan_to_num(V_hat, nan=0.0, posinf=0.0, neginf=0.0)
             
-            # Compute G_hat, D_hat
-            # G_hat_list = []
-            # D_hat_list = []
-            # for i in range(batch_size_real):
-            #     n_valid = mask[i].sum().item()
-            #     V_valid = V_hat[i, :n_valid]
-            #     G_valid = V_valid @ V_valid.t()
-                
-            #     # Distances from Gram
-            #     diag = torch.diag(G_valid).unsqueeze(1)
-            #     D_valid = torch.sqrt(torch.clamp(diag + diag.t() - 2 * G_valid, min=0))
-                
-            #     # Pad back to n_max
-            #     G_padded = torch.zeros(n_max, n_max, device=device)
-            #     D_padded = torch.zeros(n_max, n_max, device=device)
-            #     G_padded[:n_valid, :n_valid] = G_valid
-            #     D_padded[:n_valid, :n_valid] = D_valid
-                
-            #     G_hat_list.append(G_padded)
-            #     D_hat_list.append(D_padded)
-            
-            # G_hat = torch.stack(G_hat_list, dim=0)
-            # D_hat = torch.stack(D_hat_list, dim=0)
-
-
             # (B, n, n) Gram for entire batch
             G_hat = V_hat @ V_hat.transpose(1, 2)
 
@@ -480,76 +538,82 @@ def train_stageC_diffusion_generator(
 
             
             # b) Heat kernel (simplified: just on first batch item for speed)
-            # L_heat = torch.tensor(0.0, device=device)
-            # if epoch % 50 == 0:
-            #     for i in range(min(1, batch_size_real)):
-            #         n_valid = int(mask[i].sum().item())
-            #         if n_valid > 10:
-            #             Dp = D_hat[i, :n_valid, :n_valid]
-            #             Dt = D_target[i, :n_valid, :n_valid]
-            #             if torch.isfinite(Dp).all() and torch.isfinite(Dt).all():
-            #                 # kNN from distance (utils_et.build_knn_graph_from_distance)
-            #                 ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=20, device=device)
-            #                 Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)
-            #                 ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=20, device=device)
-            #                 Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)
-            #                 L_heat = uet.HeatKernelLoss()(
-            #                     Lp, Lt, mask=None
-            #                 ).float()
             # --- Heat-kernel (trace) loss: guarded and sparse schedule ---
             L_heat = torch.tensor(0.0, device=device)
 
-            # Compute on a single item per epoch and only every 50 epochs
-            if (epoch % 50 == 0) and (batch_idx == 0):  # batch_idx from the for-loop
-                i = 0  # first item in the batch
+            # # Compute on a single item per epoch and only every 50 epochs
+            # if (epoch % 10 == 0) and (batch_idx == 0):  # batch_idx from the for-loop
+            #     i = 0  # first item in the batch
+            #     n_valid = int(mask[i].sum().item())
+            #     if n_valid > 10:
+            #         Dp = D_hat[i, :n_valid, :n_valid].contiguous()
+            #         Dt = D_target[i, :n_valid, :n_valid].contiguous()
+
+            #         # Build kNN graphs (smaller k, faster)
+            #         ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=10, device=device)
+            #         Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)
+
+            #         ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=10, device=device)
+            #         Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)
+
+            #         # Use the fast SLQ-based heat trace (added below in utils_et.py)
+            #         traces_p = uet.heat_trace_slq_dense(Lp, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
+            #         traces_t = uet.heat_trace_slq_dense(Lt, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
+            #         L_heat = ((traces_p - traces_t) ** 2).mean()
+
+            # b) Heat kernel trace loss - compute for all items in batch
+
+            for i in range(batch_size_real):
                 n_valid = int(mask[i].sum().item())
                 if n_valid > 10:
                     Dp = D_hat[i, :n_valid, :n_valid].contiguous()
                     Dt = D_target[i, :n_valid, :n_valid].contiguous()
 
-                    # Build kNN graphs (smaller k, faster)
                     ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=10, device=device)
                     Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)
 
                     ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=10, device=device)
                     Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)
 
-                    # Use the fast SLQ-based heat trace (added below in utils_et.py)
                     traces_p = uet.heat_trace_slq_dense(Lp, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
                     traces_t = uet.heat_trace_slq_dense(Lt, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
-                    L_heat = ((traces_p - traces_t) ** 2).mean()
+                    L_heat += ((traces_p - traces_t) ** 2).mean()
 
-
-            
-            # c) Distance histogram SW
-            # L_sw = 0
-            # for i in range(batch_size_real):
-            #     n_valid = mask[i].sum().item()
-            #     if n_valid > 10:
-            #         D_valid = D_hat[i, :n_valid, :n_valid]
-            #         d_95 = torch.quantile(D_valid[torch.triu(torch.ones_like(D_valid), diagonal=1).bool()], 0.95)
-            #         bins = torch.linspace(0, d_95, H_target.shape[1] + 1, device=device)
-            #         H_hat = uet.compute_distance_hist(D_valid, bins)
-            #         L_sw += loss_sw(H_hat, H_target[i])
-            # L_sw = L_sw / batch_size_real
+            L_heat = L_heat / batch_size_real
 
             # c) Distance histogram SW  ──> bins must come from ST target distances (pose‑free)
             L_sw = 0
             num_bins = H_target.shape[1]
+
             for i in range(batch_size_real):
                 n_valid = int(mask[i].sum().item())
+                # if n_valid > 10:
+                #     # Predicted distances for this mini-set
+                #     D_pred = D_hat[i, :n_valid, :n_valid]
+                #     # Reference (target) distances from Stage B for the same mini-set
+                #     D_ref  = D_target[i, :n_valid, :n_valid]
+                #     # Build bin edges from the target 95th percentile (as specified in Stage B)
+                #     tri = torch.triu(torch.ones(n_valid, n_valid, device=device, dtype=torch.bool), diagonal=1)
+                #     d_95_ref = torch.quantile(D_ref[tri], 0.95)
+                #     bins = torch.linspace(0.0, d_95_ref, num_bins + 1, device=device)
+                #     # Histogram of predicted distances evaluated on target-derived bins
+                #     H_hat = uet.compute_distance_hist(D_pred, bins)
+                #     L_sw += loss_sw(H_hat, H_target[i])
+                
                 if n_valid > 10:
-                    # Predicted distances for this mini-set
                     D_pred = D_hat[i, :n_valid, :n_valid]
-                    # Reference (target) distances from Stage B for the same mini-set
-                    D_ref  = D_target[i, :n_valid, :n_valid]
-                    # Build bin edges from the target 95th percentile (as specified in Stage B)
-                    tri = torch.triu(torch.ones(n_valid, n_valid, device=device, dtype=torch.bool), diagonal=1)
-                    d_95_ref = torch.quantile(D_ref[tri], 0.95)
-                    bins = torch.linspace(0.0, d_95_ref, num_bins + 1, device=device)
-                    # Histogram of predicted distances evaluated on target-derived bins
+                    
+                    # Use the EXACT same bins that created H_target
+                    bins = batch['H_bins'][i]  # ← The bins from dataset
+                    
                     H_hat = uet.compute_distance_hist(D_pred, bins)
-                    L_sw += loss_sw(H_hat, H_target[i])
+                    
+                    # Normalize
+                    H_hat_norm = H_hat / (H_hat.sum() + 1e-12)
+                    H_target_norm = H_target[i] / (H_target[i].sum() + 1e-12)
+                    
+                    L_sw += loss_sw(H_hat_norm, H_target_norm)
+
             L_sw = L_sw / batch_size_real
             
             # d) Ordinal triplet
@@ -568,7 +632,14 @@ def train_stageC_diffusion_generator(
             L_ord = L_ord / batch_size_real
             
             # 8. Total loss
-            alpha, beta, gamma, eta = loss_weights['alpha'], loss_weights['beta'], loss_weights['gamma'], loss_weights['eta']
+            #UPDATE gamma dynamically
+            gamma_current = get_gamma_annealed(epoch, n_epochs)
+
+            # alpha, beta, gamma, eta = loss_weights['alpha'], loss_weights['beta'], loss_weights['gamma'], loss_weights['eta']
+            # L_total = L_score + alpha * L_gram + beta * L_heat + gamma * L_sw + eta * L_ord
+
+            # 8. Total loss
+            alpha, beta, gamma, eta = loss_weights['alpha'], loss_weights['beta'], gamma_current, loss_weights['eta']  # ← Use gamma_current
             L_total = L_score + alpha * L_gram + beta * L_heat + gamma * L_sw + eta * L_ord
             
             # 9. Backward
@@ -576,6 +647,18 @@ def train_stageC_diffusion_generator(
             L_total.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             optimizer.step()
+
+            # Track losses
+            batch_loss_dict = {
+                'batch': batch_idx,
+                'total': L_total.item(),
+                'score': L_score.item(),
+                'gram': L_gram.item(),
+                'heat': L_heat.item(),
+                'sw': L_sw.item(),
+                'triplet': L_ord.item()
+            }
+            batch_losses_this_epoch.append(batch_loss_dict)
             
             # Track losses
             epoch_losses['score'].append(L_score.item())
@@ -585,13 +668,39 @@ def train_stageC_diffusion_generator(
             epoch_losses['triplet'].append(L_ord.item())
             epoch_losses['total'].append(L_total.item())
             
-            if batch_idx % 50 == 0:
-                tqdm.write(f"Batch {batch_idx} | Total: {L_total.item():.4f} | Score: {L_score.item():.4f} | Gram: {L_gram.item():.4f}")
+            # if batch_idx % 50 == 0:
+            #     tqdm.write(f"Batch {batch_idx} | Total: {L_total.item():.4f} | Score: {L_score.item():.4f} | Gram: {L_gram.item():.4f}")
         
         scheduler.step()
+
+        # Compute epoch averages
+        avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
+        
+        # Save to history
+        history['epoch'].append(epoch)
+        history['batch_losses'].append(batch_losses_this_epoch)
+        for k, v in avg_losses.items():
+            history['epoch_avg'][k].append(v)
+        
+        # Print epoch summary
+        print(f"Epoch {epoch}/{n_epochs} | "
+            f"Total: {avg_losses['total']:.4f} | "
+            f"Score: {avg_losses['score']:.4f} | "
+            f"Gram: {avg_losses['gram']:.4f} | "
+            f"Heat: {avg_losses['heat']:.4f} | "
+            f"SW: {avg_losses['sw']:.4f} | "
+            f"Triplet: {avg_losses['triplet']:.4f}")
+        
+        # Save JSON log every epoch (lightweight)
+        with open(log_file, 'w') as f:
+            json.dump(history, f, indent=2)
+        
+        # Plot every 10 epochs (or customize)
+        if epoch % 10 == 0 or epoch == n_epochs - 1:
+            plot_losses(history, plot_dir, epoch)
         
         # Logging
-        if epoch % 100 == 0:
+        if epoch % 5 == 0:
             avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
             print(f"Epoch {epoch}/{n_epochs} | "
                   f"Total: {avg_losses['total']:.4f} | "

@@ -210,8 +210,6 @@ def compute_spectral_targets(
 # ==============================================================================
 # PART 4: DISTANCE & GEOMETRY FUNCTIONS
 # ==============================================================================
-
-
     
 def _symmetrize(A: torch.Tensor) -> torch.Tensor:
     return 0.5 * (A + A.mT)

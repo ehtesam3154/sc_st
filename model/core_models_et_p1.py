@@ -455,6 +455,7 @@ class STSetDataset(Dataset):
         d_95 = torch.quantile(D_subset[torch.triu(torch.ones_like(D_subset), diagonal=1).bool()], 0.95)
         bins = torch.linspace(0, d_95, 64, device=self.device)
         H_subset = uet.compute_distance_hist(D_subset, bins)
+
         
         # Resample ordinal triplets within subset
         triplets_subset = uet.sample_ordinal_triplets(D_subset, n_triplets=min(500, n), margin_ratio=0.05)
@@ -471,6 +472,7 @@ class STSetDataset(Dataset):
             'G_target': G_subset,
             'D_target': D_subset,
             'H_target': H_subset,
+            'H_bins': bins,
             'L_info': L_info,
             'triplets': triplets_subset,
             'n': n
@@ -503,6 +505,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     
     L_info_batch = []
     triplets_batch = []
+    H_bins_batch = []
     
     for i, item in enumerate(batch):
         n = item['n']
@@ -514,6 +517,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         mask_batch[i, :n] = True
         L_info_batch.append(item['L_info'])
         triplets_batch.append(item['triplets'])
+        H_bins_batch.append(item['H_bins'])
     
     return {
         'Z_set': Z_batch,
@@ -523,5 +527,6 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'H_target': H_batch,
         'L_info': L_info_batch,
         'triplets': triplets_batch,
+        'H_bins': H_bins_batch,
         'mask': mask_batch
     }
