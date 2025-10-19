@@ -75,6 +75,8 @@ def train_encoder(
     lr: float = 1e-3,
     sigma: Optional[float] = None,
     alpha: float = 0.9,
+    ratio_start: float = 0.0,
+    ratio_end: float = 1.0,
     mmdbatch: float = 0.1,
     device: str = 'cuda',
     outf: str = 'output'
@@ -105,6 +107,12 @@ def train_encoder(
     model = model.to(device)
     model.train()
     
+    st_gene_expr = st_gene_expr.to(device)
+    st_coords = st_coords.to(device)
+    sc_gene_expr = sc_gene_expr.to(device)
+    if slide_ids is not None:
+        slide_ids = slide_ids.to(device)
+
     # Normalize ST coordinates (pose-invariant)
     st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
     
@@ -134,6 +142,8 @@ def train_encoder(
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    nettrue = A_target
     
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
@@ -157,20 +167,54 @@ def train_encoder(
         loss_pred = F.mse_loss(Z_st_sim * slide_mask_batch.float(), 
                                A_target_batch * slide_mask_batch.float())
         
+        #loss 1: rbf adjacency prediction (with slide mask)
+        netpred = Z_st @ Z_st.t()
+        A_target_batch = A_target[idx_st][:, idx_st]
+        slide_mask_batch = slide_mask[idx_st][:, idx_st]
+
+        #apply mask to both prediction and target
+        netpred_masked = netpred * slide_mask_batch.float()
+        A_target_masked = A_target_batch * slide_mask_batch.float()
+
+        #normalize (row-wise) where mask is activae
+        row_sums = A_target_masked.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        A_target_masked = A_target_masked / row_sums
+
+        loss_pred = F.cross_entropy(netpred_masked, A_target_masked, reduction='mean') 
+
+        #normalize (row-wise) where 
+        
         # Loss 2: Circular coupling
         # ST → SC (use all SC)
-        Z_sc_all = model(sc_gene_expr)
-        sim_st_to_sc = Z_st @ Z_sc_all.t()
-        P_st_to_sc = F.softmax(sim_st_to_sc / 0.1, dim=1)
-        Z_st_recon = P_st_to_sc @ Z_sc_all
+        # Z_sc_all = model(sc_gene_expr)
+        # sim_st_to_sc = Z_st @ Z_sc_all.t()
+        # P_st_to_sc = F.softmax(sim_st_to_sc / 0.1, dim=1)
+        # Z_st_recon = P_st_to_sc @ Z_sc_all
         
-        # SC → ST (use all ST)
+        # # SC → ST (use all ST)
+        # Z_st_all = model(st_gene_expr)
+        # sim_sc_to_st = Z_sc @ Z_st_all.t()
+        # P_sc_to_st = F.softmax(sim_sc_to_st / 0.1, dim=1)
+        # Z_sc_recon = P_sc_to_st @ Z_st_all
+        
+        # loss_circle = F.mse_loss(Z_st, Z_st_recon) + F.mse_loss(Z_sc, Z_sc_recon)
+
+        #loss 2: circular coupling
+        # Get all embeddings
         Z_st_all = model(st_gene_expr)
-        sim_sc_to_st = Z_sc @ Z_st_all.t()
-        P_sc_to_st = F.softmax(sim_sc_to_st / 0.1, dim=1)
-        Z_sc_recon = P_sc_to_st @ Z_st_all
-        
-        loss_circle = F.mse_loss(Z_st, Z_st_recon) + F.mse_loss(Z_sc, Z_sc_recon)
+        Z_sc_all = model(sc_gene_expr)
+
+        # ST batch → SC → ST batch mapping
+        st2sc = F.softmax(Z_st @ Z_sc_all.t(), dim=1)
+        sc2st = F.softmax(Z_sc_all @ Z_st.t(), dim=1)
+        st2st_unnorm = st2sc @ sc2st
+        st2st = torch.log(st2st_unnorm + 1e-7)
+
+        # Get target and RE-NORMALIZE for batch
+        nettrue_batch = nettrue[idx_st][:, idx_st]
+        nettrue_batch = nettrue_batch / (nettrue_batch.sum(dim=1, keepdim=True) + 1e-8)  # ✅ ADD THIS LINE
+
+        loss_circle = F.kl_div(st2st, nettrue_batch, reduction='none').sum(1).mean()
         
         # Loss 3: MMD
         n_mmd = int(mmdbatch * min(Z_st.shape[0], Z_sc.shape[0]))
@@ -188,8 +232,11 @@ def train_encoder(
             loss_mmd = torch.tensor(0.0, device=device)
         
         # Total loss
-        ratio = min(1.0, epoch / (n_epochs * 0.2))  # Warmup for circular coupling
-        loss = loss_pred + alpha * ratio * loss_circle + 0.1 * loss_mmd
+        # ratio = min(1.0, epoch / (n_epochs * 0.2))  # Warmup for circular coupling
+        # ratio = min(1.0, epoch / (n_epochs * 0.8))  # Warmup for circular coupling
+        ratio = ratio_start + (ratio_end - ratio_start) * min(epoch / (n_epochs * 0.8), 1.0)
+        # loss = loss_pred + alpha * ratio * loss_circle + 0.1 * loss_mmd
+        loss = loss_pred + alpha * loss_mmd + ratio * loss_circle
         
         # Backward
         optimizer.zero_grad()

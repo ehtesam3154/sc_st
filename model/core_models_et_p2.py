@@ -563,58 +563,94 @@ def train_stageC_diffusion_generator(
 
             # b) Heat kernel trace loss - compute for all items in batch
 
-            for i in range(batch_size_real):
-                n_valid = int(mask[i].sum().item())
-                if n_valid > 10:
-                    Dp = D_hat[i, :n_valid, :n_valid].contiguous()
-                    Dt = D_target[i, :n_valid, :n_valid].contiguous()
+            # for i in range(batch_size_real):
+            #     n_valid = int(mask[i].sum().item())
+            #     if n_valid > 10:
+            #         Dp = D_hat[i, :n_valid, :n_valid].contiguous()
+            #         Dt = D_target[i, :n_valid, :n_valid].contiguous()
 
-                    ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=10, device=device)
-                    Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)
+            #         ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=10, device=device)
+            #         Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)
 
-                    ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=10, device=device)
-                    Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)
+            #         ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=10, device=device)
+            #         Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)
 
-                    traces_p = uet.heat_trace_slq_dense(Lp, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
-                    traces_t = uet.heat_trace_slq_dense(Lt, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
-                    L_heat += ((traces_p - traces_t) ** 2).mean()
+            #         traces_p = uet.heat_trace_slq_dense(Lp, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
+            #         traces_t = uet.heat_trace_slq_dense(Lt, t_list=[0.25, 1.0, 4.0], num_probe=6, m=25)
+            #         L_heat += ((traces_p - traces_t) ** 2).mean()
 
-            L_heat = L_heat / batch_size_real
+            # L_heat = L_heat / batch_size_real
+
+            # L_heat = torch.tensor(0.0, device=device)
+
+            '''
+            # Pick **one** item (first or random) – doing all items is overkill
+            i = torch.randint(batch_size_real, (1,)).item() #or i = 0
+            n_valid = int(mask[i].sum().item())
+            if n_valid > 10:
+                Dp = D_hat[i, :n_valid, :n_valid].contiguous()
+                Dt = D_target[i, :n_valid, :n_valid].contiguous()
+
+                # If your dataset already returns precomputed L_target, use it:
+                # Lt = batch['L_info'][i]['L'] if available; else build:
+                ei_p, ew_p = uet.build_knn_graph_from_distance(Dp, k=15, device=device)
+                Lp = uet.compute_graph_laplacian(ei_p, ew_p, n_valid)           # **sparse, normalized**
+
+                ei_t, ew_t = uet.build_knn_graph_from_distance(Dt, k=15, device=device)
+                Lt = uet.compute_graph_laplacian(ei_t, ew_t, n_valid)           # **sparse, normalized**
+
+                traces_p = uet.heat_trace_slq_dense(Lp, t_list=[0.25, 1.0, 4.0], num_probe=4, m=12)
+                traces_t = uet.heat_trace_slq_dense(Lt, t_list=[0.25, 1.0, 4.0], num_probe=4, m=12)
+                # MSE of per-node traces (size-invariant)
+                L_heat = ((traces_p - traces_t) ** 2).mean()
+            '''
 
             # c) Distance histogram SW  ──> bins must come from ST target distances (pose‑free)
-            L_sw = 0
-            num_bins = H_target.shape[1]
+            # L_sw = 0
+            # num_bins = H_target.shape[1]
 
+            # for i in range(batch_size_real):
+            #     n_valid = int(mask[i].sum().item())
+            #     # if n_valid > 10:
+            #     #     # Predicted distances for this mini-set
+            #     #     D_pred = D_hat[i, :n_valid, :n_valid]
+            #     #     # Reference (target) distances from Stage B for the same mini-set
+            #     #     D_ref  = D_target[i, :n_valid, :n_valid]
+            #     #     # Build bin edges from the target 95th percentile (as specified in Stage B)
+            #     #     tri = torch.triu(torch.ones(n_valid, n_valid, device=device, dtype=torch.bool), diagonal=1)
+            #     #     d_95_ref = torch.quantile(D_ref[tri], 0.95)
+            #     #     bins = torch.linspace(0.0, d_95_ref, num_bins + 1, device=device)
+            #     #     # Histogram of predicted distances evaluated on target-derived bins
+            #     #     H_hat = uet.compute_distance_hist(D_pred, bins)
+            #     #     L_sw += loss_sw(H_hat, H_target[i])
+                
+            #     if n_valid > 10:
+            #         D_pred = D_hat[i, :n_valid, :n_valid]
+                    
+            #         # Use the EXACT same bins that created H_target
+            #         bins = batch['H_bins'][i]  # ← The bins from dataset
+                    
+            #         H_hat = uet.compute_distance_hist(D_pred, bins)
+                    
+            #         # Normalize
+            #         H_hat_norm = H_hat / (H_hat.sum() + 1e-12)
+            #         H_target_norm = H_target[i] / (H_target[i].sum() + 1e-12)
+                    
+            #         L_sw += loss_sw(H_hat_norm, H_target_norm)
+
+            # L_sw = L_sw / batch_size_real
+
+            # --- Distributional distance on distances (differentiable) ---
+            L_sw = 0.0
             for i in range(batch_size_real):
                 n_valid = int(mask[i].sum().item())
-                # if n_valid > 10:
-                #     # Predicted distances for this mini-set
-                #     D_pred = D_hat[i, :n_valid, :n_valid]
-                #     # Reference (target) distances from Stage B for the same mini-set
-                #     D_ref  = D_target[i, :n_valid, :n_valid]
-                #     # Build bin edges from the target 95th percentile (as specified in Stage B)
-                #     tri = torch.triu(torch.ones(n_valid, n_valid, device=device, dtype=torch.bool), diagonal=1)
-                #     d_95_ref = torch.quantile(D_ref[tri], 0.95)
-                #     bins = torch.linspace(0.0, d_95_ref, num_bins + 1, device=device)
-                #     # Histogram of predicted distances evaluated on target-derived bins
-                #     H_hat = uet.compute_distance_hist(D_pred, bins)
-                #     L_sw += loss_sw(H_hat, H_target[i])
-                
                 if n_valid > 10:
-                    D_pred = D_hat[i, :n_valid, :n_valid]
-                    
-                    # Use the EXACT same bins that created H_target
-                    bins = batch['H_bins'][i]  # ← The bins from dataset
-                    
-                    H_hat = uet.compute_distance_hist(D_pred, bins)
-                    
-                    # Normalize
-                    H_hat_norm = H_hat / (H_hat.sum() + 1e-12)
-                    H_target_norm = H_target[i] / (H_target[i].sum() + 1e-12)
-                    
-                    L_sw += loss_sw(H_hat_norm, H_target_norm)
+                    Dp = D_hat[i, :n_valid, :n_valid]
+                    Dt = D_target[i, :n_valid, :n_valid]
+                    # W1 on quantiles, robustly normalized by target p95, with subsampling
+                    L_sw += uet.wasserstein_1d_quantile_loss(Dp, Dt, m_pairs=4096, p=1, norm="p95")
+            L_sw = L_sw / max(batch_size_real, 1)
 
-            L_sw = L_sw / batch_size_real
             
             # d) Ordinal triplet
             L_ord = 0
@@ -834,3 +870,221 @@ def sample_sc_edm(
     
     print("SC inference complete!")
     return result
+
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Dict, Optional
+from tqdm import tqdm
+import gc
+
+
+def sample_sc_edm_batched(
+    sc_gene_expr: torch.Tensor,
+    encoder: nn.Module,
+    context_encoder: nn.Module,
+    score_net: nn.Module,
+    n_timesteps_sample: int = 250,
+    sigma_min: float = 0.01,
+    sigma_max: float = 50.0,
+    return_coords: bool = True,
+    batch_size: int = 512,
+    device: str = 'cuda'
+) -> Dict[str, torch.Tensor]:
+    """
+    MEMORY-OPTIMIZED batched inference for SC data.
+    
+    Key optimizations:
+    1. Process SC cells in batches to avoid OOM
+    2. Clear CUDA cache between batches
+    3. Use torch.no_grad() throughout
+    4. Move results to CPU immediately
+    
+    Args:
+        sc_gene_expr: (n_sc, n_genes) SC gene expression
+        encoder: frozen SharedEncoder
+        context_encoder: trained SetEncoderContext
+        score_net: trained DiffusionScoreNet
+        n_timesteps_sample: number of reverse diffusion steps
+        sigma_min, sigma_max: VE SDE noise levels
+        return_coords: whether to compute coordinates via MDS
+        batch_size: number of cells to process per batch
+        device: torch device
+        
+    Returns:
+        dict with 'D_edm', optionally 'coords', 'coords_canon'
+    """
+    encoder.eval()
+    context_encoder.eval()
+    score_net.eval()
+    
+    n_sc = sc_gene_expr.shape[0]
+    D_latent = score_net.D_latent
+    
+    print(f"Processing {n_sc} cells in batches of {batch_size}...")
+    
+    # Calculate number of batches
+    n_batches = (n_sc + batch_size - 1) // batch_size
+    
+    # Store results for each batch
+    all_V_0 = []
+    
+    with torch.no_grad():
+        for batch_idx in tqdm(range(n_batches), desc="Inference batches"):
+            # Get batch indices
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_sc)
+            batch_size_actual = end_idx - start_idx
+            
+            # Extract batch
+            sc_batch = sc_gene_expr[start_idx:end_idx].to(device)
+            
+            # 1. Encode batch
+            Z_sc_batch = encoder(sc_batch)  # (batch_size_actual, h_dim)
+            
+            # 2. Add batch dimension for context encoder
+            Z_sc_input = Z_sc_batch.unsqueeze(0)  # (1, batch_size_actual, h_dim)
+            mask = torch.ones(1, batch_size_actual, dtype=torch.bool, device=device)
+            
+            # 3. Context encoding
+            H = context_encoder(Z_sc_input, mask)  # (1, batch_size_actual, c_dim)
+            
+            # 4. Initialize noise
+            V_t = torch.randn(1, batch_size_actual, D_latent, device=device) * sigma_max
+            V_t = V_t - V_t.mean(dim=1, keepdim=True)  # Center
+            
+            # 5. Reverse diffusion
+            sigmas = torch.exp(torch.linspace(
+                np.log(sigma_max), 
+                np.log(sigma_min), 
+                n_timesteps_sample, 
+                device=device
+            ))
+            
+            for t_idx in reversed(range(n_timesteps_sample)):
+                t_norm = torch.tensor([[t_idx / (n_timesteps_sample - 1)]], device=device)
+                sigma_t = sigmas[t_idx]
+                
+                # Predict noise
+                eps_pred = score_net(V_t, t_norm, H, mask)
+                
+                # DDPM-style update
+                if t_idx > 0:
+                    sigma_prev = sigmas[t_idx - 1]
+                    alpha = sigma_prev / sigma_t
+                    noise = torch.randn_like(V_t)
+                    V_t = alpha * (V_t - (1 - alpha) * eps_pred) + noise * (sigma_prev * (1 - alpha)).sqrt()
+                else:
+                    V_t = V_t - eps_pred * sigma_t
+                
+                # Recenter
+                V_t = V_t - V_t.mean(dim=1, keepdim=True)
+            
+            # 6. Store V_0 on CPU to save GPU memory
+            V_0_batch = V_t.squeeze(0).cpu()  # (batch_size_actual, D_latent)
+            all_V_0.append(V_0_batch)
+            
+            # Clear GPU cache
+            del Z_sc_batch, Z_sc_input, H, V_t, eps_pred, sc_batch
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+    
+    # Concatenate all batches
+    V_0_full = torch.cat(all_V_0, dim=0)  # (n_sc, D_latent)
+    print(f"Concatenated V_0 shape: {V_0_full.shape}")
+    
+    # 7. Compute Gram and distances (on CPU to save GPU memory)
+    print("Computing Gram matrix and distances...")
+    G = V_0_full @ V_0_full.t()  # (n_sc, n_sc)
+    diag = torch.diag(G).unsqueeze(1)
+    D = torch.sqrt(torch.clamp(diag + diag.t() - 2 * G, min=0))
+    
+    # 8. EDM projection (move to GPU for this operation if possible)
+    print("Projecting to EDM...")
+    try:
+        D_gpu = D.to(device)
+        import utils_et as uet
+        D_edm = uet.edm_project(D_gpu).cpu()
+        del D_gpu
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+    except:
+        # Fallback: do it on CPU
+        import utils_et as uet
+        D_edm = uet.edm_project(D)
+    
+    result = {'D_edm': D_edm}
+    
+    # 9. Optional: compute coordinates via MDS
+    if return_coords:
+        print("Computing coordinates via classical MDS...")
+        try:
+            # Try on GPU first
+            D_edm_gpu = D_edm.to(device)
+            n = D_edm_gpu.shape[0]
+            J = torch.eye(n, device=device) - torch.ones(n, n, device=device) / n
+            B = -0.5 * J @ (D_edm_gpu ** 2) @ J
+            
+            import utils_et as uet
+            coords = uet.classical_mds(B, d_out=2)
+            coords_canon = uet.canonicalize_coords(coords)
+            
+            result['coords'] = coords.cpu()
+            result['coords_canon'] = coords_canon.cpu()
+            
+            del D_edm_gpu, J, B, coords, coords_canon
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+        except:
+            # Fallback: MDS on CPU (slower but won't OOM)
+            print("GPU OOM for MDS, falling back to CPU...")
+            n = D_edm.shape[0]
+            J = torch.eye(n) - torch.ones(n, n) / n
+            B = -0.5 * J @ (D_edm ** 2) @ J
+            
+            import utils_et as uet
+            coords = uet.classical_mds(B, d_out=2)
+            coords_canon = uet.canonicalize_coords(coords)
+            
+            result['coords'] = coords
+            result['coords_canon'] = coords_canon
+    
+    print("SC inference complete!")
+    return result
+
+
+def infer_sc_coordinates_optimized(model, sc_expr, batch_size=512, device='cuda'):
+    """
+    OPTIMIZED inference wrapper with automatic batch size selection.
+    
+    Args:
+        model: GEMSModel instance
+        sc_expr: (n_sc, n_genes) tensor
+        batch_size: cells per batch (reduce if still getting OOM)
+        device: 'cuda' or 'cpu'
+    """
+    print("\n" + "="*70)
+    print("SC COORDINATE INFERENCE (BATCHED)")
+    print("="*70)
+    print(f"Total cells: {sc_expr.shape[0]}")
+    print(f"Batch size: {batch_size}")
+    
+    # Clear cache before starting
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    results = sample_sc_edm_batched(
+        sc_gene_expr=sc_expr,
+        encoder=model.encoder,
+        context_encoder=model.context_encoder,
+        score_net=model.score_net,
+        n_timesteps_sample=250,
+        sigma_min=0.01,
+        sigma_max=50.0,
+        return_coords=True,
+        batch_size=batch_size,
+        device=device
+    )
+    
+    return results

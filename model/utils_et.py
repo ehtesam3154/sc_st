@@ -129,36 +129,97 @@ def build_knn_graph(
         return edge_index.long(), None
 
 
-def compute_graph_laplacian(edge_index: torch.Tensor, edge_weight: torch.Tensor, n_nodes: int) -> torch.Tensor:
-    """
-    Compute graph Laplacian L = D - W from edge list.
+# def compute_graph_laplacian(edge_index: torch.Tensor, edge_weight: torch.Tensor, n_nodes: int) -> torch.Tensor:
+#     """
+#     Compute graph Laplacian L = D - W from edge list.
     
-    Args:
-        edge_index: (2, E)
-        edge_weight: (E,)
-        n_nodes: number of nodes
+#     Args:
+#         edge_index: (2, E)
+#         edge_weight: (E,)
+#         n_nodes: number of nodes
         
-    Returns:
-        L: (n, n) Laplacian matrix (dense)
+#     Returns:
+#         L: (n, n) Laplacian matrix (dense)
+#     """
+#     device = edge_index.device
+    
+#     # Build adjacency matrix W
+#     W = torch.zeros(n_nodes, n_nodes, device=device)
+#     src, dst = edge_index[0], edge_index[1]
+#     W[src, dst] = edge_weight
+    
+#     # Symmetrize (kNN is directed, make undirected)
+#     W = (W + W.t()) / 2
+    
+#     # Degree matrix
+#     deg = W.sum(dim=1)
+#     D = torch.diag(deg)
+    
+#     # Laplacian
+#     L = D - W
+#     return L
+
+def compute_graph_laplacian(edge_index: torch.Tensor,
+                            edge_weight: torch.Tensor,
+                            n_nodes: int,
+                            normalized: bool = True,
+                            eps: float = 1e-8) -> torch.Tensor:
+    """
+    Graph Laplacian. Returns a **sparse** tensor.
+    If normalized=True, returns L_sym = I - D^{-1/2} W D^{-1/2}.
     """
     device = edge_index.device
-    
-    # Build adjacency matrix W
-    W = torch.zeros(n_nodes, n_nodes, device=device)
     src, dst = edge_index[0], edge_index[1]
-    W[src, dst] = edge_weight
-    
-    # Symmetrize (kNN is directed, make undirected)
-    W = (W + W.t()) / 2
-    
-    # Degree matrix
-    deg = W.sum(dim=1)
-    D = torch.diag(deg)
-    
-    # Laplacian
-    L = D - W
-    return L
+    w = edge_weight
 
+    # make undirected
+    idx_i = torch.cat([src, dst], dim=0)
+    idx_j = torch.cat([dst, src], dim=0)
+    vals  = torch.cat([w,   w  ], dim=0)
+
+    W = torch.sparse_coo_tensor(
+        torch.stack([idx_i, idx_j], dim=0),
+        vals,
+        (n_nodes, n_nodes),
+        device=device
+    ).coalesce()
+
+    # degree
+    deg = torch.sparse.sum(W, dim=1).to_dense().clamp_min(eps)
+
+    if normalized:
+        # S = D^{-1/2} W D^{-1/2}
+        di = 1.0 / torch.sqrt(deg)
+        # scale edge weights
+        row, col = W.indices()
+        s_vals = W.values() * di[row] * di[col]
+        S = torch.sparse_coo_tensor(
+            torch.stack([row, col], dim=0),
+            s_vals,
+            (n_nodes, n_nodes),
+            device=device
+        ).coalesce()
+        # L = I - S  (sparse)
+        eye_idx = torch.arange(n_nodes, device=device)
+        I = torch.sparse_coo_tensor(
+            torch.stack([eye_idx, eye_idx], dim=0),
+            torch.ones(n_nodes, device=device),
+            (n_nodes, n_nodes),
+            device=device
+        )
+        L = (I - S).coalesce()
+        return L
+    else:
+        # L = D - W
+        eye_idx = torch.arange(n_nodes, device=device)
+        D = torch.sparse_coo_tensor(
+            torch.stack([eye_idx, eye_idx], dim=0),
+            deg,
+            (n_nodes, n_nodes),
+            device=device
+        )
+        L = (D - W).coalesce()
+        return L
 
 # ==============================================================================
 # PART 3: SPECTRAL & HEAT KERNEL COMPUTATIONS
@@ -768,41 +829,81 @@ import torch.nn as nn
 #fast heat trace via strochastic lanczos quadratur (dense L)
 @torch.no_grad()
 
-def lanczos_dense(A, v0, m, tol=1e-6):
-    '''run m-step lanczos on dense symmetric A with start vector v0
-    returns symmetric tridiagonal T (j * j), where j < =m if eraly stop
-    '''
+# def lanczos_dense(A, v0, m, tol=1e-6):
+#     '''run m-step lanczos on dense symmetric A with start vector v0
+#     returns symmetric tridiagonal T (j * j), where j < =m if eraly stop
+#     '''
 
-    device , dtype = A.device, A.dtype
+#     device , dtype = A.device, A.dtype
+#     n = v0.numel()
+#     Q = torch.zeros(n, m, device=device, dtype=dtype)
+#     alpha = torch.zeros(m, device=device, dtype=dtype)
+#     beta = torch.zeros(m-1, device=device, dtype=dtype)
+
+#     v = v0 / (v0.norm() + 1e-12)
+#     w = A @ v
+#     alpha[0] = torch.dot(v, w)
+#     Q[:, 0] = v
+#     w = w - alpha[0] * v
+
+#     j = 1
+#     for j in range(1, m):
+#         beta[j-1] = w.norm()
+#         if beta[j-1] <= tol:
+#             #truncate 
+#             alpha = alpha[:j]
+#             beta = beta[:j-1]
+#             Q = Q[:, :j]
+#             break 
+#         v_next = w / beta[j-1]
+#         Q[:, j] = v_next
+#         w = A @ v_next - beta[j-1] * v
+#         alpha[j] = torch.dot(v_next, w)
+#         w = w - alpha[j] * v_next
+#         v = v_next 
+
+#     T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
+#     return T
+
+def lanczos_dense(A, v0, m, tol=1e-6):
+    """
+    m-step Lanczos on symmetric A (dense or sparse). Returns tridiagonal T.
+    """
+    device, dtype = A.device, A.dtype
     n = v0.numel()
     Q = torch.zeros(n, m, device=device, dtype=dtype)
     alpha = torch.zeros(m, device=device, dtype=dtype)
-    beta = torch.zeros(m-1, device=device, dtype=dtype)
+    beta  = torch.zeros(m-1, device=device, dtype=dtype)
+
+    def matvec(x):
+        if A.is_sparse:
+            return torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1)
+        else:
+            return A @ x
 
     v = v0 / (v0.norm() + 1e-12)
-    w = A @ v
+    w = matvec(v)
     alpha[0] = torch.dot(v, w)
     Q[:, 0] = v
     w = w - alpha[0] * v
 
-    j = 1
     for j in range(1, m):
         beta[j-1] = w.norm()
         if beta[j-1] <= tol:
-            #truncate 
             alpha = alpha[:j]
-            beta = beta[:j-1]
-            Q = Q[:, :j]
-            break 
+            beta  = beta[:j-1]
+            Q     = Q[:, :j]
+            break
         v_next = w / beta[j-1]
         Q[:, j] = v_next
-        w = A @ v_next - beta[j-1] * v
+        w = matvec(v_next) - beta[j-1] * v
         alpha[j] = torch.dot(v_next, w)
         w = w - alpha[j] * v_next
-        v = v_next 
+        v = v_next
 
     T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
     return T
+
 
 @torch.no_grad()
 def _quad_form_exp_from_T(T, t):
@@ -815,32 +916,98 @@ def _quad_form_exp_from_T(T, t):
     return (weights * torch.exp(-t * evals)).sum()
 
 
-@torch.no_grad()
-def heat_trace_slq_dense(L, t_list, num_probe=6, m=25):
-    """
-    Approximate Tr(exp(-t L)) for each t in t_list using SLQ on dense symmetric PSD L.
-    Returns tensor of shape [len(t_list)] on L.device.
+# @torch.no_grad()
+# def heat_trace_slq_dense(L, t_list, num_probe=6, m=25):
+#     """
+#     Approximate Tr(exp(-t L)) for each t in t_list using SLQ on dense symmetric PSD L.
+#     Returns tensor of shape [len(t_list)] on L.device.
 
-    Args:
-        L: (n, n) symmetric PSD (float32/float64), typically a Laplacian
-        t_list: list/tuple of float
-        num_probe: number of Hutchinson probe vectors
-        m: Lanczos steps per probe
-    """
-    device = L.device
-    dtype  = L.dtype
-    n      = L.size(0)
+#     Args:
+#         L: (n, n) symmetric PSD (float32/float64), typically a Laplacian
+#         t_list: list/tuple of float
+#         num_probe: number of Hutchinson probe vectors
+#         m: Lanczos steps per probe
+#     """
+#     device = L.device
+#     dtype  = L.dtype
+#     n      = L.size(0)
 
-    # Rademacher probes
+#     # Rademacher probes
+#     traces = torch.zeros(len(t_list), device=device, dtype=dtype)
+#     for _ in range(num_probe):
+#         v = torch.empty(n, device=device, dtype=dtype).uniform_(-1.0, 1.0).sign()
+#         v = v / math.sqrt(n)
+#         T = lanczos_dense(L, v, m)
+#         # eval f(T) once per t
+#         for j, t in enumerate(t_list):
+#             traces[j] += _quad_form_exp_from_T(T, float(t))
+
+#     traces /= float(num_probe)
+#     # Hutchinson is unbiased for trace, so multiply by n
+#     return traces * n
+
+def heat_trace_slq_dense(L, t_list, num_probe=4, m=12):
+    """
+    Tr(exp(-t L)) per node via SLQ (supports sparse L).
+    Returns tensor [len(t_list)], **already divided by n**.
+    """
+    device, dtype = L.device, L.dtype
+    n = L.size(0)
     traces = torch.zeros(len(t_list), device=device, dtype=dtype)
+
     for _ in range(num_probe):
         v = torch.empty(n, device=device, dtype=dtype).uniform_(-1.0, 1.0).sign()
-        v = v / math.sqrt(n)
+        v = v / (n ** 0.5)
         T = lanczos_dense(L, v, m)
-        # eval f(T) once per t
+        evals, evecs = torch.linalg.eigh(T)      # small j x j
+        w1 = (evecs[0, :] ** 2)                  # e1^T f(T) e1 weights
         for j, t in enumerate(t_list):
-            traces[j] += _quad_form_exp_from_T(T, float(t))
+            traces[j] += (w1 * torch.exp(-t * evals)).sum()
 
-    traces /= float(num_probe)
-    # Hutchinson is unbiased for trace, so multiply by n
-    return traces * n
+    traces = traces / float(num_probe)
+    # Hutchinson gives (1/n) * trace when v is 1/sqrt(n)-scaled
+    return traces  # per-node trace, roughly in [e^{-2t}, 1] for normalized L
+
+
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def _upper_tri_vec(D):
+    n = D.size(0)
+    iu = torch.triu_indices(n, n, offset=1, device=D.device)
+    return D[iu[0], iu[1]]  # (n*(n-1)/2,)
+
+def wasserstein_1d_quantile_loss(D_pred, D_tgt, m_pairs=4096, p=1, norm="p95"):
+    """
+    Differentiable 1D OT on distances. Returns scalar loss.
+    D_pred, D_tgt: (n,n), symmetric with zeros on diag.
+    m_pairs: subsample count for speed.
+    p: 1 -> W1 (L1), 2 -> W2 (MSE on quantiles).
+    norm: 'none' | 'median' | 'p95' (normalize by target scale).
+    """
+    dp = _upper_tri_vec(D_pred)
+    dt = _upper_tri_vec(D_tgt)
+
+    # optional subsample (same indices for both)
+    if dp.numel() > m_pairs:
+        idx = torch.randperm(dp.numel(), device=dp.device)[:m_pairs]
+        dp = dp.index_select(0, idx)
+        dt = dt.index_select(0, idx)
+
+    # robust normalization (decouples global scale from shape)
+    if norm != "none":
+        if norm == "median":
+            s = dt.median().clamp_min(1e-6)
+        else:  # p95
+            s = torch.quantile(dt, 0.95).clamp_min(1e-6)
+        dp = dp / s
+        dt = dt / s
+
+    dp_sorted = torch.sort(dp).values
+    dt_sorted = torch.sort(dt).values
+    if p == 1:
+        return F.l1_loss(dp_sorted, dt_sorted)
+    else:
+        return F.mse_loss(dp_sorted, dt_sorted)
+
