@@ -211,16 +211,18 @@ def train_gems_hscc(
     print("="*70)
     
     model.train_stageA(
-        st_gene_expr=st_expr_combined.to(device),
-        st_coords=st_coords_combined.to(device),
-        sc_gene_expr=sc_expr.to(device),
-        slide_ids=slide_ids.to(device),
-        n_epochs=1200,
+        st_gene_expr=st_expr_combined,
+        st_coords=st_coords_combined,
+        sc_gene_expr=sc_expr,
+        slide_ids=slide_ids,
+        n_epochs=1000,
         batch_size=256,
-        lr=2e-3,
+        lr=0.002,
         sigma=None,
-        alpha=0.9,
-        mmdbatch=0.1,
+        alpha=0.8,
+        mmdbatch=1.0,
+        ratio_start=0.0,
+        ratio_end=1.0,
         outf=output_dir
     )
     
@@ -255,16 +257,16 @@ def train_gems_hscc(
     
     model.train_stageC(
         st_gene_expr_dict=st_gene_expr_dict_device,
-        n_min=256,
-        n_max=1024,
-        num_samples=10000,
-        n_epochs=3000,
-        batch_size=4,
+        n_min=128,
+        n_max=512,
+        num_samples=300,
+        n_epochs=10,
+        batch_size=8,
         lr=1e-4,
-        n_timesteps=1000,
+        n_timesteps=600,
         sigma_min=0.01,
-        sigma_max=50.0,
-        loss_weights={'alpha': 0.1, 'beta': 1.0, 'gamma': 0.25, 'eta': 0.5},
+        sigma_max=10.0,
+        loss_weights={'alpha': 0.1, 'beta': 1.0, 'gamma': 0.5, 'eta': 0.5},
         outf=output_dir
     )
     
@@ -396,10 +398,24 @@ if __name__ == '__main__':
     # Inference
     # ========================================================================
     print("\nStep 4: Running inference on SC data...")
-    results = infer_sc_coordinates(model, sc_expr_tensor, device=device)
-    
-    print(f"\nInference complete:")
-    print(f"  D_edm shape: {results['D_edm'].shape}")
+
+    # Clear cache before inference
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
+    # Use batched inference
+    results = model.infer_sc_batched(
+        sc_gene_expr=sc_expr_tensor.to(device),
+        n_timesteps_sample=250,
+        return_coords=True,
+        batch_size=512
+    )
+
+print(f"\nInference complete:")
+print(f"  D_edm shape: {results['D_edm'].shape}")
+if 'coords_canon' in results:
     print(f"  Coordinates shape: {results['coords_canon'].shape}")
     
     # Add coordinates to scadata
