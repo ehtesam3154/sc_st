@@ -14,7 +14,7 @@ from core_models_et_p1 import (
 )
 from core_models_et_p2 import (
     SetEncoderContext, MetricSetGenerator, DiffusionScoreNet,
-    train_stageC_diffusion_generator, sample_sc_edm
+    train_stageC_diffusion_generator
 )
 import utils_et as uet
 import numpy as np
