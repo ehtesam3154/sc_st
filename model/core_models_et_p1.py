@@ -181,24 +181,7 @@ def train_encoder(
         A_target_masked = A_target_masked / row_sums
 
         loss_pred = F.cross_entropy(netpred_masked, A_target_masked, reduction='mean') 
-
-        #normalize (row-wise) where 
         
-        # Loss 2: Circular coupling
-        # ST → SC (use all SC)
-        # Z_sc_all = model(sc_gene_expr)
-        # sim_st_to_sc = Z_st @ Z_sc_all.t()
-        # P_st_to_sc = F.softmax(sim_st_to_sc / 0.1, dim=1)
-        # Z_st_recon = P_st_to_sc @ Z_sc_all
-        
-        # # SC → ST (use all ST)
-        # Z_st_all = model(st_gene_expr)
-        # sim_sc_to_st = Z_sc @ Z_st_all.t()
-        # P_sc_to_st = F.softmax(sim_sc_to_st / 0.1, dim=1)
-        # Z_sc_recon = P_sc_to_st @ Z_st_all
-        
-        # loss_circle = F.mse_loss(Z_st, Z_st_recon) + F.mse_loss(Z_sc, Z_sc_recon)
-
         #loss 2: circular coupling
         # Get all embeddings
         Z_st_all = model(st_gene_expr)
