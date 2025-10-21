@@ -463,6 +463,10 @@ class GEMSModel:
                 V_t = torch.randn(1, batch_size_actual, D_latent, device=self.device) * 50.0
                 V_t = V_t - V_t.mean(dim=1, keepdim=True)
                 
+                if not torch.isfinite(V_t).all():
+                    print(f"WARNING: NaNs in batch {batch_idx+1}/{n_batches}")
+                    V_t = torch.nan_to_num(V_t, nan=0.0, posinf=0.0, neginf=0.0)
+
                 # Reverse diffusion
                 sigmas = torch.exp(torch.linspace(
                     np.log(50.0), np.log(0.01), n_timesteps_sample, device=self.device
@@ -473,14 +477,20 @@ class GEMSModel:
                     sigma_t = sigmas[t_idx]
                     
                     eps_pred = self.score_net(V_t, t_norm, H, mask)
-                    
+                    s_hat = -eps_pred / (sigma_t + 1e-8)  # Convert eps to score
+
                     if t_idx > 0:
                         sigma_prev = sigmas[t_idx - 1]
-                        alpha = sigma_prev / sigma_t
-                        V_t = alpha * (V_t - (1 - alpha) * eps_pred) + \
-                            torch.randn_like(V_t) * (sigma_prev * (1 - alpha)).sqrt()
+                        d_sigma = sigma_prev - sigma_t
+                        V_t = V_t + d_sigma * s_hat
+                        
+                        # Optional stochasticity
+                        eta = 0.2  # Start deterministic
+                        if eta > 0:
+                            noise_std = ((sigma_prev**2 - sigma_t**2).clamp(min=0)).sqrt()
+                            V_t = V_t + eta * noise_std * torch.randn_like(V_t)
                     else:
-                        V_t = V_t - eps_pred * sigma_t
+                        V_t = V_t - sigma_t * s_hat
                     
                     V_t = V_t - V_t.mean(dim=1, keepdim=True)
                 
@@ -512,6 +522,10 @@ class GEMSModel:
                 torch.cuda.empty_cache()
         except:
             D_edm = uet.edm_project(D)
+
+        if not torch.isfinite(D).all():
+            print("WARNING: Non-finite distances before EDM projection!")
+            D = torch.nan_to_num(D, nan=1e-3, posinf=1e3, neginf=0.0)
         
         result = {'D_edm': D_edm}
         
@@ -541,4 +555,47 @@ class GEMSModel:
         
         print("SC inference complete!")
         return result
+    
+    def infer_sc_anchored(
+        self,
+        sc_gene_expr: torch.Tensor,
+        n_timesteps_sample: int = 160,
+        return_coords: bool = True,
+        anchor_size: int = 384,
+        batch_size: int = 512,
+        eta: float = 0.0
+    ) -> Dict[str, torch.Tensor]:
+        """
+        ANCHOR-CONDITIONED inference for SC data (FIXES GLOBAL GEOMETRY).
+        
+        This is the RECOMMENDED inference method. It ensures all cells
+        are placed in a globally consistent coordinate system.
+        
+        Args:
+            sc_gene_expr: (n_sc, n_genes)
+            n_timesteps_sample: diffusion steps (120-200 recommended for 20GB GPU)
+            return_coords: compute coordinates
+            anchor_size: number of anchor cells (256-384)
+            batch_size: cells per batch excluding anchors (384-512)
+            eta: stochasticity (0.0 = deterministic, safer)
+            
+        Returns:
+            dict with 'D_edm', 'coords', 'coords_canon'
+        """
+        from core_models_et_p2 import sample_sc_edm_anchored
+        
+        return sample_sc_edm_anchored(
+            sc_gene_expr=sc_gene_expr,
+            encoder=self.encoder,
+            context_encoder=self.context_encoder,
+            score_net=self.score_net,
+            n_timesteps_sample=n_timesteps_sample,
+            sigma_min=0.01,
+            sigma_max=50.0,
+            return_coords=return_coords,
+            anchor_size=anchor_size,
+            batch_size=batch_size,
+            eta=eta,
+            device=self.device
+        )
 

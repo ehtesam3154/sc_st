@@ -1011,3 +1011,62 @@ def wasserstein_1d_quantile_loss(D_pred, D_tgt, m_pairs=4096, p=1, norm="p95"):
     else:
         return F.mse_loss(dp_sorted, dt_sorted)
 
+
+import torch
+
+def farthest_point_sampling(Z: torch.Tensor, k: int, device='cpu') -> torch.Tensor:
+    """
+    Farthest Point Sampling to select k representative points.
+    
+    Args:
+        Z: (N, d) embeddings
+        k: number of points to select
+        device: 'cpu' recommended for large N
+        
+    Returns:
+        (k,) tensor of selected indices
+    """
+    Z = Z.to(device)
+    N = Z.shape[0]
+    k = min(k, N)
+    
+    # Start with random point
+    idx = torch.randint(0, N, (1,), device=device).item()
+    selected = [idx]
+    dist = torch.full((N,), float('inf'), device=device)
+    
+    for _ in range(1, k):
+        # Distance from last selected to all points
+        d = torch.cdist(Z[selected[-1]].unsqueeze(0), Z, p=2).squeeze(0)
+        dist = torch.minimum(dist, d)
+        selected.append(int(torch.argmax(dist)))
+    
+    return torch.tensor(selected, dtype=torch.long)
+
+
+def mds_from_latent(X: torch.Tensor, d_out: int = 2) -> torch.Tensor:
+    """
+    Fast classical MDS directly from centered latent V_0 (N x D).
+    
+    Equivalent to classical MDS on the EDM induced by X, but O(N D²) instead of O(N³).
+    Since distances are constructed from V_0 itself, this is mathematically exact.
+    
+    Args:
+        X: (N, D) centered latent matrix
+        d_out: output dimensionality (typically 2)
+        
+    Returns:
+        (N, d_out) coordinates
+        
+    Complexity: O(N D²) for SVD of N×D matrix (D=16, so ~256 ops per row)
+    """
+    # Ensure centered
+    Xc = X - X.mean(dim=0, keepdim=True)
+    
+    # Thin SVD on tall matrix (no N×N eigen!)
+    U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    
+    # U Σ gives classical MDS coordinates
+    coords = U[:, :d_out] * S[:d_out].unsqueeze(0)
+    
+    return coords

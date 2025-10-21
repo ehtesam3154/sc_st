@@ -952,6 +952,10 @@ def sample_sc_edm_batched(
             # 4. Initialize noise
             V_t = torch.randn(1, batch_size_actual, D_latent, device=device) * sigma_max
             V_t = V_t - V_t.mean(dim=1, keepdim=True)  # Center
+
+            if not torch.isfinite(V_t).all():
+                print(f"WARNING: NaNs in batch {batch_idx+1}, attempting recovery...")
+                V_t = torch.nan_to_num(V_t, nan=0.0, posinf=0.0, neginf=0.0)
             
             # 5. Reverse diffusion
             sigmas = torch.exp(torch.linspace(
@@ -966,16 +970,34 @@ def sample_sc_edm_batched(
                 sigma_t = sigmas[t_idx]
                 
                 # Predict noise
-                eps_pred = score_net(V_t, t_norm, H, mask)
+                # eps_pred = score_net(V_t, t_norm, H, mask)
                 
-                # DDPM-style update
+                # # DDPM-style update
+                # if t_idx > 0:
+                #     sigma_prev = sigmas[t_idx - 1]
+                #     alpha = sigma_prev / sigma_t
+                #     noise = torch.randn_like(V_t)
+                #     V_t = alpha * (V_t - (1 - alpha) * eps_pred) + noise * (sigma_prev * (1 - alpha)).sqrt()
+                # else:
+                #     V_t = V_t - eps_pred * sigma_t
+
+                # Predict noise and convert to score
+                eps_pred = score_net(V_t, t_norm, H, mask)
+                s_hat = -eps_pred / (sigma_t + 1e-8)
+
+                # EDM Euler update
                 if t_idx > 0:
                     sigma_prev = sigmas[t_idx - 1]
-                    alpha = sigma_prev / sigma_t
-                    noise = torch.randn_like(V_t)
-                    V_t = alpha * (V_t - (1 - alpha) * eps_pred) + noise * (sigma_prev * (1 - alpha)).sqrt()
+                    d_sigma = sigma_prev - sigma_t
+                    V_t = V_t + d_sigma * s_hat
+                    
+                    # Optional stochasticity (start with eta=0.0)
+                    eta = 0.2
+                    if eta > 0:
+                        noise_std = ((sigma_prev**2 - sigma_t**2).clamp(min=0)).sqrt()
+                        V_t = V_t + eta * noise_std * torch.randn_like(V_t)
                 else:
-                    V_t = V_t - eps_pred * sigma_t
+                    V_t = V_t - sigma_t * s_hat
                 
                 # Recenter
                 V_t = V_t - V_t.mean(dim=1, keepdim=True)
@@ -1088,3 +1110,311 @@ def infer_sc_coordinates_optimized(model, sc_expr, batch_size=512, device='cuda'
     )
     
     return results
+
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Dict, Optional
+from tqdm import tqdm
+import gc
+
+
+def sample_sc_edm_anchored(
+    sc_gene_expr: torch.Tensor,
+    encoder: nn.Module,
+    context_encoder: nn.Module,
+    score_net: nn.Module,
+    n_timesteps_sample: int = 160,
+    sigma_min: float = 0.01,
+    sigma_max: float = 50.0,
+    return_coords: bool = True,
+    anchor_size: int = 384,
+    batch_size: int = 512,
+    eta: float = 0.0,
+    device: str = 'cuda'
+) -> Dict[str, torch.Tensor]:
+    """
+    ANCHOR-CONDITIONED batched inference for SC data.
+    
+    This fixes the global geometry problem by:
+    1. Selecting anchor cells that span expression space
+    2. Sampling anchors once to get stable positions
+    3. Freezing anchors in each batch so all batches see same global scaffold
+    4. Computing ONE global EDM/MDS at the end
+    
+    Args:
+        sc_gene_expr: (n_sc, n_genes)
+        encoder: frozen SharedEncoder
+        context_encoder: trained SetEncoderContext
+        score_net: trained DiffusionScoreNet
+        n_timesteps_sample: diffusion steps (120-200 recommended)
+        sigma_min, sigma_max: VE SDE noise levels
+        return_coords: compute coordinates via MDS
+        anchor_size: number of anchor cells (256-384 recommended)
+        batch_size: cells per batch excluding anchors (384-512)
+        eta: stochasticity (0.0 = deterministic)
+        device: torch device
+        
+    Returns:
+        dict with 'D_edm', 'coords', 'coords_canon'
+    """
+    print("\n" + "="*70)
+    print("ANCHOR-CONDITIONED SC INFERENCE")
+    print("="*70)
+    
+    encoder.eval()
+    context_encoder.eval()
+    score_net.eval()
+    
+    n_sc = sc_gene_expr.shape[0]
+    D_latent = score_net.D_latent
+    
+    print(f"Total cells: {n_sc}")
+    print(f"Anchor cells: {anchor_size}")
+    print(f"Batch size: {batch_size}")
+    print(f"Timesteps: {n_timesteps_sample}")
+    
+    # ==========================================================================
+    # STEP 1: Encode all SC cells and select anchors
+    # ==========================================================================
+    print("\nStep 1: Encoding SC cells and selecting anchors...")
+    
+    with torch.no_grad():
+        Z_all = []
+        encode_bs = 1024
+        for i in range(0, n_sc, encode_bs):
+            z = encoder(sc_gene_expr[i:i+encode_bs].to(device)).cpu()
+            Z_all.append(z)
+        Z_all = torch.cat(Z_all, dim=0)  # (n_sc, h_dim)
+    
+    # Farthest point sampling for anchors
+    import utils_et as uet
+    anchor_size = min(anchor_size, n_sc)
+    anchor_idx = uet.farthest_point_sampling(Z_all, anchor_size, device='cpu')
+    non_anchor_idx = torch.tensor(
+        [i for i in range(n_sc) if i not in set(anchor_idx.tolist())],
+        dtype=torch.long
+    )
+    
+    print(f"Selected {len(anchor_idx)} anchors")
+    print(f"Remaining cells: {len(non_anchor_idx)}")
+    
+    # ==========================================================================
+    # STEP 2: Sample anchors once (mini one-shot)
+    # ==========================================================================
+    print("\nStep 2: Sampling anchor positions...")
+    
+    Z_A = Z_all[anchor_idx].to(device).unsqueeze(0)  # (1, A, h_dim)
+    mask_A = torch.ones(1, Z_A.shape[1], dtype=torch.bool, device=device)
+    
+    # Build context for anchors
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        H_A = context_encoder(Z_A, mask_A)  # (1, A, c_dim)
+    
+    # VE SDE schedule
+    sigmas = torch.exp(torch.linspace(
+        np.log(sigma_max), np.log(sigma_min), 
+        n_timesteps_sample, device=device
+    ))
+    
+    # Initialize V_T for anchors
+    V_t = torch.randn(1, Z_A.shape[1], D_latent, device=device) * sigmas[0]
+    
+    # Reverse diffusion for anchors (FIXED VE Euler update)
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        for t_idx in reversed(range(n_timesteps_sample)):
+            sigma_t = sigmas[t_idx]
+            t_norm = torch.tensor([[t_idx / (n_timesteps_sample - 1)]], device=device)
+            
+            # Predict noise
+            eps = score_net(V_t, t_norm, H_A, mask_A)
+            
+            # Convert ε-prediction to score
+            s_hat = -eps / (sigma_t + 1e-8)
+            
+            if t_idx > 0:
+                sigma_prev = sigmas[t_idx - 1]
+                d_sigma = sigma_prev - sigma_t  # Positive for decreasing schedule
+                
+                # Euler step
+                V_t = V_t + d_sigma * s_hat
+                
+                # Optional stochasticity
+                if eta > 0:
+                    noise_std = torch.sqrt(torch.clamp(sigma_prev**2 - sigma_t**2, min=0))
+                    V_t = V_t + eta * noise_std * torch.randn_like(V_t)
+            else:
+                # Final step
+                V_t = V_t - sigma_t * s_hat
+    
+    V_A = V_t.squeeze(0).detach()  # (A, D_latent)
+    print(f"Anchor coordinates sampled: {V_A.shape}")
+    
+    # ==========================================================================
+    # STEP 3: Batch the rest with anchors frozen
+    # ==========================================================================
+    print("\nStep 3: Processing remaining cells with frozen anchors...")
+    
+    all_V = [V_A.cpu()]  # Store all latents in original order
+    order = [anchor_idx.tolist()]
+    
+    n_batches = (non_anchor_idx.numel() + batch_size - 1) // batch_size
+    
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        for batch_idx in tqdm(range(n_batches), desc="Batching"):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, non_anchor_idx.numel())
+            idx_B = non_anchor_idx[start_idx:end_idx]
+            
+            Z_B = Z_all[idx_B].to(device).unsqueeze(0)  # (1, B, h_dim)
+            
+            # Combined set: anchors + new batch
+            Z_C = torch.cat([Z_A, Z_B], dim=1)  # (1, A+B, h_dim)
+            mask_C = torch.ones(1, Z_C.shape[1], dtype=torch.bool, device=device)
+            
+            # Context for combined set
+            H_C = context_encoder(Z_C, mask_C)  # (1, A+B, c_dim)
+            
+            # Initialize V_t: anchors fixed, new cells noisy
+            V_t = torch.empty(1, Z_C.shape[1], D_latent, device=device)
+            V_t[:, :V_A.shape[0], :] = V_A.to(device)  # Anchors
+            V_t[:, V_A.shape[0]:, :] = torch.randn(
+                1, Z_C.shape[1] - V_A.shape[0], D_latent, device=device
+            ) * sigmas[0]  # New cells
+            
+            # Update mask: 0 for anchors (frozen), 1 for new cells
+            upd_mask = torch.ones_like(V_t)
+            upd_mask[:, :V_A.shape[0], :] = 0.0
+            
+            # Reverse diffusion with frozen anchors
+            for t_idx in reversed(range(n_timesteps_sample)):
+                sigma_t = sigmas[t_idx]
+                t_norm = torch.tensor([[t_idx / (n_timesteps_sample - 1)]], device=device)
+                
+                eps = score_net(V_t, t_norm, H_C, mask_C)
+                s_hat = -eps / (sigma_t + 1e-8)
+                
+                if t_idx > 0:
+                    sigma_prev = sigmas[t_idx - 1]
+                    d_sigma = sigma_prev - sigma_t
+                    V_new = V_t + d_sigma * s_hat
+                    
+                    if eta > 0:
+                        noise_std = torch.sqrt(torch.clamp(sigma_prev**2 - sigma_t**2, min=0))
+                        V_new = V_new + eta * noise_std * torch.randn_like(V_new)
+                else:
+                    V_new = V_t - sigma_t * s_hat
+                
+                # FREEZE ANCHORS: only update new cells
+                V_t = upd_mask * V_new + (1.0 - upd_mask) * V_t
+            
+            # Extract new cells only (not anchors)
+            V_B_only = V_t.squeeze(0)[V_A.shape[0]:, :].detach().cpu()
+            
+            all_V.append(V_B_only)
+            order.append(idx_B.tolist())
+            
+            # Clear cache
+            del Z_B, Z_C, H_C, V_t, V_new, eps, s_hat, V_B_only
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+    
+    # ==========================================================================
+    # STEP 4: Reassemble in original order
+    # ==========================================================================
+    print("\nStep 4: Reassembling coordinates...")
+    
+    V_0_full = torch.empty(n_sc, D_latent)
+    V_0_full[anchor_idx] = all_V[0]
+    for idxs, Vs in zip(order[1:], all_V[1:]):
+        V_0_full[torch.tensor(idxs, dtype=torch.long)] = Vs
+    
+    # ONE GLOBAL CENTERING (not per-batch!)
+    V_0_full = V_0_full - V_0_full.mean(dim=0, keepdim=True)
+    
+    print(f"Final latent shape: {V_0_full.shape}")
+    
+    # ==========================================================================
+    # STEP 5: ONE GLOBAL EDM/MDS
+    # ==========================================================================
+    print("\nStep 5: Computing global EDM...")
+    
+    # Gram matrix
+    G = V_0_full @ V_0_full.t()
+    diag = torch.diag(G).unsqueeze(1)
+    D = torch.sqrt(torch.clamp(diag + diag.t() - 2 * G, min=0))
+    
+    # EDM projection
+    D_edm = uet.edm_project(D)
+    
+    result = {'D_edm': D_edm.cpu()}
+    
+    # MDS
+    if return_coords:
+        print("Computing coordinates via MDS...")
+        try:
+            # Try GPU
+            n = D_edm.shape[0]
+            J = torch.eye(n, device=device) - torch.ones(n, n, device=device) / n
+            B = -0.5 * J @ (D_edm.to(device) ** 2) @ J
+            
+            coords = uet.classical_mds(B, d_out=2)
+            coords_canon = uet.canonicalize_coords(coords)
+            
+            result['coords'] = coords.cpu()
+            result['coords_canon'] = coords_canon.cpu()
+            
+            del J, B, coords, coords_canon
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+        except:
+            # Fallback CPU
+            print("GPU OOM for MDS, using CPU...")
+            n = D_edm.shape[0]
+            J = torch.eye(n) - torch.ones(n, n) / n
+            B = -0.5 * J @ (D_edm ** 2) @ J
+            
+            coords = uet.classical_mds(B, d_out=2)
+            coords_canon = uet.canonicalize_coords(coords)
+            
+            result['coords'] = coords
+            result['coords_canon'] = coords_canon
+    
+    # print("\n" + "="*70)
+    # print("ANCHOR-CONDITIONED INFERENCE COMPLETE!")
+    # print("="*70)
+
+    # print("\nStep 5: Computing coordinates (fast path)...")
+
+    # # Method A: Direct MDS from latent (FASTEST - RECOMMENDED)
+    # # Since V_0_full is the latent that defines distances, we can skip
+    # # distance computation entirely and do thin SVD
+    # coords = uet.mds_from_latent(V_0_full.to(device), d_out=2)
+    # coords_canon = uet.canonicalize_coords(coords)
+
+    # result = {
+    #     'coords': coords.cpu(),
+    #     'coords_canon': coords_canon.cpu()
+    # }
+
+    # # Optional: Compute D_edm if needed for downstream analysis
+    # # This is exact Euclidean distance from latent (no projection needed)
+    # if return_coords:  # If you need the distance matrix
+    #     print("Computing distance matrix...")
+    #     D_edm = torch.cdist(V_0_full.to(device), V_0_full.to(device))
+    #     result['D_edm'] = D_edm.cpu()
+        
+    #     del D_edm
+    #     if device == 'cuda':
+    #         torch.cuda.empty_cache()
+
+    # del coords
+    # if device == 'cuda':
+    #     torch.cuda.empty_cache()
+
+    # print("\n" + "="*70)
+    # print("ANCHOR-CONDITIONED INFERENCE COMPLETE!")
+    # print("="*70)
+
+    return result
+    
