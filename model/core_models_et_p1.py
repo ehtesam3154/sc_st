@@ -158,15 +158,7 @@ def train_encoder(
         # Forward pass
         Z_st = model(X_st_batch)
         Z_sc = model(X_sc_batch)
-        
-        # Loss 1: RBF adjacency prediction (with slide mask)
-        Z_st_sim = F.softmax(Z_st @ Z_st.t() / 0.1, dim=1)  # Temperature = 0.1
-        A_target_batch = A_target[idx_st][:, idx_st]
-        slide_mask_batch = slide_mask[idx_st][:, idx_st]
-        
-        loss_pred = F.mse_loss(Z_st_sim * slide_mask_batch.float(), 
-                               A_target_batch * slide_mask_batch.float())
-        
+               
         #loss 1: rbf adjacency prediction (with slide mask)
         netpred = Z_st @ Z_st.t()
         A_target_batch = A_target[idx_st][:, idx_st]
@@ -180,7 +172,10 @@ def train_encoder(
         row_sums = A_target_masked.sum(dim=1, keepdim=True).clamp(min=1e-8)
         A_target_masked = A_target_masked / row_sums
 
-        loss_pred = F.cross_entropy(netpred_masked, A_target_masked, reduction='mean') 
+        # loss_pred = F.cross_entropy(netpred_masked, A_target_masked, reduction='mean')
+        logits = netpred_masked / 0.1
+        log_probs = F.log_softmax(logits, dim=1)
+        loss_pred = F.kl_div(log_probs, A_target_masked, reduction='batchmean')
         
         #loss 2: circular coupling
         # Get all embeddings
@@ -456,6 +451,7 @@ class STSetDataset(Dataset):
     def __len__(self):
         return self.num_samples
     
+    
     def __getitem__(self, idx):
         # Sample slide and subset size
         slide_id = np.random.choice(list(self.targets_dict.keys()))
@@ -465,14 +461,23 @@ class STSetDataset(Dataset):
         m = targets.y_hat.shape[0]
         n = min(n, m)  # Don't exceed slide size
         
-        # Sample random subset of spots
-        indices = torch.randperm(m, device=self.device)[:n]
+        # Sample random subset of spots (keep indices on CPU)
+        indices = torch.randperm(m)[:n]  # CPU tensor
+        
+        # Store overlap info (CPU tensors)
+        overlap_info = {
+            'slide_id': slide_id,
+            'indices': indices  # Keep on CPU
+        }
+        
+        # Move indices to device for actual data extraction
+        indices_device = indices.to(self.device)
         
         # Extract subset data
-        Z_set = self.Z_dict[slide_id][indices]  # (n, h)
-        y_hat_subset = targets.y_hat[indices].to(self.device)  # (n, 2)
-        G_subset = targets.G[indices][:, indices].to(self.device)  # (n, n)
-        D_subset = targets.D[indices][:, indices].to(self.device)  # (n, n)
+        Z_set = self.Z_dict[slide_id][indices_device]  # (n, h)
+        y_hat_subset = targets.y_hat[indices_device].to(self.device)  # (n, 2)
+        G_subset = targets.G[indices_device][:, indices_device].to(self.device)  # (n, n)
+        D_subset = targets.D[indices_device][:, indices_device].to(self.device)  # (n, n)
         
         # Factor Gram to get V_target
         V_target = uet.factor_from_gram(G_subset, self.D_latent)  # (n, D)
@@ -485,7 +490,6 @@ class STSetDataset(Dataset):
         d_95 = torch.quantile(D_subset[torch.triu(torch.ones_like(D_subset), diagonal=1).bool()], 0.95)
         bins = torch.linspace(0, d_95, 64, device=self.device)
         H_subset = uet.compute_distance_hist(D_subset, bins)
-
         
         # Resample ordinal triplets within subset
         triplets_subset = uet.sample_ordinal_triplets(D_subset, n_triplets=min(500, n), margin_ratio=0.05)
@@ -505,8 +509,9 @@ class STSetDataset(Dataset):
             'H_bins': bins,
             'L_info': L_info,
             'triplets': triplets_subset,
-            'n': n
-        }  
+            'n': n,
+            'overlap_info': overlap_info
+        }
     
 def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
@@ -532,10 +537,12 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     D_batch = torch.zeros(batch_size, n_max, n_max, device=device)
     H_batch = torch.zeros(batch_size, num_bins, device=device)
     mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
+    n_batch = torch.zeros(batch_size, dtype=torch.long)  # Store actual sizes
     
     L_info_batch = []
     triplets_batch = []
     H_bins_batch = []
+    overlap_info_batch = []
     
     for i, item in enumerate(batch):
         n = item['n']
@@ -545,9 +552,11 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         D_batch[i, :n, :n] = item['D_target']
         H_batch[i] = item['H_target']
         mask_batch[i, :n] = True
+        n_batch[i] = n  # Store actual size
         L_info_batch.append(item['L_info'])
         triplets_batch.append(item['triplets'])
         H_bins_batch.append(item['H_bins'])
+        overlap_info_batch.append(item['overlap_info'])  # Keep CPU tensors
     
     return {
         'Z_set': Z_batch,
@@ -558,5 +567,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'L_info': L_info_batch,
         'triplets': triplets_batch,
         'H_bins': H_bins_batch,
-        'mask': mask_batch
+        'mask': mask_batch,
+        'n': n_batch,  # Add this
+        'overlap_info': overlap_info_batch
     }

@@ -89,7 +89,7 @@ class SetEncoderContext(nn.Module):
 
         for isab in self.isab_blocks:
             # ISAB expects (batch, n, dim); keep the set intact
-            H = isab(H)
+            H = isab(H, mask=mask)
             H = H * mask.unsqueeze(-1).float()
 
         
@@ -437,8 +437,8 @@ def train_stageC_diffusion_generator(
     # Training history
     history = {
         'epoch': [],
-        'batch_losses': [],  # List of dicts per epoch
-        'epoch_avg': {'total': [], 'score': [], 'gram': [], 'heat': [], 'sw': [], 'triplet': [], 'dist_corr': []}
+        'batch_losses': [],
+        'epoch_avg': {'total': [], 'score': [], 'gram': [], 'heat': [], 'sw': [], 'triplet': [], 'dist_corr': [], 'overlap': [], 'num_overlap_pairs': []}
     }
     
     # Annealing schedule for SW weight
@@ -450,8 +450,9 @@ def train_stageC_diffusion_generator(
     print(f"Training Stage C for {n_epochs} epochs...")
 
     for epoch in range(n_epochs):
-        epoch_losses = {'score': [], 'gram': [], 'heat': [], 'sw': [], 'triplet': [], 'dist_corr': [], 'total': []}
+        epoch_losses = {'score': [], 'gram': [], 'heat': [], 'sw': [], 'triplet': [], 'overlap': [], 'dist_corr': [], 'total': [], 'num_overlap_pairs': []}
         batch_losses_this_epoch = []
+        pairs_epoch = 0  # Track overlap pairs across all batches
     
         
         # for batch in dataloader:
@@ -638,7 +639,8 @@ def train_stageC_diffusion_generator(
                     valid_triplets = triplets[triplets.max(dim=1).values < n_valid]
                     if len(valid_triplets) > 0:
                         D_valid = D_hat[i, :n_valid, :n_valid]
-                        median_dist = torch.median(D_valid[torch.triu(torch.ones_like(D_valid), diagonal=1).bool()])
+                        D_target_valid = D_target[i, :n_valid, :n_valid]
+                        median_dist = torch.median(D_target_valid[torch.triu(torch.ones_like(D_target_valid), diagonal=1).bool()]).clamp(min=1e-6)
                         margin = 0.05 * median_dist
                         L_ord += loss_triplet(D_valid, valid_triplets, margin)
             L_ord = L_ord / batch_size_real
@@ -721,7 +723,89 @@ def train_stageC_diffusion_generator(
             L_dist_corr = L_dist_corr / max(batch_size_real, 1)
             # ======================================
 
+            # 7. Overlap consistency loss (stitches mini-sets from same slide)
+            # e) Overlap consistency loss with Procrustes alignment
+            L_overlap = torch.tensor(0.0, device=device)
+            overlap_info = batch['overlap_info']
+            n_list = batch['n']  # Actual sizes per item
 
+            # Find pairs of mini-sets from the same slide with proper correspondence
+            overlap_pairs = []
+            for i in range(batch_size_real):
+                for j in range(i + 1, batch_size_real):
+                    if overlap_info[i]['slide_id'] == overlap_info[j]['slide_id']:
+                        # Get indices (CPU tensors)
+                        indices_i = overlap_info[i]['indices']  # (ni,)
+                        indices_j = overlap_info[j]['indices']  # (nj,)
+                        
+                        # Find shared indices using sorted intersection
+                        si, order_i = torch.sort(indices_i)
+                        sj, order_j = torch.sort(indices_j)
+                        
+                        # torch.intersect1d returns (shared_values, indices_in_sorted_i, indices_in_sorted_j)
+                        shared = torch.from_numpy(np.intersect1d(si.numpy(), sj.numpy()))
+                        
+                        if len(shared) == 0:
+                            continue
+                        
+                        # Find positions in sorted arrays
+                        pos_i = torch.searchsorted(si, shared)
+                        pos_j = torch.searchsorted(sj, shared)
+                        
+                        # Map back to original positions
+                        corr_i = order_i[pos_i]
+                        corr_j = order_j[pos_j]
+                        
+                        n_shared = len(shared)
+                        
+                        # Dynamic overlap threshold (at least 5 or 20% of smaller set)
+                        min_overlap = max(5, int(0.2 * min(int(n_list[i]), int(n_list[j]))))
+                        
+                        if n_shared >= min_overlap:
+                            overlap_pairs.append((i, j, corr_i, corr_j, n_shared))
+
+            # Compute overlap consistency for each pair
+            num_overlap_pairs = len(overlap_pairs)
+            for i, j, corr_i, corr_j, n_shared in overlap_pairs:
+                # Get predicted V for both sets
+                ni = int(n_list[i].item())
+                nj = int(n_list[j].item())
+                V_i = V_hat[i, :ni, :]  # (ni, D)
+                V_j = V_hat[j, :nj, :]  # (nj, D)
+                
+                # Move correspondence indices to device
+                corr_i_dev = corr_i.to(device)
+                corr_j_dev = corr_j.to(device)
+                
+                # Extract overlapping points in corresponding order
+                Vi_overlap = V_i[corr_i_dev]  # (n_shared, D)
+                Vj_overlap = V_j[corr_j_dev]  # (n_shared, D)
+                
+                # Center both
+                Vi_c = Vi_overlap - Vi_overlap.mean(0, keepdim=True)
+                Vj_c = Vj_overlap - Vj_overlap.mean(0, keepdim=True)
+                
+                # Scale-invariant Procrustes (similarity transform)
+                # Compute isotropic scale
+                cross = Vi_c.T @ Vj_c
+                den = (Vj_c.pow(2).sum()).clamp_min(1e-8)
+                s = torch.trace(cross) / den
+                
+                # Compute rotation
+                U, _, VT = torch.linalg.svd(cross, full_matrices=False)
+                R = U @ VT
+                
+                # Align Vj to Vi
+                Vj_aligned = (s * Vj_c) @ R.T
+                
+                # Compute MSE on overlap
+                L_overlap += ((Vi_c - Vj_aligned) ** 2).mean()
+
+            # Average over pairs
+            if num_overlap_pairs > 0:
+                L_overlap = L_overlap / num_overlap_pairs
+            else:
+                L_overlap = torch.tensor(0.0, device=device)
 
             
             # 8. Total loss
@@ -731,10 +815,20 @@ def train_stageC_diffusion_generator(
             # alpha, beta, gamma, eta = loss_weights['alpha'], loss_weights['beta'], loss_weights['gamma'], loss_weights['eta']
             # L_total = L_score + alpha * L_gram + beta * L_heat + gamma * L_sw + eta * L_ord
             zeta = 0.0 #weight for dfistance correlation loss
+            overlap_wt = 0.2
 
             # 8. Total loss
             alpha, beta, gamma, eta = loss_weights['alpha'], loss_weights['beta'], gamma_current, loss_weights['eta']  # ← Use gamma_current
-            L_total = L_score + alpha * L_gram + beta * L_heat + gamma * L_sw + eta * L_ord + zeta * L_dist_corr
+            # Overlap weight warmup (0 → 0.15 over first 30% of training)
+            overlap_w0, overlap_w1 = 0.0, 0.15
+            overlap_weight = overlap_w0 + (overlap_w1 - overlap_w0) * min(epoch / (0.3 * n_epochs), 1.0)
+
+            # Total loss with overlap consistency
+            L_total = (loss_weights['alpha'] * L_score +
+                    loss_weights['beta'] * L_gram +
+                    loss_weights['gamma'] * gamma * L_sw +
+                    loss_weights['eta'] * L_ord +
+                    overlap_weight * L_overlap + L_dist_corr)
             
             # 9. Backward
             optimizer.zero_grad()
@@ -743,15 +837,17 @@ def train_stageC_diffusion_generator(
             optimizer.step()
 
             # Track losses
+            # Log batch losses
             batch_loss_dict = {
-                'batch': batch_idx,
                 'total': L_total.item(),
                 'score': L_score.item(),
                 'gram': L_gram.item(),
-                'heat': L_heat.item(),
+                'heat': 0.0,  # Not computed
                 'sw': L_sw.item(),
                 'triplet': L_ord.item(),
-                'dist_corr': L_dist_corr.item()
+                'dist_corr': L_dist_corr.item(),
+                'overlap': L_overlap.item(),
+                'num_overlap_pairs': num_overlap_pairs
             }
             batch_losses_this_epoch.append(batch_loss_dict)
             
@@ -761,8 +857,10 @@ def train_stageC_diffusion_generator(
             epoch_losses['heat'].append(L_heat.item())
             epoch_losses['sw'].append(L_sw.item())
             epoch_losses['triplet'].append(L_ord.item())
-            epoch_losses['dist_corr'].append(L_dist_corr.item())
+            epoch_losses['overlap'].append(L_overlap.item())  # NEW
+            epoch_losses['dist_corr'].append(L_dist_corr.item())  # Keep for compatibility
             epoch_losses['total'].append(L_total.item())
+            epoch_losses['num_overlap_pairs'].append(num_overlap_pairs)
             
             # if batch_idx % 50 == 0:
             #     tqdm.write(f"Batch {batch_idx} | Total: {L_total.item():.4f} | Score: {L_score.item():.4f} | Gram: {L_gram.item():.4f}")
@@ -779,14 +877,16 @@ def train_stageC_diffusion_generator(
             history['epoch_avg'][k].append(v)
         
         # Print epoch summary
+        avg_pairs = np.mean(epoch_losses.get('num_overlap_pairs', [0]))
         print(f"Epoch {epoch}/{n_epochs} | "
             f"Total: {avg_losses['total']:.4f} | "
             f"Score: {avg_losses['score']:.4f} | "
             f"Gram: {avg_losses['gram']:.4f} | "
             f"Heat: {avg_losses['heat']:.4f} | "
             f"SW: {avg_losses['sw']:.4f} | "
+            f"DistCorr: {avg_losses['dist_corr']:.4f} | "
             f"Triplet: {avg_losses['triplet']:.4f} | "
-            f"DistCorr: {avg_losses['dist_corr']:.4f}")
+            f"Overlap: {avg_losses['overlap']:.4f} (pairs: {avg_pairs:.1f})")
         
         # Save JSON log every epoch (lightweight)
         with open(log_file, 'w') as f:

@@ -34,7 +34,7 @@ class MAB(nn.Module):
             self.ln1 = nn.LayerNorm(dim_V)
         self.fc_o = nn.Linear(dim_V, dim_V)
 
-    def forward(self, Q, K):
+    def forward(self, Q, K, key_mask=None):
         """
         Args:
             Q: Query tensor of shape (batch_size, n_queries, dim_Q)
@@ -53,7 +53,16 @@ class MAB(nn.Module):
 
         # A = torch.softmax(Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.dim_V), 2)
         d_k = self.dim_V // self.num_heads
-        A = torch.softmax(Q_.bmm(K_.transpose(1, 2)) / math.sqrt(max(d_k, 1)), dim=2)
+        attn_logits = Q_.bmm(K_.transpose(1,2)) / math.sqrt(max(d_k, 1))
+
+        #apply mask if provided
+        if key_mask is not None:
+            #key mask: (batch, n_leys) -> expand to (batch * heads, 1, n_keys)
+            mask = (~key_mask).unsqueeze(1) # true where invalid
+            mask = mask.repeat(self.num_heads, 1, 1) #repeat for each head
+            attn_logits = attn_logits.masked_fill(mask, -1e-9)
+
+        A = torch.softmax(attn_logits, dim=2)
 
         O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
         O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
@@ -77,7 +86,7 @@ class SAB(nn.Module):
         super(SAB, self).__init__()
         self.mab = MAB(dim_in, dim_in, dim_out, num_heads, ln=ln)
 
-    def forward(self, X):
+    def forward(self, X, mask=None):
         """
         Args:
             X: Input tensor of shape (batch_size, n_points, dim_in)
@@ -85,7 +94,7 @@ class SAB(nn.Module):
         Returns:
             Output tensor of shape (batch_size, n_points, dim_out)
         """
-        return self.mab(X, X)
+        return self.mab(X, X, key_mask=mask)
 
 
 class ISAB(nn.Module):
@@ -108,7 +117,7 @@ class ISAB(nn.Module):
         self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads, ln=ln)
         self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads, ln=ln)
 
-    def forward(self, X):
+    def forward(self, X, mask=None):
         """
         Args:
             X: Input tensor of shape (batch_size, n_points, dim_in)
@@ -116,7 +125,7 @@ class ISAB(nn.Module):
         Returns:
             Output tensor of shape (batch_size, n_points, dim_out)
         """
-        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X)
+        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X, key_mask=mask)
         return self.mab1(X, H)
 
 
