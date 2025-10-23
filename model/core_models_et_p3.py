@@ -176,14 +176,16 @@ class GEMSModel:
     ):
         """
         Precompute pose-free geometric targets for ST slides.
-        
-        Args:
-            slides: {slide_id: (st_coords, st_gene_expr)}
-            outdir: cache directory
         """
         print("\n" + "="*60)
         print("STAGE B: Precomputing Geometric Targets")
         print("="*60)
+        
+        # Auto-clear old cache if it exists
+        import shutil
+        if os.path.exists(outdir):
+            print(f"Clearing old cache at {outdir}")
+            shutil.rmtree(outdir)
         
         self.targets_dict = self.precomputer.precompute(
             slides=slides,
@@ -191,7 +193,7 @@ class GEMSModel:
             outdir=outdir
         )
         
-        print("Stage B complete. Targets cached.")
+        print("Stage B complete. Targets computed.")
     
     # ==========================================================================
     # STAGE C: TRAIN DIFFUSION GENERATOR

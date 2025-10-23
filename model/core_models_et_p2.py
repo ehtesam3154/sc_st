@@ -20,6 +20,9 @@ import matplotlib.pyplot as plt
 import json
 from datetime import datetime
 
+from torch.utils.data import DataLoader
+from core_models_et_p1 import collate_minisets, collate_sc_minisets
+
 # ==============================================================================
 # STAGE C: SET-EQUIVARIANT CONTEXT ENCODER
 # ==============================================================================
@@ -632,9 +635,8 @@ def train_stageC_diffusion_generator(
                     if d_vec.numel() > 0:
                         d_95_p = torch.quantile(d_vec, 0.95)
                         bins_p = torch.linspace(0, d_95_p, len(H_bins), device=device)
-                        H_p, _ = torch.histogram(d_vec, bins=bins_p)
-                        H_p = H_p.float() / H_p.sum().clamp_min(1)
-                        
+                        H_p = uet.compute_distance_hist(D_p.detach(), bins_p)
+
                         L_sw_st += loss_sw(H_p.unsqueeze(0), H_target[i].unsqueeze(0))
                 L_sw_st = L_sw_st / batch_size_real
                 
@@ -660,20 +662,21 @@ def train_stageC_diffusion_generator(
                     V_i = V_hat[i, :n_valid]
                     
                     centroid = Z_i.mean(dim=0).cpu()
-                    proto_idx = find_nearest_prototype(centroid, prototype_bank)
+                    proto_idx = find_nearest_prototypes(centroid, prototype_bank)
                     proto = prototype_bank['prototypes'][proto_idx]
                     
                     D_p = torch.cdist(V_i, V_i)
                     d_95_p = torch.quantile(D_p[torch.triu(torch.ones_like(D_p), diagonal=1).bool()], 0.95)
                     bins_p = torch.linspace(0, d_95_p, len(proto['bins']), device=device)
-                    H_p = uet.compute_distance_hist(D_p, bins_p)
+                    H_p = uet.compute_distance_hist(D_p.detach(), bins_p)
                     
                     H_t = proto['hist'].to(device)
                     L_sw_sc += loss_sw(H_p.unsqueeze(0), H_t.unsqueeze(0))
                 L_sw_sc = L_sw_sc / batch_size_real
                 
                 # Distance-only overlap
-                if (global_step % EVERY_K_STEPS) == 0:
+                # Distance-only overlap (SC ONLY)
+                if is_sc and (global_step % EVERY_K_STEPS) == 0:
                     shared_info = batch['shared_info']
                     n_pairs = len(shared_info)
                     

@@ -347,31 +347,15 @@ class STStageBPrecomputer:
         outdir: str = 'stage_b_cache',
         use_affine_whitening: bool = True,
         use_geodesic_targets: bool = True,
-        geodesic_k: int = 15,
-        force_recompute: bool = False  # ADD THIS
+        geodesic_k: int = 15
     ) -> Dict[int, STTargets]:
         """
-        Precompute pose-free targets for ST slides with whitening and geodesic distances.
+        Precompute pose-free targets for ST slides (NO CACHING - always recompute).
         """
-        os.makedirs(outdir, exist_ok=True)
         targets_dict = {}
         
         encoder.eval()
         for slide_id, (st_coords, st_gene_expr) in slides.items():
-            cache_file = os.path.join(outdir, f'slide_{slide_id}_targets.pt')
-            
-            # Skip cache if forcing recompute or if cache is incompatible
-            if not force_recompute and os.path.exists(cache_file):
-                print(f"Loading cached targets for slide {slide_id}")
-                loaded = torch.load(cache_file)
-                
-                # Only load if it's already an STTargets object (new format)
-                if isinstance(loaded, STTargets):
-                    targets_dict[slide_id] = loaded
-                    continue
-                else:
-                    print(f"  Old cache format detected, recomputing...")
-            
             print(f"Computing targets for slide {slide_id} (n={st_coords.shape[0]})")
             
             # Normalize coordinates
@@ -407,23 +391,22 @@ class STStageBPrecomputer:
             edge_index, edge_weight = uet.build_knn_graph(y_hat, k=self.k, device=self.device)
             L = uet.compute_graph_laplacian(edge_index, edge_weight, n)
             
-            # Create STTargets object
+            # Create STTargets object (keep on device for speed)
             targets = STTargets(
-                y_hat=y_hat.cpu(),
-                G=G.cpu(),
-                D=D.cpu(),
-                H=H.cpu(),
-                H_bins=bins.cpu(),
-                L=L.cpu(),
+                y_hat=y_hat,
+                G=G,
+                D=D,
+                H=H,
+                H_bins=bins,
+                L=L,
                 t_list=self.t_list,
-                triplets=triplets.cpu(),
+                triplets=triplets,
                 k=self.k,
                 scale=scale
             )
             
-            torch.save(targets, cache_file)
             targets_dict[slide_id] = targets
-            print(f"  Cached to {cache_file}")
+            print(f"  Targets computed for slide {slide_id}")
         
         return targets_dict
     
@@ -656,7 +639,7 @@ class SCSetDataset(Dataset):
         if torch.rand(1).item() < self.large_fraction:
             n = torch.randint(self.n_large_min, self.n_large_max + 1, (1,)).item()
         else:
-            n = torch.randint(self.n_min, self.n_max + 1, (1.)).item()
+            n = torch.randint(self.n_min, self.n_max + 1, (1,)).item()
 
         n_overlap = torch.randint(self.overlap_min, min(self.overlap_max, n // 2) + 1, (1,)).item()
 
