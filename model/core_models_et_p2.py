@@ -498,7 +498,7 @@ def train_stageC_diffusion_generator(
     
     epoch_pbar = tqdm(range(n_epochs), desc="Training Epochs", position=0)  # Top bar
 
-    for epoch in range(n_epochs):
+    for epoch in epoch_pbar:
         st_iter = iter(st_loader)
         sc_iter = iter(sc_loader)
         
@@ -787,6 +787,7 @@ def train_stageC_diffusion_generator(
                 'history': history
             }
             torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
+        epoch_pbar.update(1)
     
     print("Training complete!")
 
