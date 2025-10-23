@@ -244,18 +244,16 @@ def train_encoder(
 @dataclass
 class STTargets:
     """Per-slide geometric targets (pose-free)."""
-    slide_id: int
-    center: torch.Tensor  # (2,)
-    scale: float
     y_hat: torch.Tensor  # (m, 2) pose-normalized coords
-    G: torch.Tensor  # (m, m) Gram matrix
-    D: torch.Tensor  # (m, m) distance matrix
-    H: torch.Tensor  # (num_bins,) distance histogram
+    G: torch.Tensor      # (m, m) Gram matrix
+    D: torch.Tensor      # (m, m) distance matrix
+    H: torch.Tensor      # (num_bins,) distance histogram
+    H_bins: torch.Tensor # (num_bins,) histogram bin edges
+    L: torch.Tensor      # (m, m) graph Laplacian
     t_list: List[float]  # Heat kernel times
-    k: int  # kNN parameter
-    sigma_policy: str  # "median_knn"
     triplets: torch.Tensor  # (T, 3) ordinal triplets
-    Z_indices: torch.Tensor  # (m,) indices into encoder embeddings
+    k: int              # kNN parameter
+    scale: float        # Scaling factor
 
 
 class STStageBPrecomputer:
@@ -602,7 +600,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'overlap_info': overlap_info_batch
     }
 
-def SCSetDataset(Dataset):
+class SCSetDataset(Dataset):
     '''
     dataset for SC mini sets with intentional overlap pairs
     '''

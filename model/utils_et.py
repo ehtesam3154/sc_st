@@ -313,9 +313,12 @@ def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
         hist[0] = 1.0
         return hist
     
-    hist = torch.histc(dists, bins=len(bins)-1, min=minv, max=maxv)
-    s = hist.sum()
-    hist = hist / (s + 1e-12)
+    triu_i, triu_j = torch.triu_indices(n, n, 1, device=device)
+    d_vec = D[triu_i, triu_j]
+    
+    hist, _ = torch.histogram(d_vec, bins=bins)
+    hist = hist.float() / hist.sum().clamp_min(1)  # Normalize
+    
     return hist
 
 

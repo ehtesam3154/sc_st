@@ -87,7 +87,7 @@ class SetEncoderContext(nn.Module):
     
 def precompute_st_prototypes(
     targets_dict: Dict[int, 'STTargets'],
-    encoder: SharedEncoder,
+    encoder: 'SharedEncoder',
     st_gene_expr_dict: Dict[int, torch.Tensor],
     n_prototypes: int = 3000,
     n_min: int = 64,
@@ -547,10 +547,34 @@ def train_stageC_diffusion_generator(
             V_t = V_t * mask.unsqueeze(-1).float()
             
             # Predict noise
-            eps_pred = score_net(V_t, t_norm.unsqueeze(1), H, mask)
+            # CFG: Drop context randomly during training
+            p_uncond = 0.15  # 10-20% works well
+            drop_mask = (torch.rand(batch_size_real, device=device) < p_uncond).float().view(-1, 1, 1)
+            H_train = H * (1 - drop_mask)  # Zero context for random subset
+
+            eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask)
             
-            # Score loss
-            L_score = ((eps_pred - eps) ** 2 * mask.unsqueeze(-1).float()).sum() / mask.sum()
+            # VE SDE
+            sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), n_timesteps, device=device))
+
+            # Compute sigma_data from actual V_0 statistics (run once at start)
+            print("Computing sigma_data from data statistics...")
+            with torch.no_grad():
+                # Sample a few batches to estimate V_0 scale
+                sample_stds = []
+                for _ in range(min(10, len(st_loader))):
+                    batch = next(iter(st_loader))
+                    G_batch = batch['G_target'].to(device)
+                    for i in range(min(4, G_batch.shape[0])):
+                        V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
+                        sample_stds.append(V_temp.std().item())
+                sigma_data = np.median(sample_stds)
+                print(f"Computed sigma_data = {sigma_data:.4f}")
+
+            # EDM loss weighting (sigma_t already sampled above)
+            w = (sigma_t**2 + sigma_data**2) / ((sigma_t * sigma_data)**2)  # Shape: (B, 1, 1)
+            #score loss
+            L_score = (w * (eps_pred - eps)**2 * mask.unsqueeze(-1).float()).sum() / mask.sum()
             
             # Initialize other losses
             L_gram = torch.tensor(0.0, device=device)
@@ -568,11 +592,21 @@ def train_stageC_diffusion_generator(
                 # ===== ST LOSSES =====
                 
                 # Gram loss
+                # Use masked Frobenius loss
                 for i in range(batch_size_real):
                     n_valid = int(n_list[i].item())
+                    mask_i = mask[i, :n_valid]  # Boolean mask for valid entries
+                    
                     G_p = V_hat[i, :n_valid] @ V_hat[i, :n_valid].T
                     G_t = G_target[i, :n_valid, :n_valid]
-                    L_gram += loss_gram(G_p, G_t)
+                    
+                    # Compute pair mask (both dimensions)
+                    P = mask_i.unsqueeze(-1) & mask_i.unsqueeze(-2)  # (n, n)
+                    
+                    # Masked Frobenius
+                    diff_sq = (G_p - G_t)**2 * P.float()
+                    L_gram += diff_sq.sum() / P.sum().clamp_min(1)
+
                 L_gram = L_gram / batch_size_real
                 
                 # Heat kernel trace (simplified)
@@ -585,14 +619,23 @@ def train_stageC_diffusion_generator(
                 
                 for i in range(batch_size_real):
                     n_valid = int(n_list[i].item())
+                    mask_i = mask[i, :n_valid]
                     V_i = V_hat[i, :n_valid]
                     D_p = torch.cdist(V_i, V_i)
                     
-                    d_95_p = torch.quantile(D_p[torch.triu(torch.ones_like(D_p), diagonal=1).bool()], 0.95)
-                    bins_p = torch.linspace(0, d_95_p, len(H_bins), device=device)
-                    H_p = uet.compute_distance_hist(D_p, bins_p)
+                    # Extract upper triangle with mask
+                    triu_i, triu_j = torch.triu_indices(n_valid, n_valid, 1, device=device)
+                    P_i = mask_i.unsqueeze(-1) & mask_i.unsqueeze(-2)  # Pair mask
+                    valid_pairs = P_i[triu_i, triu_j]
+                    d_vec = D_p[triu_i, triu_j][valid_pairs]
                     
-                    L_sw_st += loss_sw(H_p.unsqueeze(0), H_target[i].unsqueeze(0))
+                    if d_vec.numel() > 0:
+                        d_95_p = torch.quantile(d_vec, 0.95)
+                        bins_p = torch.linspace(0, d_95_p, len(H_bins), device=device)
+                        H_p, _ = torch.histogram(d_vec, bins=bins_p)
+                        H_p = H_p.float() / H_p.sum().clamp_min(1)
+                        
+                        L_sw_st += loss_sw(H_p.unsqueeze(0), H_target[i].unsqueeze(0))
                 L_sw_st = L_sw_st / batch_size_real
                 
             else:
@@ -791,7 +834,7 @@ import gc
 
 def sample_sc_edm_anchored(
     sc_gene_expr: torch.Tensor,
-    encoder: SharedEncoder,
+    encoder: 'SharedEncoder',
     context_encoder: SetEncoderContext,
     score_net: DiffusionScoreNet,
     n_timesteps_sample: int = 160,

@@ -570,7 +570,8 @@ class GEMSModel:
         return_coords: bool = True,
         anchor_size: int = 384,
         batch_size: int = 512,
-        eta: float = 0.0
+        eta: float = 0.0,
+        guidance_scale: float = 7.0
     ) -> Dict[str, torch.Tensor]:
         """
         ANCHOR-CONDITIONED inference for SC data (FIXES GLOBAL GEOMETRY).
@@ -603,6 +604,7 @@ class GEMSModel:
             anchor_size=anchor_size,
             batch_size=batch_size,
             eta=eta,
+            guidance_scale=guidance_scale,  # <- ADD THIS
             device=self.device
         )
 
