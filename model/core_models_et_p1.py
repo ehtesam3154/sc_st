@@ -533,12 +533,6 @@ class STSetDataset(Dataset):
 def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
     Collate mini-sets with padding.
-    
-    Args:
-        batch: list of mini-set dicts
-        
-    Returns:
-        padded batch dict with masks
     """
     device = batch[0]['Z_set'].device
     n_max = max(item['n'] for item in batch)
@@ -554,7 +548,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     D_batch = torch.zeros(batch_size, n_max, n_max, device=device)
     H_batch = torch.zeros(batch_size, num_bins, device=device)
     mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
-    n_batch = torch.zeros(batch_size, dtype=torch.long)  # Store actual sizes
+    n_batch = torch.zeros(batch_size, dtype=torch.long)
     
     L_info_batch = []
     triplets_batch = []
@@ -569,11 +563,11 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         D_batch[i, :n, :n] = item['D_target']
         H_batch[i] = item['H_target']
         mask_batch[i, :n] = True
-        n_batch[i] = n  # Store actual size
+        n_batch[i] = n
         L_info_batch.append(item['L_info'])
         triplets_batch.append(item['triplets'])
         H_bins_batch.append(item['H_bins'])
-        overlap_info_batch.append(item['overlap_info'])  # Keep CPU tensors
+        overlap_info_batch.append(item['overlap_info'])
     
     return {
         'Z_set': Z_batch,
@@ -585,8 +579,9 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'triplets': triplets_batch,
         'H_bins': H_bins_batch,
         'mask': mask_batch,
-        'n': n_batch,  # Add this
-        'overlap_info': overlap_info_batch
+        'n': n_batch,
+        'overlap_info': overlap_info_batch,
+        'is_sc': False 
     }
 
 class SCSetDataset(Dataset):
@@ -666,8 +661,7 @@ def collate_sc_minisets(batch: List[Dict]) -> Dict:
     '''
     collate SC mini-set pairs
     '''
-
-    device= batch[0]['Z_A'].device
+    device = batch[0]['Z_A'].device
     batch_size = len(batch)
 
     n_max_A = max(item['n_A'] for item in batch)
@@ -675,7 +669,6 @@ def collate_sc_minisets(batch: List[Dict]) -> Dict:
     n_max = max(n_max_A, n_max_B)
     h_dim = batch[0]['Z_A'].shape[1]
 
-    #two sets per batch item
     Z_batch = torch.zeros(batch_size * 2, n_max, h_dim, device=device)
     mask_batch = torch.zeros(batch_size * 2, n_max, dtype=torch.bool, device=device)
     n_batch = torch.zeros(batch_size * 2, dtype=torch.long)
@@ -687,18 +680,18 @@ def collate_sc_minisets(batch: List[Dict]) -> Dict:
         n_B = item['n_B']
 
         Z_batch[2 * i, :n_A] = item['Z_A']
-        Z_batch[2 * i+1, :n_B] = item['Z_B']
+        Z_batch[2 * i + 1, :n_B] = item['Z_B']
 
         mask_batch[2 * i, :n_A] = True
-        mask_batch[2 * i, :n_B] = True 
+        mask_batch[2 * i + 1, :n_B] = True 
 
         n_batch[2 * i] = n_A
-        n_batch[2 * i+1] = n_B
+        n_batch[2 * i + 1] = n_B
 
         shared_info.append({
             'pair_idx': i,
             'idx_A': 2 * i,
-            'idx_B': 2 * i+1,
+            'idx_B': 2 * i + 1,
             'shared_A': item['shared_A'],
             'shared_B': item['shared_B']
         })
@@ -707,6 +700,6 @@ def collate_sc_minisets(batch: List[Dict]) -> Dict:
         'Z_set': Z_batch,
         'mask': mask_batch,
         'n': n_batch,
-        'shared_info': shared_info,
+        'shared_info': shared_info,  # CRITICAL: Must include this
         'is_sc': True
     }
