@@ -22,6 +22,9 @@ from datetime import datetime
 
 from torch.utils.data import DataLoader
 from core_models_et_p1 import collate_minisets, collate_sc_minisets
+from tqdm.auto import tqdm
+import sys
+
 
 # ==============================================================================
 # STAGE C: SET-EQUIVARIANT CONTEXT ENCODER
@@ -493,6 +496,8 @@ def train_stageC_diffusion_generator(
     
     global_step = 0
     
+    epoch_pbar = tqdm(range(n_epochs), desc="Training Epochs", position=0)  # Top bar
+
     for epoch in range(n_epochs):
         st_iter = iter(st_loader)
         sc_iter = iter(sc_loader)
@@ -504,7 +509,10 @@ def train_stageC_diffusion_generator(
         # Mixed schedule: [ST, ST, SC] repeat
         schedule = ['ST', 'ST', 'SC'] * (max(len(st_loader), len(sc_loader)) // 3 + 1)
         
-        for batch_type in schedule:
+        # Batch progress bar
+        batch_pbar = tqdm(schedule, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False, position=1)
+        
+        for batch_type in batch_pbar:
             if batch_type == 'ST':
                 batch = next(st_iter, None)
                 if batch is None:
@@ -561,18 +569,18 @@ def train_stageC_diffusion_generator(
             sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), n_timesteps, device=device))
 
             # Compute sigma_data from actual V_0 statistics (run once at start)
-            print("Computing sigma_data from data statistics...")
+            # print("Computing sigma_data from data statistics...")
             with torch.no_grad():
                 # Sample a few batches to estimate V_0 scale
                 sample_stds = []
                 for _ in range(min(10, len(st_loader))):
-                    batch = next(iter(st_loader))
-                    G_batch = batch['G_target'].to(device)
+                    sample_batch = next(iter(st_loader))  # Use a different variable name!
+                    G_batch = sample_batch['G_target'].to(device)
                     for i in range(min(4, G_batch.shape[0])):
                         V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
                         sample_stds.append(V_temp.std().item())
                 sigma_data = np.median(sample_stds)
-                print(f"Computed sigma_data = {sigma_data:.4f}")
+                # print(f"Computed sigma_data = {sigma_data:.4f}")
 
             # EDM loss weighting (sigma_t already sampled above)
             w = (sigma_t**2 + sigma_data**2) / ((sigma_t * sigma_data)**2)  # Shape: (B, 1, 1)
@@ -752,6 +760,7 @@ def train_stageC_diffusion_generator(
             
             n_batches += 1
             global_step += 1
+            batch_pbar.update(1)
         
         scheduler.step()
         
@@ -762,8 +771,9 @@ def train_stageC_diffusion_generator(
         
         history['epoch'].append(epoch)
         
-        if (epoch + 1) % 50 == 0:
-            print(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_losses['total']:.4f} | "
+        # batch_pbar.close()
+        if (epoch + 1) % 10 == 0:
+            tqdm.write(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_losses['total']:.4f} | "
                   f"Score: {epoch_losses['score']:.4f} | Gram: {epoch_losses['gram']:.4f} | "
                   f"SW_ST: {epoch_losses['sw_st']:.4f} | Ord_SC: {epoch_losses['ordinal_sc']:.4f}")
         
