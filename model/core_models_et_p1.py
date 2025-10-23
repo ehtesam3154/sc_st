@@ -243,17 +243,17 @@ def train_encoder(
 
 @dataclass
 class STTargets:
-    """Per-slide geometric targets (pose-free)."""
-    y_hat: torch.Tensor  # (m, 2) pose-normalized coords
-    G: torch.Tensor      # (m, m) Gram matrix
-    D: torch.Tensor      # (m, m) distance matrix
-    H: torch.Tensor      # (num_bins,) distance histogram
-    H_bins: torch.Tensor # (num_bins,) histogram bin edges
-    L: torch.Tensor      # (m, m) graph Laplacian
-    t_list: List[float]  # Heat kernel times
-    triplets: torch.Tensor  # (T, 3) ordinal triplets
-    k: int              # kNN parameter
-    scale: float        # Scaling factor
+    """Precomputed geometric targets for an ST slide."""
+    y_hat: torch.Tensor      # (n, 2) normalized coords
+    G: torch.Tensor          # (n, n) Gram matrix
+    D: torch.Tensor          # (n, n) distance matrix
+    H: torch.Tensor          # (num_bins,) distance histogram
+    H_bins: torch.Tensor     # (num_bins,) histogram bin edges
+    L: torch.Tensor          # (n, n) graph Laplacian
+    t_list: List[float]      # heat kernel time points
+    triplets: torch.Tensor   # (T, 3) ordinal triplets
+    k: int                   # kNN parameter
+    scale: float             # normalization scale factor
 
 
 class STStageBPrecomputer:
@@ -348,7 +348,7 @@ class STStageBPrecomputer:
         use_affine_whitening: bool = True,
         use_geodesic_targets: bool = True,
         geodesic_k: int = 15
-    ) -> Dict[int, 'STTargets']:
+    ) -> Dict[int, STTargets]:
         """
         Precompute pose-free targets for ST slides with whitening and geodesic distances.
         """
@@ -399,15 +399,16 @@ class STStageBPrecomputer:
             edge_index, edge_weight = uet.build_knn_graph(y_hat, k=self.k, device=self.device)
             L = uet.compute_graph_laplacian(edge_index, edge_weight, n)
             
+            # Create STTargets object
             targets = STTargets(
-                y_hat=y_hat,
-                G=G,
-                D=D,
-                H=H,
-                H_bins=bins,
-                L=L,
+                y_hat=y_hat.cpu(),
+                G=G.cpu(),
+                D=D.cpu(),
+                H=H.cpu(),
+                H_bins=bins.cpu(),
+                L=L.cpu(),
                 t_list=self.t_list,
-                triplets=triplets,
+                triplets=triplets.cpu(),
                 k=self.k,
                 scale=scale
             )
