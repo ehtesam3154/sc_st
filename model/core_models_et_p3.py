@@ -200,67 +200,74 @@ class GEMSModel:
     def train_stageC(
         self,
         st_gene_expr_dict: Dict[int, torch.Tensor],
-        n_min: int = 256,
-        n_max: int = 1024,
-        num_samples: int = 10000,
+        sc_gene_expr: torch.Tensor,
+        n_min: int = 64,
+        n_max: int = 256,
+        num_st_samples: int = 10000,
+        num_sc_samples: int = 5000,
         n_epochs: int = 1000,
         batch_size: int = 4,
         lr: float = 1e-4,
-        n_timesteps: int = 1000,
+        n_timesteps: int = 600,
         sigma_min: float = 0.01,
-        sigma_max: float = 50.0,
-        loss_weights: Optional[Dict[str, float]] = None,
+        sigma_max: float = 5.0,
         outf: str = 'output'
     ):
         """
-        Train set-equivariant diffusion generator (Stage C).
-        
-        Args:
-            st_gene_expr_dict: {slide_id: st_gene_expr}
-            n_min, n_max: mini-set size range
-            num_samples: number of mini-sets
-            n_epochs: training epochs
-            batch_size: batch size
-            lr: learning rate
-            n_timesteps: diffusion steps
-            sigma_min, sigma_max: VE SDE noise levels
-            loss_weights: {'alpha', 'beta', 'gamma', 'eta'}
-            outf: output directory
+        Train diffusion generator with mixed ST/SC regimen.
         """
         print("\n" + "="*60)
-        print("STAGE C: Training Diffusion Generator")
+        print("STAGE C: Training Diffusion Generator (Mixed ST/SC)")
         print("="*60)
         
-        if loss_weights is None:
-            loss_weights = {'alpha': 0.1, 'beta': 1.0, 'gamma': 0.25, 'eta': 0.5}
-        
-        # Create mini-set dataset
-        dataset = STSetDataset(
+        # ST dataset
+        from core_models_et_p1 import STSetDataset, SCSetDataset
+        st_dataset = STSetDataset(
             targets_dict=self.targets_dict,
             encoder=self.encoder,
             st_gene_expr_dict=st_gene_expr_dict,
             n_min=n_min,
             n_max=n_max,
             D_latent=self.D_latent,
-            num_samples=num_samples,
+            num_samples=num_st_samples,
             device=self.device
         )
         
-        print(f"Created dataset with {len(dataset)} mini-sets")
+        # SC dataset
+        sc_dataset = SCSetDataset(
+            sc_gene_expr=sc_gene_expr,
+            encoder=self.encoder,
+            n_min=n_min,
+            n_max=n_max,
+            num_samples=num_sc_samples,
+            device=self.device
+        )
+        
+        # Precompute ST prototypes
+        from core_models_et_p2 import precompute_st_prototypes
+        prototype_bank = precompute_st_prototypes(
+            targets_dict=self.targets_dict,
+            encoder=self.encoder,
+            st_gene_expr_dict=st_gene_expr_dict,
+            n_prototypes=3000,
+            device=self.device
+        )
         
         # Train
+        from core_models_et_p2 import train_stageC_diffusion_generator
         train_stageC_diffusion_generator(
             context_encoder=self.context_encoder,
             generator=self.generator,
             score_net=self.score_net,
-            dataset=dataset,
+            st_dataset=st_dataset,
+            sc_dataset=sc_dataset,
+            prototype_bank=prototype_bank,
             n_epochs=n_epochs,
             batch_size=batch_size,
             lr=lr,
             n_timesteps=n_timesteps,
             sigma_min=sigma_min,
             sigma_max=sigma_max,
-            loss_weights=loss_weights,
             device=self.device,
             outf=outf
         )

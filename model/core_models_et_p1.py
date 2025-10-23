@@ -344,51 +344,81 @@ class STStageBPrecomputer:
     
     def precompute(
         self,
-        slides: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        slides: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
         encoder: SharedEncoder,
-        outdir: str = 'stage_b_cache'
-    ) -> Dict[int, STTargets]:
+        outdir: str = 'stage_b_cache',
+        use_affine_whitening: bool = True,
+        use_geodesic_targets: bool = True,
+        geodesic_k: int = 15
+    ) -> Dict[int, 'STTargets']:
         """
-        Precompute targets for multiple slides and save to disk.
-        
-        Args:
-            slides: dict of {slide_id: (st_coords, st_gene_expr, ...)}
-            encoder: frozen encoder
-            outdir: output directory for caches
-            
-        Returns:
-            dict of {slide_id: STTargets}
+        Precompute pose-free targets for ST slides with whitening and geodesic distances.
         """
         os.makedirs(outdir, exist_ok=True)
+        targets_dict = {}
         
-        all_targets = {}
+        encoder.eval()
         for slide_id, (st_coords, st_gene_expr) in slides.items():
-            print(f"Precomputing targets for slide {slide_id}...")
+            cache_file = os.path.join(outdir, f'slide_{slide_id}_targets.pt')
             
-            targets = self.precompute_slide(slide_id, st_coords, encoder, st_gene_expr)
-            all_targets[slide_id] = targets
+            if os.path.exists(cache_file):
+                print(f"Loading cached targets for slide {slide_id}")
+                targets_dict[slide_id] = torch.load(cache_file)
+                continue
             
-            # Save to disk
-            save_path = os.path.join(outdir, f'slide_{slide_id}_targets.pt')
-            torch.save({
-                'slide_id': targets.slide_id,
-                'center': targets.center.cpu(),
-                'scale': targets.scale,
-                'y_hat': targets.y_hat.cpu(),
-                'G': targets.G.cpu(),
-                'D': targets.D.cpu(),
-                'H': targets.H.cpu(),
-                't_list': targets.t_list,
-                'k': targets.k,
-                'sigma_policy': targets.sigma_policy,
-                'triplets': targets.triplets.cpu(),
-                'Z_indices': targets.Z_indices.cpu()
-            }, save_path)
+            print(f"Computing targets for slide {slide_id} (n={st_coords.shape[0]})")
             
-            print(f"  Saved to {save_path}")
+            # Normalize coordinates
+            if use_affine_whitening:
+                y_hat, scale = uet.affine_whitening(st_coords, eps=1e-6)
+            else:
+                y_hat = uet.normalize_coordinates_isotropic(st_coords)
+                scale = 1.0
+            
+            n = y_hat.shape[0]
+            
+            # Compute distances
+            if use_geodesic_targets:
+                D = uet.compute_geodesic_distances(y_hat, k=geodesic_k, device=self.device)
+            else:
+                D = torch.cdist(y_hat, y_hat)
+            
+            # Gram from geodesic or coords
+            if use_geodesic_targets:
+                G = uet.gram_from_geodesic(D)
+            else:
+                G = uet.gram_from_coords(y_hat)
+            
+            # Distance histogram
+            d_95 = torch.quantile(D[torch.triu(torch.ones_like(D), diagonal=1).bool()], 0.95)
+            bins = torch.linspace(0, d_95, self.num_bins, device=self.device)
+            H = uet.compute_distance_hist(D, bins)
+            
+            # Ordinal triplets from geodesic distances
+            triplets = uet.sample_ordinal_triplets(D, n_triplets=self.n_triplets, margin_ratio=self.margin_ratio)
+            
+            # Graph Laplacian
+            edge_index, edge_weight = uet.build_knn_graph(y_hat, k=self.k, device=self.device)
+            L = uet.compute_graph_laplacian(edge_index, edge_weight, n)
+            
+            targets = STTargets(
+                y_hat=y_hat,
+                G=G,
+                D=D,
+                H=H,
+                H_bins=bins,
+                L=L,
+                t_list=self.t_list,
+                triplets=triplets,
+                k=self.k,
+                scale=scale
+            )
+            
+            torch.save(targets, cache_file)
+            targets_dict[slide_id] = targets
+            print(f"  Cached to {cache_file}")
         
-        print("Stage B precomputation complete!")
-        return all_targets
+        return targets_dict
     
 
 # ==============================================================================
@@ -570,4 +600,126 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'mask': mask_batch,
         'n': n_batch,  # Add this
         'overlap_info': overlap_info_batch
+    }
+
+def SCSetDataset(Dataset):
+    '''
+    dataset for SC mini sets with intentional overlap pairs
+    '''
+
+    def __init__(
+            self,
+            sc_gene_expr: torch.Tensor,
+            encoder: SharedEncoder,
+            n_min: int=64,
+            n_max: int=256,
+            n_large_min: int=384,
+            n_large_max: int=512,
+            large_fraction: float=0.15,
+            overlap_min: int=20,
+            overlap_max: int=512,
+            num_samples: int=5000,
+            device: str='cuda'
+    ):
+        self.sc_gene_expr = sc_gene_expr
+        self.encoder = encoder.eval()
+        self.n_min = n_min
+        self.n_max = n_max
+        self.n_large_min = n_large_min
+        self.n_large_max = n_large_max
+        self.large_fraction = large_fraction
+        self.overlap_min = overlap_min
+        self.overlap_max = overlap_max
+        self.num_samples = num_samples
+        self.device = device
+
+        #precompute all SC embeddings
+        print('encoding SC cells....')
+        with torch.no_grad():
+            Z_all = []
+            batch_size = 1024
+            for i in range(0, sc_gene_expr.shape[0], batch_size):
+                z = self.encoder(sc_gene_expr[i: i+batch_size].to(device)).cpu()
+                Z_all.append(z)
+            self.Z_all = torch.cat(Z_all, dim=0)
+        print(f'SC embeddings computed: {self.Z_all.shape}')
+
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        #decide size
+        if torch.rand(1).item() < self.large_fraction:
+            n = torch.randint(self.n_large_min, self.n_large_max + 1, (1,)).item()
+        else:
+            n = torch.randint(self.n_min, self.n_max + 1, (1.)).item()
+
+        n_overlap = torch.randint(self.overlap_min, min(self.overlap_max, n // 2) + 1, (1,)).item()
+
+        #create pair
+        indices_A, indices_B, shared_A, shared_B = uet.create_sc_miniset_pair(
+            self.Z_all, n, n_overlap, k_nn=50, device='cpu'
+        )
+
+        Z_A = self.Z_all[indices_A]
+        Z_B = self.Z_all[indices_B]
+
+        return {
+            'Z_A': Z_A,
+            'Z_B': Z_B,
+            'n_A': len(indices_A),
+            'n_B': len(indices_B),
+            'shared_A': shared_A,
+            'shared_B': shared_B,
+            'is_sc': True
+        }
+    
+
+def collate_sc_minisets(batch: List[Dict]) -> Dict:
+    '''
+    collate SC mini-set pairs
+    '''
+
+    device= batch[0]['Z_A'].device
+    batch_size = len(batch)
+
+    n_max_A = max(item['n_A'] for item in batch)
+    n_max_B = max(item['n_B'] for item in batch)
+    n_max = max(n_max_A, n_max_B)
+    h_dim = batch[0]['Z_A'].shape[1]
+
+    #two sets per batch item
+    Z_batch = torch.zeros(batch_size * 2, n_max, h_dim, device=device)
+    mask_batch = torch.zeros(batch_size * 2, n_max, dtype=torch.bool, device=device)
+    n_batch = torch.zeros(batch_size * 2, dtype=torch.long)
+
+    shared_info = []
+
+    for i, item in enumerate(batch):
+        n_A = item['n_A']
+        n_B = item['n_B']
+
+        Z_batch[2 * i, :n_A] = item['Z_A']
+        Z_batch[2 * i+1, :n_B] = item['Z_B']
+
+        mask_batch[2 * i, :n_A] = True
+        mask_batch[2 * i, :n_B] = True 
+
+        n_batch[2 * i] = n_A
+        n_batch[2 * i+1] = n_B
+
+        shared_info.append({
+            'pair_idx': i,
+            'idx_A': 2 * i,
+            'idx_B': 2 * i+1,
+            'shared_A': item['shared_A'],
+            'shared_B': item['shared_B']
+        })
+
+    return {
+        'Z_set': Z_batch,
+        'mask': mask_batch,
+        'n': n_batch,
+        'shared_info': shared_info,
+        'is_sc': True
     }

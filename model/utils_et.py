@@ -128,37 +128,6 @@ def build_knn_graph(
     else:
         return edge_index.long(), None
 
-
-# def compute_graph_laplacian(edge_index: torch.Tensor, edge_weight: torch.Tensor, n_nodes: int) -> torch.Tensor:
-#     """
-#     Compute graph Laplacian L = D - W from edge list.
-    
-#     Args:
-#         edge_index: (2, E)
-#         edge_weight: (E,)
-#         n_nodes: number of nodes
-        
-#     Returns:
-#         L: (n, n) Laplacian matrix (dense)
-#     """
-#     device = edge_index.device
-    
-#     # Build adjacency matrix W
-#     W = torch.zeros(n_nodes, n_nodes, device=device)
-#     src, dst = edge_index[0], edge_index[1]
-#     W[src, dst] = edge_weight
-    
-#     # Symmetrize (kNN is directed, make undirected)
-#     W = (W + W.t()) / 2
-    
-#     # Degree matrix
-#     deg = W.sum(dim=1)
-#     D = torch.diag(deg)
-    
-#     # Laplacian
-#     L = D - W
-#     return L
-
 def compute_graph_laplacian(edge_index: torch.Tensor,
                             edge_weight: torch.Tensor,
                             n_nodes: int,
@@ -829,42 +798,6 @@ import torch.nn as nn
 #fast heat trace via strochastic lanczos quadratur (dense L)
 @torch.no_grad()
 
-# def lanczos_dense(A, v0, m, tol=1e-6):
-#     '''run m-step lanczos on dense symmetric A with start vector v0
-#     returns symmetric tridiagonal T (j * j), where j < =m if eraly stop
-#     '''
-
-#     device , dtype = A.device, A.dtype
-#     n = v0.numel()
-#     Q = torch.zeros(n, m, device=device, dtype=dtype)
-#     alpha = torch.zeros(m, device=device, dtype=dtype)
-#     beta = torch.zeros(m-1, device=device, dtype=dtype)
-
-#     v = v0 / (v0.norm() + 1e-12)
-#     w = A @ v
-#     alpha[0] = torch.dot(v, w)
-#     Q[:, 0] = v
-#     w = w - alpha[0] * v
-
-#     j = 1
-#     for j in range(1, m):
-#         beta[j-1] = w.norm()
-#         if beta[j-1] <= tol:
-#             #truncate 
-#             alpha = alpha[:j]
-#             beta = beta[:j-1]
-#             Q = Q[:, :j]
-#             break 
-#         v_next = w / beta[j-1]
-#         Q[:, j] = v_next
-#         w = A @ v_next - beta[j-1] * v
-#         alpha[j] = torch.dot(v_next, w)
-#         w = w - alpha[j] * v_next
-#         v = v_next 
-
-#     T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
-#     return T
-
 def lanczos_dense(A, v0, m, tol=1e-6):
     """
     m-step Lanczos on symmetric A (dense or sparse). Returns tridiagonal T.
@@ -915,36 +848,6 @@ def _quad_form_exp_from_T(T, t):
     weights = (evecs[0, :] ** 2)                 # (j,)
     return (weights * torch.exp(-t * evals)).sum()
 
-
-# @torch.no_grad()
-# def heat_trace_slq_dense(L, t_list, num_probe=6, m=25):
-#     """
-#     Approximate Tr(exp(-t L)) for each t in t_list using SLQ on dense symmetric PSD L.
-#     Returns tensor of shape [len(t_list)] on L.device.
-
-#     Args:
-#         L: (n, n) symmetric PSD (float32/float64), typically a Laplacian
-#         t_list: list/tuple of float
-#         num_probe: number of Hutchinson probe vectors
-#         m: Lanczos steps per probe
-#     """
-#     device = L.device
-#     dtype  = L.dtype
-#     n      = L.size(0)
-
-#     # Rademacher probes
-#     traces = torch.zeros(len(t_list), device=device, dtype=dtype)
-#     for _ in range(num_probe):
-#         v = torch.empty(n, device=device, dtype=dtype).uniform_(-1.0, 1.0).sign()
-#         v = v / math.sqrt(n)
-#         T = lanczos_dense(L, v, m)
-#         # eval f(T) once per t
-#         for j, t in enumerate(t_list):
-#             traces[j] += _quad_form_exp_from_T(T, float(t))
-
-#     traces /= float(num_probe)
-#     # Hutchinson is unbiased for trace, so multiply by n
-#     return traces * n
 
 def heat_trace_slq_dense(L, t_list, num_probe=4, m=12):
     """
@@ -1070,3 +973,153 @@ def mds_from_latent(X: torch.Tensor, d_out: int = 2) -> torch.Tensor:
     coords = U[:, :d_out] * S[:d_out].unsqueeze(0)
     
     return coords
+
+# Add these imports at the top if not already present
+import scipy.sparse as sp
+from scipy.sparse.csgraph import shortest_path
+from scipy.spatial.distance import pdist, squareform
+
+def affine_whitening(coords: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, float]:
+    """
+    Affine whitening with eigendecomp. Returns whitened coords and scale factor.
+    """
+    n = coords.shape[0]
+    coords_centered = coords - coords.mean(dim=0, keepdim=True)
+    
+    cov = (coords_centered.T @ coords_centered) / (n - 1)
+    cov = cov + eps * torch.eye(cov.shape[0], device=coords.device, dtype=coords.dtype)
+    
+    eigvals, eigvecs = safe_eigh(cov, eps=eps)  # Use your safe version
+    eigvals = eigvals.clamp(min=eps)
+    Sigma_inv_sqrt = eigvecs @ torch.diag(1.0 / torch.sqrt(eigvals)) @ eigvecs.T
+    
+    coords_whitened = coords_centered @ Sigma_inv_sqrt
+    
+    # Scale to median 1-NN ≈ 1
+    D_1nn = torch.cdist(coords_whitened, coords_whitened)
+    D_1nn.fill_diagonal_(float('inf'))
+    nn_dists = D_1nn.min(dim=1)[0]
+    median_1nn = nn_dists.median().item()
+    scale = median_1nn if median_1nn > 1e-8 else 1.0
+    coords_whitened = coords_whitened / scale
+    
+    return coords_whitened, scale
+
+
+def compute_geodesic_distances(coords: torch.Tensor, k: int = 15, device: str = 'cuda') -> torch.Tensor:
+    """
+    Compute graph-geodesic distances via shortest-path on kNN graph.
+    """
+    n = coords.shape[0]
+    coords_np = coords.cpu().numpy()
+    
+    # Build kNN graph with Euclidean edge weights
+    from sklearn.neighbors import kneighbors_graph
+    knn_graph = kneighbors_graph(coords_np, n_neighbors=k, mode='distance', metric='euclidean', include_self=False)
+    
+    # Symmetrize
+    knn_graph = (knn_graph + knn_graph.T) / 2.0
+    
+    # Shortest paths
+    D_geo = shortest_path(knn_graph, method='auto', directed=False)
+    D_geo = torch.from_numpy(D_geo).float().to(device)
+    
+    # Handle infinities (disconnected components)
+    D_geo = torch.nan_to_num(D_geo, nan=0.0, posinf=D_geo[D_geo != float('inf')].max().item() * 2)
+    
+    return D_geo
+
+
+def gram_from_geodesic(D_geo: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Gram matrix from geodesic distances: B = -0.5 * H * D_geo^2 * H
+    """
+    n = D_geo.shape[0]
+    H = torch.eye(n, device=D_geo.device) - torch.ones(n, n, device=D_geo.device) / n
+    B = -0.5 * H @ (D_geo ** 2) @ H
+    return B
+
+
+def sample_ordinal_triplets_from_Z(Z: torch.Tensor, n_per_anchor: int = 10, k_nn: int = 25, margin_ratio: float = 0.2) -> torch.Tensor:
+    """
+    Sample ordinal triplets from Z-space neighborhoods.
+    For each anchor i: j from k-NN, k from outside k-NN, enforce d_Z(i,j) < d_Z(i,k).
+    Returns (T, 3) tensor of triplet indices.
+    """
+    n = Z.shape[0]
+    if n < k_nn + 5:
+        k_nn = max(3, n // 3)
+    
+    D_Z = torch.cdist(Z, Z)
+    
+    triplets = []
+    for i in range(n):
+        dists = D_Z[i]
+        sorted_idx = torch.argsort(dists)
+        
+        neighbors = sorted_idx[1:k_nn+1]  # Exclude self
+        non_neighbors = sorted_idx[k_nn+1:min(k_nn*4+1, n)]
+        
+        if len(neighbors) == 0 or len(non_neighbors) == 0:
+            continue
+        
+        for _ in range(n_per_anchor):
+            if len(neighbors) == 0 or len(non_neighbors) == 0:
+                break
+            j = neighbors[torch.randint(len(neighbors), (1,))].item()
+            k_idx = non_neighbors[torch.randint(len(non_neighbors), (1,))].item()
+            
+            d_ij = dists[j].item()
+            d_ik = dists[k_idx].item()
+            
+            if d_ij < d_ik:
+                triplets.append([i, j, k_idx])
+    
+    if len(triplets) == 0:
+        # Fallback
+        return torch.zeros((0, 3), dtype=torch.long, device=Z.device)
+    
+    return torch.tensor(triplets, dtype=torch.long, device=Z.device)
+
+
+def create_sc_miniset_pair(Z_all: torch.Tensor, n_set: int, n_overlap: int, k_nn: int = 50, device: str = 'cuda') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create two overlapping SC mini-sets from Z-space.
+    Returns: indices_A, indices_B, shared_indices_in_A, shared_indices_in_B
+    """
+    n_total = Z_all.shape[0]
+    
+    # Sample seed for set A
+    seed_i = torch.randint(n_total, (1,)).item()
+    D_from_seed = torch.cdist(Z_all[seed_i:seed_i+1], Z_all)[0]
+    indices_A = torch.argsort(D_from_seed)[:n_set]
+    
+    # Select overlap subset
+    n_overlap = min(n_overlap, n_set - 5)
+    overlap_positions = torch.randperm(n_set)[:n_overlap]
+    shared_global = indices_A[overlap_positions]
+    
+    # Sample seed for set B near seed_i
+    D_from_seed_all = torch.cdist(Z_all[seed_i:seed_i+1], Z_all)[0]
+    nearby = torch.argsort(D_from_seed_all)[1:k_nn]
+    seed_j = nearby[torch.randint(len(nearby), (1,))].item()
+    
+    # Build set B: shared + new cells
+    D_from_seed_j = torch.cdist(Z_all[seed_j:seed_j+1], Z_all)[0]
+    candidates = torch.argsort(D_from_seed_j)
+    
+    # Exclude cells already in A\S
+    non_shared_A = indices_A[~torch.isin(torch.arange(n_set, device=device), overlap_positions)]
+    mask = ~torch.isin(candidates, non_shared_A)
+    candidates = candidates[mask]
+    
+    n_new = n_set - n_overlap
+    new_cells = candidates[:n_new] if len(candidates) >= n_new else candidates
+    
+    indices_B = torch.cat([shared_global, new_cells])[:n_set]
+    
+    # Find shared positions in both sets
+    shared_in_A = overlap_positions
+    shared_in_B = torch.tensor([torch.where(indices_B == g)[0][0].item() for g in shared_global if g in indices_B], device=device)
+    
+    return indices_A, indices_B, shared_in_A, shared_in_B
