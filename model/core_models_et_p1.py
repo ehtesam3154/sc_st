@@ -347,7 +347,8 @@ class STStageBPrecomputer:
         outdir: str = 'stage_b_cache',
         use_affine_whitening: bool = True,
         use_geodesic_targets: bool = True,
-        geodesic_k: int = 15
+        geodesic_k: int = 15,
+        force_recompute: bool = False  # ADD THIS
     ) -> Dict[int, STTargets]:
         """
         Precompute pose-free targets for ST slides with whitening and geodesic distances.
@@ -359,10 +360,17 @@ class STStageBPrecomputer:
         for slide_id, (st_coords, st_gene_expr) in slides.items():
             cache_file = os.path.join(outdir, f'slide_{slide_id}_targets.pt')
             
-            if os.path.exists(cache_file):
+            # Skip cache if forcing recompute or if cache is incompatible
+            if not force_recompute and os.path.exists(cache_file):
                 print(f"Loading cached targets for slide {slide_id}")
-                targets_dict[slide_id] = torch.load(cache_file)
-                continue
+                loaded = torch.load(cache_file)
+                
+                # Only load if it's already an STTargets object (new format)
+                if isinstance(loaded, STTargets):
+                    targets_dict[slide_id] = loaded
+                    continue
+                else:
+                    print(f"  Old cache format detected, recomputing...")
             
             print(f"Computing targets for slide {slide_id} (n={st_coords.shape[0]})")
             
@@ -490,26 +498,23 @@ class STSetDataset(Dataset):
         m = targets.y_hat.shape[0]
         n = min(n, m)  # Don't exceed slide size
         
-        # Sample random subset of spots (keep indices on CPU)
-        indices = torch.randperm(m)[:n]  # CPU tensor
+        # Sample random subset of spots (KEEP ON CPU)
+        indices = torch.randperm(m)[:n]
         
         # Store overlap info (CPU tensors)
         overlap_info = {
             'slide_id': slide_id,
-            'indices': indices  # Keep on CPU
+            'indices': indices
         }
         
-        # Move indices to device for actual data extraction
-        indices_device = indices.to(self.device)
-        
-        # Extract subset data
-        Z_set = self.Z_dict[slide_id][indices_device]  # (n, h)
-        y_hat_subset = targets.y_hat[indices_device].to(self.device)  # (n, 2)
-        G_subset = targets.G[indices_device][:, indices_device].to(self.device)  # (n, n)
-        D_subset = targets.D[indices_device][:, indices_device].to(self.device)  # (n, n)
+        # Extract subset data (index on CPU, then move to device)
+        Z_set = self.Z_dict[slide_id][indices.to(self.device)]  # Z_dict is on device
+        y_hat_subset = targets.y_hat[indices].to(self.device)   # targets on CPU, index on CPU
+        G_subset = targets.G[indices][:, indices].to(self.device)
+        D_subset = targets.D[indices][:, indices].to(self.device)
         
         # Factor Gram to get V_target
-        V_target = uet.factor_from_gram(G_subset, self.D_latent)  # (n, D)
+        V_target = uet.factor_from_gram(G_subset, self.D_latent)
         
         # Recompute Laplacian on subset (kNN changes with subset)
         edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=targets.k, device=self.device)

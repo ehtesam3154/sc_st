@@ -289,37 +289,24 @@ def safe_eigh(A: torch.Tensor, return_vecs: bool = True, cpu: bool = True):
 
 def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
     """
-    Compute histogram of pairwise distances (upper triangle).
-    
-    Args:
-        D: (n, n) distance matrix
-        bins: (num_bins+1,) bin edges
-        
-    Returns:
-        hist: (num_bins,) histogram counts (normalized)
+    Compute normalized histogram of pairwise distances (upper triangle only).
+    FIXED: moves to CPU for histogram computation.
     """
-    # Extract upper triangle
-    triu_indices = torch.triu_indices(D.shape[0], D.shape[0], offset=1, device=D.device)
-    dists = D[triu_indices[0], triu_indices[1]]
-    
-    # Compute histogram
-    hist = torch.histc(dists, bins=len(bins)-1, min=bins[0].item(), max=bins[-1].item())
-    hist = hist / hist.sum()  # Normalize
-
-    minv, maxv = bins[0].item(), bins[-1].item()
-    if not (maxv > minv + 1e-12):
-        # put all mass in the first bin
-        hist = torch.zeros(len(bins)-1, device=D.device, dtype=D.dtype)
-        hist[0] = 1.0
-        return hist
-    
-    triu_i, triu_j = torch.triu_indices(n, n, 1, device=device)
+    n = D.shape[0]
+    triu_i, triu_j = torch.triu_indices(n, n, offset=1)
     d_vec = D[triu_i, triu_j]
     
-    hist, _ = torch.histogram(d_vec, bins=bins)
-    hist = hist.float() / hist.sum().clamp_min(1)  # Normalize
+    # Move to CPU for histogram (not supported on CUDA)
+    device = d_vec.device
+    d_vec_cpu = d_vec.cpu()
+    bins_cpu = bins.cpu()
     
-    return hist
+    # Compute histogram on CPU
+    hist, _ = torch.histogram(d_vec_cpu, bins=bins_cpu)
+    hist = hist.float() / hist.sum().clamp_min(1)
+    
+    # Move back to original device
+    return hist.to(device)
 
 
 def sample_ordinal_triplets(
@@ -992,7 +979,7 @@ def affine_whitening(coords: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Ten
     cov = (coords_centered.T @ coords_centered) / (n - 1)
     cov = cov + eps * torch.eye(cov.shape[0], device=coords.device, dtype=coords.dtype)
     
-    eigvals, eigvecs = safe_eigh(cov, eps=eps)  # Use your safe version
+    eigvals, eigvecs = safe_eigh(cov)  # Use your safe version
     eigvals = eigvals.clamp(min=eps)
     Sigma_inv_sqrt = eigvecs @ torch.diag(1.0 / torch.sqrt(eigvals)) @ eigvecs.T
     
