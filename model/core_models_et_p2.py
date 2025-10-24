@@ -433,6 +433,12 @@ def train_stageC_diffusion_generator(
     Train diffusion generator with mixed ST/SC regimen.
     OPTIMIZED with: AMP, loss alternation, CFG, reduced overlap computation.
     """
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+    
     # Enable TF32 for Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

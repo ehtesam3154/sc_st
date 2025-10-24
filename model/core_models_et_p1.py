@@ -444,7 +444,7 @@ class STSetDataset(Dataset):
         with torch.no_grad():
             for slide_id, st_expr in st_gene_expr_dict.items():
                 Z = self.encoder(st_expr.to(device))
-                self.Z_dict[slide_id] = Z
+                self.Z_dict[slide_id] = Z.cpu() #changed to store on cpu
     
     def __len__(self):
         return self.num_samples
@@ -469,21 +469,28 @@ class STSetDataset(Dataset):
         }
         
         # Extract subset data (index on CPU, then move to device)
-        Z_set = self.Z_dict[slide_id][indices.to(self.device)]  # Z_dict is on device
-        y_hat_subset = targets.y_hat[indices].to(self.device)   # targets on CPU, index on CPU
-        G_subset = targets.G[indices][:, indices].to(self.device)
-        D_subset = targets.D[indices][:, indices].to(self.device)
+        # Z_set = self.Z_dict[slide_id][indices.to(self.device)]  # Z_dict is on device
+        # y_hat_subset = targets.y_hat[indices].to(self.device)   # targets on CPU, index on CPU
+        # G_subset = targets.G[indices][:, indices].to(self.device)
+        # D_subset = targets.D[indices][:, indices].to(self.device)
+
+        # Extract subset data - ALL ON CPU
+        Z_set = self.Z_dict[slide_id][indices]  # CPU indexing
+        y_hat_subset = targets.y_hat[indices]   # Already CPU
+        G_subset = targets.G[indices][:, indices]
+        D_subset = targets.D[indices][:, indices]
         
         # Factor Gram to get V_target
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
 
         # Recompute Laplacian on subset (kNN changes with subset)
-        edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k, device=self.device)  # Use self.knn_k
+        edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k, device='cpu')  # Use self.knn_k
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n)
         
         # Recompute distance histogram for subset
         d_95 = torch.quantile(D_subset[torch.triu(torch.ones_like(D_subset), diagonal=1).bool()], 0.95)
-        bins = torch.linspace(0, d_95, 64, device=self.device)
+        # bins = torch.linspace(0, d_95, 64, device=self.device)
+        bins = torch.linspace(0, d_95, 64)
         H_subset = uet.compute_distance_hist(D_subset, bins)
         
         # Resample ordinal triplets within subset
