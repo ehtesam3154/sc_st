@@ -487,7 +487,7 @@ def train_stageC_diffusion_generator(
         batch_size=batch_size, 
         shuffle=True,
         collate_fn=collate_sc_minisets, 
-        num_workers=0           # CHANGED from 0
+        num_workers=0         # CHANGED from 0
     )
     
     os.makedirs(outf, exist_ok=True)

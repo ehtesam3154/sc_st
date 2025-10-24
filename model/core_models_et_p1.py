@@ -473,7 +473,7 @@ class STSetDataset(Dataset):
         n = min(n, m)  # Don't exceed slide size
         
         # Sample random subset of spots (KEEP ON CPU)
-        indices = torch.randperm(m)[:n]
+        indices = torch.randperm(m, device=self.device)[:n]
         
         # Store overlap info (CPU tensors)
         overlap_info = {
@@ -486,12 +486,6 @@ class STSetDataset(Dataset):
         y_hat_subset = targets.y_hat[indices].to(self.device)   # targets on CPU, index on CPU
         G_subset = targets.G[indices][:, indices].to(self.device)
         D_subset = targets.D[indices][:, indices].to(self.device)
-
-        # Extract subset data - ALL ON CPU
-        # Z_set = self.Z_dict[slide_id][indices]  # CPU indexing
-        # y_hat_subset = targets.y_hat[indices]   # Already CPU
-        # G_subset = targets.G[indices][:, indices]
-        # D_subset = targets.D[indices][:, indices]
         
         # Factor Gram to get V_target
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
@@ -501,12 +495,11 @@ class STSetDataset(Dataset):
         edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)  # Use self.knn_k
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n)
         # CRITICAL FIX: Convert sparse tensor to dense for pin_memory compatibility
-        L_subset = L_subset.to_dense() if L_subset.is_sparse else L_subset
+        # L_subset = L_subset.to_dense() if L_subset.is_sparse else L_subset
         
         # Recompute distance histogram for subset
         d_95 = torch.quantile(D_subset[torch.triu(torch.ones_like(D_subset), diagonal=1).bool()], 0.95)
-        # bins = torch.linspace(0, d_95, 64, device=self.device)
-        bins = torch.linspace(0, d_95, 64)
+        bins = torch.linspace(0, d_95, 64, device=self.device)
         H_subset = uet.compute_distance_hist(D_subset, bins)
         
         # Resample ordinal triplets within subset
@@ -638,7 +631,7 @@ class SCSetDataset(Dataset):
             Z_all = []
             batch_size = 1024
             for i in range(0, sc_gene_expr.shape[0], batch_size):
-                z = self.encoder(sc_gene_expr[i: i+batch_size].to(device)).cpu()
+                z = self.encoder(sc_gene_expr[i: i+batch_size].to(device))
                 Z_all.append(z)
             self.Z_all = torch.cat(Z_all, dim=0)
         print(f'SC embeddings computed: {self.Z_all.shape}')
@@ -657,7 +650,7 @@ class SCSetDataset(Dataset):
 
         #create pair
         indices_A, indices_B, shared_A, shared_B = uet.create_sc_miniset_pair(
-            self.Z_all, n, n_overlap, k_nn=50, device='cpu'
+            self.Z_all, n, n_overlap, k_nn=50
         )
 
         Z_A = self.Z_all[indices_A]
