@@ -896,25 +896,25 @@ class FrobeniusGramLoss(nn.Module):
         loss = torch.mean(diff ** 2)
         return loss
 
-# def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):
-#     """
-#     kNN graph from a distance matrix (no coordinates needed).
-#     D: (n, n) with zeros on diag, symmetric.
-#     """
-#     n = D.shape[0]
-#     D = _symmetrize(D)
-#     D = D + torch.eye(n, device=D.device, dtype=D.dtype) * 1e10  # mask self
-#     knn_dists, knn_idx = torch.topk(D, k, dim=1, largest=False)
-#     src = torch.arange(n, device=D.device).unsqueeze(1).expand(-1, k).reshape(-1)
-#     dst = knn_idx.reshape(-1)
-#     edge_index = torch.stack([src, dst], dim=0)
+def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):
+    """
+    kNN graph from a distance matrix (no coordinates needed).
+    D: (n, n) with zeros on diag, symmetric.
+    """
+    n = D.shape[0]
+    D = _symmetrize(D)
+    D = D + torch.eye(n, device=D.device, dtype=D.dtype) * 1e10  # mask self
+    knn_dists, knn_idx = torch.topk(D, k, dim=1, largest=False)
+    src = torch.arange(n, device=D.device).unsqueeze(1).expand(-1, k).reshape(-1)
+    dst = knn_idx.reshape(-1)
+    edge_index = torch.stack([src, dst], dim=0)
 
-#     # Adaptive sigma from knn distances
-#     sigma = torch.median(knn_dists).item()
-#     if sigma < 1e-8:
-#         sigma = 1.0
-#     edge_weight = torch.exp(-(knn_dists.reshape(-1) ** 2) / (2 * sigma ** 2))
-#     return edge_index.long(), edge_weight.float()
+    # Adaptive sigma from knn distances
+    sigma = torch.median(knn_dists).item()
+    if sigma < 1e-8:
+        sigma = 1.0
+    edge_weight = torch.exp(-(knn_dists.reshape(-1) ** 2) / (2 * sigma ** 2))
+    return edge_index.long(), edge_weight.float()
 
 def build_knn_graph(
     coords_or_features: torch.Tensor,

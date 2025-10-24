@@ -404,6 +404,19 @@ class STStageBPrecomputer:
                 k=self.k,
                 scale=scale
             )
+
+            # targets = STTargets(
+            #     y_hat=y_hat.cpu(),
+            #     G=G.cpu(),
+            #     D=D.cpu(),
+            #     H=H.cpu(),
+            #     H_bins=bins.cpu(),
+            #     L=L.to_dense().cpu() if L.is_sparse else L.cpu(),  # Convert sparse to dense + CPU
+            #     t_list=self.t_list,
+            #     triplets=triplets.cpu(),
+            #     k=self.k,
+            #     scale=scale
+            # )
             
             targets_dict[slide_id] = targets
             print(f"  Targets computed for slide {slide_id}")
@@ -444,7 +457,7 @@ class STSetDataset(Dataset):
         with torch.no_grad():
             for slide_id, st_expr in st_gene_expr_dict.items():
                 Z = self.encoder(st_expr.to(device))
-                self.Z_dict[slide_id] = Z.cpu() #changed to store on cpu
+                self.Z_dict[slide_id] = Z #changed to store on cpu
     
     def __len__(self):
         return self.num_samples
@@ -469,23 +482,26 @@ class STSetDataset(Dataset):
         }
         
         # Extract subset data (index on CPU, then move to device)
-        # Z_set = self.Z_dict[slide_id][indices.to(self.device)]  # Z_dict is on device
-        # y_hat_subset = targets.y_hat[indices].to(self.device)   # targets on CPU, index on CPU
-        # G_subset = targets.G[indices][:, indices].to(self.device)
-        # D_subset = targets.D[indices][:, indices].to(self.device)
+        Z_set = self.Z_dict[slide_id][indices.to(self.device)]  # Z_dict is on device
+        y_hat_subset = targets.y_hat[indices].to(self.device)   # targets on CPU, index on CPU
+        G_subset = targets.G[indices][:, indices].to(self.device)
+        D_subset = targets.D[indices][:, indices].to(self.device)
 
         # Extract subset data - ALL ON CPU
-        Z_set = self.Z_dict[slide_id][indices]  # CPU indexing
-        y_hat_subset = targets.y_hat[indices]   # Already CPU
-        G_subset = targets.G[indices][:, indices]
-        D_subset = targets.D[indices][:, indices]
+        # Z_set = self.Z_dict[slide_id][indices]  # CPU indexing
+        # y_hat_subset = targets.y_hat[indices]   # Already CPU
+        # G_subset = targets.G[indices][:, indices]
+        # D_subset = targets.D[indices][:, indices]
         
         # Factor Gram to get V_target
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
 
         # Recompute Laplacian on subset (kNN changes with subset)
-        edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k, device='cpu')  # Use self.knn_k
+        # y_hat_subset = y_hat_subset.cpu() if y_hat_subset.is_cuda else y_hat_subset
+        edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)  # Use self.knn_k
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n)
+        # CRITICAL FIX: Convert sparse tensor to dense for pin_memory compatibility
+        L_subset = L_subset.to_dense() if L_subset.is_sparse else L_subset
         
         # Recompute distance histogram for subset
         d_95 = torch.quantile(D_subset[torch.triu(torch.ones_like(D_subset), diagonal=1).bool()], 0.95)
@@ -514,7 +530,23 @@ class STSetDataset(Dataset):
             'n': n,
             'overlap_info': overlap_info
         }
-    
+
+        # return {
+        #     'Z_set': Z_set.cpu(),              # Move to CPU
+        #     'V_target': V_target.cpu(),         # Move to CPU
+        #     'G_target': G_subset.cpu(),         # Move to CPU
+        #     'D_target': D_subset.cpu(),         # Move to CPU
+        #     'H_target': H_subset.cpu(),         # Move to CPU
+        #     'H_bins': bins.cpu(),               # Move to CPU
+        #     'L_info': {
+        #         'L': L_subset.to_dense().cpu() if L_subset.is_sparse else L_subset.cpu(),  # Dense + CPU
+        #         't_list': targets.t_list
+        #     },
+        #     'triplets': triplets_subset.cpu(),  # Move to CPU
+        #     'n': n,
+        #     'overlap_info': overlap_info
+        # }
+            
 def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
     Collate mini-sets with padding.
@@ -640,6 +672,16 @@ class SCSetDataset(Dataset):
             'shared_B': shared_B,
             'is_sc': True
         }
+    
+        # return {
+        # 'Z_A': Z_A.cpu(),
+        # 'Z_B': Z_B.cpu(),
+        # 'n_A': len(indices_A),
+        # 'n_B': len(indices_B),
+        # 'shared_A': shared_A,
+        # 'shared_B': shared_B,
+        # 'is_sc': True
+        # }
     
 
 def collate_sc_minisets(batch: List[Dict]) -> Dict:

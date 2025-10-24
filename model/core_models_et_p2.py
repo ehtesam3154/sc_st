@@ -438,7 +438,7 @@ def train_stageC_diffusion_generator(
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
         pass  # Already set
-    
+
     # Enable TF32 for Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -480,18 +480,14 @@ def train_stageC_diffusion_generator(
         batch_size=batch_size, 
         shuffle=True, 
         collate_fn=collate_minisets, 
-        num_workers=4,           # CHANGED from 0
-        pin_memory=True,         # NEW
-        persistent_workers=True  # NEW
+        num_workers=0          # CHANGED from 0
     )
     sc_loader = DataLoader(
         sc_dataset, 
         batch_size=batch_size, 
         shuffle=True,
         collate_fn=collate_sc_minisets, 
-        num_workers=4,           # CHANGED from 0
-        pin_memory=True,         # NEW
-        persistent_workers=True  # NEW
+        num_workers=0           # CHANGED from 0
     )
     
     os.makedirs(outf, exist_ok=True)
@@ -601,6 +597,10 @@ def train_stageC_diffusion_generator(
 
                 # Generate V_0 using generator (works for both ST and SC)
                 V_0 = generator(H, mask)
+
+                # For ST: still load G_target (needed for Gram loss later)
+                if not is_sc:
+                    G_target = batch['G_target'].to(device)
                 
                 # Add noise
                 eps = torch.randn_like(V_0)
