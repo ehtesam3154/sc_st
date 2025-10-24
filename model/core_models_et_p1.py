@@ -416,50 +416,28 @@ class STStageBPrecomputer:
 # ==============================================================================
 
 class STSetDataset(Dataset):
-    """
-    Dataset yielding mini-sets from precomputed ST targets.
-    
-    Each item is a mini-set of size n ∈ [n_min, n_max]:
-    - Z_set: (n, h) encoder embeddings
-    - V_target: (n, D) target factor
-    - G_target: (n, n) target Gram
-    - D_target: (n, n) target distances
-    - H_target: (num_bins,) distance histogram
-    - L_info: dict with Laplacian metadata
-    - triplets: (T, 3) ordinal triplets (subset)
-    - mask: (n,) boolean mask
-    """
-    
     def __init__(
         self,
         targets_dict: Dict[int, STTargets],
         encoder: SharedEncoder,
         st_gene_expr_dict: Dict[int, torch.Tensor],
-        n_min: int = 256,
-        n_max: int = 1024,
+        n_min: int = 64,
+        n_max: int = 256,
         D_latent: int = 16,
         num_samples: int = 10000,
+        knn_k: int = 12,  # NEW parameter
         device: str = 'cuda'
     ):
-        """
-        Args:
-            targets_dict: precomputed ST targets per slide
-            encoder: frozen encoder
-            st_gene_expr_dict: {slide_id: st_gene_expr}
-            n_min: minimum mini-set size
-            n_max: maximum mini-set size
-            D_latent: latent dimension for V
-            num_samples: number of mini-sets to generate
-            device: torch device
-        """
         self.targets_dict = targets_dict
-        self.encoder = encoder.eval()
+        self.encoder = encoder
         self.st_gene_expr_dict = st_gene_expr_dict
         self.n_min = n_min
         self.n_max = n_max
         self.D_latent = D_latent
         self.num_samples = num_samples
+        self.knn_k = knn_k  # Store knn_k
         self.device = device
+        self.slide_ids = list(targets_dict.keys())
         
         # Precompute encoder embeddings for all slides
         self.Z_dict = {}
@@ -498,9 +476,9 @@ class STSetDataset(Dataset):
         
         # Factor Gram to get V_target
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
-        
+
         # Recompute Laplacian on subset (kNN changes with subset)
-        edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=targets.k, device=self.device)
+        edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k, device=self.device)  # Use self.knn_k
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n)
         
         # Recompute distance histogram for subset

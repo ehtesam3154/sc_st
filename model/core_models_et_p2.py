@@ -314,16 +314,8 @@ class DiffusionScoreNet(nn.Module):
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return emb
     
-    def forward(
-        self,
-        V_t: torch.Tensor,
-        t: torch.Tensor,
-        H: torch.Tensor,
-        mask: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, V_t: torch.Tensor, t: torch.Tensor, H: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
-        Predict noise ε̂ from noisy V_t.
-        
         Args:
             V_t: (batch, n, D_latent) noisy factor
             t: (batch, 1) normalized time
@@ -336,25 +328,25 @@ class DiffusionScoreNet(nn.Module):
         batch_size, n, _ = V_t.shape
         
         # Time embedding
-        t_emb = self.get_time_embedding(t)  # (batch, time_emb_dim)
-        t_emb = self.time_mlp(t_emb)  # (batch, c_dim)
-        t_emb = t_emb.unsqueeze(1).expand(-1, n, -1)  # (batch, n, c_dim)
+        t_emb = self.get_time_embedding(t)
+        t_emb = self.time_mlp(t_emb)
+        t_emb = t_emb.unsqueeze(1).expand(-1, n, -1)
         
         # Combine V_t and H
-        V_H = torch.cat([V_t, H], dim=-1)  # (batch, n, D_latent + c_dim)
-        X = self.input_proj(V_H)  # (batch, n, c_dim)
-        
-        # Add time embedding
+        V_H = torch.cat([V_t, H], dim=-1)
+        X = self.input_proj(V_H)
         X = X + t_emb
         
+        # Apply blocks with gradient checkpointing during training
         for block in self.denoise_blocks:
-            X = block(X)
+            if self.training:
+                X = torch.utils.checkpoint.checkpoint(block, X, use_reentrant=False)
+            else:
+                X = block(X)
             X = X * mask.unsqueeze(-1).float()
         
         # Predict noise
-        eps_pred = self.output_head(X)  # (batch, n, D_latent)
-        
-        # Apply mask
+        eps_pred = self.output_head(X)
         eps_pred = eps_pred * mask.unsqueeze(-1).float()
         
         return eps_pred
@@ -431,7 +423,7 @@ def train_stageC_diffusion_generator(
     n_epochs: int = 1000,
     batch_size: int = 4,
     lr: float = 1e-4,
-    n_timesteps: int = 600,
+    n_timesteps: int = 400,  # CHANGED from 600
     sigma_min: float = 0.01,
     sigma_max: float = 5.0,
     device: str = 'cuda',
@@ -439,7 +431,17 @@ def train_stageC_diffusion_generator(
 ):
     """
     Train diffusion generator with mixed ST/SC regimen.
+    OPTIMIZED with: AMP, loss alternation, CFG, reduced overlap computation.
     """
+    # Enable TF32 for Ampere+ GPUs
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Setup AMP with new API
+    use_bf16 = torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    scaler = torch.amp.GradScaler(enabled=not use_bf16)  # auto-noop for bf16
+    
     context_encoder = context_encoder.to(device).train()
     score_net = score_net.to(device).train()
     
@@ -450,20 +452,41 @@ def train_stageC_diffusion_generator(
     # VE SDE
     sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), n_timesteps, device=device))
     
-    # Loss modules
+    # Loss modules - OPTIMIZED: Heat loss with Hutchinson
     loss_gram = uet.FrobeniusGramLoss()
-    loss_heat = uet.HeatKernelLoss()
+    loss_heat = uet.HeatKernelLoss(
+        use_hutchinson=True,
+        num_probes=8,
+        chebyshev_degree=10,
+        knn_k=8,
+        t_list=(0.5, 1.0),
+        laplacian='sym'
+    )
     loss_sw = uet.SlicedWassersteinLoss1D()
     loss_triplet = uet.OrdinalTripletLoss()
     
-    # DataLoaders
+    # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
     from core_models_et_p1 import collate_minisets, collate_sc_minisets
     
-    st_loader = DataLoader(st_dataset, batch_size=batch_size, shuffle=True, 
-                           collate_fn=collate_minisets, num_workers=0)
-    sc_loader = DataLoader(sc_dataset, batch_size=batch_size, shuffle=True,
-                           collate_fn=collate_sc_minisets, num_workers=0)
+    st_loader = DataLoader(
+        st_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=collate_minisets, 
+        num_workers=4,           # CHANGED from 0
+        pin_memory=True,         # NEW
+        persistent_workers=True  # NEW
+    )
+    sc_loader = DataLoader(
+        sc_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        collate_fn=collate_sc_minisets, 
+        num_workers=4,           # CHANGED from 0
+        pin_memory=True,         # NEW
+        persistent_workers=True  # NEW
+    )
     
     os.makedirs(outf, exist_ok=True)
     plot_dir = os.path.join(outf, 'plots')
@@ -480,10 +503,13 @@ def train_stageC_diffusion_generator(
         'ordinal_sc': 0.5
     }
     
-    # Overlap config
-    EVERY_K_STEPS = 2
-    MAX_OVERLAP_POINTS = 64
+    # Overlap config - OPTIMIZED
+    EVERY_K_STEPS = 8   # CHANGED from 2
+    MAX_OVERLAP_POINTS = 32  # CHANGED from 64
     MIN_OVERLAP_ABS = 5
+    
+    # CFG config (same as original)
+    p_uncond = 0.15  # 10-20% works well
     
     history = {
         'epoch': [],
@@ -494,9 +520,22 @@ def train_stageC_diffusion_generator(
         }
     }
     
+    # Compute sigma_data once at start
+    print("Computing sigma_data from data statistics...")
+    with torch.no_grad():
+        sample_stds = []
+        for _ in range(min(10, len(st_loader))):
+            sample_batch = next(iter(st_loader))
+            G_batch = sample_batch['G_target'].to(device)
+            for i in range(min(4, G_batch.shape[0])):
+                V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
+                sample_stds.append(V_temp.std().item())
+        sigma_data = np.median(sample_stds)
+        print(f"Computed sigma_data = {sigma_data:.4f}")
+    
     global_step = 0
     
-    epoch_pbar = tqdm(range(n_epochs), desc="Training Epochs", position=0)  # Top bar
+    epoch_pbar = tqdm(range(n_epochs), desc="Training Epochs", position=0)
 
     for epoch in epoch_pbar:
         st_iter = iter(st_loader)
@@ -537,55 +576,48 @@ def train_stageC_diffusion_generator(
             
             D_latent = score_net.D_latent
             
-            # Context encoding
-            H = context_encoder(Z_set, mask)
-            
-            # Sample noise level
-            t_idx = torch.randint(0, n_timesteps, (batch_size_real,), device=device)
-            t_norm = t_idx.float() / n_timesteps
-            sigma_t = sigmas[t_idx].view(-1, 1, 1)
-            
-            # Generate V_0 from Gram (for ST) or random (for SC)
-            if not is_sc:
-                G_target = batch['G_target'].to(device)
-                V_0 = torch.stack([uet.factor_from_gram(G_target[i], D_latent) for i in range(batch_size_real)])
-            else:
-                V_0 = torch.randn(batch_size_real, Z_set.shape[1], D_latent, device=device) * 0.1
-            
-            # Add noise
-            eps = torch.randn_like(V_0)
-            V_t = V_0 + sigma_t * eps
-            V_t = V_t * mask.unsqueeze(-1).float()
-            
-            # Predict noise
-            # CFG: Drop context randomly during training
-            p_uncond = 0.15  # 10-20% works well
-            drop_mask = (torch.rand(batch_size_real, device=device) < p_uncond).float().view(-1, 1, 1)
-            H_train = H * (1 - drop_mask)  # Zero context for random subset
+            # ===== FORWARD PASS WITH AMP =====
+            with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                # Context encoding
+                H = context_encoder(Z_set, mask)
+                
+                # Sample noise level
+                t_idx = torch.randint(0, n_timesteps, (batch_size_real,), device=device)
+                t_norm = t_idx.float() / n_timesteps
+                sigma_t = sigmas[t_idx].view(-1, 1, 1)
+                
+                # Generate V_0 from Gram (for ST) or random (for SC)
+                # if not is_sc:
+                #     G_target = batch['G_target'].to(device)
+                #     V_0 = torch.stack([uet.factor_from_gram(G_target[i], D_latent) for i in range(batch_size_real)])
+                # else:
+                #     V_0 = torch.randn(batch_size_real, Z_set.shape[1], D_latent, device=device) * 0.1
 
-            eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask)
+                # Generate V_0 using generator (works for both ST and SC)
+                V_0 = generator(H, mask)
+                
+                # Add noise
+                eps = torch.randn_like(V_0)
+                V_t = V_0 + sigma_t * eps
+                V_t = V_t * mask.unsqueeze(-1).float()
+                
+                # CFG: Drop context randomly during training (RESTORED)
+                drop_mask = (torch.rand(batch_size_real, device=device) < p_uncond).float().view(-1, 1, 1)
+                H_train = H * (1 - drop_mask)  # Zero context for random subset
+                
+                # Predict noise
+                eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask)
             
-            # VE SDE
-            sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), n_timesteps, device=device))
-
-            # Compute sigma_data from actual V_0 statistics (run once at start)
-            # print("Computing sigma_data from data statistics...")
-            with torch.no_grad():
-                # Sample a few batches to estimate V_0 scale
-                sample_stds = []
-                for _ in range(min(10, len(st_loader))):
-                    sample_batch = next(iter(st_loader))  # Use a different variable name!
-                    G_batch = sample_batch['G_target'].to(device)
-                    for i in range(min(4, G_batch.shape[0])):
-                        V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
-                        sample_stds.append(V_temp.std().item())
-                sigma_data = np.median(sample_stds)
-                # print(f"Computed sigma_data = {sigma_data:.4f}")
-
-            # EDM loss weighting (sigma_t already sampled above)
-            w = (sigma_t**2 + sigma_data**2) / ((sigma_t * sigma_data)**2)  # Shape: (B, 1, 1)
-            #score loss
-            L_score = (w * (eps_pred - eps)**2 * mask.unsqueeze(-1).float()).sum() / mask.sum()
+            # ===== SCORE LOSS (in fp32 for numerical stability) =====
+            with torch.autocast(device_type='cuda', enabled=False):
+                sigma_t_fp32 = sigma_t.float()
+                eps_pred_fp32 = eps_pred.float()
+                eps_fp32 = eps.float()
+                mask_fp32 = mask.float()
+                
+                # EDM loss weighting
+                w = (sigma_t_fp32**2 + sigma_data**2) / ((sigma_t_fp32 * sigma_data)**2)
+                L_score = (w * (eps_pred_fp32 - eps_fp32)**2 * mask_fp32.unsqueeze(-1)).sum() / mask_fp32.sum()
             
             # Initialize other losses
             L_gram = torch.tensor(0.0, device=device)
@@ -596,143 +628,168 @@ def train_stageC_diffusion_generator(
             L_ordinal_sc = torch.tensor(0.0, device=device)
             
             # Denoise to get V_hat
-            V_hat = V_t - sigma_t * eps_pred
-            V_hat = V_hat * mask.unsqueeze(-1).float()
+            with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                V_hat = V_t - sigma_t * eps_pred
+                V_hat = V_hat * mask.unsqueeze(-1).float()
             
+            # ===== LOSS ALTERNATION =====
             if not is_sc:
-                # ===== ST LOSSES =====
+                # ===== ST STEP: Score + Gram + Heat + SW_ST =====
                 
-                # Gram loss
-                # Use masked Frobenius loss
-                for i in range(batch_size_real):
-                    n_valid = int(n_list[i].item())
-                    mask_i = mask[i, :n_valid]  # Boolean mask for valid entries
+                # Gram loss (in fp32)
+                with torch.autocast(device_type='cuda', enabled=False):
+                    V_hat_fp32 = V_hat.float()
+                    G_target_fp32 = G_target.float()
                     
-                    G_p = V_hat[i, :n_valid] @ V_hat[i, :n_valid].T
-                    G_t = G_target[i, :n_valid, :n_valid]
+                    for i in range(batch_size_real):
+                        n_valid = int(n_list[i].item())
+                        mask_i = mask[i, :n_valid]
+                        
+                        G_p = V_hat_fp32[i, :n_valid] @ V_hat_fp32[i, :n_valid].T
+                        G_t = G_target_fp32[i, :n_valid, :n_valid]
+                        
+                        # Compute pair mask
+                        P = mask_i.unsqueeze(-1) & mask_i.unsqueeze(-2)
+                        
+                        # Masked Frobenius
+                        diff_sq = (G_p - G_t)**2 * P.float()
+                        L_gram += diff_sq.sum() / P.sum().clamp_min(1)
                     
-                    # Compute pair mask (both dimensions)
-                    P = mask_i.unsqueeze(-1) & mask_i.unsqueeze(-2)  # (n, n)
-                    
-                    # Masked Frobenius
-                    diff_sq = (G_p - G_t)**2 * P.float()
-                    L_gram += diff_sq.sum() / P.sum().clamp_min(1)
-
-                L_gram = L_gram / batch_size_real
+                    L_gram = L_gram / batch_size_real
                 
-                # Heat kernel trace (simplified)
-                L_heat = torch.tensor(0.0, device=device)
+                # Heat kernel loss (with Hutchinson)
+                L_info_batch = batch.get('L_info', [])
+                if L_info_batch:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        for i in range(batch_size_real):
+                            n_valid = int(n_list[i].item())
+                            mask_i = mask[i, :n_valid]
+                            V_i = V_hat[i, :n_valid].float()
+                            
+                            # Build predicted Laplacian from V_i
+                            D_V = torch.cdist(V_i, V_i)
+                            edge_index, edge_weight = uet.build_knn_graph_from_distance(
+                                D_V, k=8, device=device
+                            )
+                            L_pred = uet.compute_graph_laplacian(edge_index, edge_weight, n_valid)
+                            
+                            L_tgt = L_info_batch[i]['L'].to(device).float()
+                            t_list = L_info_batch[i].get('t_list', [0.5, 1.0])
+                            
+                            L_heat += loss_heat(L_pred, L_tgt, mask=mask_i, t_list=t_list)
+                        
+                        L_heat = L_heat / batch_size_real
                 
-                # Distance histogram SW
+                # Distance histogram SW (in fp32)
                 D_target = batch['D_target'].to(device)
                 H_target = batch['H_target'].to(device)
                 H_bins = batch['H_bins'][0].to(device)
                 
-                for i in range(batch_size_real):
-                    n_valid = int(n_list[i].item())
-                    mask_i = mask[i, :n_valid]
-                    V_i = V_hat[i, :n_valid]
-                    D_p = torch.cdist(V_i, V_i)
+                with torch.autocast(device_type='cuda', enabled=False):
+                    for i in range(batch_size_real):
+                        n_valid = int(n_list[i].item())
+                        mask_i = mask[i, :n_valid]
+                        V_i = V_hat[i, :n_valid].float()
+                        D_p = torch.cdist(V_i, V_i)
+                        
+                        # Extract upper triangle with mask
+                        triu_i, triu_j = torch.triu_indices(n_valid, n_valid, 1, device=device)
+                        P_i = mask_i.unsqueeze(-1) & mask_i.unsqueeze(-2)
+                        valid_pairs = P_i[triu_i, triu_j]
+                        d_vec = D_p[triu_i, triu_j][valid_pairs]
+                        
+                        if d_vec.numel() > 0:
+                            d_95_p = torch.quantile(d_vec, 0.95)
+                            bins_p = torch.linspace(0, d_95_p, len(H_bins), device=device)
+                            H_p = uet.compute_distance_hist(D_p.detach(), bins_p)
+                            L_sw_st += loss_sw(H_p.unsqueeze(0), H_target[i].unsqueeze(0))
                     
-                    # Extract upper triangle with mask
-                    triu_i, triu_j = torch.triu_indices(n_valid, n_valid, 1, device=device)
-                    P_i = mask_i.unsqueeze(-1) & mask_i.unsqueeze(-2)  # Pair mask
-                    valid_pairs = P_i[triu_i, triu_j]
-                    d_vec = D_p[triu_i, triu_j][valid_pairs]
-                    
-                    if d_vec.numel() > 0:
-                        d_95_p = torch.quantile(d_vec, 0.95)
-                        bins_p = torch.linspace(0, d_95_p, len(H_bins), device=device)
-                        H_p = uet.compute_distance_hist(D_p.detach(), bins_p)
-
-                        L_sw_st += loss_sw(H_p.unsqueeze(0), H_target[i].unsqueeze(0))
-                L_sw_st = L_sw_st / batch_size_real
+                    L_sw_st = L_sw_st / batch_size_real
                 
             else:
-                # ===== SC LOSSES =====
+                # ===== SC STEP: Score + SW_SC + Ordinal =====
                 
-                # Ordinal from Z
-                for i in range(batch_size_real):
-                    n_valid = int(n_list[i].item())
-                    Z_i = Z_set[i, :n_valid]
-                    V_i = V_hat[i, :n_valid]
-                    
-                    triplets = uet.sample_ordinal_triplets_from_Z(Z_i, n_per_anchor=10, k_nn=25)
-                    if len(triplets) > 0:
-                        D_V = torch.cdist(V_i, V_i)
-                        L_ordinal_sc += loss_triplet(D_V, triplets)
-                L_ordinal_sc = L_ordinal_sc / batch_size_real
-                
-                # Z-matched distogram
-                for i in range(batch_size_real):
-                    n_valid = int(n_list[i].item())
-                    Z_i = Z_set[i, :n_valid]
-                    V_i = V_hat[i, :n_valid]
-                    
-                    centroid = Z_i.mean(dim=0).cpu()
-                    proto_idx = find_nearest_prototypes(centroid, prototype_bank)
-                    proto = prototype_bank['prototypes'][proto_idx]
-                    
-                    D_p = torch.cdist(V_i, V_i)
-                    d_95_p = torch.quantile(D_p[torch.triu(torch.ones_like(D_p), diagonal=1).bool()], 0.95)
-                    bins_p = torch.linspace(0, d_95_p, len(proto['bins']), device=device)
-                    H_p = uet.compute_distance_hist(D_p.detach(), bins_p)
-                    
-                    H_t = proto['hist'].to(device)
-                    L_sw_sc += loss_sw(H_p.unsqueeze(0), H_t.unsqueeze(0))
-                L_sw_sc = L_sw_sc / batch_size_real
-                
-                # Distance-only overlap
-                # Distance-only overlap (SC ONLY)
-                if is_sc and (global_step % EVERY_K_STEPS) == 0:
-                    shared_info = batch['shared_info']
-                    n_pairs = len(shared_info)
-                    
-                    if n_pairs > 0:
-                        pair_losses = []
-                        for info in shared_info:
-                            idx_A = info['idx_A']
-                            idx_B = info['idx_B']
-                            shared_A = info['shared_A']
-                            shared_B = info['shared_B']
-                            
-                            if len(shared_A) < MIN_OVERLAP_ABS:
-                                continue
-                            
-                            # Subsample if needed
-                            if len(shared_A) > MAX_OVERLAP_POINTS:
-                                sel = torch.randperm(len(shared_A))[:MAX_OVERLAP_POINTS]
-                                shared_A = shared_A[sel]
-                                shared_B = shared_B[sel]
-                            
-                            n_A = int(n_list[idx_A].item())
-                            n_B = int(n_list[idx_B].item())
-                            
-                            V_A = V_hat[idx_A, :n_A]
-                            V_B = V_hat[idx_B, :n_B]
-                            
-                            # Move shared indices to device
-                            shared_A_dev = shared_A.to(device)
-                            shared_B_dev = shared_B.to(device)
-                            
-                            # Extract shared points
-                            V_A_shared = V_A[shared_A_dev]
-                            V_B_shared = V_B[shared_B_dev]
-                            
-                            # Compute distance matrices
-                            D_A = torch.cdist(V_A_shared, V_A_shared)
-                            D_B = torch.cdist(V_B_shared, V_B_shared)
-                            
-                            # Upper triangle only
-                            m = len(shared_A_dev)
-                            triu_idx = torch.triu_indices(m, m, offset=1, device=device)
-                            d_A = D_A[triu_idx[0], triu_idx[1]]
-                            d_B = D_B[triu_idx[0], triu_idx[1]]
-                            
-                            pair_losses.append(((d_A - d_B) ** 2).mean())
+                # Ordinal from Z (in fp32)
+                with torch.autocast(device_type='cuda', enabled=False):
+                    for i in range(batch_size_real):
+                        n_valid = int(n_list[i].item())
+                        Z_i = Z_set[i, :n_valid].float()
+                        V_i = V_hat[i, :n_valid].float()
                         
-                        if len(pair_losses) > 0:
-                            L_overlap = torch.stack(pair_losses).mean()
+                        triplets = uet.sample_ordinal_triplets_from_Z(Z_i, n_per_anchor=10, k_nn=25)
+                        if len(triplets) > 0:
+                            D_V = torch.cdist(V_i, V_i)
+                            L_ordinal_sc += loss_triplet(D_V, triplets)
+                    
+                    L_ordinal_sc = L_ordinal_sc / batch_size_real
+                
+                # Z-matched distogram (in fp32)
+                with torch.autocast(device_type='cuda', enabled=False):
+                    for i in range(batch_size_real):
+                        n_valid = int(n_list[i].item())
+                        Z_i = Z_set[i, :n_valid].float()
+                        V_i = V_hat[i, :n_valid].float()
+                        
+                        centroid = Z_i.mean(dim=0).cpu()
+                        proto_idx = find_nearest_prototypes(centroid, prototype_bank)
+                        proto = prototype_bank['prototypes'][proto_idx]
+                        
+                        D_p = torch.cdist(V_i, V_i)
+                        d_95_p = torch.quantile(D_p[torch.triu(torch.ones_like(D_p), diagonal=1).bool()], 0.95)
+                        bins_p = torch.linspace(0, d_95_p, len(proto['bins']), device=device)
+                        H_p = uet.compute_distance_hist(D_p.detach(), bins_p)
+                        
+                        H_t = proto['hist'].to(device)
+                        L_sw_sc += loss_sw(H_p.unsqueeze(0), H_t.unsqueeze(0))
+                    
+                    L_sw_sc = L_sw_sc / batch_size_real
+                
+                # Distance-only overlap (SC ONLY, every 8 steps) - OPTIMIZED
+                if (global_step % EVERY_K_STEPS) == 0:
+                    shared_info = batch.get('shared_info', [])
+                    
+                    if len(shared_info) > 0:
+                        pair_losses = []
+                        with torch.autocast(device_type='cuda', enabled=False):
+                            for info in shared_info:
+                                idx_A = info['idx_A']
+                                idx_B = info['idx_B']
+                                shared_A = info['shared_A']
+                                shared_B = info['shared_B']
+                                
+                                if len(shared_A) < MIN_OVERLAP_ABS:
+                                    continue
+                                
+                                # Subsample if needed (OPTIMIZED: 32 instead of 64)
+                                if len(shared_A) > MAX_OVERLAP_POINTS:
+                                    sel = torch.randperm(len(shared_A))[:MAX_OVERLAP_POINTS]
+                                    shared_A = shared_A[sel]
+                                    shared_B = shared_B[sel]
+                                
+                                n_A = int(n_list[idx_A].item())
+                                n_B = int(n_list[idx_B].item())
+                                
+                                V_A = V_hat[idx_A, :n_A].float()
+                                V_B = V_hat[idx_B, :n_B].float()
+                                
+                                shared_A_dev = shared_A.to(device)
+                                shared_B_dev = shared_B.to(device)
+                                
+                                V_A_shared = V_A[shared_A_dev]
+                                V_B_shared = V_B[shared_B_dev]
+                                
+                                D_A = torch.cdist(V_A_shared, V_A_shared)
+                                D_B = torch.cdist(V_B_shared, V_B_shared)
+                                
+                                m = len(shared_A_dev)
+                                triu_idx = torch.triu_indices(m, m, offset=1, device=device)
+                                d_A = D_A[triu_idx[0], triu_idx[1]]
+                                d_B = D_B[triu_idx[0], triu_idx[1]]
+                                
+                                pair_losses.append(((d_A - d_B) ** 2).mean())
+                            
+                            if len(pair_losses) > 0:
+                                L_overlap = torch.stack(pair_losses).mean()
             
             # Total loss
             L_total = (WEIGHTS['score'] * L_score +
@@ -743,10 +800,13 @@ def train_stageC_diffusion_generator(
                       WEIGHTS['overlap'] * L_overlap +
                       WEIGHTS['ordinal_sc'] * L_ordinal_sc)
             
-            optimizer.zero_grad()
-            L_total.backward()
+            # Backward with gradient scaling
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(L_total).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             
             # Log
             epoch_losses['total'] += L_total.item()
@@ -771,7 +831,6 @@ def train_stageC_diffusion_generator(
         
         history['epoch'].append(epoch)
         
-        # batch_pbar.close()
         if (epoch + 1) % 10 == 0:
             tqdm.write(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_losses['total']:.4f} | "
                   f"Score: {epoch_losses['score']:.4f} | Gram: {epoch_losses['gram']:.4f} | "

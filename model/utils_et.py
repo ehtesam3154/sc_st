@@ -614,17 +614,41 @@ def block_diag_mask(slide_ids: torch.Tensor) -> torch.Tensor:
 # ==============================================================================
 
 class HeatKernelLoss(nn.Module):
-    """Heat kernel trace matching loss."""
+    """
+    Heat kernel trace matching loss with Hutchinson trace estimation.
     
-    def __init__(self, t_list: List[float] = [0.25, 1.0, 4.0]):
+    Args:
+        use_hutchinson: Use stochastic Lanczos quadrature (faster)
+        num_probes: Number of Rademacher probes for Hutchinson
+        chebyshev_degree: Degree of Chebyshev polynomial approximation
+        knn_k: k for kNN graph Laplacian
+        t_list: Heat kernel diffusion times
+        laplacian: Type of Laplacian ('sym' or 'rw')
+    """
+    
+    def __init__(
+        self,
+        use_hutchinson: bool = True,
+        num_probes: int = 8,
+        chebyshev_degree: int = 10,
+        knn_k: int = 8,
+        t_list: Tuple[float, ...] = (0.5, 1.0),
+        laplacian: str = 'sym'
+    ):
         super().__init__()
+        self.use_hutchinson = use_hutchinson
+        self.num_probes = num_probes
+        self.chebyshev_degree = chebyshev_degree
+        self.knn_k = knn_k
         self.t_list = t_list
+        self.laplacian = laplacian
     
     def forward(
         self,
         L_pred: torch.Tensor,
         L_target: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
+        mask: Optional[torch.Tensor] = None,
+        t_list: Optional[List[float]] = None
     ) -> torch.Tensor:
         """
         Compute heat kernel trace loss.
@@ -633,34 +657,145 @@ class HeatKernelLoss(nn.Module):
             L_pred: (n, n) predicted Laplacian
             L_target: (n, n) target Laplacian
             mask: (n,) optional mask for valid nodes
+            t_list: optional override for diffusion times
             
         Returns:
             loss: scalar heat kernel trace loss
         """
+        if t_list is None:
+            t_list = self.t_list
+        
         # Apply mask to Laplacians
         if mask is not None:
-            n_valid = mask.sum().item()
             valid_idx = torch.where(mask)[0]
             L_pred = L_pred[valid_idx][:, valid_idx]
             L_target = L_target[valid_idx][:, valid_idx]
         
-        # Eigendecomposition
-        # eigvals_pred = torch.linalg.eigvalsh(L_pred).clamp(min=0)
-        # eigvals_target = torch.linalg.eigvalsh(L_target).clamp(min=0)
-
-        eigvals_pred, _ = safe_eigh(L_pred, return_vecs=False)
-        eigvals_target, _ = safe_eigh(L_target, return_vecs=False)
-        eigvals_pred = eigvals_pred.clamp(min=0)
-        eigvals_target = eigvals_target.clamp(min=0)
+        if self.use_hutchinson:
+            # Hutchinson trace estimation
+            traces_pred = self._hutchinson_heat_trace(L_pred, t_list)
+            traces_target = self._hutchinson_heat_trace(L_target, t_list)
+        else:
+            # Full eigendecomposition (fallback)
+            eigvals_pred, _ = safe_eigh(L_pred, return_vecs=False)
+            eigvals_target, _ = safe_eigh(L_target, return_vecs=False)
+            eigvals_pred = eigvals_pred.clamp(min=0)
+            eigvals_target = eigvals_target.clamp(min=0)
+            
+            traces_pred = []
+            traces_target = []
+            for t in t_list:
+                traces_pred.append(torch.sum(torch.exp(-t * eigvals_pred)))
+                traces_target.append(torch.sum(torch.exp(-t * eigvals_target)))
+            
+            traces_pred = torch.tensor(traces_pred, device=L_pred.device)
+            traces_target = torch.tensor(traces_target, device=L_target.device)
         
-        # Compute traces for each t
-        loss = 0.0
-        for t in self.t_list:
-            trace_pred = torch.sum(torch.exp(-t * eigvals_pred))
-            trace_target = torch.sum(torch.exp(-t * eigvals_target))
-            loss += (trace_pred - trace_target) ** 2
+        # Compute loss
+        loss = torch.mean((traces_pred - traces_target) ** 2)
+        return loss
+    
+    def _hutchinson_heat_trace(
+        self,
+        L: torch.Tensor,
+        t_list: List[float]
+    ) -> torch.Tensor:
+        """
+        Hutchinson trace estimation with Chebyshev polynomials.
         
-        return loss / len(self.t_list)
+        Args:
+            L: (n, n) Laplacian matrix
+            t_list: list of diffusion times
+            
+        Returns:
+            traces: (len(t_list),) trace estimates
+        """
+        device = L.device
+        n = L.shape[0]
+        
+        # Estimate max eigenvalue with power iteration
+        lambda_max = self._power_iter_max_eig(L, num_iter=20)
+        
+        # Scale L to [-1, 1]
+        L_scaled = L / (lambda_max + 1e-8)
+        
+        # Hutchinson trace estimation
+        traces = torch.zeros(len(t_list), device=device, dtype=torch.float32)
+        
+        for _ in range(self.num_probes):
+            # Rademacher probe
+            v = torch.empty(n, device=device, dtype=torch.float32).uniform_(-1.0, 1.0).sign()
+            v = v / (n ** 0.5)
+            
+            # Lanczos tridiagonalization
+            T = self._lanczos_tridiag(L_scaled, v, self.chebyshev_degree)
+            
+            # Compute trace for each t using Chebyshev
+            for i, t in enumerate(t_list):
+                # Scale t by lambda_max
+                t_scaled = t * lambda_max
+                trace_t = self._chebyshev_exp_trace(T, t_scaled)
+                traces[i] += trace_t
+        
+        traces = traces / float(self.num_probes)
+        return traces
+    
+    @torch.no_grad()
+    def _power_iter_max_eig(self, A: torch.Tensor, num_iter: int = 20) -> torch.Tensor:
+        """Power iteration to estimate max eigenvalue."""
+        n = A.shape[0]
+        v = torch.randn(n, device=A.device, dtype=torch.float32)
+        v = v / (v.norm() + 1e-12)
+        
+        for _ in range(num_iter):
+            v = A @ v
+            v = v / (v.norm() + 1e-12)
+        
+        lambda_max = torch.dot(v, A @ v)
+        return lambda_max.abs()
+    
+    @torch.no_grad()
+    def _lanczos_tridiag(
+        self,
+        A: torch.Tensor,
+        v0: torch.Tensor,
+        m: int,
+        tol: float = 1e-6
+    ) -> torch.Tensor:
+        """Lanczos tridiagonalization."""
+        device, dtype = A.device, torch.float32
+        n = v0.numel()
+        
+        alpha = torch.zeros(m, device=device, dtype=dtype)
+        beta = torch.zeros(m - 1, device=device, dtype=dtype)
+        
+        v = v0 / (v0.norm() + 1e-12)
+        w = A @ v
+        alpha[0] = torch.dot(v, w)
+        w = w - alpha[0] * v
+        
+        for j in range(1, m):
+            beta[j - 1] = w.norm()
+            if beta[j - 1] <= tol:
+                alpha = alpha[:j]
+                beta = beta[:j - 1]
+                break
+            
+            v_next = w / beta[j - 1]
+            w = A @ v_next - beta[j - 1] * v
+            alpha[j] = torch.dot(v_next, w)
+            w = w - alpha[j] * v_next
+            v = v_next
+        
+        T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
+        return T
+    
+    @torch.no_grad()
+    def _chebyshev_exp_trace(self, T: torch.Tensor, t: float) -> torch.Tensor:
+        """Compute e1^T exp(-t*T) e1 using eigendecomposition of small T."""
+        evals, evecs = torch.linalg.eigh(T)
+        weights = (evecs[0, :] ** 2)
+        return (weights * torch.exp(-t * evals)).sum()
 
 
 class SlicedWassersteinLoss1D(nn.Module):

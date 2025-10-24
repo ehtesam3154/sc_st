@@ -232,9 +232,10 @@ class GEMSModel:
             n_max=n_max,
             D_latent=self.D_latent,
             num_samples=num_st_samples,
+            knn_k=12,  # NEW: add knn_k parameter
             device=self.device
         )
-        
+                
         # SC dataset
         sc_dataset = SCSetDataset(
             sc_gene_expr=sc_gene_expr,
