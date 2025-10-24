@@ -896,25 +896,75 @@ class FrobeniusGramLoss(nn.Module):
         loss = torch.mean(diff ** 2)
         return loss
 
-def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):
-    """
-    kNN graph from a distance matrix (no coordinates needed).
-    D: (n, n) with zeros on diag, symmetric.
-    """
-    n = D.shape[0]
-    D = _symmetrize(D)
-    D = D + torch.eye(n, device=D.device, dtype=D.dtype) * 1e10  # mask self
-    knn_dists, knn_idx = torch.topk(D, k, dim=1, largest=False)
-    src = torch.arange(n, device=D.device).unsqueeze(1).expand(-1, k).reshape(-1)
-    dst = knn_idx.reshape(-1)
-    edge_index = torch.stack([src, dst], dim=0)
+# def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):
+#     """
+#     kNN graph from a distance matrix (no coordinates needed).
+#     D: (n, n) with zeros on diag, symmetric.
+#     """
+#     n = D.shape[0]
+#     D = _symmetrize(D)
+#     D = D + torch.eye(n, device=D.device, dtype=D.dtype) * 1e10  # mask self
+#     knn_dists, knn_idx = torch.topk(D, k, dim=1, largest=False)
+#     src = torch.arange(n, device=D.device).unsqueeze(1).expand(-1, k).reshape(-1)
+#     dst = knn_idx.reshape(-1)
+#     edge_index = torch.stack([src, dst], dim=0)
 
-    # Adaptive sigma from knn distances
-    sigma = torch.median(knn_dists).item()
-    if sigma < 1e-8:
-        sigma = 1.0
-    edge_weight = torch.exp(-(knn_dists.reshape(-1) ** 2) / (2 * sigma ** 2))
-    return edge_index.long(), edge_weight.float()
+#     # Adaptive sigma from knn distances
+#     sigma = torch.median(knn_dists).item()
+#     if sigma < 1e-8:
+#         sigma = 1.0
+#     edge_weight = torch.exp(-(knn_dists.reshape(-1) ** 2) / (2 * sigma ** 2))
+#     return edge_index.long(), edge_weight.float()
+
+def build_knn_graph(
+    coords_or_features: torch.Tensor,
+    k: int = 20,
+    metric: str = 'euclidean',
+    return_weights: bool = True,
+    device: str = 'cuda'  # Keep param for backward compatibility, but ignore it
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Build kNN graph and return edge_index + weights.
+    Vectorized, no Python loops.
+    
+    Args:
+        coords_or_features: (n, d) coordinates or features
+        k: number of neighbors
+        metric: distance metric
+        return_weights: whether to compute RBF weights
+        device: IGNORED - device is inferred from input tensor
+        
+    Returns:
+        edge_index: (2, E) edge indices
+        edge_weight: (E,) RBF weights (if return_weights=True)
+    """
+    # CRITICAL FIX: Infer device from input tensor, ignore parameter
+    device = coords_or_features.device
+    n = coords_or_features.shape[0]
+    
+    # Compute pairwise distances
+    D = torch.cdist(coords_or_features, coords_or_features, p=2)  # (n, n)
+    
+    # Find k nearest neighbors (excluding self)
+    D_noself = D + torch.eye(n, device=device) * 1e10  # Mask diagonal
+    knn_dists, knn_indices = torch.topk(D_noself, k, dim=1, largest=False)  # (n, k)
+    
+    # Build edge_index - all tensors inherit device from input
+    src = torch.arange(n, device=device).unsqueeze(1).expand(-1, k).flatten()  # (n*k,)
+    dst = knn_indices.flatten()  # Already on correct device
+    edge_index = torch.stack([src, dst], dim=0)  # (2, n*k)
+    
+    if return_weights:
+        # Compute RBF weights with adaptive sigma (median kNN distance)
+        knn_dists_sq = knn_dists ** 2
+        sigma = torch.median(knn_dists).item()
+        if sigma < 1e-8:
+            sigma = 1.0
+        
+        edge_weight = torch.exp(-knn_dists_sq.flatten() / (2 * sigma**2))
+        return edge_index.long(), edge_weight.float()
+    else:
+        return edge_index.long(), None
 
 import math 
 import torch
