@@ -537,9 +537,7 @@ def train_stageC_diffusion_generator(
     
     global_step = 0
     
-    epoch_pbar = tqdm(range(n_epochs), desc="Training Epochs", position=0)
-
-    for epoch in epoch_pbar:
+    for epoch in range(n_epochs):
         st_iter = iter(st_loader)
         sc_iter = iter(sc_loader)
         
@@ -551,7 +549,7 @@ def train_stageC_diffusion_generator(
         schedule = ['ST', 'ST', 'SC'] * (max(len(st_loader), len(sc_loader)) // 3 + 1)
         
         # Batch progress bar
-        batch_pbar = tqdm(schedule, desc=f"Epoch {epoch+1}/{n_epochs}", leave=False, position=1)
+        batch_pbar = tqdm(schedule, desc=f"Epoch {epoch+1}/{n_epochs}", leave=True)
         
         for batch_type in batch_pbar:
             if batch_type == 'ST':
@@ -588,13 +586,6 @@ def train_stageC_diffusion_generator(
                 t_norm = t_idx.float() / n_timesteps
                 sigma_t = sigmas[t_idx].view(-1, 1, 1)
                 
-                # Generate V_0 from Gram (for ST) or random (for SC)
-                # if not is_sc:
-                #     G_target = batch['G_target'].to(device)
-                #     V_0 = torch.stack([uet.factor_from_gram(G_target[i], D_latent) for i in range(batch_size_real)])
-                # else:
-                #     V_0 = torch.randn(batch_size_real, Z_set.shape[1], D_latent, device=device) * 0.1
-
                 # Generate V_0 using generator (works for both ST and SC)
                 V_0 = generator(H, mask)
 
@@ -826,7 +817,7 @@ def train_stageC_diffusion_generator(
             
             n_batches += 1
             global_step += 1
-            batch_pbar.update(1)
+            # batch_pbar.update(1)
         
         scheduler.step()
         
@@ -852,7 +843,6 @@ def train_stageC_diffusion_generator(
                 'history': history
             }
             torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
-        epoch_pbar.update(1)
     
     print("Training complete!")
 
@@ -923,7 +913,8 @@ def sample_sc_edm_anchored(
     anchor_size: int = 384,
     batch_size: int = 512,
     eta: float = 0.0,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    guidance_scale = 8.0
 ) -> Dict[str, torch.Tensor]:
     """
     ANCHOR-CONDITIONED batched inference for SC data.
@@ -1069,7 +1060,7 @@ def sample_sc_edm_anchored(
                 eps_uncond = score_net(V_t, t_norm, H_null_C, mask_C)
                 eps_cond = score_net(V_t, t_norm, H_C, mask_C)
                 
-                guidance_scale = 10.0
+                # guidance_scale = 10.0
                 eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
                 
                 # Update

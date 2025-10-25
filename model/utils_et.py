@@ -666,10 +666,26 @@ class HeatKernelLoss(nn.Module):
             t_list = self.t_list
         
         # Apply mask to Laplacians
+        # if mask is not None:
+        #     valid_idx = torch.where(mask)[0]
+        #     L_pred = L_pred[valid_idx][:, valid_idx]
+        #     L_target = L_target[valid_idx][:, valid_idx]
+
+        # NEW (GPU-safe)
         if mask is not None:
-            valid_idx = torch.where(mask)[0]
-            L_pred = L_pred[valid_idx][:, valid_idx]
-            L_target = L_target[valid_idx][:, valid_idx]
+            # Ensure boolean 1-D
+            mask = mask.bool().view(-1)
+
+            # If sparse, make dense on GPU (mini-sets are small)
+            if L_pred.layout != torch.strided:
+                L_pred = L_pred.to_dense()
+            if L_target.layout != torch.strided:
+                L_target = L_target.to_dense()
+
+            valid_idx = mask.nonzero(as_tuple=False).squeeze(1)
+            L_pred   = L_pred.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
+            L_target = L_target.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
+
         
         if self.use_hutchinson:
             # Hutchinson trace estimation
@@ -1257,44 +1273,56 @@ def sample_ordinal_triplets_from_Z(Z: torch.Tensor, n_per_anchor: int = 10, k_nn
     return torch.tensor(triplets, dtype=torch.long, device=Z.device)
 
 
-def create_sc_miniset_pair(Z_all: torch.Tensor, n_set: int, n_overlap: int, k_nn: int = 50, device: str = 'cuda') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+from typing import Tuple
+
+def create_sc_miniset_pair(
+    Z_all: torch.Tensor,
+    n_set: int,
+    n_overlap: int,
+    k_nn: int = 50,
+    device: str | torch.device | None = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Create two overlapping SC mini-sets from Z-space.
+    Create two overlapping SC mini-sets from Z-space (indices only).
     Returns: indices_A, indices_B, shared_indices_in_A, shared_indices_in_B
     """
+    # *** CRITICAL: keep everything on the same device as Z_all ***
+    dev = Z_all.device if device is None else (torch.device(device) if isinstance(device, str) else device)
+
     n_total = Z_all.shape[0]
-    
-    # Sample seed for set A
-    seed_i = torch.randint(n_total, (1,)).item()
-    D_from_seed = torch.cdist(Z_all[seed_i:seed_i+1], Z_all)[0]
-    indices_A = torch.argsort(D_from_seed)[:n_set]
-    
-    # Select overlap subset
+
+    # A: pick a seed and take n_set nearest
+    seed_i = torch.randint(n_total, (1,), device=dev).item()
+    D_from_seed = torch.cdist(Z_all[seed_i:seed_i+1], Z_all)[0]        # (n_total,) on dev
+    indices_A   = torch.argsort(D_from_seed)[:n_set]                   # (n_set,) on dev
+
+    # overlap positions inside set-A (positions 0..n_set-1)
     n_overlap = min(n_overlap, n_set - 5)
-    overlap_positions = torch.randperm(n_set)[:n_overlap]
-    shared_global = indices_A[overlap_positions]
-    
-    # Sample seed for set B near seed_i
-    D_from_seed_all = torch.cdist(Z_all[seed_i:seed_i+1], Z_all)[0]
-    nearby = torch.argsort(D_from_seed_all)[1:k_nn]
-    seed_j = nearby[torch.randint(len(nearby), (1,))].item()
-    
-    # Build set B: shared + new cells
+    overlap_positions = torch.randperm(n_set, device=dev)[:n_overlap]  # (n_overlap,) on dev
+    shared_global     = indices_A[overlap_positions]                   # (n_overlap,) on dev
+
+    # pick a nearby seed for set-B
+    nearby = torch.argsort(D_from_seed)[1:k_nn+1]
+    seed_j = nearby[torch.randint(len(nearby), (1,), device=dev)].item()
+
     D_from_seed_j = torch.cdist(Z_all[seed_j:seed_j+1], Z_all)[0]
-    candidates = torch.argsort(D_from_seed_j)
-    
-    # Exclude cells already in A\S
-    non_shared_A = indices_A[~torch.isin(torch.arange(n_set, device=device), overlap_positions)]
-    mask = ~torch.isin(candidates, non_shared_A)
-    candidates = candidates[mask]
-    
-    n_new = n_set - n_overlap
-    new_cells = candidates[:n_new] if len(candidates) >= n_new else candidates
-    
-    indices_B = torch.cat([shared_global, new_cells])[:n_set]
-    
-    # Find shared positions in both sets
-    shared_in_A = overlap_positions
-    shared_in_B = torch.tensor([torch.where(indices_B == g)[0][0].item() for g in shared_global if g in indices_B], device=device)
-    
+    candidates    = torch.argsort(D_from_seed_j)                        # (n_total,) on dev
+
+    # remove A \ overlap from candidates for B’s "new" cells
+    all_pos_A   = torch.arange(n_set, device=dev)
+    non_sharedA_pos = all_pos_A[~torch.isin(all_pos_A, overlap_positions)]
+    non_shared_A    = indices_A[non_sharedA_pos]
+    mask            = ~torch.isin(candidates, non_shared_A)
+    candidates      = candidates[mask]
+
+    n_new    = n_set - n_overlap
+    new_B    = candidates[:n_new]
+    indices_B = torch.cat([shared_global, new_B])[:n_set]               # (n_set,) on dev
+
+    # positions of the shared elements inside A and B (vectorized, device-safe)
+    shared_in_A = overlap_positions                                     # already positions in A
+    pos_map_B   = torch.full((n_total,), -1, device=dev, dtype=torch.long)
+    pos_map_B[indices_B] = torch.arange(indices_B.numel(), device=dev, dtype=torch.long)
+    shared_in_B = pos_map_B[shared_global]
+
     return indices_A, indices_B, shared_in_A, shared_in_B
