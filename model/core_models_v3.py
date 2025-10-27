@@ -16,6 +16,8 @@ from torch_geometric.data import Data
 from model.utils import *
 import pandas as pd
 from torch.utils.data import DataLoader, TensorDataset
+import math
+
 
 class AdvancedHierarchicalDiffusion(nn.Module):
     def __init__(
@@ -91,7 +93,12 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         self.alpha = alpha
         self.mmdbatch = mmdbatch
         self.n_embedding = n_embedding
-        
+
+        #slide style affine head
+        self.affine_A = nn.Parameter(torch.eye(2, device=self.device))
+        self.affine_b = nn.Parameter(torch.zeros(1, 2, device=self.device))
+        self.affine_reg = 1e-4
+
         # Create output directory
         self.outf = outf
         if not os.path.exists(outf):
@@ -215,11 +222,14 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             latent_dim=self.latent_dim,
             hidden_dim=128  # Remove condition_dim
         ).to(device)
+
+        #adapter: embedding to latent
+        self.cond_adapter = ConditionAdapter(n_embedding[-1], self.latent_dim).to(device)
         
         # Latent Denoiser (replaces hierarchical_blocks)
         self.latent_denoiser = LatentDenoiser(
             latent_dim=self.latent_dim,
-            condition_dim=n_embedding[-1],
+            condition_dim=n_embedding[-1] + self.latent_dim, #to accomodate cond adapater
             hidden_dim=hidden_dim,
             n_blocks=n_denoising_blocks
         ).to(device)
@@ -259,6 +269,22 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         # MMD Loss for domain alignment
         self.mmd_loss = MMDLoss()
 
+        #embeddong condition whitening (fit on ST and freeze as buffers)
+        with torch.no_grad():
+            F_st = self.netE(self.st_gene_expr).float()
+            mu_c = F_st.mean(0, keepdim=True)
+            C = torch.cov(F_st.T) + 1e-4 * torch.eye(F_st.shape[1], device=F_st.device)
+            L = torch.linalg.cholesky(C)
+            Linv = torch.linalg.inv(L)
+
+        self.register_buffer('cond_mu', mu_c)
+        self.register_buffer('cond_Linv', Linv)
+
+        def _whiten_cond(self, c):
+            return (c- self.cond_mu) @ self.cond_Linv
+        
+        self._whiten_cond = _whiten_cond.__get__(self, type(self))
+
         # Move entire model to device
         self.to(self.device)
 
@@ -278,11 +304,60 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             'posterior_variance': posterior_variance
         }
 
+    import torch
+
+    def _build_noise_schedule_linear(self, T:int, beta_start:float, beta_end:float):
+        betas  = torch.linspace(beta_start, beta_end, T, device=self.device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat(
+            [torch.tensor([1.0], device=self.device), alphas_cumprod[:-1]], dim=0
+        )
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        return {
+            'betas': betas, 'alphas': alphas,
+            'alphas_cumprod': alphas_cumprod,
+            'alphas_cumprod_prev': alphas_cumprod_prev,
+            'posterior_variance': posterior_variance
+        }
+
+    def _build_noise_schedule_cosine(self, T:int, s:float=0.008):
+        steps = torch.arange(T+1, device=self.device, dtype=torch.float32) / T
+        f = torch.cos((steps + s) / (1 + s) * torch.pi / 2) ** 2
+        alpha_bar = (f / f[0]).clamp(min=1e-5, max=1.0)  # ᾱ(0)=1
+        betas = (1 - (alpha_bar[1:] / alpha_bar[:-1])).clamp(1e-8, 0.999)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat(
+            [torch.tensor([1.0], device=self.device), alphas_cumprod[:-1]], dim=0
+        )
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        return {
+            'betas': betas, 'alphas': alphas,
+            'alphas_cumprod': alphas_cumprod,
+            'alphas_cumprod_prev': alphas_cumprod_prev,
+            'posterior_variance': posterior_variance
+        }
+
+
+    # def update_noise_schedule(self):
+    #     """Update noise schedule when n_timesteps changes"""
+    #     self.noise_schedule = self.build_noise_schedule(self.n_timesteps)
+    #     print(f"Updated noise schedule for T={self.n_timesteps}")
+    #     print(f"alpha_bar[0]={self.noise_schedule['alphas_cumprod'][0]:.6f}, alpha_bar[-1]={self.noise_schedule['alphas_cumprod'][-1]:.6f}")
+
     def update_noise_schedule(self):
-        """Update noise schedule when n_timesteps changes"""
-        self.noise_schedule = self.build_noise_schedule(self.n_timesteps)
-        print(f"Updated noise schedule for T={self.n_timesteps}")
-        print(f"alpha_bar[0]={self.noise_schedule['alphas_cumprod'][0]:.6f}, alpha_bar[-1]={self.noise_schedule['alphas_cumprod'][-1]:.6f}")
+        T = int(self.n_timesteps)  # single source of truth
+        if self.noise_schedule_mode == 'cosine':
+            self.noise_schedule = self._build_noise_schedule_cosine(T)
+        else:
+            # pick beta_end so ᾱ_T hits your target with *this* T
+            total = -math.log(self.noise_target_alpha_end)
+            beta_end = max(2*total/T - self.beta_start, self.beta_start + 1e-6)
+            self.noise_schedule = self._build_noise_schedule_linear(T, self.beta_start, beta_end)
+        print(f"[noise] mode={self.noise_schedule_mode}, T={T}, "
+            f"alpha_bar[-1]={self.noise_schedule['alphas_cumprod'][-1].item():.5f}")
+
 
     def setup_spatial_sampling(self):
         if hasattr(self, 'st_coords_norm'):
@@ -455,17 +530,49 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             f.write(f"n_epochs={n_epochs}, ratio_start={ratio_start}, ratio_end={ratio_end}\n")
         
         # Calculate spatial adjacency matrix
-        if self.sigma == 0:
-            nettrue = torch.eye(self.st_coords.shape[0], device=self.device)
-        else:
-            nettrue = torch.tensor(scipy.spatial.distance.cdist(
-                self.st_coords.cpu().numpy(), 
-                self.st_coords.cpu().numpy()
-            ), device=self.device).to(torch.float32)
+        # if self.sigma == 0:
+        #     nettrue = torch.eye(self.st_coords.shape[0], device=self.device)
+        # else:
+        #     nettrue = torch.tensor(scipy.spatial.distance.cdist(
+        #         self.st_coords.cpu().numpy(), 
+        #         self.st_coords.cpu().numpy()
+        #     ), device=self.device).to(torch.float32)
             
-            sigma = self.sigma
-            nettrue = torch.exp(-nettrue**2/(2*sigma**2))/(np.sqrt(2*np.pi)*sigma)
-            nettrue = F.normalize(nettrue, p=1, dim=1)
+        #     sigma = self.sigma
+        #     nettrue = torch.exp(-nettrue**2/(2*sigma**2))/(np.sqrt(2*np.pi)*sigma)
+        #     nettrue = F.normalize(nettrue, p=1, dim=1)
+
+        # Auto-calculate sigma from normalized coordinates
+        with torch.no_grad():
+            # Use normalized coords for everything
+            coords_for_rbf = self.st_coords_norm
+            D = torch.cdist(coords_for_rbf, coords_for_rbf)
+            
+            # Get k-NN distances (k=15 is robust)
+            k = 15
+            kth_distances = torch.kthvalue(D, k+1, dim=1).values  # k+1 because diagonal is 0
+            
+            # Use median as default sigma
+            auto_sigma = torch.median(kth_distances).item()
+            
+            # Apply a scaling factor for Gaussian width (0.8 = slightly tighter, 1.0 = exact median)
+            self.sigma = auto_sigma * 0.8
+            
+            print(f"Auto-calculated sigma = {self.sigma:.4f} (based on normalized coordinates)")
+            print(f"k-NN distance stats: min={kth_distances.min():.4f}, "
+                f"median={kth_distances.median():.4f}, max={kth_distances.max():.4f}")
+            
+            # Calculate spatial adjacency matrix with normalized coords and auto sigma
+            if self.sigma == 0:
+                nettrue = torch.eye(self.st_coords_norm.shape[0], device=self.device)
+            else:
+                distances = torch.cdist(coords_for_rbf, coords_for_rbf)
+                nettrue = torch.exp(-distances**2/(2*self.sigma**2))/(np.sqrt(2*np.pi)*self.sigma)
+                nettrue = F.normalize(nettrue, p=1, dim=1)
+
+        # Log the auto-calculated sigma
+        with open(self.train_log, 'a') as f:
+            f.write(f"Auto-calculated sigma={self.sigma:.4f} from normalized coordinates\n")
         
         # Training loop
         for epoch in range(n_epochs):
@@ -651,9 +758,23 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             self.cov_true = (centered.T @ centered) / (centered.shape[0] - 1)
 
         # Optimizer + scheduler
-        vae_params = list(self.graph_vae_encoder.parameters()) + list(self.graph_vae_decoder.parameters())
+        # vae_params = list(self.graph_vae_encoder.parameters()) + list(self.graph_vae_decoder.parameters()+ [self.affine_A, self.affine_b])
+        vae_params = (
+            list(self.graph_vae_encoder.parameters())
+        + list(self.graph_vae_decoder.parameters())
+        + [self.affine_A, self.affine_b]
+        )
         optimizer = torch.optim.Adam(vae_params, lr=lr, weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        # --- Neighborhood target P over ST (row-stochastic), matches your encoder's sigma ---
+        with torch.no_grad():
+            X = self.st_coords_norm                    # (N, 2) normalized coords you already use
+            D2_true = torch.cdist(X, X).pow(2)         # (N, N)
+            # temperature τ for decoder space: tie to your sigma; good start τ = max(self.sigma, 1e-3)
+            tau = max(float(self.sigma), 1e-3)
+            P = torch.softmax(-D2_true / (2.0 * tau * tau), dim=1)  # (N, N), row-stochastic
+
 
         # Initialize loss logs
         for key in ('total','reconstruction','kl','kl_raw','cov','lambda_cov','angle','radius','beta','epochs'):
@@ -677,11 +798,21 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             
             # Decoder takes ONLY z (no features)
             coords_pred_st = self.graph_vae_decoder(z_st)
+
+            #map cannonical to slide coords (for loss only)
+            coords_for_loss = coords_pred_st @ self.affine_A.T + self.affine_b
             
             #edge distance reconstruction 
             i, j = adj_idx[0], adj_idx[1]
             dist_true = (self.st_coords_norm[i] - self.st_coords_norm[j]).pow(2).sum(1).sqrt()
-            dist_pred = (coords_pred_st[i] - coords_pred_st[j]).pow(2).sum(1).sqrt()
+            # dist_pred = (coords_pred_st[i] - coords_pred_st[j]).pow(2).sum(1).sqrt()
+            dist_pred = (coords_for_loss[i] - coords_for_loss[j]).pow(2).sum(1).sqrt()
+
+            # --- Predicted neighborhoods Q from decoded coords ---
+            D2_pred = torch.cdist(coords_pred_st, coords_pred_st).pow(2)   # (N, N)
+            logQ = F.log_softmax(-D2_pred / (2.0 * tau * tau), dim=1)      # log row-stochastic
+            L_neigh = F.kl_div(logQ, P, reduction='batchmean')             # KL(P || Q)
+
 
             L_edges = F.smooth_l1_loss(dist_pred, dist_true)
             lambda_edges = 2.0
@@ -696,16 +827,23 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             L_KL = beta * KL_raw
 
             # 3) Covariance alignment (ST spots only, warm-up)
-            coords_pred_centered = coords_pred_st - coords_pred_st.mean(0, keepdim=True)
-            cov_pred = (coords_pred_centered.T @ coords_pred_centered) / (coords_pred_centered.shape[0] - 1)
+            # coords_pred_centered = coords_pred_st - coords_pred_st.mean(0, keepdim=True)
+            # cov_pred = (coords_pred_centered.T @ coords_pred_centered) / (coords_pred_centered.shape[0] - 1)
+            # L_cov = F.mse_loss(cov_pred, self.cov_true)
+
+            coords_centered = coords_for_loss - coords_for_loss.mean(0, keepdim=True)
+            cov_pred = (coords_centered.T @ coords_centered) / (coords_centered.shape[0] - 1)
             L_cov = F.mse_loss(cov_pred, self.cov_true)
+
 
             # 4) NO Gradient anchoring (as requested)
             # L_grad = 0.0
 
             # 5) Geometry-anchored angle/radius losses
             # Compute predicted angles/radii using the SAME canonical frame (c, a_theta, R)
-            v_hat = coords_pred_st - c 
+
+            # v_hat = coords_pred_st - c
+            v_hat = coords_for_loss - c 
             cross = a_theta[0] * v_hat[:, 1] - a_theta[1] * v_hat[:, 0]
             dot = a_theta[0] * v_hat[:, 0] + a_theta[1] * v_hat[:, 1]
             theta_hat = torch.atan2(cross, dot)
@@ -722,12 +860,31 @@ class AdvancedHierarchicalDiffusion(nn.Module):
 
             # 6) Total loss
             total_loss = (
-                L_recon +           # 0.0 as requested
+                L_recon +           
                 L_KL +              # Small, normalized
                 lambda_cov * L_cov +
                 L_angle + 
                 L_radius
             )
+
+
+            # Regularize A near rotation+isotropic scale and small translation
+            AtA = self.affine_A.T @ self.affine_A
+            L_aff = ((AtA - torch.eye(2, device=self.device))**2).mean() + (self.affine_b**2).mean()
+            total_loss = total_loss + self.affine_reg * L_aff
+
+
+            lambda_edges = 0.0        # turn OFF raw (x,y) edge distances (imprints hull)
+            lambda_cov   = 0.0        # turn OFF global covariance/centroid match (absolute frame)
+            lambda_angle = 0.0        # turn OFF polar angle target (absolute frame)
+            lambda_radius= 0.0        # turn OFF radius target (absolute frame)
+            lambda_neigh = 1.0        # primary geometric term
+
+            total_loss = (
+                lambda_neigh * L_neigh
+                + beta * L_KL
+            )
+
             
             total_loss.backward()
             optimizer.step()
@@ -782,7 +939,7 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             if coord_variance < 1e-4:
                 print("⚠️  WARNING: Low variance suggests potential posterior collapse!")
             else:
-                print("✅ Good: Decoder shows dependency on z")
+                print("Good: Decoder shows dependency on z")
         print("=" * 50)
 
 
@@ -922,7 +1079,7 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             print(f"[decoder FT] epoch {epoch+1:02d}/{epochs}  recon={rec:.4f}  hull={hul:.4f}  total={tot:.4f}")
 
         self.graph_vae_decoder.eval()
-        print("✅ Decoder fine-tune done (encoder + diffusion unchanged).")
+        print("Decoder fine-tune done (encoder + diffusion unchanged).")
 
 
     def train_diffusion_latent(
@@ -951,6 +1108,11 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         for p in self.graph_vae_decoder.parameters():
             p.requires_grad = False
 
+        self.noise_schedule_mode = 'linear'
+        self.noise_target_alpha_end = 0.08
+        self.beta_start = 1e-4
+        self.sampling_start_alpha = 0.08
+
         # Ensure noise schedule is current
         self.update_noise_schedule()
         self.latent_denoiser.train()
@@ -961,6 +1123,17 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             st_features_aligned = self.netE(self.st_gene_expr).float()             # (N, d_embed)
             st_adj_idx_full, _ = precompute_knn_edges(self.st_coords_norm, k=30, device=self.device)  # not used directly (we re-make per batch)
             st_mu, st_logvar = self.graph_vae_encoder(st_features_aligned, st_adj_idx_full, None)     # (N, D), (N, D)
+
+        #quick adapter fit: embedding to latent
+        opt_adapt = torch.optim.AdamW(self.cond_adapter.parameters(), lr=1e-3, weight_decay=1e-4)
+        for _ in range(5):
+            idx_adapt = torch.randperm(st_mu.size(0), device=self.device)
+            c_b = self._whiten_cond(st_features_aligned[idx_adapt])
+            z_tgt = st_mu[idx_adapt].detach()
+            loss_ad = F.mse_loss(self.cond_adapter(c_b), z_tgt)
+            opt_adapt.zero_grad()
+            loss_ad.backward()
+            opt_adapt.step()
 
         # Optimizer / scheduler / EMA for the denoiser
         optimizer = torch.optim.AdamW(self.latent_denoiser.parameters(), lr=2e-4, weight_decay=1e-5)
@@ -975,8 +1148,12 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         # Optional: learned null condition (better than zeros)
         if not hasattr(self, "null_cond"):
             with torch.no_grad():
-                null_init = st_features_aligned.mean(0, keepdim=True)
-            self.null_cond = nn.Parameter(null_init)  # trainable
+                null_c = self._whiten_cond(st_features_aligned.mean(0, keepdim=True))
+                null_z = self.cond_adapter(null_c)
+                null_full = torch.cat([null_c, null_z], dim=1)
+            self.null_cond = nn.Parameter(null_full)
+            #     null_init = st_features_aligned.mean(0, keepdim=True)
+            # self.null_cond = nn.Parameter(null_init)  # trainable
 
         # Train
         for epoch in range(n_epochs):
@@ -1002,9 +1179,17 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             z_t = torch.sqrt(alpha_bar_t) * z0 + torch.sqrt(1 - alpha_bar_t) * eps
 
             # ----- condition dropout (linear warmup) -----
+            # p_drop = p_drop_max * min(epoch / max(1, struct_warmup_epochs), 1.0)
+            # drop_mask = (torch.rand(B, 1, device=self.device) >= p_drop).float()
+            # cond = torch.where(drop_mask.bool(), batch_h, self.null_cond.expand_as(batch_h))
+            c_b = self._whiten_cond(batch_h)                        # whitened embeddings
+            z_hint = self.cond_adapter(c_b).detach()                # embeddings->latent guess
+            cond_full = torch.cat([c_b, z_hint], dim=1)           
+
+            # ----- condition dropout (linear warmup) -----
             p_drop = p_drop_max * min(epoch / max(1, struct_warmup_epochs), 1.0)
             drop_mask = (torch.rand(B, 1, device=self.device) >= p_drop).float()
-            cond = torch.where(drop_mask.bool(), batch_h, self.null_cond.expand_as(batch_h))
+            cond = drop_mask * cond_full + (1.0 - drop_mask) * self.null_cond.expand_as(cond_full)
 
             # Predict noise
             t_norm = (t.float() / max(self.n_timesteps - 1, 1)).unsqueeze(1)       # (B,1)
@@ -1019,19 +1204,48 @@ class AdvancedHierarchicalDiffusion(nn.Module):
                 batch_edge_idx, _ = precompute_knn_edges(coords_true_b.detach(), k=30, device=self.device)
             i, j = batch_edge_idx[0], batch_edge_idx[1]
 
-            # x0 prediction and decoding
+            # # x0 prediction and decoding
             sqrt_ab  = torch.sqrt(alpha_bar_t)
             sqrt_1m  = torch.sqrt(1.0 - alpha_bar_t)
             z0_pred  = (z_t - sqrt_1m * eps_pred) / (sqrt_ab + 1e-8)               # DDPM x0
             coords_pred = self.graph_vae_decoder(z0_pred)                           # (B, 2)
+            tau = max(float(self.sigma), 1e-3)
 
-            # Edge distances
-            dist_true = (coords_true_b[i] - coords_true_b[j]).pow(2).sum(1).sqrt()
-            dist_pred = (coords_pred[i]     - coords_pred[j]).pow(2).sum(1).sqrt()
-            L_struct  = F.smooth_l1_loss(dist_pred, dist_true)
+            # # Edge distances
+            # dist_true = (coords_true_b[i] - coords_true_b[j]).pow(2).sum(1).sqrt()
+            # dist_pred = (coords_pred[i]     - coords_pred[j]).pow(2).sum(1).sqrt()
+            # L_struct  = F.smooth_l1_loss(dist_pred, dist_true)
+
+            # Build P_batch on the corresponding ST coords (same τ)
+            Xb = coords_true_b                                # use self.st_coords_norm[idx] or cached X[idx]
+            D2_true_b = torch.cdist(Xb, Xb).pow(2)
+            P_b = torch.softmax(-D2_true_b / (2.0 * tau * tau), dim=1)
+
+            # Predicted neighborhoods on decoded coords
+            D2_pred_b = torch.cdist(coords_pred, coords_pred).pow(2)
+            logQ_b = F.log_softmax(-D2_pred_b / (2.0 * tau * tau), dim=1)
+
+            L_struct = F.kl_div(logQ_b, P_b, reduction='batchmean')
+
+
+
+            # x0 prediction and decoding
+            # sqrt_ab  = torch.sqrt(alpha_bar_t)
+            # sqrt_1m  = torch.sqrt(1.0 - alpha_bar_t)
+            # z0_pred  = (z_t - sqrt_1m * eps_pred) / (sqrt_ab + 1e-8)
+            # coords_pred = self.graph_vae_decoder(z0_pred)
+
+            # # Apply affine for ST structure loss only
+            # coords_for_loss = coords_pred @ self.affine_A.T + self.affine_b
+
+            # # Edge distances
+            # dist_true = (coords_true_b[i] - coords_true_b[j]).pow(2).sum(1).sqrt()
+            # dist_pred = (coords_for_loss[i] - coords_for_loss[j]).pow(2).sum(1).sqrt()
+            # L_struct  = F.smooth_l1_loss(dist_pred, dist_true)
+
 
             # Warm up structure weight: 0 → 2.0
-            lambda_struct = 2.0 * min(epoch / max(1, struct_warmup_epochs), 1.0)
+            lambda_struct = 1 * min(epoch / max(1, struct_warmup_epochs), 1.0)
 
             total_loss = loss_diffusion + lambda_struct * L_struct
 
@@ -1097,133 +1311,6 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         
         print("Complete training pipeline finished!")
 
-    def refine_coordinates_scale_free(self, coords, tau=0.9):
-        '''scale free coordinate refinement using relative min seperation
-        
-        tau: factor for minimum seperation (0.8-1.0) where 1.0 is tight'''
-
-        device = coords.device
-        n = coords.shape[0]
-
-        def compute_nearest_neighbor_distances(X):
-            '''compute distance to nearest enighbor for each point'''
-            distances = torch.cdist(X, X)
-            distances.fill_diagonal_(float('inf'))
-            nn_distances, _ = distances.min(dim=1)
-            return nn_distances
-        
-        def pairwise_distances_squared(X):
-            '''compute pairwise squared distances'''
-            s = (X * X).sum(1, keepdim=True)
-            S = s + s.T - 2 * X @ X.T
-            S = S.clamp_min_(0.0)
-            S.fill_diagonal_(0.0)
-            return S
-        
-        def gram_matrix(S):
-            '''convert gram matrix back to distance matrix'''
-            r = S.mean(1, keepdim=True)
-            c = S.mean(0, keepdim=True)
-            m = S.mean()
-            B = -0.5 * ( S - r - c + m)
-            return B
-        
-        def distance_from_gram(B):
-            """Convert Gram matrix back to distance matrix"""
-            d = torch.diag(B)
-            S = d[:, None] + d[None, :] - 2 * B
-            S = S.clamp_min_(0.0)
-            S.fill_diagonal_(0.0)
-            return S
-        
-        def project_to_euclidean(S):
-            """Project distance matrix to Euclidean space"""
-            B = gram_matrix(S)
-            vals, vecs = torch.linalg.eigh(B)
-            vals = vals.clamp_min(0.0)
-            
-            # Keep top 2 eigenvalues for 2D
-            idx = torch.argsort(vals, descending=True)[:2]
-            vals = vals[idx]
-            vecs = vecs[:, idx]
-            
-            B_proj = (vecs * vals.sqrt()) @ (vecs * vals.sqrt()).T
-            return distance_from_gram(B_proj)
-        
-        def enforce_min_separation(S, min_dist):
-            """Enforce minimum distance constraints"""
-            S = S.clone()
-            min_dist_sq = min_dist ** 2
-            mask = ~torch.eye(n, dtype=torch.bool, device=device)
-            S[mask] = torch.maximum(S[mask], torch.full_like(S[mask], min_dist_sq))
-            S.fill_diagonal_(0.0)
-            return 0.5 * (S + S.T)
-        
-        def coords_from_distances(S):
-            """Extract 2D coordinates from distance matrix"""
-            B = gram_matrix(S)
-            vals, vecs = torch.linalg.eigh(B)
-            idx = torch.argsort(vals, descending=True)[:2]
-            L = torch.diag(vals[idx].clamp_min(0.0).sqrt())
-            U = vecs[:, idx] @ L
-            return U
-
-        
-        def align_to_original(U, X_orig):
-            Um = U.mean(0)
-            Xm = X_orig.mean(0)
-            Uc = U - Um
-            Xc = X_orig - Xm  # Fixed: was X_orig - Xc
-            M = Uc.T @ Xc
-            U_svd, _, Vt = torch.linalg.svd(M, full_matrices=False)
-            R = U_svd @ Vt
-            # avoid reflection
-            if torch.linalg.det(R) < 0:
-                U_svd[:, -1] *= -1
-                R = U_svd @ Vt
-            t = Xm - (Um @ R)
-            return U @ R + t
-
-
-        
-        # Step 1: Compute scale-free minimum separation
-        nn_distances = compute_nearest_neighbor_distances(coords)
-        median_nn_dist = torch.median(nn_distances)
-        min_separation = tau * median_nn_dist
-        
-        print(f"Nearest neighbor distances: min={nn_distances.min():.4f}, "
-            f"median={median_nn_dist:.4f}, max={nn_distances.max():.4f}")
-        print(f"Using minimum separation: {min_separation:.4f} (tau={tau})")
-        
-        # Step 2: Refinement loop
-        S = pairwise_distances_squared(coords)
-        
-        for iteration in range(100):
-            S_prev = S.clone()
-            
-            # Project to Euclidean distance matrix
-            S = project_to_euclidean(S)
-            
-            # Enforce minimum separation
-            S = enforce_min_separation(S, min_separation)
-            
-            # Check convergence
-            change = (S - S_prev).norm() / (S_prev.norm() + 1e-12)
-            if change < 1e-6:
-                print(f"Converged after {iteration + 1} iterations")
-                break
-        
-        # Step 3: Extract refined coordinates
-        coords_refined = coords_from_distances(S)
-        coords_final = align_to_original(coords_refined, coords)
-        # coords_final = lock_orientation(coords_refined, coords)
-        
-        # Compute final statistics
-        final_nn_distances = compute_nearest_neighbor_distances(coords_final)
-        print(f"After refinement - min distance: {final_nn_distances.min():.4f}, "
-            f"median: {torch.median(final_nn_distances):.4f}")
-        
-        return coords_final
     
     def sample_sc_coordinates_batched(self, batch_size: int = 512, return_normalized=True):
         """
@@ -1376,7 +1463,7 @@ class AdvancedHierarchicalDiffusion(nn.Module):
     def sample_sc_coordinates(
         self,
         batch_size=512,
-        guidance_scale=1.0,
+        guidance_scale=2.0,
         k_nn=15, margin=0.05,
         lambda_trip=0.05, lambda_rep=0.08, lambda_ang=0.01,lambda_rad = 0.1,
         gamma=0.05,
@@ -1426,6 +1513,12 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             for i in range(0, z.size(0), denoiser_chunk):
                 outs.append(denoiser(z[i:i+denoiser_chunk], tnorm[i:i+denoiser_chunk], cond[i:i+denoiser_chunk]))
             return torch.cat(outs, dim=0)
+        
+        # choose a start step t_start so alpha_bar[t_start] ~ target (not near 0)
+        target_alpha = 0.08  # 0.05–0.15 is typically stable
+        alpha_bar = self.noise_schedule['alphas_cumprod']   # (T,)
+        t_start = int(torch.argmin(torch.abs(alpha_bar - target_alpha)).item())
+        alpha_bar_start = alpha_bar[t_start]
 
         all_coords = []
         n_batches = (n_total + batch_size - 1) // batch_size
@@ -1449,28 +1542,44 @@ class AdvancedHierarchicalDiffusion(nn.Module):
                 # --- baseline for tiny angle anchor (SC kNN graph; cheap) ---
                 sc_adj_idx, sc_adj_w = precompute_knn_edges(h_sc, k=30, device=self.device)
                 mu_sc, logvar_sc = self.graph_vae_encoder(h_sc, sc_adj_idx, sc_adj_w)  # (B, d_z)
+
+                #whiten + adapter
+                h_sc = self._whiten_cond(h_sc)
+                z_hint = self.cond_adapter(h_sc)
+
                 #reparam to get a posterior sample
                 z_0 = mu_sc + torch.randn_like(mu_sc) * torch.exp(0.5 * logvar_sc)
+                alpha_blend = 0.3 
+                z_0 = (1.0 - alpha_blend) * z_0 + alpha_blend * z_hint 
                 y_base = self.graph_vae_decoder(mu_sc)                         # (B, 2)
 
                 #diffuse forward to the last timestep T so we start at the same noise level used during training
-                T = self.n_timesteps - 1
-                alpha_bar_T = self.noise_schedule['alphas_cumprod'][T]
+                # T = self.n_timesteps - 1
+                # alpha_bar_T = self.noise_schedule['alphas_cumprod'][T]
+                # z_t = (
+                #     torch.sqrt(alpha_bar_T) * z_0 +
+                #     torch.sqrt(1.0 - alpha_bar_T) * torch.randn_like(z_0)
+                # )
+
+                      # 3) forward-noise to the chosen start noise level (alpha_bar_start)
                 z_t = (
-                    torch.sqrt(alpha_bar_T) * z_0 +
-                    torch.sqrt(1.0 - alpha_bar_T) * torch.randn_like(z_0)
+                    torch.sqrt(alpha_bar_start) * z_0 +
+                    torch.sqrt(1.0 - alpha_bar_start) * torch.randn_like(z_0)
                 )
 
                 # -------- reverse diffusion (Îµ-pred, classifier-free) --------
-                for t in reversed(range(self.n_timesteps)):
+                # for t in reversed(range(self.n_timesteps)):
+                for t in reversed(range(t_start + 1)):
                     # normalized timestep
                     t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
+                    cond_full = torch.cat([h_sc, z_hint], dim=1)
 
                     # Îµ-pred with CF guidance (denoiser in inference mode â†’ tiny memory)
                     with torch.inference_mode():
-                        eps_c = _denoise_eps(z_t, t_norm, h_sc)
-                        eps_u = _denoise_eps(z_t, t_norm, torch.zeros_like(h_sc))
+                        eps_c = _denoise_eps(z_t, t_norm, cond_full) #changed from h_sc to cond_full, comment for later revision
+                        eps_u = _denoise_eps(z_t, t_norm, torch.zeros_like(cond_full))
                         eps_pred = (1.0 + guidance_scale) * eps_c - guidance_scale * eps_u
+                        # eps_pred = eps_u + guidance_scale * (eps_c - eps_u)
 
                     # DDPM reverse mean (same as your old code)
                     alpha_t = self.noise_schedule['alphas'][t]

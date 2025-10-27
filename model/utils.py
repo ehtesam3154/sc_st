@@ -220,6 +220,23 @@ class GraphVAEDecoder(nn.Module):
         """
         coords = self.decoder(z)
         return coords
+    
+# class GraphVAEDecoder(nn.Module):
+#     def __init__(self, latent_dim, hidden_dim, output_dim=8):
+#         super().__init__()
+#         self.decoder = nn.Sequential(
+#             nn.Linear(latent_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, output_dim)
+#         )
+    
+#     def forward(self, z):
+#         g = self.decoder(z)
+#         # L2-normalize to unit sphere (prevents norm explosion)
+#         g = g / (g.norm(dim=1, keepdim=True) + 1e-8)
+#         return g
 
 def precompute_knn_edges(coords, k=30, device='cuda'):
     """
@@ -1025,3 +1042,5 @@ def precompute_knn_edges_from_features(
     edge_index = torch.tensor(np.vstack([src, dst]), dtype=torch.long, device=device)
     edge_weight = torch.tensor(w, dtype=torch.float32, device=device)
     return edge_index, edge_weight
+
+                

@@ -15,6 +15,7 @@ from torch_geometric.nn import GCNConv, global_mean_pool
 from torch_geometric.data import Data
 from model.utils import *
 import pandas as pd
+from torch.utils.data import DataLoader, TensorDataset
 
 class AdvancedHierarchicalDiffusion(nn.Module):
     def __init__(
@@ -169,6 +170,9 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         use_cell_types = (cell_types_sc is not None)  # Check if SC data has cell types
         self.use_cell_types = use_cell_types
 
+        # Add after line with self.eps_cache = None
+        self.latent_denoiser_ema = None
+
         if self.num_cell_types > 0:
             self.cell_type_embedding = CellTypeEmbedding(self.num_cell_types, n_embedding[-1] // 2)
             total_feature_dim = n_embedding[-1] + n_embedding[-1] // 2
@@ -202,6 +206,17 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         # ========== GRAPH-VAE COMPONENTS (REPLACING HIERARCHICAL DIFFUSION) ==========        
         # Graph-VAE parameters
         self.latent_dim = 32  # As specified in instructions
+
+        self.structured_mask_config = {
+            'basis_type' : 'pca',
+            'clean_frac': 0.20,
+            'mask_mode': 'headtail',
+            'recompute_basis_every': 0,
+            'self_condition': True,
+            'include_mask_token': True
+        }
+
+        self.eps_cache = None
         
         # Graph-VAE Encoder (learns latent representations from ST graphs)
         self.graph_vae_encoder = GraphVAEEncoder(
@@ -260,6 +275,48 @@ class AdvancedHierarchicalDiffusion(nn.Module):
 
         # Move entire model to device
         self.to(self.device)
+
+    def register_latent_basis(self, U):
+        '''U: [d,d], columns = PCA components'''
+        self.register_buffer('latent_basis_U', U)
+        self.register_buffer('latent_basis_UT', U.t())
+
+    def to_basis(self, z):
+        '''z: [B, d] standard to basis coords'''
+        return z @ self.latent_basis_UT
+    
+    def from_basis(self, zb):
+        '''zb: [B, d] basis to statndard coords'''
+        return zb @ self.latent_basis_U
+    
+    def compute_and_register_pca_basis(self):
+        '''compute pca basis from st latents and register it'''
+        print('computing pca basis from st latents.......')
+        self.netE.eval()
+        self.graph_vae_encoder.eval()
+
+        #build ST graph
+        adj_idx, adj_w = precompute_knn_edges(self.st_coords_norm, k=30, device=self.device)
+
+        with torch.no_grad():
+            st_features_aligned = self.netE(self.st_gene_expr).float()
+            mu_st, _ = self.graph_vae_encoder(st_features_aligned, adj_idx, adj_w)
+
+            #convert to numpy for PCA
+            Z = mu_st.cpu().numpy()
+
+            #compute pca
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=Z.shape[1])
+            pca.fit(Z)
+
+            #register basis
+            U = torch.tensor(pca.components_.T, dtype=torch.float32, device=self.device)
+            self.register_latent_basis(U)
+
+            print(f'pca basis registered with shape {U.shape}')
+            print(f'explained variance ration (first 5): {pca.explained_variance_ratio_[:5]}')
+
 
     def build_noise_schedule(self, T, beta_start=1e-4, beta_end=2e-2):
         """Rebuild noise schedule when T changes"""
@@ -495,8 +552,20 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             loss_E_circle = F.kl_div(st2st, nettrue, reduction='none').sum(1).mean()
             
             # MMD loss
-            ranidx = torch.randint(0, e_seq_sc.shape[0], (min(self.mmdbatch, e_seq_sc.shape[0]),), device=self.device)
-            loss_E_mmd = self.mmd_fn(e_seq_st, e_seq_sc[ranidx])
+            # ranidx = torch.randint(0, e_seq_sc.shape[0], (min(self.mmdbatch, e_seq_sc.shape[0]),), device=self.device)
+            # loss_E_mmd = self.mmd_fn(e_seq_st, e_seq_sc[ranidx])
+
+            st_ranidx = torch.randint(0, e_seq_st.shape[0], (min(self.mmdbatch, e_seq_st.shape[0]),), device=self.device)
+            sc_ranidx = torch.randint(0, e_seq_sc.shape[0], (min(self.mmdbatch, e_seq_sc.shape[0]),), device=self.device)
+            loss_E_mmd = self.mmd_fn(e_seq_st[st_ranidx], e_seq_sc[sc_ranidx])
+
+            # st_idx = torch.randint(0, self.st_gene_expr.shape[0], (self.mmdbatch,), device=self.device)
+            # sc_idx = torch.randint(0, self.sc_gene_expr.shape[0], (self.mmdbatch,), device=self.device)
+
+            # e_seq_st = self.netE(self.st_gene_expr[st_idx], True)
+            # e_seq_sc = self.netE(self.sc_gene_expr[sc_idx], False)
+
+            # loss_E_mmd = self.mmd_fn(e_seq_st, e_seq_sc)
             
             # Total loss
             loss_E = loss_E_pred + self.alpha * loss_E_mmd + ratio * loss_E_circle
@@ -665,8 +734,14 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             # Decoder takes ONLY z (no features)
             coords_pred_st = self.graph_vae_decoder(z_st)
             
-            # 1) NO Reconstruction loss (as requested)
-            L_recon = torch.tensor(0.0, device=self.device)
+            #edge distance reconstruction 
+            i, j = adj_idx[0], adj_idx[1]
+            dist_true = (self.st_coords_norm[i] - self.st_coords_norm[j]).pow(2).sum(1).sqrt()
+            dist_pred = (coords_pred_st[i] - coords_pred_st[j]).pow(2).sum(1).sqrt()
+
+            L_edges = F.smooth_l1_loss(dist_pred, dist_true)
+            lambda_edges = 3.0
+            L_recon = lambda_edges * L_edges
 
             # 2) Normalized KL divergence (Option A - no free-bits)
             # KL per dim (positive values)
@@ -742,29 +817,6 @@ class AdvancedHierarchicalDiffusion(nn.Module):
                     f"AngleErr={mean_angle_err_deg:.2f}°")
 
         print("Graph-VAE training complete.")
-        
-        # Diagnostic: Check if decoder uses z meaningfully
-        print("\n=== DECODER DEPENDENCY DIAGNOSTIC ===")
-        with torch.no_grad():
-            # Fix features, vary z
-            mu_fixed = mu_st[:5]
-            logvar_fixed = logvar_st[:5]
-            
-            coords_samples = []
-            for _ in range(5):
-                z_sample = self.graph_vae_encoder.reparameterize(mu_fixed, logvar_fixed)
-                coords_sample = self.graph_vae_decoder(z_sample)
-                coords_samples.append(coords_sample)
-            
-            coords_stack = torch.stack(coords_samples)  # (5, 5, 2)
-            coord_variance = coords_stack.var(dim=0).mean().item()  # Average variance across samples
-            
-            print(f"Coordinate variance from z sampling: {coord_variance:.6f}")
-            if coord_variance < 1e-4:
-                print("⚠️  WARNING: Low variance suggests potential posterior collapse!")
-            else:
-                print("✅ Good: Decoder shows dependency on z")
-        print("=" * 50)
 
 
     def _compute_canonical_frame(self, X_st):
@@ -829,11 +881,86 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         
         return torch.tensor(pc1, device=self.device, dtype=torch.float32)
 
-    def train_diffusion_latent(self, n_epochs=400, lambda_struct=10.0, p_drop=0.05, posterior_temp_floor=0.3):
+    def fine_tune_decoder_boundary(self,
+                               epochs=12,
+                               batch_size=1024,
+                               lambda_hull=5.0,
+                               outlier_sigma=0.5,
+                               shuffle=True):
         """
-        Train latent-space conditional DDPM as a proper conditional prior p(z|h).
+        Fine-tunes ONLY the Graph-VAE decoder so decoded coords stay inside the ST hull.
+        - shared encoder: FROZEN
+        - graph VAE encoder: FROZEN
+        - diffusion: untouched
         """
-        print("Training latent-space diffusion model...")
+        device = self.device
+
+        # 1) Freeze everything except decoder
+        self.netE.eval()                      # conditioning stays fixed
+        for p in self.netE.parameters(): p.requires_grad_(False)
+        for p in self.graph_vae_encoder.parameters(): p.requires_grad_(False)
+        self.graph_vae_decoder.train()
+        opt_dec = torch.optim.Adam(self.graph_vae_decoder.parameters(), lr=1e-4)
+
+        # 2) ST latents (mu) and targets (coords) for recon term
+        with torch.no_grad():
+            h_st = self.netE(self.st_gene_expr).float()  # (N_st, d_embed)
+            st_adj_idx, st_adj_w = precompute_knn_edges(h_st, k=30, device=device)
+            mu_st, _ = self.graph_vae_encoder(h_st, st_adj_idx, st_adj_w)   # (N_st, d_z)
+            Y_st     = self.st_coords_norm                                   # (N_st, 2)
+
+        ds = torch.utils.data.TensorDataset(mu_st.detach(), Y_st.detach())
+        batch_size = min(batch_size, len(mu_st))  # Auto-adjust if batch_size > dataset_size
+        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
+
+        # 3) Precompute convex-hull penalty over pooled ST coords (differentiable)
+        E_hull = make_hull_penalty(self.st_coords_norm.detach().cpu().numpy(), device)
+
+        # 4) Training loop
+        for epoch in range(epochs):
+            running = []
+            for mu_batch, y_true in dl:
+                mu_batch = mu_batch.to(device)
+                y_true   = y_true.to(device)
+
+                # a) standard recon on in-support latents
+                y_hat = self.graph_vae_decoder(mu_batch)
+                loss_recon = torch.mean((y_hat - y_true) ** 2)
+
+                # b) "outlier" latents to shape decoder outside training support (no targets)
+                #    (keep small; only teaches decoder to stay inside hull)
+                z_out = mu_batch + outlier_sigma * torch.randn_like(mu_batch)
+                y_out = self.graph_vae_decoder(z_out)
+                loss_hull = E_hull(y_out)
+
+                loss = loss_recon + lambda_hull * loss_hull
+
+                opt_dec.zero_grad()
+                loss.backward()
+                opt_dec.step()
+
+                running.append([loss_recon.item(), loss_hull.item(), loss.item()])
+
+            rec, hul, tot = np.array(running).mean(axis=0)
+            print(f"[decoder FT] epoch {epoch+1:02d}/{epochs}  "
+                f"recon={rec:.4f}  hull={hul:.4f}  total={tot:.4f}")
+
+        self.graph_vae_decoder.eval()
+        print("✅ Decoder fine-tune done (encoder + diffusion unchanged).")
+
+    def train_diffusion_latent(self, n_epochs=400, lambda_struct=3.0, p_drop_max=0.05, 
+                            posterior_temp_floor=0.3, struct_warmup_epochs=None, save_every=100):
+        """
+        Train latent-space conditional DDPM with structured masking and structure loss.
+        """
+        print("Training latent-space diffusion model with structure loss...")
+        
+        # Import EMA
+        from torch.optim.swa_utils import AveragedModel
+        
+        # Ensure basis is registered
+        if not hasattr(self, 'latent_basis_U'):
+            self.compute_and_register_pca_basis()
         
         # Freeze encoder and Graph-VAE encoder
         self.netE.eval()
@@ -843,134 +970,169 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         for param in self.graph_vae_encoder.parameters():
             param.requires_grad = False
         
-        # Precompute fixed ST latents as specified
+        # Precompute fixed ST latents
         print("Computing fixed ST latents...")
         st_adj_idx, st_adj_w = precompute_knn_edges(self.st_coords_norm, k=30, device=self.device)
         
         with torch.no_grad():
             st_features_aligned = self.netE(self.st_gene_expr).float()
             st_mu, st_logvar = self.graph_vae_encoder(st_features_aligned, st_adj_idx, st_adj_w)
-            # z_st = self.graph_vae_encoder.reparameterize(st_mu, st_logvar)
         
-        # Setup optimizer for latent denoiser
-        optimizer_latent = torch.optim.AdamW(
+        # Setup optimizer and EMA
+        optimizer = torch.optim.AdamW(
             self.latent_denoiser.parameters(), 
             lr=self.optimizer_diff.param_groups[0]['lr'], 
             weight_decay=1e-5
         )
-        scheduler_latent = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer_latent, T_max=n_epochs, eta_min=1e-6
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=n_epochs, eta_min=1e-6
         )
         
-        # Training loop - identical to old train_diffusion but in latent space
-        best_loss = float('inf')
+        # Initialize EMA
+        ema = AveragedModel(self.latent_denoiser, avg_fn=None)
+        
+        # Get mask parameters
+        cfg = self.structured_mask_config
+        d = self.latent_dim
+        K = max(1, int(cfg['clean_frac'] * d))
+        
+        # Warmups
+        if struct_warmup_epochs is None:
+            struct_warmup_epochs = int(0.4 * n_epochs)
+        
+        # Optional: learned null condition (better than zeros)
+        if not hasattr(self, "null_cond"):
+            with torch.no_grad():
+                null_init = st_features_aligned.mean(0, keepdim=True)
+            self.null_cond = nn.Parameter(null_init)  # trainable
         
         # Training loop
         for epoch in range(n_epochs):
-            # Sample batch indices
-            idx = torch.randperm(len(st_mu))[:self.batch_size]
+            # Batch indices
+            B = min(self.batch_size, st_mu.shape[0])
+            idx = torch.randperm(st_mu.shape[0], device=self.device)[:B]
             batch_mu = st_mu[idx]
             batch_logvar = st_logvar[idx]
             batch_h = st_features_aligned[idx]
+            coords_true = self.st_coords_norm[idx]  # True coordinates for structure loss
             
-            # Sample FRESH z0 from posterior (with temperature floor)
+            # Sample z0 from posterior with temperature floor
             eps0 = torch.randn_like(batch_mu)
             posterior_std = torch.sqrt(torch.exp(batch_logvar) + posterior_temp_floor**2)
-            z0 = batch_mu + posterior_std * eps0
+            z0_std = batch_mu + posterior_std * eps0
             
-            # Sample random timesteps
-            t = torch.randint(0, self.n_timesteps, (len(z0),), device=self.device)
+            # Transform to basis coordinates
+            z0_b = self.to_basis(z0_std)
             
-            # Forward diffusion: add noise to z0
-            eps = torch.randn_like(z0)
+            # Create structured mask (headtail mode)
+            M = torch.zeros_like(z0_b)
+            M[:, K:] = 1.0  # mask the tail dimensions
+            
+            # Sample timesteps
+            t = torch.randint(0, self.n_timesteps, (B,), device=self.device)
+            
+            # Forward diffusion only on masked dims
+            eps = torch.randn_like(z0_b)
             alpha_bar_t = self.noise_schedule['alphas_cumprod'][t].view(-1, 1)
-            z_t = torch.sqrt(alpha_bar_t) * z0 + torch.sqrt(1 - alpha_bar_t) * eps
             
-            # Classifier-free guidance: randomly drop conditioning
-            cond = batch_h.clone()
-            drop_mask = (torch.rand(len(cond), 1, device=self.device) < p_drop).float()
-            cond = cond * (1 - drop_mask)  # Zero out dropped rows
+            z_t = z0_b.clone()
+            z_t[:, K:] = torch.sqrt(alpha_bar_t) * z0_b[:, K:] + torch.sqrt(1 - alpha_bar_t) * eps[:, K:]
             
-            # Predict noise
+            # ----- condition dropout (linear warmup) -----
+            p_drop = p_drop_max * min(epoch / max(1, struct_warmup_epochs), 1.0)
+            drop_mask = (torch.rand(B, 1, device=self.device) >= p_drop).float()
+            cond_h = torch.where(drop_mask.bool(), batch_h, self.null_cond.expand_as(batch_h))
+            
+            # Build conditioning dict
+            cond = {
+                'h_shared': cond_h,
+                'z_clean': z0_b[:, :K],
+                'mask_head': K,
+                'mask_vec': M if cfg['include_mask_token'] else None,
+                'eps_prev': torch.zeros_like(z0_b)  # No self-conditioning during training
+            }
+            
+            # Predict noise in basis space
             t_norm = (t.float().unsqueeze(1) / max(self.n_timesteps - 1, 1)).clamp(0, 1)
-            # t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
-
             eps_pred = self.latent_denoiser(z_t, t_norm, cond)
-
-            # v_tgt = torch.sqrt(alpha_bar_t) * eps - torch.sqrt(1 - alpha_bar_t) * z0
-            # v_pred = self.latent_denoiser(z_t, t_norm, cond)
             
-            # Diffusion loss
-            loss_diffusion = F.mse_loss(eps_pred, eps)
-            # loss_diffusion = F.mse_loss(v_pred, v_tgt)
-
+            # Masked diffusion loss: only on masked dimensions
+            loss_diffusion = F.mse_loss(eps_pred[:, K:], eps[:, K:])
             
-            # Structure loss on x0 (denoised latent)
-            loss_struct = torch.tensor(0.0, device=self.device)
-            if lambda_struct > 0:
-                # Predict x0 from eps_pred
-                x0_pred = (z_t - torch.sqrt(1 - alpha_bar_t) * eps_pred) / torch.sqrt(alpha_bar_t + 1e-8)
-                
-                # Preserve latent geometry
-                D_target = torch.cdist(z0, z0, p=2)
-                D_pred = torch.cdist(x0_pred, x0_pred, p=2)
-                loss_struct = F.mse_loss(D_pred, D_target)
+            # ---- structure-aware loss (decode x0, match edge distances) ----
+            with torch.no_grad():
+                # kNN edges for THIS batch (keeps indices local to [0..B-1])
+                batch_edge_idx, _ = precompute_knn_edges(coords_true.detach(), k=30, device=self.device)
+            i, j = batch_edge_idx[0], batch_edge_idx[1]
             
-            # Total loss
-            # total_loss = loss_diffusion + lambda_struct * loss_struct
-            total_loss = loss_diffusion
-
-            # Record losses for plotting
-            self.latent_diffusion_losses['total'].append(total_loss.item())
-            self.latent_diffusion_losses['diffusion'].append(loss_diffusion.item())
-            self.latent_diffusion_losses['struct'].append(loss_struct.item() if isinstance(loss_struct, torch.Tensor) else loss_struct)
-            self.latent_diffusion_losses['epochs'].append(epoch)
+            # x0 prediction in basis space and decoding
+            sqrt_ab = torch.sqrt(alpha_bar_t)
+            sqrt_1m = torch.sqrt(1.0 - alpha_bar_t)
             
-            # Backward pass
-            optimizer_latent.zero_grad()
+            # Predict z0 in basis space (only update masked dims)
+            z0_pred = z_t.clone()
+            z0_pred[:, K:] = (z_t[:, K:] - sqrt_1m * eps_pred[:, K:]) / (sqrt_ab + 1e-8)
+            
+            # Transform back to standard latent space and decode
+            z0_pred_std = self.from_basis(z0_pred)
+            coords_pred = self.graph_vae_decoder(z0_pred_std)
+            
+            # Edge distances
+            dist_true = (coords_true[i] - coords_true[j]).pow(2).sum(1).sqrt()
+            dist_pred = (coords_pred[i] - coords_pred[j]).pow(2).sum(1).sqrt()
+            L_struct = F.smooth_l1_loss(dist_pred, dist_true)
+            
+            # Warm up structure weight: 0 → lambda_struct
+            lambda_struct_current = lambda_struct * min(epoch / max(1, struct_warmup_epochs), 1.0)
+            
+            total_loss = loss_diffusion + lambda_struct_current * L_struct
+            
+            # Record losses
+            self.latent_diffusion_losses.setdefault('total', []).append(total_loss.item())
+            self.latent_diffusion_losses.setdefault('diffusion', []).append(loss_diffusion.item())
+            self.latent_diffusion_losses.setdefault('struct', []).append(L_struct.item())
+            self.latent_diffusion_losses.setdefault('lambda_struct', []).append(lambda_struct_current)
+            self.latent_diffusion_losses.setdefault('epochs', []).append(epoch)
+            
+            # Backprop
+            optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.latent_denoiser.parameters(), 1.0)
-            optimizer_latent.step()
-            scheduler_latent.step()
+            optimizer.step()
+            ema.update_parameters(self.latent_denoiser)
+            scheduler.step()
             
-            # Logging
-            if epoch % 500 == 0:
-                ls = float(loss_struct) if isinstance(loss_struct, torch.Tensor) else loss_struct
-                log_msg = (
-                    f"Latent Diffusion epoch {epoch}/{n_epochs}, "
-                    f"Total: {total_loss.item():.6f}, "
-                    f"Diffusion: {loss_diffusion.item():.6f}, "
-                    f"Struct: {ls:.6f}"
-                )
-                print(log_msg)
+            # Logs / checkpoints
+            if (epoch % save_every) == 0:
+                msg = (f"[latent-diff] epoch {epoch}/{n_epochs}  "
+                    f"loss={total_loss.item():.6f}  "
+                    f"diff={loss_diffusion.item():.6f}  "
+                    f"struct={L_struct.item():.6f}  "
+                    f"λ_struct={lambda_struct_current:.3f}  p_drop={p_drop:.3f}")
+                print(msg)
                 with open(self.train_log, 'a') as f:
-                    f.write(log_msg + '\n')
-
-            
-            # Save checkpoint
-            if epoch % 500 == 0:
+                    f.write(msg + "\n")
                 torch.save({
                     'epoch': epoch,
                     'latent_denoiser_state_dict': self.latent_denoiser.state_dict(),
-                    'optimizer_state_dict': optimizer_latent.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
                 }, os.path.join(self.outf, f'latent_diffusion_checkpoint_epoch_{epoch}.pt'))
         
-        # Save final model
-        torch.save({
-            'latent_denoiser_state_dict': self.latent_denoiser.state_dict(),
-        }, os.path.join(self.outf, 'final_latent_diffusion.pt'))
+        # Save final weights
+        torch.save({'latent_denoiser_state_dict': self.latent_denoiser.state_dict()},
+                os.path.join(self.outf, 'final_latent_diffusion.pt'))
+        torch.save({'latent_denoiser_state_dict': ema.module.state_dict()},
+                os.path.join(self.outf, 'final_latent_diffusion_ema.pt'))
+        self.latent_denoiser_ema = ema.module
         
-        print("Latent diffusion training complete!")
+        print("Latent diffusion training with structure loss complete!")
                         
 
     def train(self, encoder_epochs=1000, vae_epochs=800, diffusion_epochs=400, **kwargs):
-        """
-        Combined training pipeline: encoder → graph_vae → diffusion_latent
-        ⚠️ Do **not** touch `train_encoder`; its aligned embeddings are the sole conditioning signal throughout.
-        """
+        """Combined training pipeline: encoder → graph_vae → diffusion_latent"""
         print("Starting Graph-VAE + Latent Diffusion training pipeline...")
         
-        # Stage 1: Train encoder (DO NOT MODIFY - keep existing train_encoder)
+        # Stage 1: Train encoder
         print("Stage 1: Training domain alignment encoder...")
         self.train_encoder(n_epochs=encoder_epochs)
         
@@ -978,7 +1140,11 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         print("Stage 2: Training Graph-VAE...")
         self.train_graph_vae(epochs=vae_epochs)
         
-        # Stage 3: Train latent diffusion
+        # Stage 2.5: Compute PCA basis after VAE training
+        print("Stage 2.5: Computing PCA basis...")
+        self.compute_and_register_pca_basis()
+        
+        # Stage 3: Train latent diffusion with structured masking
         print("Stage 3: Training latent diffusion...")
         self.train_diffusion_latent(n_epochs=diffusion_epochs, **kwargs)
         
@@ -1112,22 +1278,110 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         
         return coords_final
 
-    def sample_sc_coordinates_batched(self, batch_size=512, guidance_scale=1.0, refine_coords=True, refinement_tau=0.9):
+    # def sample_sc_coordinates_batched(self, batch_size=512, guidance_scale=1.0, refine_coords=True, refinement_tau=0.9):
+    #     """
+    #     Sample SC coordinates using pure noise → guided denoising → decode.
+    #     No Graph-VAE latents used during sampling.
+    #     """
+    #     n_total = len(self.sc_gene_expr)
+    #     print(f"Sampling {n_total} SC coordinates using pure noise → guided diffusion → decode...")
+    #     print(f"Using guidance scale: {guidance_scale}")
+        
+    #     # Set models to eval mode
+    #     self.netE.eval()
+    #     self.graph_vae_decoder.eval()
+    #     self.latent_denoiser.eval()
+        
+    #     # Update noise schedule for current n_timesteps
+    #     self.update_noise_schedule()
+        
+    #     all_coords = []
+    #     n_batches = (n_total + batch_size - 1) // batch_size
+        
+    #     with torch.no_grad():
+    #         for batch_idx in range(n_batches):
+    #             start_idx = batch_idx * batch_size
+    #             end_idx = min(start_idx + batch_size, n_total)
+    #             batch_sc_expr = self.sc_gene_expr[start_idx:end_idx]
+                
+    #             print(f"Processing batch {batch_idx + 1}/{n_batches} ({len(batch_sc_expr)} cells)...")
+                
+    #             # Get aligned SC embeddings
+    #             h_sc = self.netE(batch_sc_expr).float()
+    #             B = h_sc.size(0)
+                
+    #             # Start from PURE NOISE in latent space
+    #             z_t = torch.randn(B, self.latent_dim, device=self.device)
+                
+    #             # Reverse diffusion with classifier-free guidance
+    #             for t in reversed(range(self.n_timesteps)):
+    #                 # t_norm = torch.full((B, 1), t / (self.n_timesteps - 1), device=self.device)
+    #                 t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
+                    
+    #                 # Classifier-free guidance: conditional and unconditional predictions
+    #                 eps_c = self.latent_denoiser(z_t, t_norm, h_sc)
+    #                 eps_u = self.latent_denoiser(z_t, t_norm, torch.zeros_like(h_sc))
+    #                 eps_pred = (1 + guidance_scale) * eps_c - guidance_scale * eps_u
+
+    #                 # eps_pred = eps_pred.view(B, self.latent_dim)
+                    
+    #                 # DDPM reverse step
+    #                 alpha_t = self.noise_schedule['alphas'][t]
+    #                 alpha_bar_t = self.noise_schedule['alphas_cumprod'][t]
+    #                 beta_t = self.noise_schedule['betas'][t]
+                    
+    #                 # Compute mean
+    #                 mu = (1 / torch.sqrt(alpha_t)) * (
+    #                     z_t - ((1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)) * eps_pred
+    #                 )
+
+    #                 # mu = mu.view(B, self.latent_dim)
+                    
+    #                 if t > 0:
+    #                     # Add noise (use posterior variance for better sampling)
+    #                     sigma_t = torch.sqrt(self.noise_schedule['posterior_variance'][t])
+    #                     noise = torch.randn_like(z_t)
+    #                     z_t = mu + sigma_t * noise
+    #                 else:
+    #                     z_t = mu
+                
+    #             # Decode final latent to coordinates (z ONLY, no features)
+    #             batch_coords = self.graph_vae_decoder(z_t)
+
+                
+    #             # Move to CPU and store
+    #             all_coords.append(batch_coords.cpu()) 
+                
+    #             # Clear GPU cache
+    #             torch.cuda.empty_cache()
+        
+    #     # Combine all batches
+    #     final_coords = torch.cat(all_coords, dim=0)
+
+    #     # Scale-free coordinate refinement on ALL coordinates
+    #     if refine_coords:
+    #         print("Applying scale-free refinement to all coordinates...")
+    #         # Convert back to tensor on device for refinement
+    #         coords_tensor = final_coords.to(self.device)
+    #         refined_coords = self.refine_coordinates_scale_free(coords_tensor, tau=refinement_tau)
+    #         final_coords = refined_coords.cpu()
+        
+    #     print("Pure noise → guided diffusion → decode sampling complete!")
+    #     return final_coords.cpu().numpy()
+    
+    def sample_sc_coordinates_batched(self, batch_size=512):
         """
-        Sample SC coordinates using pure noise → guided denoising → decode.
-        No Graph-VAE latents used during sampling.
+        Batched version of sample_sc_coordinates to handle memory constraints.
+        ⚠️ Do **not** touch `train_encoder`; its aligned embeddings are the sole conditioning signal throughout.
         """
         n_total = len(self.sc_gene_expr)
-        print(f"Sampling {n_total} SC coordinates using pure noise → guided diffusion → decode...")
-        print(f"Using guidance scale: {guidance_scale}")
+        print(f"Sampling {n_total} SC coordinates using Graph-VAE + Latent Diffusion (batched)...")
         
         # Set models to eval mode
         self.netE.eval()
+        self.graph_vae_encoder.eval()
         self.graph_vae_decoder.eval()
         self.latent_denoiser.eval()
-        
-        # Update noise schedule for current n_timesteps
-        self.update_noise_schedule()
         
         all_coords = []
         n_batches = (n_total + batch_size - 1) // batch_size
@@ -1140,223 +1394,280 @@ class AdvancedHierarchicalDiffusion(nn.Module):
                 
                 print(f"Processing batch {batch_idx + 1}/{n_batches} ({len(batch_sc_expr)} cells)...")
                 
-                # Get aligned SC embeddings
-                h_sc = self.netE(batch_sc_expr).float()
-                B = h_sc.size(0)
+                # Get aligned SC embeddings for this batch
+                sc_features_aligned = self.netE(batch_sc_expr).float()
                 
-                # Start from PURE NOISE in latent space
-                z_t = torch.randn(B, self.latent_dim, device=self.device)
+                # Build SC graph for this batch in expression space
+                sc_adj_idx, sc_adj_w = precompute_knn_edges(batch_sc_expr, k=30, device=self.device)
                 
-                # Reverse diffusion with classifier-free guidance
+                # Get SC latents using Graph-VAE encoder
+                sc_mu, sc_logvar = self.graph_vae_encoder(sc_features_aligned, sc_adj_idx, sc_adj_w)
+                z_sc = self.graph_vae_encoder.reparameterize(sc_mu, sc_logvar)
+                
+                # ENSURE z_sc is 2D
+                if z_sc.dim() > 2:
+                    z_sc = z_sc.squeeze()
+                
+                # Initialize random noise in latent space
+                # z_t = torch.randn_like(z_sc)
+                # Instead of starting from pure random noise, start from noised Graph-VAE latents
+                eps = torch.randn_like(z_sc)
+                alpha_bar_T = self.noise_schedule['alphas_cumprod'][self.n_timesteps - 1]  # ᾱ_T (final timestep)
+                z_t = (alpha_bar_T.sqrt() * z_sc) + ((1 - alpha_bar_T).sqrt() * eps)
+                
+                # Reverse diffusion process in latent space
                 for t in reversed(range(self.n_timesteps)):
-                    # t_norm = torch.full((B, 1), t / (self.n_timesteps - 1), device=self.device)
-                    t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
+                    # FIX: Use 1D timestep tensor instead of 2D
+                    t_tensor = torch.full((len(z_sc),), t / self.n_timesteps, device=self.device)
                     
-                    # Classifier-free guidance: conditional and unconditional predictions
-                    eps_c = self.latent_denoiser(z_t, t_norm, h_sc)
-                    eps_u = self.latent_denoiser(z_t, t_norm, torch.zeros_like(h_sc))
-                    eps_pred = (1 + guidance_scale) * eps_c - guidance_scale * eps_u
-
-                    # eps_pred = eps_pred.view(B, self.latent_dim)
+                    # Predict noise in latent space
+                    noise_pred = self.latent_denoiser(z_t, t_tensor, sc_features_aligned)
                     
-                    # DDPM reverse step
+                    # ENSURE noise_pred is 2D
+                    if noise_pred.dim() > 2:
+                        noise_pred = noise_pred.squeeze()
+                    
+                    # Update latent representation (standard DDPM reverse step)
                     alpha_t = self.noise_schedule['alphas'][t]
-                    alpha_bar_t = self.noise_schedule['alphas_cumprod'][t]
+                    alpha_cumprod_t = self.noise_schedule['alphas_cumprod'][t]
                     beta_t = self.noise_schedule['betas'][t]
                     
-                    # Compute mean
-                    mu = (1 / torch.sqrt(alpha_t)) * (
-                        z_t - ((1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)) * eps_pred
-                    )
-
-                    # mu = mu.view(B, self.latent_dim)
-                    
                     if t > 0:
-                        # Add noise (use posterior variance for better sampling)
-                        sigma_t = torch.sqrt(self.noise_schedule['posterior_variance'][t])
                         noise = torch.randn_like(z_t)
-                        z_t = mu + sigma_t * noise
                     else:
-                        z_t = mu
+                        noise = 0
+                        
+                    z_t = (1 / torch.sqrt(alpha_t)) * (
+                        z_t - ((1 - alpha_t) / torch.sqrt(1 - alpha_cumprod_t)) * noise_pred
+                    ) + torch.sqrt(beta_t) * noise
+                    
+                    # ENSURE z_t stays 2D
+                    if z_t.dim() > 2:
+                        z_t = z_t.squeeze()
                 
-                # Decode final latent to coordinates (z ONLY, no features)
+                    # ENSURE both inputs to decoder are 2D - FORCE CORRECT SHAPES
+                    if z_t.dim() > 2:
+                        # If z_t is [256, 256, 32], we want [256, 32] - take diagonal or first slice
+                        if z_t.shape[0] == z_t.shape[1]:  # Square matrix case
+                            # Take diagonal elements to get [256, 32]
+                            z_t = torch.diagonal(z_t, dim1=0, dim2=1).T
+                        else:
+                            z_t = z_t.squeeze()
+
+                    if sc_features_aligned.dim() > 2:
+                        sc_features_aligned = sc_features_aligned.squeeze()
+
+                    # print(f"DEBUG AFTER FIX: z_t.shape = {z_t.shape}, sc_features_aligned.shape = {sc_features_aligned.shape}")
+
+                # Decode final latent to 2D coordinates using Graph-VAE decoder
+                # batch_coords = self.graph_vae_decoder(z_t, sc_features_aligned)
                 batch_coords = self.graph_vae_decoder(z_t)
 
                 
                 # Move to CPU and store
-                all_coords.append(batch_coords.cpu()) 
+                all_coords.append(batch_coords.cpu())
                 
-                # Clear GPU cache
+                # Clear GPU cache between batches
                 torch.cuda.empty_cache()
         
         # Combine all batches
         final_coords = torch.cat(all_coords, dim=0)
-
-        # Scale-free coordinate refinement on ALL coordinates
-        if refine_coords:
-            print("Applying scale-free refinement to all coordinates...")
-            # Convert back to tensor on device for refinement
-            coords_tensor = final_coords.to(self.device)
-            refined_coords = self.refine_coordinates_scale_free(coords_tensor, tau=refinement_tau)
-            final_coords = refined_coords.cpu()
         
-        print("Pure noise → guided diffusion → decode sampling complete!")
+        # Apply coordinate normalization if needed
+        # if hasattr(self, 'coords_center') and hasattr(self, 'coords_radius'):
+        #     final_coords = self.denormalize_coordinates(final_coords)
+        
+        print("Batched sampling complete!")
         return final_coords.cpu().numpy()
     
+    from tqdm import tqdm
+
+
+    def sample_sc_coordinates_pure_diffusion(self, batch_size=512, guidance_scale=1.0, return_normalized=True):
+        """
+        Pure diffusion sampling: Start from noise → denoise → decode.
+        No Graph VAE used for SC inference at all.
+        """
+        n_total = len(self.sc_gene_expr)
+        print(f"Sampling {n_total} SC coordinates using pure latent diffusion...")
+        
+        # Set models to eval mode
+        self.netE.eval()
+        self.graph_vae_decoder.eval()  # Only for final decoding
+        self.latent_denoiser.eval()
+        self.update_noise_schedule()
+        
+        all_coords = []
+        n_batches = (n_total + batch_size - 1) // batch_size
+        
+        with torch.no_grad():
+            for batch_idx in tqdm(range(n_batches), desc="Sampling batches"):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, n_total)
+                batch_sc_expr = self.sc_gene_expr[start_idx:end_idx]
+                
+                # Get SC conditioning (gene expression embeddings only)
+                h_sc = self.netE(batch_sc_expr).float()  # (B, d_embed)
+                B = h_sc.size(0)
+                
+                # Start from PURE NOISE in latent space (no Graph VAE)
+                z_t = torch.randn(B, self.latent_dim, device=self.device)
+                
+                # Reverse diffusion with classifier-free guidance
+                for t in reversed(range(self.n_timesteps)):
+                    t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
+                    
+                    # Classifier-free guidance
+                    eps_c = self.latent_denoiser(z_t, t_norm, h_sc)          # Conditioned
+                    eps_u = self.latent_denoiser(z_t, t_norm, torch.zeros_like(h_sc))  # Unconditioned
+                    eps_pred = (1 + guidance_scale) * eps_c - guidance_scale * eps_u
+                    
+                    # DDPM reverse step
+                    alpha_t = self.noise_schedule['alphas'][t]
+                    alpha_bar_t = self.noise_schedule['alphas_cumprod'][t]
+                    
+                    mu = (1 / torch.sqrt(alpha_t)) * (
+                        z_t - ((1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)) * eps_pred
+                    )
+                    
+                    if t > 0:
+                        sigma_t = torch.sqrt(self.noise_schedule['posterior_variance'][t])
+                        z_t = mu + sigma_t * torch.randn_like(z_t)
+                    else:
+                        z_t = mu
+                
+                # Decode final latent to coordinates (decoder only)
+                batch_coords = self.graph_vae_decoder(z_t)
+                all_coords.append(batch_coords.cpu())
+                
+                torch.cuda.empty_cache()
+        
+        final_coords = torch.cat(all_coords, dim=0)
+        print(f"Pure diffusion sampling complete! Generated {final_coords.shape[0]} coordinates.")
+        if return_normalized:
+            return final_coords
+        else:
+            return self.denormalize_coordinates(final_coords)
+        
     def sample_sc_coordinates_with_geometry_guidance(
         self,
         batch_size=512,
         guidance_scale=1.0,
-        geometry_guidance=True,
-        k_nn=15, margin=0.05,
-        lambda_trip=0.05, lambda_rep=0.08, lambda_ang=0.01,
-        gamma=0.05,
-        repulsion_sigma=None,
-        temp_sigma=1.0,          # optional diversity on reverse noise (1.0 = off)
-        denoiser_chunk=None,     # e.g., 256 if denoiser is big; None = full batch
+        geometry_guidance=False,  # Set to False to ignore geometry guidance
+        return_normalized = False,
+        **kwargs  # Ignore other geometry parameters
     ):
         """
-        ε-prediction sampler with geometry guidance and tight memory use.
-        Uses the denoising logic from `sample_sc_coordinates_batched`.
+        Sample SC coordinates using structured masking + conditional latent diffusion.
         """
         n_total = len(self.sc_gene_expr)
-        print(f"Sampling {n_total} SC coordinates (geom_guidance={geometry_guidance}, k={k_nn})")
-        # eval + schedule
-        self.netE.eval(); self.graph_vae_encoder.eval()
-        self.graph_vae_decoder.eval(); self.latent_denoiser.eval()
+        print(f"Sampling {n_total} SC coordinates using structured masking...")
+        print(f"Using guidance scale: {guidance_scale}")
+        
+        # Ensure basis is registered
+        if not hasattr(self, 'latent_basis_U'):
+            self.compute_and_register_pca_basis()
+        
+        # Set models to eval mode
+        self.netE.eval()
+        self.graph_vae_encoder.eval()
+        self.graph_vae_decoder.eval()
+        self.latent_denoiser.eval()
+        
         self.update_noise_schedule()
-
-        # ---- repulsion scale from ST once (cheap; subsample if ST is huge) ----
-        if geometry_guidance and repulsion_sigma is None:
-            with torch.no_grad():
-                n_sub = min(1024, self.st_coords_norm.shape[0])
-                idx = torch.randperm(self.st_coords_norm.shape[0], device=self.device)[:n_sub]
-                st_sub = self.st_coords_norm[idx]
-                D = torch.cdist(st_sub, st_sub)                              # (n_sub, n_sub)
-                # 5-NN distance (k=6 incl. self)
-                kth = torch.kthvalue(D, 6, dim=1).values
-                repulsion_sigma = (kth.median().item() / 2.5) or 0.1
-            # free temp tensor
-            del D
-
-        # optional micro-batched denoiser to cap peak activation memory
-        def _denoise_eps(z, tnorm, cond):
-            if denoiser_chunk is None:
-                return self.latent_denoiser(z, tnorm, cond)
-            outs = []
-            for i in range(0, z.size(0), denoiser_chunk):
-                outs.append(self.latent_denoiser(z[i:i+denoiser_chunk], tnorm[i:i+denoiser_chunk], cond[i:i+denoiser_chunk]))
-            return torch.cat(outs, dim=0)
-
+        
+        # Get mask parameters
+        cfg = self.structured_mask_config
+        d = self.latent_dim
+        K = max(1, int(cfg['clean_frac'] * d))
+        
         all_coords = []
         n_batches = (n_total + batch_size - 1) // batch_size
-
-        with torch.no_grad():  # keep denoiser & DDPM math gradient-free
-            for b in range(n_batches):
-                s = b * batch_size
-                e = min(s + batch_size, n_total)
-                batch_sc_expr = self.sc_gene_expr[s:e]
-
-                # conditioning embedding
-                h_sc = self.netE(batch_sc_expr).float()           # (B, d_embed)
+        
+        with torch.no_grad():
+            for batch_idx in tqdm(range(n_batches), desc="Sampling batches", unit="batch"):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, n_total)
+                batch_sc_expr = self.sc_gene_expr[start_idx:end_idx]
+                
+                # Get aligned SC embeddings and latents
+                h_sc = self.netE(batch_sc_expr).float()
                 B = h_sc.size(0)
-
-                # --- kNN once per batch (embedding space) ---
-                D_h = torch.cdist(h_sc, h_sc)                     # (B, B) ~ 1 MB when B=512
-                nn_idx = D_h.topk(k=k_nn+1, largest=False).indices[:, 1:]    # (B, k)
-                far_idx = D_h.topk(k=1, largest=True).indices.squeeze(1)     # (B,)
-
-                # --- baseline for tiny angle anchor (SC kNN graph; cheap) ---
+                
+                # Get SC latent means and transform to basis
                 sc_adj_idx, sc_adj_w = precompute_knn_edges(h_sc, k=30, device=self.device)
-                mu_sc, _ = self.graph_vae_encoder(h_sc, sc_adj_idx, sc_adj_w)  # (B, d_z)
-                y_base = self.graph_vae_decoder(mu_sc)                         # (B, 2)
-
-                # init from noise in latent space
-                z_t = torch.randn(B, self.latent_dim, device=self.device)
-
-                # -------- reverse diffusion (ε-pred, classifier-free) --------
+                mu_sc, _ = self.graph_vae_encoder(h_sc, sc_adj_idx, sc_adj_w)
+                z_b_cleanfull = self.to_basis(mu_sc)
+                
+                # Create mask
+                M = torch.zeros_like(z_b_cleanfull)
+                M[:, K:] = 1.0
+                
+                # Initialize x_T: clean block fixed, masked dims ~ N(0,1)
+                x_t = z_b_cleanfull.clone()
+                x_t[:, K:] = torch.randn_like(x_t[:, K:])
+                
+                # Reverse diffusion
                 for t in reversed(range(self.n_timesteps)):
-                    # normalized timestep
                     t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
-
-                    # ε-pred with CF guidance (denoiser in inference mode → tiny memory)
-                    with torch.inference_mode():
-                        eps_c = _denoise_eps(z_t, t_norm, h_sc)
-                        eps_u = _denoise_eps(z_t, t_norm, torch.zeros_like(h_sc))
-                        eps_pred = (1.0 + guidance_scale) * eps_c - guidance_scale * eps_u
-
-                    # DDPM reverse mean (same as your old code)
+                    
+                    # Build conditioning
+                    cond = {
+                        'h_shared': h_sc,
+                        'z_clean': z_b_cleanfull[:, :K],
+                        'mask_head': K,
+                        'mask_vec': M if cfg['include_mask_token'] else None,
+                        'eps_prev': self.eps_cache[:B] if cfg['self_condition'] and hasattr(self, 'eps_cache') and self.eps_cache is not None else torch.zeros_like(x_t)
+                    }
+                    
+                    # Classifier-free guidance
+                    eps_c = self.latent_denoiser(x_t, t_norm, cond)
+                    cond_zero = cond.copy()
+                    cond_zero['h_shared'] = torch.zeros_like(h_sc)
+                    eps_u = self.latent_denoiser(x_t, t_norm, cond_zero)
+                    eps_pred = (1.0 + guidance_scale) * eps_c - guidance_scale * eps_u
+                    
+                    # DDPM reverse step (only on masked dims)
                     alpha_t = self.noise_schedule['alphas'][t]
                     alpha_bar_t = self.noise_schedule['alphas_cumprod'][t]
-                    mu = (1.0 / torch.sqrt(alpha_t)) * (
-                        z_t - ((1.0 - alpha_t) / torch.sqrt(1.0 - alpha_bar_t)) * eps_pred
+                    
+                    # Predict x0 on masked block
+                    x0_masked = (x_t[:, K:] - torch.sqrt(1 - alpha_bar_t) * eps_pred[:, K:]) / torch.sqrt(alpha_bar_t + 1e-8)
+                    
+                    # Compute mean of reverse process on masked block
+                    mean_masked = (1 / torch.sqrt(alpha_t)) * (
+                        x_t[:, K:] - ((1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)) * eps_pred[:, K:]
                     )
-
-                    # ---- geometry guidance: tiny grad block on decoder only ----
-                    if geometry_guidance and t > 0:
-                        with torch.enable_grad():
-                            z_tmp = mu.detach().requires_grad_(True)
-                            y_t = self.graph_vae_decoder(z_tmp)               # (B,2)
-
-                            # Triplet hinge on decoded coords (neighbors only)
-                            yi = y_t
-                            yj = yi[nn_idx]                                   # (B,k,2)
-                            yk = yi[far_idx].unsqueeze(1).expand_as(yj)       # (B,k,2)
-                            d_pos = (yi.unsqueeze(1) - yj).norm(dim=2)        # (B,k)
-                            d_neg = (yi.unsqueeze(1) - yk).norm(dim=2)        # (B,k)
-                            L_trip = torch.relu(d_pos + margin - d_neg).mean()
-
-                            # Sparse repulsion: only neighbor pairs (avoid O(B^2))
-                            rows = torch.arange(B, device=self.device).unsqueeze(1).expand(-1, k_nn)
-                            yi_n = yi[rows.reshape(-1)]                       # (B*k, 2)
-                            yj_n = yi[nn_idx.reshape(-1)]                     # (B*k, 2)
-                            d2_n = (yi_n - yj_n).pow(2).sum(dim=1)            # (B*k,)
-                            E_rep = torch.exp(-d2_n / (2 * (repulsion_sigma ** 2))).sum()
-
-                            # Light angular anchor vs baseline
-                            theta  = torch.atan2(y_t[:, 1], y_t[:, 0])
-                            theta0 = torch.atan2(y_base[:, 1], y_base[:, 0])
-                            E_ang = (1 - torch.cos(theta - theta0)).mean()
-
-                            E_geo = lambda_trip * L_trip + lambda_rep * E_rep + lambda_ang * E_ang
-                            g = torch.autograd.grad(E_geo, z_tmp, retain_graph=False, create_graph=False)[0]
-                            g = g / (g.norm(dim=1, keepdim=True) + 1e-8)
-
-                        # subtract grad (minimize geometry energy) and detach to cut graph
-                        mu = (mu - gamma * g).detach()
-
-                    # add noise with posterior variance (optionally temperature-scaled)
+                    
                     if t > 0:
-                        sigma_post = torch.sqrt(self.noise_schedule['posterior_variance'][t])
-                        z_t = mu + sigma_post * temp_sigma * torch.randn_like(z_t)
+                        # Add noise (posterior variance)
+                        sigma_t = torch.sqrt(self.noise_schedule['posterior_variance'][t])
+                        noise = torch.randn_like(x_t[:, K:])
+                        x_t[:, K:] = mean_masked + sigma_t * noise
                     else:
-                        z_t = mu
-
-                # decode final latent → coords (z only)
-                batch_coords = self.graph_vae_decoder(z_t)
+                        x_t[:, K:] = mean_masked
+                    
+                    # Update self-conditioning cache
+                    if cfg['self_condition']:
+                        self.eps_cache = eps_pred.detach()
+                
+                # Transform back to standard latent coords and decode
+                z0_std = self.from_basis(x_t)
+                batch_coords = self.graph_vae_decoder(z0_std)
                 all_coords.append(batch_coords.cpu())
-
-                # free short-lived tensors
-                del D_h, nn_idx, far_idx, sc_adj_idx, sc_adj_w, mu_sc, y_base, z_t
+                
                 torch.cuda.empty_cache()
+        
+        final_coords = torch.cat(all_coords, dim=0)
+        print(f"Generated {final_coords.shape[0]} SC coordinates using structured masking.")
+        
+        if return_normalized:
+            return final_coords
+        else:
+            return self.denormalize_coordinates(final_coords)
 
-        coords_final = torch.cat(all_coords, dim=0)
-        print(f"Generated {coords_final.shape[0]} SC coordinates.")
-        return coords_final
-        # return self._denorm_self(coords_final)
     
-    @torch.no_grad()
-    def _denorm_self(self, coords_norm: torch.Tensor, target_center=None, target_radius=None) -> torch.Tensor:
-        """
-        Recenter on SC itself; scale by target_radius (default=1.0).
-        No ST dependency unless you choose target_radius tied to ST elsewhere.
-        """
-        c_sc = coords_norm.mean(dim=0, keepdim=True)                  # (1,2)
-        x0 = coords_norm - c_sc                                       # recenter
-        R = 1.0 if target_radius is None else float(target_radius)
-        t = torch.zeros_like(c_sc) if target_center is None else torch.as_tensor(target_center, device=coords_norm.device).view(1,2)
-        return x0 * R + t
-    
+        
 
     def denormalize_coordinates(self, normalized_coords):
         '''convert normalized coords back to original scale'''

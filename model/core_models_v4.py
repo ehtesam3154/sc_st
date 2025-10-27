@@ -16,6 +16,8 @@ from torch_geometric.data import Data
 from model.utils import *
 import pandas as pd
 from torch.utils.data import DataLoader, TensorDataset
+import math
+
 
 class AdvancedHierarchicalDiffusion(nn.Module):
     def __init__(
@@ -46,7 +48,8 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         num_heads=8,
         num_hierarchical_scales=3,
         dp=0.1,
-        outf='output'
+        outf='output',
+        slide_labels = None, **kwargs
     ):
         super().__init__()
 
@@ -215,11 +218,14 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             latent_dim=self.latent_dim,
             hidden_dim=128  # Remove condition_dim
         ).to(device)
+
+        #adapter: embedding to latent
+        self.cond_adapter = ConditionAdapter(n_embedding[-1], self.latent_dim).to(device)
         
         # Latent Denoiser (replaces hierarchical_blocks)
         self.latent_denoiser = LatentDenoiser(
             latent_dim=self.latent_dim,
-            condition_dim=n_embedding[-1],
+            condition_dim=n_embedding[-1] + self.latent_dim, #to accomodate cond adapater
             hidden_dim=hidden_dim,
             n_blocks=n_denoising_blocks
         ).to(device)
@@ -259,6 +265,45 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         # MMD Loss for domain alignment
         self.mmd_loss = MMDLoss()
 
+        #embeddong condition whitening (fit on ST and freeze as buffers)
+        with torch.no_grad():
+            F_st = self.netE(self.st_gene_expr).float()
+            mu_c = F_st.mean(0, keepdim=True)
+            C = torch.cov(F_st.T) + 1e-4 * torch.eye(F_st.shape[1], device=F_st.device)
+            L = torch.linalg.cholesky(C)
+            Linv = torch.linalg.inv(L)
+
+        self.register_buffer('cond_mu', mu_c)
+        self.register_buffer('cond_Linv', Linv)
+
+        def _whiten_cond(self, c):
+            return (c- self.cond_mu) @ self.cond_Linv
+        
+        self._whiten_cond = _whiten_cond.__get__(self, type(self))
+
+
+        self.slide_labels = slide_labels
+        if slide_labels is not None:
+            unique_slides = np.unique(slide_labels)
+            self.num_slides = len(unique_slides)
+            self.slide_to_idx = {slide: i for i, slide in enumerate(unique_slides)}
+            slide_indices = [self.slide_to_idx[slide] for slide in slide_labels]
+            self.slide_indices = torch.tensor(slide_indices, dtype=torch.long, device=device)
+            
+            # Add slide adversarial head
+            self.slide_adversarial = SlideAdversarialHead(
+                latent_dim=self.latent_dim, 
+                num_slides=self.num_slides
+            ).to(device)
+            
+            # Add cross-slide consistency loss
+            self.cross_slide_loss = CrossSlideConsistencyLoss()
+        else:
+            self.slide_adversarial = None
+            self.cross_slide_loss = None
+            
+        print(f"Initialized with {self.num_slides if slide_labels is not None else 0} slides")
+
         # Move entire model to device
         self.to(self.device)
 
@@ -277,12 +322,303 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             'alphas_cumprod_prev': alphas_cumprod_prev,
             'posterior_variance': posterior_variance
         }
+    
+    def _descriptor_variance_loss(self, coords_by_slide, n_radial=20, n_angular=72):
+        """
+        Normalized descriptor loss for slide consistency.
+        """
+        if len(coords_by_slide) < 2:
+            return torch.tensor(0.0, device=self.device)
+
+        rad_desc = []
+        ang_desc = []
+        
+        for coords in coords_by_slide:
+            # Canonicalize
+            coords_canon, _, _ = self._normalize_coordinates_to_unit_disk(coords)
+            r = torch.norm(coords_canon, dim=1).clamp(0, 1)
+            theta = torch.atan2(coords_canon[:,1], coords_canon[:,0])
+
+            # Radial histogram
+            hist_r, _ = torch.histogram(r.cpu(), bins=n_radial, range=(0.0, 1.0))
+            hist_r = hist_r.to(coords.device).float()
+            rad = hist_r / (hist_r.sum() + 1e-8)
+            rad_desc.append(rad)
+
+            # Angular histogram -> FFT
+            theta_2pi = (theta + torch.pi) % (2*torch.pi)
+            hist_t, _ = torch.histogram(theta_2pi.cpu(), bins=n_angular, range=(0.0, float(2*torch.pi)))
+            hist_t = hist_t.to(coords.device).float()
+            hist_t = hist_t - hist_t.mean()
+            
+            spec = torch.fft.rfft(hist_t, norm="ortho").abs()
+            K = min(12, spec.numel()-1)
+            ang = spec[1:1+K]
+            ang = ang / (ang.norm(p=2) + 1e-8)
+            ang_desc.append(ang)
+
+        # Variance across slides
+        rad_stack = torch.stack(rad_desc)
+        ang_stack = torch.stack(ang_desc)
+        var_rad = rad_stack.var(dim=0, unbiased=False).mean()
+        var_ang = ang_stack.var(dim=0, unbiased=False).mean()
+        return var_rad + var_ang
+
+    def _compute_expression_based_pose_anchors(self, st_features_aligned):
+        """
+        Compute pose anchors from expression data only (slide-invariant).
+        Uses PCA or curated gene programs to define consistent coordinate axes.
+        """
+        print("Computing expression-based pose anchors...")
+        
+        with torch.no_grad():
+            # Method 1: Use PCA of aligned embeddings
+            st_embeddings_np = st_features_aligned.cpu().numpy()
+            
+            # Center the data
+            mean_embedding = np.mean(st_embeddings_np, axis=0)
+            centered_embeddings = st_embeddings_np - mean_embedding
+            
+            # Compute PCA
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=2)
+            pca_coords = pca.fit_transform(centered_embeddings)
+            
+            # Define pose anchors from PCA directions
+            pc1_direction = pca.components_[0]  # First principal component
+            pc2_direction = pca.components_[1]  # Second principal component
+            
+            # BIOLOGY-TIED SIGN LOCKING
+            # Instead of using mean, use robust biological signals
+            # Option 1: Use variance - high variance genes often have biological meaning
+            gene_variance = np.var(st_embeddings_np, axis=0)
+            high_var_mask = gene_variance > np.percentile(gene_variance, 75)
+            
+            # Project high-variance genes onto PC1
+            pc1_highvar_projection = np.sum(high_var_mask * pc1_direction)
+            if pc1_highvar_projection < 0:
+                pc1_direction = -pc1_direction
+                pca_coords[:, 0] = -pca_coords[:, 0]
+            
+            # For PC2, ensure orthogonality and use a different biological signal
+            # Use mean expression as secondary signal
+            mean_expr_projection = np.sum(mean_embedding * pc2_direction)
+            if mean_expr_projection < 0:
+                pc2_direction = -pc2_direction
+                pca_coords[:, 1] = -pca_coords[:, 1]
+            
+            # Store frozen anchors - NEVER RECOMPUTE
+            pose_anchors = {
+                'pc1_direction': torch.tensor(pc1_direction, device=self.device, dtype=torch.float32),
+                'pc2_direction': torch.tensor(pc2_direction, device=self.device, dtype=torch.float32),
+                'mean_embedding': torch.tensor(mean_embedding, device=self.device, dtype=torch.float32),
+                'pca_coords': torch.tensor(pca_coords, device=self.device, dtype=torch.float32),
+                'is_frozen': True  # Flag to ensure we don't recompute
+            }
+            
+            print(f"Expression-based pose anchors computed (FROZEN):")
+            print(f"  PC1 explains {pca.explained_variance_ratio_[0]:.3f} variance")
+            print(f"  PC2 explains {pca.explained_variance_ratio_[1]:.3f} variance")
+            print(f"  Sign locked to biological signals")
+            
+            return pose_anchors
+
+    def _normalize_coordinates_to_unit_disk(self, coords):
+        """
+        Normalize coordinates to unit disk (removes boundary bias).
+        """
+        with torch.no_grad():
+            # Center coordinates
+            center = coords.mean(dim=0)
+            centered_coords = coords - center
+            
+            # Scale to unit disk
+            max_radius = torch.max(torch.norm(centered_coords, dim=1))
+            normalized_coords = centered_coords / (max_radius + 1e-8)
+            
+            return normalized_coords, center, max_radius
+
+    def _apply_expression_based_coordinate_transform(self, coords, st_features_aligned, pose_anchors):
+        """
+        Transform coordinates to be aligned with expression-based axes.
+        """
+        with torch.no_grad():
+            # Get embeddings relative to mean
+            centered_embeddings = st_features_aligned - pose_anchors['mean_embedding']
+            
+            # Project onto PC directions to get new coordinate system
+            x_coords = torch.sum(centered_embeddings * pose_anchors['pc1_direction'], dim=1)
+            y_coords = torch.sum(centered_embeddings * pose_anchors['pc2_direction'], dim=1)
+            
+            # Stack and normalize to unit disk
+            expression_aligned_coords = torch.stack([x_coords, y_coords], dim=1)
+            normalized_coords, _, _ = self._normalize_coordinates_to_unit_disk(expression_aligned_coords)
+            
+            return normalized_coords
+
+    def _apply_random_transforms(self, coords):
+        """
+        Apply small random rigid transforms to coordinates (boundary-agnostic training).
+        """
+        with torch.no_grad():
+            batch_size = coords.shape[0]
+            device = coords.device
+            
+            # 1. Random rotation - FULL range [0, 2π]
+            angle = torch.rand(1, device=device) * 2 * torch.pi
+            cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+            R = torch.tensor([[cos_a, -sin_a], 
+                            [sin_a, cos_a]], device=device)
+            
+            # 2. Random reflections (50% chance each axis)
+            reflect_x = torch.rand(1, device=device) > 0.5
+            reflect_y = torch.rand(1, device=device) > 0.5
+            
+            if reflect_x:
+                R = R @ torch.tensor([[1, 0], [0, -1]], device=device, dtype=R.dtype)
+            if reflect_y:
+                R = R @ torch.tensor([[-1, 0], [0, 1]], device=device, dtype=R.dtype)
+            
+            # 3. Anisotropic scaling
+            scale_x = torch.rand(1, device=device) * 0.3 + 0.85  # [0.85, 1.15]
+            scale_y = torch.rand(1, device=device) * 0.3 + 0.85  # [0.85, 1.15]
+            S = torch.tensor([[scale_x, 0], 
+                            [0, scale_y]], device=device)
+            
+            # 4. Small translation (optional, but kept small)
+            t = torch.randn(2, device=device) * 0.02
+            
+            # Apply transform: scale -> rotate/reflect -> translate
+            transformed_coords = coords @ (S @ R).T + t
+            
+            return transformed_coords
+
+    def _compute_expression_based_angle_loss(self, coords_pred, coords_target):
+        """
+        Compute angle loss based on expression-derived reference frame.
+        """
+        # Simple angular consistency - you can make this more sophisticated
+        # For now, just ensure the principal directions are preserved
+        center_pred = coords_pred.mean(dim=0)
+        center_target = coords_target.mean(dim=0)
+        
+        # Compute angle differences from centers
+        angles_pred = torch.atan2(coords_pred[:, 1] - center_pred[1], 
+                                coords_pred[:, 0] - center_pred[0])
+        angles_target = torch.atan2(coords_target[:, 1] - center_target[1], 
+                                coords_target[:, 0] - center_target[0])
+        
+        # Circular loss
+        angle_diff = angles_pred - angles_target
+        loss = (1.0 - torch.cos(angle_diff)).mean()
+        
+        return loss
+
+    def _compute_expression_based_radius_loss(self, coords_pred, coords_target):
+        """
+        Compute radius loss based on expression-derived reference frame.
+        """
+        center_pred = coords_pred.mean(dim=0)
+        center_target = coords_target.mean(dim=0)
+        
+        radii_pred = torch.norm(coords_pred - center_pred, dim=1)
+        radii_target = torch.norm(coords_target - center_target, dim=1)
+        
+        loss = F.mse_loss(radii_pred, radii_target)
+        
+        return loss
+
+
+    def _build_noise_schedule_linear(self, T:int, beta_start:float, beta_end:float):
+        betas  = torch.linspace(beta_start, beta_end, T, device=self.device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat(
+            [torch.tensor([1.0], device=self.device), alphas_cumprod[:-1]], dim=0
+        )
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        return {
+            'betas': betas, 'alphas': alphas,
+            'alphas_cumprod': alphas_cumprod,
+            'alphas_cumprod_prev': alphas_cumprod_prev,
+            'posterior_variance': posterior_variance
+        }
+
+    def _build_noise_schedule_cosine(self, T:int, s:float=0.008):
+        steps = torch.arange(T+1, device=self.device, dtype=torch.float32) / T
+        f = torch.cos((steps + s) / (1 + s) * torch.pi / 2) ** 2
+        alpha_bar = (f / f[0]).clamp(min=1e-5, max=1.0)  # ᾱ(0)=1
+        betas = (1 - (alpha_bar[1:] / alpha_bar[:-1])).clamp(1e-8, 0.999)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat(
+            [torch.tensor([1.0], device=self.device), alphas_cumprod[:-1]], dim=0
+        )
+        posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        return {
+            'betas': betas, 'alphas': alphas,
+            'alphas_cumprod': alphas_cumprod,
+            'alphas_cumprod_prev': alphas_cumprod_prev,
+            'posterior_variance': posterior_variance
+        }
+
+
+    def _build_block_diagonal_graph(self, st_features_aligned, slide_labels):
+        """
+        Build block-diagonal adjacency matrix for multiple slides.
+        Prevents cross-slide edges while maintaining within-slide structure.
+        """
+        print("Building block-diagonal graph for multiple slides...")
+        
+        unique_slides = np.unique(slide_labels)
+        all_edge_indices = []
+        all_edge_weights = []
+        
+        offset = 0
+        for slide in unique_slides:
+            slide_mask = np.array(slide_labels) == slide
+            slide_indices = np.where(slide_mask)[0]
+            
+            if len(slide_indices) > 0:
+                # Extract features for this slide
+                slide_features = st_features_aligned[slide_indices]
+                
+                # Build kNN graph within this slide
+                slide_adj_idx, slide_adj_w = precompute_knn_edges(
+                    slide_features, k=min(30, len(slide_indices)-1), device=self.device
+                )
+                
+                # Adjust indices to global coordinates
+                global_adj_idx = slide_adj_idx + offset
+                
+                all_edge_indices.append(global_adj_idx)
+                all_edge_weights.append(slide_adj_w)
+                
+                offset += len(slide_indices)
+        
+        # Concatenate all edges
+        if len(all_edge_indices) > 0:
+            combined_edge_idx = torch.cat(all_edge_indices, dim=1)
+            combined_edge_w = torch.cat(all_edge_weights, dim=0)
+        else:
+            combined_edge_idx = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            combined_edge_w = torch.empty((0,), dtype=torch.float, device=self.device)
+        
+        print(f"Block-diagonal graph: {combined_edge_idx.shape[1]} edges across {len(unique_slides)} slides")
+        return combined_edge_idx, combined_edge_w
 
     def update_noise_schedule(self):
-        """Update noise schedule when n_timesteps changes"""
-        self.noise_schedule = self.build_noise_schedule(self.n_timesteps)
-        print(f"Updated noise schedule for T={self.n_timesteps}")
-        print(f"alpha_bar[0]={self.noise_schedule['alphas_cumprod'][0]:.6f}, alpha_bar[-1]={self.noise_schedule['alphas_cumprod'][-1]:.6f}")
+        T = int(self.n_timesteps)  # single source of truth
+        if self.noise_schedule_mode == 'cosine':
+            self.noise_schedule = self._build_noise_schedule_cosine(T)
+        else:
+            # pick beta_end so ᾱ_T hits your target with *this* T
+            total = -math.log(self.noise_target_alpha_end)
+            beta_end = max(2*total/T - self.beta_start, self.beta_start + 1e-6)
+            self.noise_schedule = self._build_noise_schedule_linear(T, self.beta_start, beta_end)
+        print(f"[noise] mode={self.noise_schedule_mode}, T={T}, "
+            f"alpha_bar[-1]={self.noise_schedule['alphas_cumprod'][-1].item():.5f}")
+
 
     def setup_spatial_sampling(self):
         if hasattr(self, 'st_coords_norm'):
@@ -454,18 +790,37 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             f.write(f"{localtime} - Starting STEM encoder training\n")
             f.write(f"n_epochs={n_epochs}, ratio_start={ratio_start}, ratio_end={ratio_end}\n")
         
-        # Calculate spatial adjacency matrix
-        if self.sigma == 0:
-            nettrue = torch.eye(self.st_coords.shape[0], device=self.device)
-        else:
-            nettrue = torch.tensor(scipy.spatial.distance.cdist(
-                self.st_coords.cpu().numpy(), 
-                self.st_coords.cpu().numpy()
-            ), device=self.device).to(torch.float32)
+        # Auto-calculate sigma from normalized coordinates
+        with torch.no_grad():
+            # Use normalized coords for everything
+            coords_for_rbf = self.st_coords_norm
+            D = torch.cdist(coords_for_rbf, coords_for_rbf)
             
-            sigma = self.sigma
-            nettrue = torch.exp(-nettrue**2/(2*sigma**2))/(np.sqrt(2*np.pi)*sigma)
-            nettrue = F.normalize(nettrue, p=1, dim=1)
+            # Get k-NN distances (k=15 is robust)
+            k = 15
+            kth_distances = torch.kthvalue(D, k+1, dim=1).values  # k+1 because diagonal is 0
+            
+            # Use median as default sigma
+            auto_sigma = torch.median(kth_distances).item()
+            
+            # Apply a scaling factor for Gaussian width (0.8 = slightly tighter, 1.0 = exact median)
+            self.sigma = auto_sigma * 0.8
+            
+            print(f"Auto-calculated sigma = {self.sigma:.4f} (based on normalized coordinates)")
+            print(f"k-NN distance stats: min={kth_distances.min():.4f}, "
+                f"median={kth_distances.median():.4f}, max={kth_distances.max():.4f}")
+            
+            # Calculate spatial adjacency matrix with normalized coords and auto sigma
+            if self.sigma == 0:
+                nettrue = torch.eye(self.st_coords_norm.shape[0], device=self.device)
+            else:
+                distances = torch.cdist(coords_for_rbf, coords_for_rbf)
+                nettrue = torch.exp(-distances**2/(2*self.sigma**2))/(np.sqrt(2*np.pi)*self.sigma)
+                nettrue = F.normalize(nettrue, p=1, dim=1)
+
+        # Log the auto-calculated sigma
+        with open(self.train_log, 'a') as f:
+            f.write(f"Auto-calculated sigma={self.sigma:.4f} from normalized coordinates\n")
         
         # Training loop
         for epoch in range(n_epochs):
@@ -616,174 +971,181 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         
         print("Encoder training complete!")
 
-    def train_graph_vae(self, epochs=800, lr=1e-3, warmup_epochs=320,  # 40% of epochs
-                    lambda_cov_max=0.3, angle_loss_weight=0.2, 
-                    radius_loss_weight=1.0, angle_warmup_epochs=0, 
-                    beta_final=1e-3):  # Small β_final to prevent blow-up
+    def train_graph_vae(self, epochs=800, lr=1e-3,
+                                            adversarial_weight=0.2,  # Increased
+                                            consistency_weight=0.1,   # Increased
+                                            warmup_epochs=320,
+                                            use_expression_pose=True):
         """
-        Train the Graph-VAE with:
-        1) normalized KL (no free-bits, mean over batch and dims)
-        2) covariance warm-up (fix axes)  
-        3) geometry-anchored angle/radius loss (fix gauge deterministically)
-        4) NO reconstruction loss, NO gradient loss (as requested)
+        Fixed version of train_graph_vae with proper adversarial training.
+        Key changes:
+        1. Two-step alternating optimization
+        2. Adversarial loss actually backprops through VAE
+        3. Cross-slide consistency is computed correctly
         """
-        print("Training Graph-VAE with normalized KL and polar losses...")
+        print("Training Graph-VAE with PROPER slide-adversarial training...")
+        
+        # Check if we have slides
+        if not hasattr(self, 'slide_adversarial') or self.slide_adversarial is None:
+            print("ERROR: No slide adversarial head found!")
+            return
         
         # Freeze encoder
         self.netE.eval()
         for p in self.netE.parameters():
             p.requires_grad = False
-
-        # Build ST graph
-        adj_idx, adj_w = precompute_knn_edges(self.st_coords_norm, k=30, device=self.device)
-
-        # Precompute aligned features (ST only for training)
+        
+        # Precompute aligned features
         with torch.no_grad():
             st_features_aligned = self.netE(self.st_gene_expr).float()
-
-        # Precompute canonical frame and angle/radius targets for ST
-        print('Computing canonical angular frame for geometry anchoring....')
-        c, a_theta, R, theta_true, r_true = self._compute_canonical_frame(self.st_coords_norm)
-
-        # Precompute true covariance of ST spots
-        with torch.no_grad():
-            centered = self.st_coords_norm - self.st_coords_norm.mean(0, keepdim=True)
-            self.cov_true = (centered.T @ centered) / (centered.shape[0] - 1)
-
-        # Optimizer + scheduler
+        
+        # Compute pose anchors ONCE and freeze them
+        if not hasattr(self, 'pose_anchors') or not self.pose_anchors.get('is_frozen', False):
+            self.pose_anchors = self._compute_expression_based_pose_anchors(st_features_aligned)
+        
+        # Build ST graph
+        if self.slide_labels is None:
+            adj_idx, adj_w = precompute_knn_edges(st_features_aligned, k=30, device=self.device)
+        else:
+            adj_idx, adj_w = self._build_block_diagonal_graph(st_features_aligned, self.slide_labels)
+        
+        # Transform coordinates using frozen pose anchors
+        coords_target = self._apply_expression_based_coordinate_transform(
+            self.st_coords_norm, st_features_aligned, self.pose_anchors
+        )
+        
+        # Canonicalize coordinates ONCE
+        coords_target, _, _ = self._normalize_coordinates_to_unit_disk(coords_target)
+        
+        # Setup TWO separate optimizers for alternating training
         vae_params = list(self.graph_vae_encoder.parameters()) + list(self.graph_vae_decoder.parameters())
-        optimizer = torch.optim.Adam(vae_params, lr=lr, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
-        # Initialize loss logs
-        for key in ('total','reconstruction','kl','kl_raw','cov','lambda_cov','angle','radius','beta','epochs'):
-            self.vae_losses.setdefault(key, [])
-
-        # Training loop
+        optimizer_vae = torch.optim.Adam(vae_params, lr=lr, weight_decay=1e-5)
+        optimizer_adv = torch.optim.Adam(self.slide_adversarial.parameters(), lr=lr*2, weight_decay=1e-5)
+        
+        scheduler_vae = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_vae, T_max=epochs)
+        scheduler_adv = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_adv, T_max=epochs)
+        
+        # Training loop with ALTERNATING optimization
         for epoch in range(epochs):
-            optimizer.zero_grad()
-
-            # Compute loss weights with warmups
-            lambda_cov = lambda_cov_max * min(epoch+1, warmup_epochs) / warmup_epochs
-            w_theta = 0.0 if epoch < angle_warmup_epochs else angle_loss_weight
-            w_radius = 0.0 if epoch < angle_warmup_epochs else radius_loss_weight
             
-            # KL warm-up: β from 0 to β_final (small value)
-            beta = beta_final * min(epoch+1, warmup_epochs) / warmup_epochs
-
-            # Forward pass for ST spots only
+            # ===== STEP 1: Train Slide Adversarial (to predict slides) =====
+            self.slide_adversarial.train()
+            self.graph_vae_encoder.eval()  # Freeze VAE during adversarial training
+            
+            optimizer_adv.zero_grad()
+            
+            # Get latents (detached from VAE)
+            with torch.no_grad():
+                mu_st_detach, logvar_st_detach = self.graph_vae_encoder(st_features_aligned, adj_idx, adj_w)
+                z_st_detach = self.graph_vae_encoder.reparameterize(mu_st_detach, logvar_st_detach)
+            
+            # Predict slides
+            slide_pred_logits = self.slide_adversarial(z_st_detach)
+            
+            # MINIMIZE cross-entropy (head wants to predict correctly)
+            L_slide_classification = F.nll_loss(slide_pred_logits, self.slide_indices)
+            
+            L_slide_classification.backward()
+            optimizer_adv.step()
+            
+            # ===== STEP 2: Train VAE (to fool adversarial + reconstruct) =====
+            self.graph_vae_encoder.train()
+            self.graph_vae_decoder.train()
+            self.slide_adversarial.eval()  # Freeze adversarial during VAE training
+            
+            optimizer_vae.zero_grad()
+            
+            # Forward pass
             mu_st, logvar_st = self.graph_vae_encoder(st_features_aligned, adj_idx, adj_w)
             z_st = self.graph_vae_encoder.reparameterize(mu_st, logvar_st)
-            
-            # Decoder takes ONLY z (no features)
             coords_pred_st = self.graph_vae_decoder(z_st)
             
-            #edge distance reconstruction 
-            i, j = adj_idx[0], adj_idx[1]
-            dist_true = (self.st_coords_norm[i] - self.st_coords_norm[j]).pow(2).sum(1).sqrt()
-            dist_pred = (coords_pred_st[i] - coords_pred_st[j]).pow(2).sum(1).sqrt()
-
-            L_edges = F.smooth_l1_loss(dist_pred, dist_true)
-            lambda_edges = 2.0
-            L_recon = lambda_edges * L_edges
-
-            # 2) Normalized KL divergence (Option A - no free-bits)
-            # KL per dim (positive values)
-            kl_per_dim = -0.5 * (1 + logvar_st - mu_st.pow(2) - logvar_st.exp())  # [N, latent_dim]
+            # Apply strong augmentation to target coords for boundary-agnostic training
+            if epoch > warmup_epochs // 2:
+                coords_target_aug = self._apply_random_transforms(coords_target)
+                coords_pred_aug = self._apply_random_transforms(coords_pred_st)
+            else:
+                coords_target_aug = coords_target
+                coords_pred_aug = coords_pred_st
             
-            # Mean over batch AND latent dims (this prevents blow-up)
-            KL_raw = kl_per_dim.mean()  # O(1) scale, not O(latent_dim)
-            L_KL = beta * KL_raw
+            # Canonicalize BOTH before computing losses
+            coords_target_canon, _, _ = self._normalize_coordinates_to_unit_disk(coords_target_aug)
+            coords_pred_canon, _, _ = self._normalize_coordinates_to_unit_disk(coords_pred_aug)
+            
+            # Edge distance reconstruction on canonicalized coords
+            i, j = adj_idx[0], adj_idx[1]
+            dist_true = (coords_target_canon[i] - coords_target_canon[j]).pow(2).sum(1).sqrt()
+            dist_pred = (coords_pred_canon[i] - coords_pred_canon[j]).pow(2).sum(1).sqrt()
+            L_recon = F.smooth_l1_loss(dist_pred, dist_true)
+            
+            # KL divergence
+            kl_per_dim = -0.5 * (1 + logvar_st - mu_st.pow(2) - logvar_st.exp())
+            L_KL = kl_per_dim.mean() * 1e-3
+            
+            # ADVERSARIAL LOSS - VAE tries to fool the slide predictor
+            slide_pred_logits_vae = self.slide_adversarial(z_st)
+            
+            # MAXIMIZE entropy (fool the adversarial)
+            # uniform_target = torch.ones_like(slide_pred_logits_vae) / self.num_slides
+            # L_adversarial_vae = -F.kl_div(slide_pred_logits_vae, uniform_target, reduction='batchmean')
 
-            # 3) Covariance alignment (ST spots only, warm-up)
-            coords_pred_centered = coords_pred_st - coords_pred_st.mean(0, keepdim=True)
-            cov_pred = (coords_pred_centered.T @ coords_pred_centered) / (coords_pred_centered.shape[0] - 1)
-            L_cov = F.mse_loss(cov_pred, self.cov_true)
+            # Fight the trained head directly (negative NLL)
+            slide_labels_full = self.slide_indices
+            L_adversarial_vae = -F.nll_loss(slide_pred_logits_vae, slide_labels_full)
+            
+            # Cross-slide consistency loss
+            if epoch > 100 and self.cross_slide_loss is not None:
+                coords_by_slide = []
+                for slide_idx in range(self.num_slides):
+                    slide_mask = (self.slide_indices == slide_idx)
+                    if slide_mask.any():
+                        slide_coords_canon, _, _ = self._normalize_coordinates_to_unit_disk(
+                            coords_pred_st[slide_mask]
+                        )
+                        coords_by_slide.append(slide_coords_canon)
+                
+                # if len(coords_by_slide) > 1:
+                #     L_consistency = self.cross_slide_loss(coords_by_slide, None)
+                # else:
+                #     L_consistency = torch.tensor(0.0, device=self.device)
 
-            # 4) NO Gradient anchoring (as requested)
-            # L_grad = 0.0
-
-            # 5) Geometry-anchored angle/radius losses
-            # Compute predicted angles/radii using the SAME canonical frame (c, a_theta, R)
-            v_hat = coords_pred_st - c 
-            cross = a_theta[0] * v_hat[:, 1] - a_theta[1] * v_hat[:, 0]
-            dot = a_theta[0] * v_hat[:, 0] + a_theta[1] * v_hat[:, 1]
-            theta_hat = torch.atan2(cross, dot)
-            r_hat = v_hat.norm(dim=1) / (R + 1e-8)
-
-            # Circular angle loss: 1 - cos(delta)
-            delta = theta_hat - theta_true
-            L_angle_raw = (1.0 - torch.cos(delta)).mean()
-            L_angle = w_theta * L_angle_raw
-
-            # Radius loss
-            L_radius_raw = F.mse_loss(r_hat, r_true)
-            L_radius = w_radius * L_radius_raw
-
-            # 6) Total loss
-            total_loss = (
-                L_recon +           # 0.0 as requested
-                L_KL +              # Small, normalized
-                lambda_cov * L_cov +
-                L_angle + 
-                L_radius
+                if len(coords_by_slide) > 1:
+                    L_consistency = self._descriptor_variance_loss(coords_by_slide)
+                else:
+                    L_consistency = torch.tensor(0.0, device=self.device)
+            else:
+                L_consistency = torch.tensor(0.0, device=self.device)
+            
+            # Total VAE loss
+            total_vae_loss = (
+                L_recon + 
+                L_KL + 
+                adversarial_weight * L_adversarial_vae +  # Note: negative for maximization
+                (1e-3 * consistency_weight) * L_consistency
             )
             
-            total_loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            # Log losses
-            self.vae_losses['total'].append(total_loss.item())
-            self.vae_losses['reconstruction'].append(L_recon.item())
-            self.vae_losses['kl'].append(L_KL.item())
-            self.vae_losses['kl_raw'].append(KL_raw.item())
-            self.vae_losses['cov'].append(L_cov.item())
-            self.vae_losses['lambda_cov'].append(lambda_cov)
-            self.vae_losses['angle'].append(L_angle.item())
-            self.vae_losses['radius'].append(L_radius.item())
-            self.vae_losses['beta'].append(beta)
-            self.vae_losses['epochs'].append(epoch)
-
-            if epoch % 100 == 0 or epoch == epochs-1:
-                # Compute interpretable angle error in degrees
-                with torch.no_grad():
-                    mean_angle_err_deg = torch.mean(torch.abs(torch.rad2deg(torch.atan2(torch.sin(delta), torch.cos(delta))))).item()
+            total_vae_loss.backward()
+            torch.nn.utils.clip_grad_norm_(vae_params, 1.0)
+            optimizer_vae.step()
+            
+            # Step schedulers
+            scheduler_vae.step()
+            scheduler_adv.step()
+            
+            # Logging
+            if epoch % 100 == 0:
+                print(f"Epoch {epoch+1}/{epochs}")
+                print(f"  VAE: L_recon={L_recon:.4f}, L_KL={L_KL:.6f}, "
+                    f"L_adv_vae={L_adversarial_vae:.4f}, L_consist={L_consistency:.4f}")
+                print(f"  ADV: L_slide_class={L_slide_classification:.4f}")
                 
-                print(f"Epoch {epoch+1}/{epochs}  "
-                    f"Loss={total_loss:.4f}  "
-                    f"L_recon={L_recon:.4f}  "
-                    f"L_KL={L_KL:.6f}(β={beta:.6f})  "
-                    f"KL_raw={KL_raw:.4f}  "
-                    f"L_cov={L_cov:.4f}  "
-                    f"L_angle={L_angle:.4f}  "
-                    f"L_radius={L_radius:.4f}  "
-                    f"AngleErr={mean_angle_err_deg:.2f}°")
-
-        print("Graph-VAE training complete.")
+                # Check if adversarial is being fooled
+                with torch.no_grad():
+                    slide_accuracy = (slide_pred_logits.argmax(1) == self.slide_indices).float().mean()
+                    print(f"  Slide prediction accuracy: {slide_accuracy:.3f} "
+                        f"(should decrease if VAE is fooling it)")
         
-        # Diagnostic: Check if decoder uses z meaningfully
-        print("\n=== DECODER DEPENDENCY DIAGNOSTIC ===")
-        with torch.no_grad():
-            # Fix features, vary z
-            mu_fixed = mu_st[:5]
-            logvar_fixed = logvar_st[:5]
-            
-            coords_samples = []
-            for _ in range(5):
-                z_sample = self.graph_vae_encoder.reparameterize(mu_fixed, logvar_fixed)
-                coords_sample = self.graph_vae_decoder(z_sample)
-                coords_samples.append(coords_sample)
-            
-            coords_stack = torch.stack(coords_samples)  # (5, 5, 2)
-            coord_variance = coords_stack.var(dim=0).mean().item()  # Average variance across samples
-            
-            print(f"Coordinate variance from z sampling: {coord_variance:.6f}")
-            if coord_variance < 1e-4:
-                print("⚠️  WARNING: Low variance suggests potential posterior collapse!")
-            else:
-                print("✅ Good: Decoder shows dependency on z")
-        print("=" * 50)
+        print("Graph-VAE training with proper adversarial complete!")
 
 
     def _compute_canonical_frame(self, X_st):
@@ -922,28 +1284,29 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             print(f"[decoder FT] epoch {epoch+1:02d}/{epochs}  recon={rec:.4f}  hull={hul:.4f}  total={tot:.4f}")
 
         self.graph_vae_decoder.eval()
-        print("✅ Decoder fine-tune done (encoder + diffusion unchanged).")
+        print("Decoder fine-tune done (encoder + diffusion unchanged).")
 
 
     def train_diffusion_latent(
         self,
         n_epochs: int = 400,
-        p_drop_max: float = 0.05,
+        p_drop_max: float = 0.1,
         struct_warmup_epochs: int = None,
         posterior_temp_floor: float = 0.30,
+        adversarial_weight: float = 0.2,
         save_every: int = 500,
     ):
         """
-        Train a conditional DDPM prior over Graph-VAE latents.
-        Adds (i) condition dropout and (ii) structure-aware loss by decoding x0
-        and matching local edge distances in coordinate space.
+        Train diffusion model with pooled slides and slide-adversarial training.
+        Creates slide-invariant latent representations.
         """
-        print("Training latent-space diffusion model...")
+        print("Training slide-invariant latent diffusion model...")
 
-        # Freeze encoder + VAE (encoder, *and* decoder) during diffusion training
+        # Freeze encoder + VAE during diffusion training
         self.netE.eval()
         self.graph_vae_encoder.eval()
         self.graph_vae_decoder.eval()
+        
         for p in self.netE.parameters():
             p.requires_grad = False
         for p in self.graph_vae_encoder.parameters():
@@ -951,128 +1314,329 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         for p in self.graph_vae_decoder.parameters():
             p.requires_grad = False
 
-        # Ensure noise schedule is current
+        # Update noise schedule
+        self.noise_schedule_mode = 'linear'
+        self.noise_target_alpha_end = 0.08
+        self.beta_start = 1e-4
+        self.sampling_start_alpha = 0.08
         self.update_noise_schedule()
+        
         self.latent_denoiser.train()
 
-        # Precompute ST latents (μ, logσ²) and ST aligned features (condition)
-        print("Computing fixed ST latents...")
+        # Precompute ST latents and features for ALL slides
+        print("Computing latents for pooled slides...")
         with torch.no_grad():
-            st_features_aligned = self.netE(self.st_gene_expr).float()             # (N, d_embed)
-            st_adj_idx_full, _ = precompute_knn_edges(self.st_coords_norm, k=30, device=self.device)  # not used directly (we re-make per batch)
-            st_mu, st_logvar = self.graph_vae_encoder(st_features_aligned, st_adj_idx_full, None)     # (N, D), (N, D)
+            st_features_aligned = self.netE(self.st_gene_expr).float()
+            
+            # Build graph for pooled data
+            if hasattr(self, 'slide_labels') and self.slide_labels is not None:
+                # Create block-diagonal adjacency for multiple slides
+                adj_idx_full, adj_w_full = self._build_block_diagonal_graph(
+                    st_features_aligned, self.slide_labels
+                )
+            else:
+                adj_idx_full, adj_w_full = precompute_knn_edges(
+                    st_features_aligned.detach(), k=30, device=self.device
+                )
+            
+            st_mu, st_logvar = self.graph_vae_encoder(st_features_aligned, adj_idx_full, adj_w_full)
+            
+        # Quick adapter fit: embedding to latent  
+        opt_adapt = torch.optim.AdamW(self.cond_adapter.parameters(), lr=1e-3, weight_decay=1e-4)
+        for _ in range(5):
+            idx_adapt = torch.randperm(st_mu.size(0), device=self.device)[:min(256, st_mu.size(0))]
+            c_b = self._whiten_cond(st_features_aligned[idx_adapt])
+            z_tgt = st_mu[idx_adapt].detach()
+            loss_ad = F.mse_loss(self.cond_adapter(c_b), z_tgt)
+            opt_adapt.zero_grad()
+            loss_ad.backward()
+            opt_adapt.step()
 
-        # Optimizer / scheduler / EMA for the denoiser
-        optimizer = torch.optim.AdamW(self.latent_denoiser.parameters(), lr=2e-4, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-6)
+        # TWO optimizers for alternating training
+        optimizer_denoiser = torch.optim.AdamW(self.latent_denoiser.parameters(), lr=2e-4, weight_decay=1e-5)
+        scheduler_denoiser = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_denoiser, T_max=n_epochs, eta_min=1e-6)
+        
+        if self.slide_adversarial is not None:
+            optimizer_adv = torch.optim.AdamW(self.slide_adversarial.parameters(), lr=4e-4, weight_decay=1e-5)
+            scheduler_adv = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_adv, T_max=n_epochs)
+        
+        # EMA for stable sampling
         from torch.optim.swa_utils import AveragedModel
         ema = AveragedModel(self.latent_denoiser, avg_fn=None)
-
+        
         # Warmups
         if struct_warmup_epochs is None:
-            struct_warmup_epochs = int(0.7 * n_epochs)  # 0 → 2.0 over first ~40% epochs
-
-        # Optional: learned null condition (better than zeros)
+            struct_warmup_epochs = int(0.7 * n_epochs)
+        
+        # Learned null condition
         if not hasattr(self, "null_cond"):
             with torch.no_grad():
-                null_init = st_features_aligned.mean(0, keepdim=True)
-            self.null_cond = nn.Parameter(null_init)  # trainable
-
-        # Train
+                null_c = self._whiten_cond(st_features_aligned.mean(0, keepdim=True))
+                null_z = self.cond_adapter(null_c)
+                null_full = torch.cat([null_c, null_z], dim=1)
+            self.null_cond = nn.Parameter(null_full)
+        
+        # Training loop with ALTERNATING optimization
         for epoch in range(n_epochs):
-            # Batch indices
+            
+            # ===== TRAIN SLIDE ADVERSARIAL =====
+            if self.slide_adversarial is not None and epoch % 2 == 0:
+                self.slide_adversarial.train()
+                self.latent_denoiser.eval()
+                
+                optimizer_adv.zero_grad()
+                
+                # Sample batch BALANCED across slides
+                B = min(self.batch_size, st_mu.shape[0])
+                idx = self._sample_balanced_batch(B, self.slide_indices)
+                idx = idx.to(torch.long)
+                
+                batch_mu = st_mu[idx]
+                batch_logvar = st_logvar[idx]
+                batch_h = st_features_aligned[idx]
+                batch_slide_labels = self.slide_indices[idx]
+                
+                # Get x0 prediction from denoiser (detached)
+                with torch.no_grad():
+                    # Sample z0
+                    eps0 = torch.randn_like(batch_mu)
+                    posterior_std = torch.sqrt(torch.exp(batch_logvar) + posterior_temp_floor**2)
+                    z0 = batch_mu + posterior_std * eps0
+                    
+                    # Forward noise to random t
+                    t = torch.randint(0, self.n_timesteps, (B,), device=self.device)
+                    alpha_bar_t = self.noise_schedule['alphas_cumprod'][t].view(-1, 1)
+                    
+                    eps = torch.randn_like(z0)
+                    z_t = torch.sqrt(alpha_bar_t) * z0 + torch.sqrt(1 - alpha_bar_t) * eps
+                    
+                    # Predict noise
+                    c_b = self._whiten_cond(batch_h)
+                    z_hint = self.cond_adapter(c_b)
+                    cond_full = torch.cat([c_b, z_hint], dim=1)
+                    
+                    t_norm = (t.float() / max(self.n_timesteps - 1, 1)).unsqueeze(1)
+                    eps_pred = self.latent_denoiser(z_t, t_norm, cond_full)
+                    
+                    # Recover x0
+                    sqrt_ab = torch.sqrt(alpha_bar_t)
+                    sqrt_1m = torch.sqrt(1.0 - alpha_bar_t)
+                    z0_pred = (z_t - sqrt_1m * eps_pred) / (sqrt_ab + 1e-8)
+                
+                # Predict slides from z0_pred
+                slide_pred_logits = self.slide_adversarial(z0_pred.detach())
+                L_slide_classification = F.nll_loss(slide_pred_logits, batch_slide_labels)
+                
+                L_slide_classification.backward()
+                optimizer_adv.step()
+                scheduler_adv.step()
+            else:
+                L_slide_classification = torch.tensor(0.0)
+            
+            # ===== TRAIN DENOISER (to fool adversarial + denoise) =====
+            self.latent_denoiser.train()
+            if self.slide_adversarial is not None:
+                self.slide_adversarial.eval()
+            
+            optimizer_denoiser.zero_grad()
+            
+            # Sample batch BALANCED across slides
             B = min(self.batch_size, st_mu.shape[0])
-            idx = torch.randperm(st_mu.shape[0], device=self.device)[:B]
-            batch_mu      = st_mu[idx]                      # (B, D)
-            batch_logvar  = st_logvar[idx]                  # (B, D)
-            batch_h       = st_features_aligned[idx]        # (B, d_embed)
-            coords_true_b = self.st_coords_norm[idx]        # (B, 2)
-
-            # Posterior sampling for z0 with a small temperature floor
+            idx = self._sample_balanced_batch(B, self.slide_indices if hasattr(self, 'slide_indices') else None)
+            idx = idx.to(torch.long)
+            
+            batch_mu = st_mu[idx]
+            batch_logvar = st_logvar[idx]
+            batch_h = st_features_aligned[idx]
+            coords_true_b = self.st_coords_norm[idx]
+            
+            if hasattr(self, 'slide_indices'):
+                batch_slide_labels = self.slide_indices[idx]
+            else:
+                batch_slide_labels = None
+            
+            # Sample z0
             eps0 = torch.randn_like(batch_mu)
             posterior_std = torch.sqrt(torch.exp(batch_logvar) + posterior_temp_floor**2)
-            z0  = batch_mu + posterior_std * eps0           # (B, D)
-
+            z0 = batch_mu + posterior_std * eps0
+            
             # Sample timesteps
             t = torch.randint(0, self.n_timesteps, (B,), device=self.device)
             alpha_bar_t = self.noise_schedule['alphas_cumprod'][t].view(-1, 1)
-
+            
             # Forward noising
             eps = torch.randn_like(z0)
             z_t = torch.sqrt(alpha_bar_t) * z0 + torch.sqrt(1 - alpha_bar_t) * eps
-
-            # ----- condition dropout (linear warmup) -----
+            
+            # Prepare conditioning with dropout
+            c_b = self._whiten_cond(batch_h)
+            z_hint = self.cond_adapter(c_b).detach()
+            cond_full = torch.cat([c_b, z_hint], dim=1)
+            
+            # Condition dropout with warmup
             p_drop = p_drop_max * min(epoch / max(1, struct_warmup_epochs), 1.0)
             drop_mask = (torch.rand(B, 1, device=self.device) >= p_drop).float()
-            cond = torch.where(drop_mask.bool(), batch_h, self.null_cond.expand_as(batch_h))
-
+            cond = drop_mask * cond_full + (1.0 - drop_mask) * self.null_cond.expand_as(cond_full)
+            
             # Predict noise
-            t_norm = (t.float() / max(self.n_timesteps - 1, 1)).unsqueeze(1)       # (B,1)
+            t_norm = (t.float() / max(self.n_timesteps - 1, 1)).unsqueeze(1)
             eps_pred = self.latent_denoiser(z_t, t_norm, cond)
-
-            # Diffusion (simple MSE)
+            
+            # Basic diffusion loss
             loss_diffusion = F.mse_loss(eps_pred, eps)
-
-            # ---- structure-aware loss (decode x0, match edge distances) ----
+            
+            # Structure-aware loss on CANONICALIZED coords
             with torch.no_grad():
-                # kNN edges for THIS batch (keeps indices local to [0..B-1])
-                batch_edge_idx, _ = precompute_knn_edges(coords_true_b.detach(), k=30, device=self.device)
-            i, j = batch_edge_idx[0], batch_edge_idx[1]
-
-            # x0 prediction and decoding
-            sqrt_ab  = torch.sqrt(alpha_bar_t)
-            sqrt_1m  = torch.sqrt(1.0 - alpha_bar_t)
-            z0_pred  = (z_t - sqrt_1m * eps_pred) / (sqrt_ab + 1e-8)               # DDPM x0
-            coords_pred = self.graph_vae_decoder(z0_pred)                           # (B, 2)
-
-            # Edge distances
-            dist_true = (coords_true_b[i] - coords_true_b[j]).pow(2).sum(1).sqrt()
-            dist_pred = (coords_pred[i]     - coords_pred[j]).pow(2).sum(1).sqrt()
-            L_struct  = F.smooth_l1_loss(dist_pred, dist_true)
-
-            # Warm up structure weight: 0 → 2.0
-            lambda_struct = 2.0 * min(epoch / max(1, struct_warmup_epochs), 1.0)
-
-            total_loss = loss_diffusion + lambda_struct * L_struct
-
-            # Bookkeeping
-            self.latent_diffusion_losses.setdefault('total', []).append(total_loss.item())
-            self.latent_diffusion_losses.setdefault('diffusion', []).append(loss_diffusion.item())
-            self.latent_diffusion_losses.setdefault('struct', []).append(L_struct.item())
-            self.latent_diffusion_losses.setdefault('lambda_struct', []).append(lambda_struct)
-            self.latent_diffusion_losses.setdefault('epochs', []).append(epoch)
-
-            # Backprop
-            optimizer.zero_grad()
+                # Map global to local indices for edges
+                N = self.st_gene_expr.size(0)
+                map_gl2loc = torch.full((N,), -1, dtype=torch.long, device=self.device)
+                map_gl2loc[idx] = torch.arange(B, device=self.device, dtype=torch.long)
+                
+                src_loc = map_gl2loc[adj_idx_full[0]]
+                dst_loc = map_gl2loc[adj_idx_full[1]]
+                
+                valid = (src_loc >= 0) & (dst_loc >= 0)
+                if valid.any():
+                    batch_edge_idx = torch.stack([src_loc[valid], dst_loc[valid]], dim=0)
+                else:
+                    batch_edge_idx = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            
+            if batch_edge_idx.shape[1] > 0:
+                i, j = batch_edge_idx[0], batch_edge_idx[1]
+                
+                # x0 prediction and decoding
+                sqrt_ab = torch.sqrt(alpha_bar_t)
+                sqrt_1m = torch.sqrt(1.0 - alpha_bar_t)
+                z0_pred = (z_t - sqrt_1m * eps_pred) / (sqrt_ab + 1e-8)
+                coords_pred = self.graph_vae_decoder(z0_pred)
+                
+                # CANONICALIZE both before computing edge distances
+                coords_true_canon, _, _ = self._normalize_coordinates_to_unit_disk(coords_true_b)
+                coords_pred_canon, _, _ = self._normalize_coordinates_to_unit_disk(coords_pred)
+                
+                # Edge distance loss on canonicalized coords
+                dist_true = (coords_true_canon[i] - coords_true_canon[j]).pow(2).sum(1).sqrt()
+                dist_pred = (coords_pred_canon[i] - coords_pred_canon[j]).pow(2).sum(1).sqrt()
+                L_struct = F.smooth_l1_loss(dist_pred, dist_true)
+            else:
+                L_struct = torch.tensor(0.0, device=self.device)
+                z0_pred = (z_t - torch.sqrt(1.0 - alpha_bar_t) * eps_pred) / (torch.sqrt(alpha_bar_t) + 1e-8)
+            
+            # Slide adversarial loss (denoiser tries to fool)
+            # Slide adversarial loss (denoiser tries to fool the *trained* head)
+            if self.slide_adversarial is not None and batch_slide_labels is not None:
+                slide_pred_logits = self.slide_adversarial(z0_pred)
+                L_slide_adversarial = -F.nll_loss(slide_pred_logits, batch_slide_labels)
+            else:
+                L_slide_adversarial = torch.tensor(0.0, device=self.device)
+            
+            # Total denoiser loss
+            lambda_struct = 1.0 * min(epoch / max(1, struct_warmup_epochs), 1.0)
+            total_loss = (
+                loss_diffusion + 
+                lambda_struct * L_struct + 
+                adversarial_weight * L_slide_adversarial
+            )
+            
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.latent_denoiser.parameters(), 1.0)
-            optimizer.step()
+            optimizer_denoiser.step()
             ema.update_parameters(self.latent_denoiser)
-            scheduler.step()
-
-            # Logs / checkpoints
-            if (epoch % save_every) == 0:
-                msg = (f"[latent-diff] epoch {epoch}/{n_epochs}  "
+            scheduler_denoiser.step()
+            
+            # Logging
+            if epoch % save_every == 0:
+                msg = (f"[diff] epoch {epoch}/{n_epochs}  "
                     f"loss={total_loss.item():.6f}  "
                     f"diff={loss_diffusion.item():.6f}  "
                     f"struct={L_struct.item():.6f}  "
-                    f"λ_struct={lambda_struct:.3f}  p_drop={p_drop:.3f}")
+                    f"slide_adv={L_slide_adversarial.item():.6f}  "
+                    f"slide_class={L_slide_classification.item():.6f}")
                 print(msg)
-                with open(self.train_log, 'a') as f:
-                    f.write(msg + "\n")
-                torch.save({
-                    'epoch': epoch,
-                    'latent_denoiser_state_dict': self.latent_denoiser.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, os.path.join(self.outf, f'latent_diffusion_checkpoint_epoch_{epoch}.pt'))
-
-        # Save final weights
+        
+        # Save final models
         torch.save({'latent_denoiser_state_dict': self.latent_denoiser.state_dict()},
-                os.path.join(self.outf, 'final_latent_diffusion.pt'))
+                os.path.join(self.outf, 'final_slide_invariant_latent_diffusion.pt'))
         torch.save({'latent_denoiser_state_dict': ema.module.state_dict()},
-                os.path.join(self.outf, 'final_latent_diffusion_ema.pt'))
+                os.path.join(self.outf, 'final_slide_invariant_latent_diffusion_ema.pt'))
+        
         self.latent_denoiser_ema = ema.module
-        print("Latent diffusion training complete!")
+        print("Slide-invariant latent diffusion training complete!")
+
+    # Helper function for balanced batch sampling
+    def _sample_balanced_batch(self, batch_size, slide_indices=None):
+        """
+        Sample a batch with equal representation from each slide.
+        """
+        if slide_indices is None:
+            return torch.randperm(self.st_gene_expr.shape[0], device=self.device)[:batch_size]
+        
+        unique_slides = torch.unique(slide_indices)
+        n_slides = len(unique_slides)
+        samples_per_slide = batch_size // n_slides
+        remainder = batch_size % n_slides
+        
+        indices = []
+        for i, slide in enumerate(unique_slides):
+            slide_mask = (slide_indices == slide)
+            slide_idxs = torch.where(slide_mask)[0]
+            
+            n_to_sample = samples_per_slide + (1 if i < remainder else 0)
+            n_to_sample = min(n_to_sample, len(slide_idxs))
+            
+            if n_to_sample > 0:
+                perm = torch.randperm(len(slide_idxs), device=self.device)[:n_to_sample]
+                indices.append(slide_idxs[perm])
+        
+        if len(indices) > 0:
+            return torch.cat(indices)
+        else:
+            return torch.randperm(self.st_gene_expr.shape[0], device=self.device)[:batch_size]
+
+
+    def _build_block_diagonal_graph(self, st_features_aligned, slide_labels):
+        """
+        Build block-diagonal adjacency matrix for multiple slides.
+        Prevents cross-slide edges while maintaining within-slide structure.
+        """
+        print("Building block-diagonal graph for multiple slides...")
+        
+        unique_slides = np.unique(slide_labels)
+        all_edge_indices = []
+        all_edge_weights = []
+        
+        offset = 0
+        for slide in unique_slides:
+            slide_mask = np.array(slide_labels) == slide
+            slide_indices = np.where(slide_mask)[0]
+            
+            if len(slide_indices) > 0:
+                # Extract features for this slide
+                slide_features = st_features_aligned[slide_indices]
+                
+                # Build kNN graph within this slide
+                slide_adj_idx, slide_adj_w = precompute_knn_edges(
+                    slide_features, k=min(30, len(slide_indices)-1), device=self.device
+                )
+                
+                # Adjust indices to global coordinates
+                global_adj_idx = slide_adj_idx + offset
+                
+                all_edge_indices.append(global_adj_idx)
+                all_edge_weights.append(slide_adj_w)
+                
+                offset += len(slide_indices)
+        
+        # Concatenate all edges
+        if len(all_edge_indices) > 0:
+            combined_edge_idx = torch.cat(all_edge_indices, dim=1)
+            combined_edge_w = torch.cat(all_edge_weights, dim=0)
+        else:
+            combined_edge_idx = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            combined_edge_w = torch.empty((0,), dtype=torch.float, device=self.device)
+        
+        print(f"Block-diagonal graph: {combined_edge_idx.shape[1]} edges across {len(unique_slides)} slides")
+        return combined_edge_idx, combined_edge_w
 
                         
 
@@ -1097,133 +1661,170 @@ class AdvancedHierarchicalDiffusion(nn.Module):
         
         print("Complete training pipeline finished!")
 
-    def refine_coordinates_scale_free(self, coords, tau=0.9):
-        '''scale free coordinate refinement using relative min seperation
+    # INTEGRATION: Main training method that uses all the fixes
+    def train_slide_invariant_pipeline(self, 
+                                    encoder_epochs=1000,
+                                    vae_epochs=800, 
+                                    diffusion_epochs=400,
+                                    use_adversarial=True,
+                                    **kwargs):
+        """
+        Complete training pipeline with slide-invariant fixes.
+        This replaces the regular train() method when you want slide invariance.
+        """
+        print("="*60)
+        print("Starting SLIDE-INVARIANT training pipeline")
+        print("="*60)
         
-        tau: factor for minimum seperation (0.8-1.0) where 1.0 is tight'''
-
-        device = coords.device
-        n = coords.shape[0]
-
-        def compute_nearest_neighbor_distances(X):
-            '''compute distance to nearest enighbor for each point'''
-            distances = torch.cdist(X, X)
-            distances.fill_diagonal_(float('inf'))
-            nn_distances, _ = distances.min(dim=1)
-            return nn_distances
+        # Verify we have slide information
+        if not hasattr(self, 'slide_adversarial') or self.slide_adversarial is None:
+            if self.slide_labels is not None:
+                print("ERROR: Slide labels provided but no adversarial head initialized!")
+                return
+            else:
+                print("WARNING: No slide labels provided, training without slide invariance")
+                use_adversarial = False
         
-        def pairwise_distances_squared(X):
-            '''compute pairwise squared distances'''
-            s = (X * X).sum(1, keepdim=True)
-            S = s + s.T - 2 * X @ X.T
-            S = S.clamp_min_(0.0)
-            S.fill_diagonal_(0.0)
-            return S
+        # Stage 1: Train encoder (keep as is - DO NOT MODIFY)
+        print("\nStage 1: Training domain alignment encoder...")
+        print("-"*40)
+        self.train_encoder(n_epochs=encoder_epochs)
         
-        def gram_matrix(S):
-            '''convert gram matrix back to distance matrix'''
-            r = S.mean(1, keepdim=True)
-            c = S.mean(0, keepdim=True)
-            m = S.mean()
-            B = -0.5 * ( S - r - c + m)
-            return B
+        # Stage 2: Train Graph-VAE with proper adversarial
+        print("\nStage 2: Training Graph-VAE with slide invariance...")
+        print("-"*40)
         
-        def distance_from_gram(B):
-            """Convert Gram matrix back to distance matrix"""
-            d = torch.diag(B)
-            S = d[:, None] + d[None, :] - 2 * B
-            S = S.clamp_min_(0.0)
-            S.fill_diagonal_(0.0)
-            return S
+        # Replace the old methods with fixed versions
+        self._compute_expression_based_pose_anchors = self._compute_expression_based_pose_anchors
+        self._apply_random_transforms = self._apply_random_transforms
         
-        def project_to_euclidean(S):
-            """Project distance matrix to Euclidean space"""
-            B = gram_matrix(S)
-            vals, vecs = torch.linalg.eigh(B)
-            vals = vals.clamp_min(0.0)
-            
-            # Keep top 2 eigenvalues for 2D
-            idx = torch.argsort(vals, descending=True)[:2]
-            vals = vals[idx]
-            vecs = vecs[:, idx]
-            
-            B_proj = (vecs * vals.sqrt()) @ (vecs * vals.sqrt()).T
-            return distance_from_gram(B_proj)
+        if use_adversarial and self.slide_adversarial is not None:
+            self.train_graph_vae(
+                epochs=vae_epochs,
+                adversarial_weight=0.2,
+                consistency_weight=0.1,
+                use_expression_pose=True
+            )
+        else:
+            # Fallback to regular training if no slides
+            self.train_graph_vae(epochs=vae_epochs)
         
-        def enforce_min_separation(S, min_dist):
-            """Enforce minimum distance constraints"""
-            S = S.clone()
-            min_dist_sq = min_dist ** 2
-            mask = ~torch.eye(n, dtype=torch.bool, device=device)
-            S[mask] = torch.maximum(S[mask], torch.full_like(S[mask], min_dist_sq))
-            S.fill_diagonal_(0.0)
-            return 0.5 * (S + S.T)
+        # Stage 3: Train latent diffusion with adversarial
+        print("\nStage 3: Training latent diffusion with slide invariance...")
+        print("-"*40)
         
-        def coords_from_distances(S):
-            """Extract 2D coordinates from distance matrix"""
-            B = gram_matrix(S)
-            vals, vecs = torch.linalg.eigh(B)
-            idx = torch.argsort(vals, descending=True)[:2]
-            L = torch.diag(vals[idx].clamp_min(0.0).sqrt())
-            U = vecs[:, idx] @ L
-            return U
-
+        # Replace with fixed version
+        # self._sample_balanced_batch = _sample_balanced_batch.__get__(self, type(self))
         
-        def align_to_original(U, X_orig):
-            Um = U.mean(0)
-            Xm = X_orig.mean(0)
-            Uc = U - Um
-            Xc = X_orig - Xm  # Fixed: was X_orig - Xc
-            M = Uc.T @ Xc
-            U_svd, _, Vt = torch.linalg.svd(M, full_matrices=False)
-            R = U_svd @ Vt
-            # avoid reflection
-            if torch.linalg.det(R) < 0:
-                U_svd[:, -1] *= -1
-                R = U_svd @ Vt
-            t = Xm - (Um @ R)
-            return U @ R + t
+        if use_adversarial and self.slide_adversarial is not None:
+            self.train_diffusion_latent(
+                n_epochs=diffusion_epochs,
+                adversarial_weight=0.2,
+                **kwargs
+            )
+        else:
+            # Fallback to regular training if no slides
+            self.train_diffusion_latent(n_epochs=diffusion_epochs, **kwargs)
+        
+        print("\n" + "="*60)
+        print("SLIDE-INVARIANT training pipeline complete!")
+        print("="*60)
+        
+        # Run diagnostics
+        self._run_slide_invariance_diagnostics()
 
 
+    def _run_slide_invariance_diagnostics(self):
+        """
+        Run diagnostics to check if slide invariance is working.
+        """
+        print("\n" + "="*60)
+        print("SLIDE INVARIANCE DIAGNOSTICS")
+        print("="*60)
         
-        # Step 1: Compute scale-free minimum separation
-        nn_distances = compute_nearest_neighbor_distances(coords)
-        median_nn_dist = torch.median(nn_distances)
-        min_separation = tau * median_nn_dist
+        if not hasattr(self, 'slide_adversarial') or self.slide_adversarial is None:
+            print("No slide adversarial head - skipping diagnostics")
+            return
         
-        print(f"Nearest neighbor distances: min={nn_distances.min():.4f}, "
-            f"median={median_nn_dist:.4f}, max={nn_distances.max():.4f}")
-        print(f"Using minimum separation: {min_separation:.4f} (tau={tau})")
-        
-        # Step 2: Refinement loop
-        S = pairwise_distances_squared(coords)
-        
-        for iteration in range(100):
-            S_prev = S.clone()
+        with torch.no_grad():
+            # Get ST embeddings and latents
+            st_features = self.netE(self.st_gene_expr).float()
+            adj_idx, adj_w = precompute_knn_edges(st_features, k=30, device=self.device)
+            mu_st, _ = self.graph_vae_encoder(st_features, adj_idx, adj_w)
             
-            # Project to Euclidean distance matrix
-            S = project_to_euclidean(S)
+            # Test 1: Check if adversarial can predict slides from latents
+            slide_pred_logits = self.slide_adversarial(mu_st)
+            slide_pred = slide_pred_logits.argmax(1)
+            accuracy = (slide_pred == self.slide_indices).float().mean()
             
-            # Enforce minimum separation
-            S = enforce_min_separation(S, min_separation)
+            print(f"\n1. Slide prediction accuracy from latents: {accuracy:.3f}")
+            if accuracy < 0.4:  # Near chance for 3 slides
+                print("   ✓ GOOD: Latents are slide-invariant (adversarial is confused)")
+            else:
+                print("   ⚠ WARNING: Latents still contain slide information!")
             
-            # Check convergence
-            change = (S - S_prev).norm() / (S_prev.norm() + 1e-12)
-            if change < 1e-6:
-                print(f"Converged after {iteration + 1} iterations")
-                break
+            # Test 2: Check coordinate consistency across slides
+            coords_pred = self.graph_vae_decoder(mu_st)
+            
+            # Compute descriptors per slide
+            descriptors = []
+            for slide_id in range(self.num_slides):
+                mask = (self.slide_indices == slide_id)
+                if mask.any():
+                    slide_coords = coords_pred[mask]
+                    # Canonicalize
+                    slide_coords_canon, _, _ = self._normalize_coordinates_to_unit_disk(slide_coords)
+                    
+                    # Compute radial histogram
+                    radii = torch.norm(slide_coords_canon, dim=1)
+                    # hist, _ = torch.histogram(radii, bins=10, range=(0, 1))
+                    hist, _ = torch.histogram(radii.cpu(), bins=10, range=(0, 1))
+                    hist = hist.to(radii.device)  # Move back to original device
+                    hist = hist.float() / hist.sum()
+                    descriptors.append(hist)
+            
+            if len(descriptors) > 1:
+                descriptors_stack = torch.stack(descriptors)
+                variance = descriptors_stack.var(dim=0).mean()
+                print(f"\n2. Cross-slide descriptor variance: {variance:.6f}")
+                if variance < 0.01:
+                    print("   ✓ GOOD: Slides have consistent global structure")
+                else:
+                    print("   ⚠ WARNING: Slides have different structures")
+            
+            # Test 3: Check if decoder depends on z (not collapsed)
+            sample_mu = mu_st[:5]
+            sample_coords = []
+            for _ in range(5):
+                noise = torch.randn_like(sample_mu) * 0.1
+                coords = self.graph_vae_decoder(sample_mu + noise)
+                sample_coords.append(coords)
+            
+            coords_stack = torch.stack(sample_coords)
+            coord_std = coords_stack.std(dim=0).mean()
+            print(f"\n3. Decoder sensitivity to z: std={coord_std:.6f}")
+            if coord_std > 1e-3:
+                print("   ✓ GOOD: Decoder uses latent z meaningfully")
+            else:
+                print("   ⚠ WARNING: Possible posterior collapse!")
         
-        # Step 3: Extract refined coordinates
-        coords_refined = coords_from_distances(S)
-        coords_final = align_to_original(coords_refined, coords)
-        # coords_final = lock_orientation(coords_refined, coords)
+        print("="*60)
+
+    # Fix for initialization - use COSINE noise schedule
+    def initialize_with_cosine_schedule(self):
+        """
+        Call this right after creating the model to use cosine noise schedule.
+        This should be called in __init__ or right after model creation.
+        """
+        # Replace the linear schedule with cosine
+        self.noise_schedule_mode = 'linear'
+        self.noise_schedule = self._build_noise_schedule_cosine(self.n_timesteps, s=0.008)
         
-        # Compute final statistics
-        final_nn_distances = compute_nearest_neighbor_distances(coords_final)
-        print(f"After refinement - min distance: {final_nn_distances.min():.4f}, "
-            f"median: {torch.median(final_nn_distances):.4f}")
-        
-        return coords_final
+        print(f"Initialized with COSINE noise schedule")
+        print(f"  α_bar[0] = {self.noise_schedule['alphas_cumprod'][0]:.6f}")
+        print(f"  α_bar[T-1] = {self.noise_schedule['alphas_cumprod'][-1]:.6f}")
+
+
     
     def sample_sc_coordinates_batched(self, batch_size: int = 512, return_normalized=True):
         """
@@ -1307,67 +1908,106 @@ class AdvancedHierarchicalDiffusion(nn.Module):
     from tqdm import tqdm
 
 
-    def sample_sc_coordinates_pure_diffusion(self, batch_size=512, guidance_scale=1.0, return_normalized=True):
+    def sample_sc_coordinates_slide_invariant(
+        self,
+        batch_size=512,
+        guidance_scale=2.0,
+        return_normalized=True,
+        deterministic=False
+    ):
         """
-        Pure diffusion sampling: Start from noise → denoise → decode.
-        No Graph VAE used for SC inference at all.
+        Sample SC coordinates using slide-invariant diffusion prior.
+        Uses deterministic sampling (z0=μ, temp=0) for consistency.
         """
         n_total = len(self.sc_gene_expr)
-        print(f"Sampling {n_total} SC coordinates using pure latent diffusion...")
+        print(f"Sampling {n_total} SC coordinates with slide-invariant prior...")
         
         # Set models to eval mode
         self.netE.eval()
-        self.graph_vae_decoder.eval()  # Only for final decoding
-        self.latent_denoiser.eval()
+        self.graph_vae_encoder.eval()
+        self.graph_vae_decoder.eval()
+        denoiser = getattr(self, "latent_denoiser_ema", self.latent_denoiser).eval()
         self.update_noise_schedule()
         
         all_coords = []
         n_batches = (n_total + batch_size - 1) // batch_size
         
         with torch.no_grad():
-            for batch_idx in tqdm(range(n_batches), desc="Sampling batches"):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, n_total)
-                batch_sc_expr = self.sc_gene_expr[start_idx:end_idx]
+            for b in tqdm(range(n_batches), desc="Sampling batches", unit="batch"):
+                s = b * batch_size
+                e = min(s + batch_size, n_total)
+                X_sc = self.sc_gene_expr[s:e]
                 
-                # Get SC conditioning (gene expression embeddings only)
-                h_sc = self.netE(batch_sc_expr).float()  # (B, d_embed)
-                B = h_sc.size(0)
+                # 1) Shared embedding (condition)
+                h_sc = self.netE(X_sc).float()
+                B = h_sc.shape[0]
+
+                if deterministic:
+                    # DETERMINISTIC: Use μ directly (no sampling)
+                    # Build SC graph for amortized initialization
+                    sc_adj_idx, sc_adj_w = precompute_knn_edges(h_sc, k=min(30, B-1), device=self.device)
+                    mu_sc, _ = self.graph_vae_encoder(h_sc, sc_adj_idx, sc_adj_w)
+                    z0 = mu_sc  # No sampling - deterministic
+                    
+                else:
+                    # STOCHASTIC: Sample from posterior
+                    sc_adj_idx, sc_adj_w = precompute_knn_edges(h_sc, k=min(30, B-1), device=self.device)
+                    mu_sc, logvar_sc = self.graph_vae_encoder(h_sc, sc_adj_idx, sc_adj_w)
+                    z0 = mu_sc + torch.randn_like(mu_sc) * torch.exp(0.5 * logvar_sc)
+
+                # 2) Use expression-based coordinate system if available
+                if hasattr(self, 'pose_anchors'):
+                    # Project to expression-aligned coordinate space
+                    z_hint = self.cond_adapter(self._whiten_cond(h_sc))
+                    alpha_blend = 0.3
+                    z0 = (1.0 - alpha_blend) * z0 + alpha_blend * z_hint
+
+                # 3) Diffusion sampling (can be deterministic or stochastic)
+                T = self.n_timesteps - 1
+                alpha_bar_T = self.noise_schedule['alphas_cumprod'][T]
                 
-                # Start from PURE NOISE in latent space (no Graph VAE)
-                z_t = torch.randn(B, self.latent_dim, device=self.device)
+                # Start from noised z0
+                eps_T = torch.randn_like(z0) if not deterministic else torch.zeros_like(z0)
+                z_t = alpha_bar_T.sqrt() * z0 + (1.0 - alpha_bar_T).sqrt() * eps_T
                 
-                # Reverse diffusion with classifier-free guidance
+                # Reverse diffusion
                 for t in reversed(range(self.n_timesteps)):
-                    t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
+                    t_norm = (torch.full((B, 1), t, device=self.device) / 
+                            max(self.n_timesteps - 1, 1))
                     
-                    # Classifier-free guidance
-                    eps_c = self.latent_denoiser(z_t, t_norm, h_sc)          # Conditioned
-                    eps_u = self.latent_denoiser(z_t, t_norm, torch.zeros_like(h_sc))  # Unconditioned
-                    eps_pred = (1 + guidance_scale) * eps_c - guidance_scale * eps_u
+                    # Prepare conditioning
+                    c_b = self._whiten_cond(h_sc)
+                    z_hint = self.cond_adapter(c_b)
+                    cond_full = torch.cat([c_b, z_hint], dim=1)
                     
-                    # DDPM reverse step
+                    # Predict noise with guidance
+                    eps_c = denoiser(z_t, t_norm, cond_full)
+                    eps_u = denoiser(z_t, t_norm, torch.zeros_like(cond_full))
+                    eps_pred = eps_u + guidance_scale * (eps_c - eps_u)
+                    
+                    # DDPM update
                     alpha_t = self.noise_schedule['alphas'][t]
                     alpha_bar_t = self.noise_schedule['alphas_cumprod'][t]
+                    beta_t = self.noise_schedule['betas'][t]
                     
-                    mu = (1 / torch.sqrt(alpha_t)) * (
-                        z_t - ((1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)) * eps_pred
+                    mu = (1.0 / alpha_t.sqrt()) * (
+                        z_t - ((1.0 - alpha_t) / (1.0 - alpha_bar_t).sqrt()) * eps_pred
                     )
                     
                     if t > 0:
-                        sigma_t = torch.sqrt(self.noise_schedule['posterior_variance'][t])
-                        z_t = mu + sigma_t * torch.randn_like(z_t)
+                        noise = torch.randn_like(z_t) if not deterministic else torch.zeros_like(z_t)
+                        sigma = beta_t.sqrt()
+                        z_t = mu + sigma * noise
                     else:
                         z_t = mu
                 
-                # Decode final latent to coordinates (decoder only)
-                batch_coords = self.graph_vae_decoder(z_t)
-                all_coords.append(batch_coords.cpu())
-                
-                torch.cuda.empty_cache()
-        
+                # 4) Decode to coordinates
+                coords = self.graph_vae_decoder(z_t)
+                all_coords.append(coords.cpu())
+
         final_coords = torch.cat(all_coords, dim=0)
-        print(f"Pure diffusion sampling complete! Generated {final_coords.shape[0]} coordinates.")
+        print(f"Slide-invariant sampling complete! Generated {final_coords.shape[0]} coordinates.")
+        
         if return_normalized:
             return final_coords
         else:
@@ -1376,7 +2016,7 @@ class AdvancedHierarchicalDiffusion(nn.Module):
     def sample_sc_coordinates(
         self,
         batch_size=512,
-        guidance_scale=1.0,
+        guidance_scale=2.0,
         k_nn=15, margin=0.05,
         lambda_trip=0.05, lambda_rep=0.08, lambda_ang=0.01,lambda_rad = 0.1,
         gamma=0.05,
@@ -1426,6 +2066,12 @@ class AdvancedHierarchicalDiffusion(nn.Module):
             for i in range(0, z.size(0), denoiser_chunk):
                 outs.append(denoiser(z[i:i+denoiser_chunk], tnorm[i:i+denoiser_chunk], cond[i:i+denoiser_chunk]))
             return torch.cat(outs, dim=0)
+        
+        # choose a start step t_start so alpha_bar[t_start] ~ target (not near 0)
+        target_alpha = 0.08  # 0.05–0.15 is typically stable
+        alpha_bar = self.noise_schedule['alphas_cumprod']   # (T,)
+        t_start = int(torch.argmin(torch.abs(alpha_bar - target_alpha)).item())
+        alpha_bar_start = alpha_bar[t_start]
 
         all_coords = []
         n_batches = (n_total + batch_size - 1) // batch_size
@@ -1449,28 +2095,45 @@ class AdvancedHierarchicalDiffusion(nn.Module):
                 # --- baseline for tiny angle anchor (SC kNN graph; cheap) ---
                 sc_adj_idx, sc_adj_w = precompute_knn_edges(h_sc, k=30, device=self.device)
                 mu_sc, logvar_sc = self.graph_vae_encoder(h_sc, sc_adj_idx, sc_adj_w)  # (B, d_z)
+
+                #whiten + adapter
+                h_sc = self._whiten_cond(h_sc)
+                z_hint = self.cond_adapter(h_sc)
+
                 #reparam to get a posterior sample
                 z_0 = mu_sc + torch.randn_like(mu_sc) * torch.exp(0.5 * logvar_sc)
+                # z_0 = mu_sc
+                alpha_blend = 0.3 
+                z_0 = (1.0 - alpha_blend) * z_0 + alpha_blend * z_hint 
                 y_base = self.graph_vae_decoder(mu_sc)                         # (B, 2)
 
                 #diffuse forward to the last timestep T so we start at the same noise level used during training
-                T = self.n_timesteps - 1
-                alpha_bar_T = self.noise_schedule['alphas_cumprod'][T]
+                # T = self.n_timesteps - 1
+                # alpha_bar_T = self.noise_schedule['alphas_cumprod'][T]
+                # z_t = (
+                #     torch.sqrt(alpha_bar_T) * z_0 +
+                #     torch.sqrt(1.0 - alpha_bar_T) * torch.randn_like(z_0)
+                # )
+
+                      # 3) forward-noise to the chosen start noise level (alpha_bar_start)
                 z_t = (
-                    torch.sqrt(alpha_bar_T) * z_0 +
-                    torch.sqrt(1.0 - alpha_bar_T) * torch.randn_like(z_0)
+                    torch.sqrt(alpha_bar_start) * z_0 +
+                    torch.sqrt(1.0 - alpha_bar_start) * torch.randn_like(z_0)
                 )
 
                 # -------- reverse diffusion (Îµ-pred, classifier-free) --------
-                for t in reversed(range(self.n_timesteps)):
+                # for t in reversed(range(self.n_timesteps)):
+                for t in reversed(range(t_start + 1)):
                     # normalized timestep
                     t_norm = torch.full((B, 1), t / max(self.n_timesteps - 1, 1), device=self.device)
+                    cond_full = torch.cat([h_sc, z_hint], dim=1)
 
                     # Îµ-pred with CF guidance (denoiser in inference mode â†’ tiny memory)
                     with torch.inference_mode():
-                        eps_c = _denoise_eps(z_t, t_norm, h_sc)
-                        eps_u = _denoise_eps(z_t, t_norm, torch.zeros_like(h_sc))
+                        eps_c = _denoise_eps(z_t, t_norm, cond_full) #changed from h_sc to cond_full, comment for later revision
+                        eps_u = _denoise_eps(z_t, t_norm, torch.zeros_like(cond_full))
                         eps_pred = (1.0 + guidance_scale) * eps_c - guidance_scale * eps_u
+                        # eps_pred = eps_u + guidance_scale * (eps_c - eps_u)
 
                     # DDPM reverse mean (same as your old code)
                     alpha_t = self.noise_schedule['alphas'][t]
