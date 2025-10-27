@@ -11,8 +11,8 @@ import os
 from typing import Dict, List, Tuple, Optional
 
 # Import from project knowledge Set-Transformer components
-from modules import MAB, SAB, ISAB, PMA
-import utils_et as uet
+from .modules import MAB, SAB, ISAB, PMA
+from . import utils_et as uet
 
 from tqdm import tqdm
 
@@ -21,7 +21,7 @@ import json
 from datetime import datetime
 
 from torch.utils.data import DataLoader
-from core_models_et_p1 import collate_minisets, collate_sc_minisets
+from .core_models_et_p1 import collate_minisets, collate_sc_minisets
 from tqdm.auto import tqdm
 import sys
 

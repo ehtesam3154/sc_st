@@ -1,15 +1,6 @@
 """
 Full GEMS Pipeline with DDP for Mouse Brain
 Runs Stage A (single GPU) → Stage B → Stage C (DDP on 2 GPUs)
-
-Usage:
-    # For full pipeline (Stage A+B+C):
-    torchrun --standalone --nproc_per_node=2 scripts/run_full_pipeline_ddp.py \
-        --mode full --n_epochs_stageC 2
-    
-    # For Stage C only (if A+B already done):
-    torchrun --standalone --nproc_per_node=2 scripts/run_full_pipeline_ddp.py \
-        --mode stagec_only --n_epochs_stageC 400
 """
 
 import os
@@ -25,67 +16,44 @@ from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import scanpy as sc
 import pandas as pd
-from datetime import datetime
 
-
-#add paths
+# Add paths
 sys.path.insert(0, str(Path(__file__).parent.parent / 'model'))
 
-#import GEMS components
+# Import GEMS components
 from core_models_et_p1 import SharedEncoder, STStageBPrecomputer, STSetDataset, SCSetDataset, collate_minisets, collate_sc_minisets
-from core_models_et_p2 import SetEncoderContext, DiffusionScoreNet, precompute_st_prototypes
-from core_models_et_p3 import GEMSModel
+from core_models_et_p2 import SetEncoderContext, DiffusionScoreNet, precompute_st_prototypes, MetricSetGenerator
 import utils_et as uet
 
 # Import DDP utilities
 from ddp_utils import (
     init_dist, cleanup_dist, is_main_process, get_rank, get_world_size,
-    rank_print, seed_all, rank_tqdm, all_reduce_mean, broadcast_object
+    rank_print, seed_all, all_reduce_mean, broadcast_object
 )
-from pairwise_shard import is_sharding_beneficial
 
 
 def load_mousebrain_data(data_dir: Path):
-    """Load mouse brain SC and ST data - EXACT COPY from mouse_brain_gems.ipynb."""
+    """Load mouse brain SC and ST data."""
     rank_print("Loading mouse brain data...")
     
-    # Load SC data
     scdata = pd.read_csv(data_dir / 'simu_sc_counts.csv', index_col=0).T
     scmetadata = pd.read_csv(data_dir / 'metadata.csv', index_col=0)
-    
-    # Load ST data
     stdata = pd.read_csv(data_dir / 'simu_st_counts.csv', index_col=0).T
     spcoor = pd.read_csv(data_dir / 'simu_st_metadata.csv', index_col=0)
-    stgtcelltype = pd.read_csv(data_dir / 'simu_st_celltype.csv', index_col=0)
     
-    # Create SC AnnData - EXACT COPY from notebook
     scadata = sc.AnnData(scdata, obs=scmetadata)
     sc.pp.normalize_total(scadata)
     sc.pp.log1p(scadata)
     scadata.obsm['spatial'] = scmetadata[['x_global', 'y_global']].values
     
-    # Create ST AnnData - EXACT COPY from notebook
     stadata = sc.AnnData(stdata)
     sc.pp.normalize_total(stadata)
     sc.pp.log1p(stadata)
     stadata.obsm['spatial'] = spcoor[['coord_x', 'coord_y']].values
     
-    # Process ST cell type information - EXACT COPY from notebook
-    cell_type_columns = stgtcelltype.columns
-    dominant_celltypes = []
-    
-    for i in range(stgtcelltype.shape[0]):
-        cell_types_present = [col for col, val in zip(cell_type_columns, stgtcelltype.iloc[i]) if val > 0]
-        dominant_celltype = cell_types_present[0] if cell_types_present else 'Unknown'
-        dominant_celltypes.append(dominant_celltype)
-    
-    stadata.obs['celltype'] = dominant_celltypes
-    
-    # Get common genes
     common_genes = sorted(list(set(scadata.var_names) & set(stadata.var_names)))
     n_genes = len(common_genes)
     
-    # Extract tensors
     sc_expr = scadata[:, common_genes].X
     st_expr = stadata[:, common_genes].X
     
@@ -108,14 +76,12 @@ def load_mousebrain_data(data_dir: Path):
         'sc_expr': sc_expr_tensor,
         'st_expr': st_expr_tensor,
         'st_coords': st_coords_tensor,
-        'n_genes': n_genes,
-        'common_genes': common_genes,
-        'scadata': scadata,
-        'stadata': stadata
+        'n_genes': n_genes
     }
 
+
 def run_stage_a(data, args, device):
-    """Stage A: Train shared encoder (single GPU on rank 0)."""
+    """Stage A: Train shared encoder (rank 0 only)."""
     if not is_main_process():
         return None
     
@@ -123,17 +89,14 @@ def run_stage_a(data, args, device):
     rank_print("STAGE A: Training Shared Encoder (Rank 0 only)")
     rank_print("="*70)
     
-    # Build encoder
     encoder = SharedEncoder(
         n_genes=data['n_genes'],
         n_embedding=[512, 256, 128],
         dropout=0.1
     ).to(device)
     
-    # Single slide
     slide_ids = torch.zeros(data['st_expr'].shape[0], dtype=torch.long)
     
-    # Train encoder
     from core_models_et_p1 import train_encoder
     train_encoder(
         model=encoder,
@@ -153,7 +116,6 @@ def run_stage_a(data, args, device):
         outf=str(args.output_dir)
     )
     
-    # Save encoder
     encoder_path = args.output_dir / 'encoder_stageA.pt'
     torch.save(encoder.state_dict(), encoder_path)
     rank_print(f"✓ Encoder saved: {encoder_path}")
@@ -170,18 +132,10 @@ def run_stage_b(data, encoder, args, device):
     rank_print("STAGE B: Precomputing Geometric Targets (Rank 0 only)")
     rank_print("="*70)
     
-    # Create precomputer
-    precomputer = STStageBPrecomputer(
-        device=device
-    )
-    
-    # Prepare slide dict
-    slides_dict = {
-        0: (data['st_coords'].to(device), data['st_expr'].to(device))
-    }
-    
-    # Precompute
+    precomputer = STStageBPrecomputer(device=device)
+    slides_dict = {0: (data['st_coords'].to(device), data['st_expr'].to(device))}
     cache_dir = args.output_dir / 'stage_b_cache'
+    
     targets_dict = precomputer.precompute(
         slides=slides_dict,
         encoder=encoder,
@@ -190,13 +144,52 @@ def run_stage_b(data, encoder, args, device):
     
     rank_print(f"✓ Stage B complete. Targets cached at: {cache_dir}")
     
+    # Move to CPU for broadcasting
+    rank_print("Moving targets to CPU for broadcasting...")
+    for slide_id, targets in targets_dict.items():
+        targets.y_hat = targets.y_hat.cpu()
+        targets.G = targets.G.cpu()
+        targets.D = targets.D.cpu()
+        targets.H = targets.H.cpu()
+        targets.H_bins = targets.H_bins.cpu()
+        if hasattr(targets, 'L') and targets.L is not None:
+            if targets.L.is_sparse:
+                targets.L = targets.L.to_dense().cpu()
+            else:
+                targets.L = targets.L.cpu()
+        if hasattr(targets, 'triplets') and targets.triplets is not None:
+            targets.triplets = targets.triplets.cpu()
+    
     return targets_dict
+
 
 def run_stage_c_ddp(data, encoder, targets_dict, args, device, rank, world_size):
     """Stage C: Train diffusion generator with DDP."""
     rank_print("\n" + "="*70)
     rank_print("STAGE C: Training Diffusion Generator (DDP)")
     rank_print("="*70)
+    
+    # Clear CUDA cache
+    torch.cuda.empty_cache()
+    if world_size > 1:
+        dist.barrier()
+    
+    # Move targets to device
+    rank_print(f"Moving targets to cuda:{rank}...")
+    if targets_dict is not None:
+        for slide_id, targets in targets_dict.items():
+            targets.y_hat = targets.y_hat.to(device)
+            targets.G = targets.G.to(device)
+            targets.D = targets.D.to(device)
+            targets.H = targets.H.to(device)
+            targets.H_bins = targets.H_bins.to(device)
+            if hasattr(targets, 'L') and targets.L is not None:
+                targets.L = targets.L.to(device)
+            if hasattr(targets, 'triplets') and targets.triplets is not None:
+                targets.triplets = targets.triplets.to(device)
+    
+    torch.cuda.synchronize(device)
+    rank_print("✓ Targets moved to device")
     
     # Determine AMP dtype
     if torch.cuda.is_bf16_supported():
@@ -209,34 +202,50 @@ def run_stage_c_ddp(data, encoder, targets_dict, args, device, rank, world_size)
     rank_print(f"AMP dtype: {amp_dtype}, using GradScaler: {use_scaler}")
     
     # Build models
+    rank_print("Building models...")
     context_encoder = SetEncoderContext(
-        h_dim=128,
-        c_dim=256,
-        n_heads=4,
-        n_blocks=3,
-        isab_m=64
+        h_dim=128, c_dim=256, n_heads=4, n_blocks=3, isab_m=64
+    ).to(device)
+    
+    generator = MetricSetGenerator(
+        c_dim=256, D_latent=args.D_latent, n_heads=4, n_blocks=2, isab_m=64
     ).to(device)
     
     score_net = DiffusionScoreNet(
-        D_latent=args.D_latent,
-        c_dim=256,
-        time_emb_dim=128,
-        n_blocks=4
+        D_latent=args.D_latent, c_dim=256, time_emb_dim=128, n_blocks=4
     ).to(device)
+    
+    torch.cuda.synchronize(device)
+    rank_print("✓ Models created")
     
     # Wrap in DDP
     if world_size > 1:
+        dist.barrier()
+        rank_print("Wrapping models in DDP...")
         context_encoder = DDP(context_encoder, device_ids=[rank], output_device=rank)
+        generator = DDP(generator, device_ids=[rank], output_device=rank)
         score_net = DDP(score_net, device_ids=[rank], output_device=rank)
+        rank_print("✓ Models wrapped in DDP")
     
     # Optimizer
-    params = list(context_encoder.parameters()) + list(score_net.parameters())
+    params = (
+        list(context_encoder.parameters()) + 
+        list(generator.parameters()) + 
+        list(score_net.parameters())
+    )
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler() if use_scaler else None
     
-    # Datasets
-    st_gene_expr_dict = {0: data['st_expr']}
+    # Ensure encoder is on device
+    encoder = encoder.to(device)
+    encoder.eval()
+    for param in encoder.parameters():
+        param.requires_grad = False
     
+    # Create datasets
+    st_gene_expr_dict = {0: data['st_expr'].to(device)}
+    
+    rank_print("Creating datasets...")
     st_dataset = STSetDataset(
         targets_dict=targets_dict,
         encoder=encoder,
@@ -246,16 +255,16 @@ def run_stage_c_ddp(data, encoder, targets_dict, args, device, rank, world_size)
         D_latent=args.D_latent,
         num_samples=args.num_st_samples,
         knn_k=12,
-        device=device
+        device=str(device)
     )
     
     sc_dataset = SCSetDataset(
-        sc_gene_expr=data['sc_expr'],
+        sc_gene_expr=data['sc_expr'].to(device),
         encoder=encoder,
         n_min=args.n_min,
         n_max=args.n_max,
         num_samples=args.num_sc_samples,
-        device=device
+        device=str(device)
     )
     
     rank_print(f"  ST dataset: {len(st_dataset)} samples")
@@ -269,30 +278,51 @@ def run_stage_c_ddp(data, encoder, targets_dict, args, device, rank, world_size)
             encoder=encoder,
             st_gene_expr_dict=st_gene_expr_dict,
             n_prototypes=3000,
-            device=device
+            device=str(device)
         )
+        # Move to CPU for broadcasting
+        prototype_bank['centroids'] = prototype_bank['centroids'].cpu()
+        for proto in prototype_bank['prototypes']:
+            proto['centroid_Z'] = proto['centroid_Z'].cpu()
+            proto['hist'] = proto['hist'].cpu()
+            proto['bins'] = proto['bins'].cpu()
+            proto['D'] = proto['D'].cpu()
+        rank_print("✓ Prototypes computed")
     else:
         prototype_bank = None
     
+    # Broadcast prototypes
     if world_size > 1:
+        rank_print("Broadcasting prototypes...")
         prototype_bank = broadcast_object(prototype_bank, src=0)
+        if prototype_bank is not None:
+            prototype_bank['centroids'] = prototype_bank['centroids'].to(device)
+            for proto in prototype_bank['prototypes']:
+                proto['centroid_Z'] = proto['centroid_Z'].to(device)
+                proto['hist'] = proto['hist'].to(device)
+                proto['bins'] = proto['bins'].to(device)
+                proto['D'] = proto['D'].to(device)
+        rank_print("✓ Prototypes received")
     
-    # Samplers and loaders
-    st_sampler = DistributedSampler(st_dataset, shuffle=True) if world_size > 1 else None
-    sc_sampler = DistributedSampler(sc_dataset, shuffle=True) if world_size > 1 else None
+    # Create samplers and dataloaders
+    st_sampler = DistributedSampler(
+        st_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    ) if world_size > 1 else None
+    
+    sc_sampler = DistributedSampler(
+        sc_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    ) if world_size > 1 else None
     
     st_loader = DataLoader(
         st_dataset, batch_size=args.batch_size,
         sampler=st_sampler, shuffle=(st_sampler is None),
-        collate_fn=collate_minisets, num_workers=4,
-        pin_memory=True, persistent_workers=True
+        collate_fn=collate_minisets, num_workers=0, pin_memory=False
     )
     
     sc_loader = DataLoader(
         sc_dataset, batch_size=args.batch_size,
         sampler=sc_sampler, shuffle=(sc_sampler is None),
-        collate_fn=collate_sc_minisets, num_workers=4,
-        pin_memory=True, persistent_workers=True
+        collate_fn=collate_sc_minisets, num_workers=0, pin_memory=False
     )
     
     # Sigma schedule
@@ -302,85 +332,83 @@ def run_stage_c_ddp(data, encoder, targets_dict, args, device, rank, world_size)
     ))
     
     # Loss modules
-    loss_modules = {
-        'gram': uet.FrobeniusGramLoss(),
-        'heat': uet.HeatKernelLoss(
-            use_hutchinson=True, num_probes=8,
-            chebyshev_degree=10, knn_k=8,
-            t_list=(0.5, 1.0), laplacian='sym'
-        ),
-        'sw': uet.SlicedWassersteinLoss1D(),
-        'triplet': uet.OrdinalTripletLoss()
-    }
-    
-    # Loss weights
-    weights = {
-        'score': 1.0, 'gram': 0.5, 'heat': 0.25,
-        'sw_st': 0.5, 'sw_sc': 0.3,
-        'overlap': 0.25, 'ordinal_sc': 0.5
-    }
+    gram_loss = uet.FrobeniusGramLoss()
     
     # Training loop
+    rank_print(f"\nStarting Stage C training for {args.n_epochs} epochs...")
+    
     for epoch in range(args.n_epochs):
-        if st_sampler:
+        if world_size > 1:
             st_sampler.set_epoch(epoch)
-        if sc_sampler:
             sc_sampler.set_epoch(epoch)
         
         context_encoder.train()
+        generator.train()
         score_net.train()
+        
+        epoch_losses = []
         
         st_iter = iter(st_loader)
         sc_iter = iter(sc_loader)
-        total_batches = len(st_loader) + len(sc_loader)
         
-        pbar = rank_tqdm(range(total_batches), desc=f"Epoch {epoch+1}/{args.n_epochs}")
-        
-        epoch_loss = 0.0
-        n_batches = 0
-        
-        for batch_idx in pbar:
+        for batch_idx in range(max(len(st_loader), len(sc_loader))):
+            # Get batch (alternate ST/SC)
             is_st = (batch_idx % 2 == 0) and (batch_idx // 2 < len(st_loader))
             
             try:
-                batch = next(st_iter) if is_st else next(sc_iter)
-                batch_type = 'ST' if is_st else 'SC'
+                if is_st:
+                    batch = next(st_iter)
+                else:
+                    batch = next(sc_iter)
             except StopIteration:
                 try:
-                    batch = next(sc_iter if is_st else st_iter)
-                    batch_type = 'SC' if is_st else 'ST'
+                    batch = next(sc_iter) if is_st else next(st_iter)
                 except StopIteration:
                     break
             
-            # Move to device
+            # Move batch to device
             Z_set = batch['Z_set'].to(device)
-            V_target = batch['V_target'].to(device)
             mask = batch['mask'].to(device)
             
-            # Sample timestep
-            batch_size = Z_set.shape[0]
-            t_idx = torch.randint(0, len(sigmas), (batch_size,), device=device)
-            sigma_t = sigmas[t_idx].view(-1, 1, 1)
+            optimizer.zero_grad(set_to_none=True)
             
-            # Add noise
-            noise = torch.randn_like(V_target)
-            V_noisy = V_target + sigma_t * noise
-            
-            # Forward with AMP
-            with torch.autocast(device_type='cuda', dtype=amp_dtype):
+            # Forward pass with AMP (use torch.amp instead of torch.cuda.amp)
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
+                # Context encoding
                 H = context_encoder(Z_set, mask)
-                t_normalized = t_idx.float() / (len(sigmas) - 1)
-                eps_pred = score_net(V_noisy, t_normalized.view(-1, 1), H, mask)
                 
-                # Score matching loss
-                loss_score = ((eps_pred - noise) ** 2 * mask.unsqueeze(-1).float()).sum()
-                loss_score = loss_score / (mask.sum() * V_target.shape[-1])
+                # Generate V_0
+                V_0 = generator(H, mask)
                 
-                # Simple loss for now (full loss with geometric terms can be added)
-                loss = weights['score'] * loss_score
+                # Sample timestep
+                batch_size_real = Z_set.shape[0]
+                t_idx = torch.randint(0, args.n_timesteps, (batch_size_real,), device=device)
+                t_norm = t_idx.float() / args.n_timesteps
+                sigma_t = sigmas[t_idx].view(-1, 1, 1)
+                
+                # Add noise
+                eps = torch.randn_like(V_0)
+                V_t = V_0 + sigma_t * eps
+                V_t = V_t * mask.unsqueeze(-1).float()
+                
+                # Predict noise
+                eps_pred = score_net(V_t, t_norm.unsqueeze(1), H, mask)
+                
+                # Score loss
+                loss_score = ((eps_pred - eps) ** 2 * mask.unsqueeze(-1).float()).sum()
+                loss_score = loss_score / (mask.sum() * V_0.shape[-1])
+                
+                # Gram loss (only for ST batches)
+                loss_gram = torch.tensor(0.0, device=device)
+                if is_st and 'G_target' in batch:
+                    V_pred = V_t - sigma_t * eps_pred
+                    G_target = batch['G_target'].to(device)
+                    loss_gram = gram_loss(V_pred, G_target, mask)
+                
+                # Total loss
+                loss = loss_score + 0.5 * loss_gram
             
-            # Backward
-            optimizer.zero_grad()
+            # Backward pass
             if scaler:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -389,33 +417,35 @@ def run_stage_c_ddp(data, encoder, targets_dict, args, device, rank, world_size)
                 loss.backward()
                 optimizer.step()
             
-            epoch_loss += loss.item()
-            n_batches += 1
-            
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'type': batch_type})
+            epoch_losses.append(loss.item())
         
-        # Print epoch summary
+        # Aggregate loss
+        avg_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
+        if world_size > 1:
+            avg_loss = all_reduce_mean(avg_loss)
+        
         if is_main_process():
-            avg_loss = epoch_loss / max(n_batches, 1)
-            print(f"\nEpoch {epoch+1}/{args.n_epochs} | Loss: {avg_loss:.4f}")
+            rank_print(f"Epoch {epoch+1}/{args.n_epochs} | Loss: {avg_loss:.4f}")
         
-        # Save checkpoint (only final or every 50 epochs)
+        # Save checkpoint
         if is_main_process() and ((epoch + 1) == args.n_epochs or (epoch + 1) % 50 == 0):
             ckpt_dir = args.output_dir / 'checkpoints'
             ckpt_dir.mkdir(exist_ok=True)
             
-            # Unwrap DDP
             if world_size > 1:
                 context_state = context_encoder.module.state_dict()
+                generator_state = generator.module.state_dict()
                 score_state = score_net.module.state_dict()
             else:
                 context_state = context_encoder.state_dict()
+                generator_state = generator.state_dict()
                 score_state = score_net.state_dict()
             
             ckpt = {
                 'epoch': epoch,
                 'encoder': encoder.state_dict(),
                 'context_encoder': context_state,
+                'generator': generator_state,
                 'score_net': score_state,
                 'optimizer': optimizer.state_dict(),
                 'cfg': {
@@ -436,10 +466,14 @@ def run_stage_c_ddp(data, encoder, targets_dict, args, device, rank, world_size)
             ckpt_path = ckpt_dir / f'checkpoint_epoch{epoch+1:04d}.pt'
             torch.save(ckpt, ckpt_path)
             rank_print(f"  ✓ Checkpoint saved: {ckpt_path}")
+        
+        if world_size > 1:
+            dist.barrier()
     
     rank_print("✓ Stage C complete")
     
     return context_encoder, score_net
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -449,29 +483,18 @@ def main():
     parser.add_argument('--output_dir', type=str,
                         default='./gems_mousebrain_ddp_output')
     
-    # STAGE C PARAMS (THESE ARE WHAT MATTER FOR SPEED)
-    parser.add_argument('--n_epochs', type=int, default=3,
-                        help='Stage C epochs (main bottleneck)')
-    parser.add_argument('--n_min', type=int, default=128,
-                        help='Min mini-set size (lower=faster)')
-    parser.add_argument('--n_max', type=int, default=256,
-                        help='Max mini-set size (lower=faster)')
-    parser.add_argument('--num_st_samples', type=int, default=100,
-                        help='ST dataset size (lower=faster)')
-    parser.add_argument('--num_sc_samples', type=int, default=300,
-                        help='SC dataset size (lower=faster)')
+    parser.add_argument('--n_epochs', type=int, default=3)
+    parser.add_argument('--n_min', type=int, default=128)
+    parser.add_argument('--n_max', type=int, default=256)
+    parser.add_argument('--num_st_samples', type=int, default=100)
+    parser.add_argument('--num_sc_samples', type=int, default=300)
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--n_timesteps', type=int, default=400,
-                        help='Diffusion steps (lower=faster)')
+    parser.add_argument('--n_timesteps', type=int, default=400)
     parser.add_argument('--sigma_min', type=float, default=0.1)
     parser.add_argument('--sigma_max', type=float, default=5.0)
     parser.add_argument('--lr', type=float, default=1e-4)
-    
-    # Less important params
-    parser.add_argument('--n_epochs_stageA', type=int, default=1000,
-                        help='Stage A epochs (fast, dont worry about it)')
+    parser.add_argument('--n_epochs_stageA', type=int, default=1000)
     parser.add_argument('--D_latent', type=int, default=16)
-    parser.add_argument('--save_every', type=int, default=1)
     parser.add_argument('--seed', type=int, default=1234)
     
     args = parser.parse_args()
@@ -480,32 +503,22 @@ def main():
     
     # Initialize distributed
     rank, local_rank, world_size, device = init_dist()
-    
     print(f"Rank {rank}/{world_size-1} on cuda:{local_rank} | seed={args.seed+rank}")
     
-    # Seed
     seed_all(args.seed, rank)
-    
-    # Load data
     data = load_mousebrain_data(args.data_dir)
     
-    # Create output directory
     if is_main_process():
         args.output_dir.mkdir(parents=True, exist_ok=True)
     
     if world_size > 1:
-        dist.barrier()  # Wait for rank 0 to create directory
+        dist.barrier()
     
-    # Run pipeline
     if args.mode == 'full':
-        # =====================================================================
-        # STAGE A: Train encoder (rank 0 only)
-        # =====================================================================
         encoder = run_stage_a(data, args, device)
         
-        # Load encoder on all ranks
         if world_size > 1:
-            dist.barrier()  # Wait for rank 0 to save
+            dist.barrier()
         
         if not is_main_process():
             encoder = SharedEncoder(
@@ -517,18 +530,14 @@ def main():
         
         encoder.eval()
         
-        # =====================================================================
-        # STAGE B: Precompute targets (rank 0 only, then broadcast)
-        # =====================================================================
         targets_dict = run_stage_b(data, encoder, args, device)
         
-        # BROADCAST targets instead of loading from disk
         if world_size > 1:
             rank_print("Broadcasting Stage B targets from rank 0...")
             targets_dict = broadcast_object(targets_dict, src=0)
             rank_print(f"  Rank {rank} received targets")
-        
-    else:  # stagec_only
+    
+    else:
         rank_print("Loading encoder and targets from previous run...")
         encoder = SharedEncoder(
             n_genes=data['n_genes'],
@@ -538,17 +547,9 @@ def main():
         encoder.load_state_dict(torch.load(encoder_path, map_location=device))
         encoder.eval()
         
-        # Load from cache (all ranks)
         cache_dir = args.output_dir / 'stage_b_cache'
-        targets_0 = torch.load(cache_dir / 'slide_0.pt', map_location=device)
+        targets_0 = torch.load(cache_dir / 'slide_0.pt', map_location='cpu')
         targets_dict = {0: targets_0}
-    
-    # =========================================================================
-    # STAGE C: DDP training (all ranks)
-    # =========================================================================
-    rank_print("\n" + "="*70)
-    rank_print("STAGE C: Training Diffusion Generator (DDP)")
-    rank_print("="*70)
     
     context_encoder, score_net = run_stage_c_ddp(
         data, encoder, targets_dict, args, device, rank, world_size
@@ -557,14 +558,9 @@ def main():
     rank_print("\n" + "="*70)
     rank_print("PIPELINE COMPLETE!")
     rank_print("="*70)
-    rank_print(f"Output directory: {args.output_dir}")
     
     cleanup_dist()
 
 
 if __name__ == '__main__':
     main()
-
-
-
-

@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset
 
 # Import from project knowledge Set-Transformer components
-from modules import MAB, SAB, ISAB, PMA
-import utils_et as uet
+from .modules import MAB, SAB, ISAB, PMA
+from . import utils_et as uet
 
 
 # ==============================================================================

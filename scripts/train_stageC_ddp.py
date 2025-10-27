@@ -25,17 +25,17 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 #import GEMS checkpoint
-from core_models_et_p1 import SharedEncoder, STSetDataset, SCSetDataset, collate_minisets, collate_sc_minisets
-from core_models_et_p2 import SetEncoderContext, DiffusionScoreNet, precompute_st_prototypes
-from core_models_et_p3 import GEMSModel
-import utils_et as uet
+from model.core_models_et_p1 import SharedEncoder, STSetDataset, SCSetDataset, collate_minisets, collate_sc_minisets
+from model.core_models_et_p2 import SetEncoderContext, DiffusionScoreNet, precompute_st_prototypes
+from model.core_models_et_p3 import GEMSModel
+from model import utils_et as uet
 
 #import DDP utilities 
-from ddp_utils import (
+from model.ddp_utils import (
     init_dist, cleanup_dist, is_main_process, get_rank, get_world_size,
     rank_print, seed_all, rank_tqdm, all_reduce_mean
 )
-from pairwise_shard import is_sharding_beneficial
+from model.pairwise_shard import is_sharding_beneficial
 
 def load_config(cfg_path: str, cli_overrides: Dict[str, any]) -> Dict[str, Any]:
     '''load YAML config and apply CLI overrides'''
@@ -56,28 +56,27 @@ def load_config(cfg_path: str, cli_overrides: Dict[str, any]) -> Dict[str, Any]:
 
     return cfg
 
-def load_stage_c_data(cfg: Dict[str, Any], device=torch.device):
-    '''
-    load stage C training data from .pt file or h5ad files
+def load_stage_c_data(cfg: Dict[str, Any], device: torch.device):
+    """
+    Load Stage C training data from .pt file or h5ad files.
     
-    returns:
+    Returns:
         (st_gene_expr_dict, sc_gene_expr, targets_dict)
-    '''
-
-    rank_print('loading stage C data......')
-
-    #check for precomputed .pt file first
+    """
+    rank_print("Loading Stage C data...")
+    
+    # Check for precomputed .pt file first
     if cfg['data'].get('stagec_pt') and Path(cfg['data']['stagec_pt']).exists():
-        rank_print(f'loading from: {cfg['data']['stagec_pt']}')
-        data = torch.load(cfg['data']['stagec_pt'], map_location='cpu')
-
+        rank_print(f"  Loading from: {cfg['data']['stagec_pt']}")
+        data = torch.load(cfg['data']['stagec_pt'], map_location='cpu', weights_only=False)
+        
         st_gene_expr_dict = data['st_gene_expr_dict']
         sc_gene_expr = data['sc_gene_expr']
         targets_dict = data['targets_dict']
-
-        rank_print(f' SC expression: {sc_gene_expr.shape}')
-        rank_print(f' ST slides: {list(st_gene_expr_dict.keys())}')
-
+        
+        rank_print(f"  SC expression: {sc_gene_expr.shape}")
+        rank_print(f"  ST slides: {list(st_gene_expr_dict.keys())}")
+        
         return st_gene_expr_dict, sc_gene_expr, targets_dict
     
     else:
@@ -126,7 +125,7 @@ def wrap_ddp(model: nn.Module, device: torch.device, local_rank: int) -> nn.Modu
     '''
     wrap model in DDP if distributed
     '''
-    if get_world_size > 1:
+    if get_world_size() > 1:
         return DDP(
             model,
             device_ids=[local_rank],
@@ -319,7 +318,7 @@ def train_one_epoch(
     #progress bar
     pbar = rank_tqdm(
         range(total_batches),
-        desc=f'epoch {epoch+1}/{cfg['training']['n_epochs']}'
+        desc=f"Epoch {epoch+1}/{cfg['training']['n_epochs']}"
     )
 
     for batch_idx in pbar:
@@ -431,42 +430,88 @@ def train_one_epoch(
     return metrics
 
 def main():
-    parser = argparse.ArgumentParser(description='stage C DDP training')
-    parser.add_argument('--cfg', dtype=str, required=True, help='path to config YAML')
-    parser.add_argument('--batch_size', type=int, help='override batch size')
-    parser.add_argument('--n_epochs', dtype=int, help='override number of epochs')
-    parser.add_argument('--lr', dtype=float, help='override learning rate')
-    parser.add_argument('--resume', dtype=str, help='override resume checkpoint path')
-
-    args, unknown = parser.parse_known_args()
-
-    #parse unknown args as overrides (e.g --training.lr 1e-3)
-    cli_overrides = {}
-    if args.batch_size:
-        cli_overrides['training.batch_size'] = args.batch_size
-    if args.n_epochs:
-        cli_overrides['training.n_epochs'] = args.n_epochs
-    if args.lr:
-        cli_overrides['training.lr'] = args.lr
-    if args.resume:
-        cli_overrides['checkpoint.resume'] = args.resume
-
-    #load config
-    cfg = load_config(args.cfg, cli_overrides)
-
-    #init distributed
-    rank, local_rank, world_size, device= init_dist()
-
-    #print startup info
+    parser = argparse.ArgumentParser(description='Stage C DDP Training')
+    parser.add_argument('--data_pt', type=str, required=True, help='Path to stageC_inputs.pt')
+    parser.add_argument('--output_dir', type=str, default='./checkpoints_ddp')
+    parser.add_argument('--n_epochs', type=int, default=3)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--n_min', type=int, default=128)
+    parser.add_argument('--n_max', type=int, default=256)
+    parser.add_argument('--num_st_samples', type=int, default=100)
+    parser.add_argument('--num_sc_samples', type=int, default=300)
+    parser.add_argument('--n_timesteps', type=int, default=400)
+    parser.add_argument('--sigma_min', type=float, default=0.1)
+    parser.add_argument('--sigma_max', type=float, default=5.0)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--seed', type=int, default=1234)
+    
+    args = parser.parse_args()
+    
+    # ========================================================================
+    # INITIALIZE DISTRIBUTED FIRST
+    # ========================================================================
+    rank, local_rank, world_size, device = init_dist()
+    
+    # Print startup info
     if world_size > 1:
-        print(f'rank {rank}/{world_size-1} on cuda: {local_rank} | seed={cfg['device']['seed'] + rank}')
+        print(f"Rank {rank}/{world_size-1} on cuda:{local_rank} | seed={args.seed+rank}")
     else:
-        rank_print(f'single-GPU mode on {device}')
-
-    #seed
-    seed_all(cfg['device']['seed'], rank)
-
-    #determine amp dtype
+        rank_print(f"Single-GPU mode on {device}")
+    
+    # Seed
+    seed_all(args.seed, rank)
+    
+    # ========================================================================
+    # BUILD CONFIG
+    # ========================================================================
+    cfg = {
+        'device': {'amp_dtype': 'auto', 'seed': args.seed},
+        'model': {},  # Will be loaded from data_pt
+        'dataset': {
+            'n_min': args.n_min,
+            'n_max': args.n_max,
+            'num_st_samples': args.num_st_samples,
+            'num_sc_samples': args.num_sc_samples,
+            'knn_k': 12
+        },
+        'training': {
+            'n_epochs': args.n_epochs,
+            'batch_size': args.batch_size,
+            'lr': args.lr,
+            'weight_decay': 1e-4,
+            'n_timesteps': args.n_timesteps,
+            'sigma_min': args.sigma_min,
+            'sigma_max': args.sigma_max,
+            'loss_weights': {
+                'score': 1.0,
+                'gram': 0.5,
+                'heat': 0.25,
+                'sw_st': 0.5,
+                'sw_sc': 0.3,
+                'overlap': 0.25,
+                'ordinal_sc': 0.5
+            }
+        },
+        'pairwise_shard': {
+            'enable': True,
+            'threshold_N': 512,
+            'block_size': 512
+        },
+        'checkpoint': {
+            'out_dir': args.output_dir,
+            'save_every': 1,
+            'keep_last': 5,
+            'resume': None
+        }
+    }
+    
+    # Load data and update config
+    rank_print(f"Loading data from: {args.data_pt}")
+    data = torch.load(args.data_pt, map_location='cpu', weights_only=False)
+    cfg['model'] = data['model_config']
+    cfg['data'] = {'stagec_pt': args.data_pt}
+    
+    # Determine AMP dtype
     amp_dtype_str = cfg['device']['amp_dtype']
     if amp_dtype_str == 'auto':
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -476,18 +521,22 @@ def main():
         amp_dtype = torch.float16
     else:
         amp_dtype = torch.float32
-
+    
     use_scaler = (amp_dtype == torch.float16)
-    rank_print(f'AMP dtype: {amp_dtype}, using GradScaler: {use_scaler}')
-
-    #enable tf32 for ampere+
+    rank_print(f"AMP dtype: {amp_dtype}, using GradScaler: {use_scaler}")
+    
+    # Enable TF32 for Ampere+
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backen.cudnn.allow_tf32 = True
-
-    #load data
-    st_gene_expr_dict, sc_gene_expr, targets_dict = load_stage_c_data(cfg, device)
-
-    #build models
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Load data
+    st_gene_expr_dict = data['st_gene_expr_dict']
+    sc_gene_expr = data['sc_gene_expr']
+    targets_dict = data['targets_dict']
+    rank_print(f"  SC expression: {sc_gene_expr.shape}")
+    rank_print(f"  ST slides: {list(st_gene_expr_dict.keys())}")
+    
+    # Build models (NOW we have device and rank)
     encoder, context_encoder, score_net = build_models(cfg, device, rank)
 
     #load encoder weights (stage A checkpoint)
