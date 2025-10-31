@@ -8,15 +8,17 @@ import torch.nn as nn
 import os
 from typing import Dict, List, Tuple, Optional
 
-from .core_models_et_p1 import (
+from core_models_et_p1 import (
     SharedEncoder, train_encoder, STStageBPrecomputer, 
     STSetDataset, STTargets
 )
-from .core_models_et_p2 import (
+
+from core_models_et_p2 import (
     SetEncoderContext, MetricSetGenerator, DiffusionScoreNet,
     train_stageC_diffusion_generator
 )
-from . import utils_et as uet
+
+import utils_et as uet
 import numpy as np
 
 # ==============================================================================
@@ -213,7 +215,10 @@ class GEMSModel:
         n_timesteps: int = 600,
         sigma_min: float = 0.01,
         sigma_max: float = 5.0,
-        outf: str = 'output'
+        outf: str = 'output',
+        fabric: Optional['Fabric'] = None,
+        precision: str = "16-mixed",
+
     ):
         """
         Train diffusion generator with mixed ST/SC regimen.
@@ -224,27 +229,36 @@ class GEMSModel:
         
         # ST dataset
         from core_models_et_p1 import STSetDataset, SCSetDataset
+
+        # Ensure gene expression is on CPU for datasets
+        st_gene_expr_dict_cpu = {
+            k: v.cpu() if torch.is_tensor(v) else v 
+            for k, v in st_gene_expr_dict.items()
+        }
+        sc_gene_expr_cpu = sc_gene_expr.cpu() if torch.is_tensor(sc_gene_expr) else sc_gene_expr
+
         st_dataset = STSetDataset(
             targets_dict=self.targets_dict,
             encoder=self.encoder,
-            st_gene_expr_dict=st_gene_expr_dict,
+            st_gene_expr_dict=st_gene_expr_dict_cpu,  # Use CPU version
             n_min=n_min,
             n_max=n_max,
             D_latent=self.D_latent,
             num_samples=num_st_samples,
-            knn_k=12,  # NEW: add knn_k parameter
+            knn_k=12,
             device=self.device
         )
                 
         # SC dataset
         sc_dataset = SCSetDataset(
-            sc_gene_expr=sc_gene_expr,
+            sc_gene_expr=sc_gene_expr_cpu,  # Use CPU version
             encoder=self.encoder,
             n_min=n_min,
             n_max=n_max,
             num_samples=num_sc_samples,
             device=self.device
         )
+
         
         # Precompute ST prototypes
         from core_models_et_p2 import precompute_st_prototypes
@@ -272,7 +286,9 @@ class GEMSModel:
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             device=self.device,
-            outf=outf
+            outf=outf,
+            fabric=fabric,
+            precision=precision,
         )
         
         print("Stage C complete.")

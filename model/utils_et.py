@@ -244,69 +244,384 @@ def compute_spectral_targets(
 def _symmetrize(A: torch.Tensor) -> torch.Tensor:
     return 0.5 * (A + A.mT)
 
-def safe_eigh(A: torch.Tensor, return_vecs: bool = True, cpu: bool = True):
+def safe_eigh(A, cpu=False, return_vecs=True, regularize=1e-6):
     """
-    Robust Hermitian eigensolver:
-    - symmetrize
-    - adaptive jitter
-    - float64 on CPU
-    - numpy fallback
-    """
-
-    A = _symmetrize(A)
-    n = A.shape[0]
-    dev, dtype = A.device, A.dtype
-
-    #adaptive jitter scaled to matrix magnitude
-    scale = torch.nan_to_num(A.abs().max(), nan=1.0, posinf=1.0, neginf=1.0)
-    jitter = (1e-8 + 1e-6 * float(scale)) * torch.eye(n, device=dev, dtype=dtype)
-    A = A + jitter 
-
-    A64 = A.double().cpu() if cpu else A.double()
-    try:
-        if return_vecs:
-            w, V = torch.linalg.eigh(A64)
-        else:
-            w = torch.linalg.eigvalsh(A64)
-            V = None
-    except Exception:
-        import numpy as np
-        a_np = A64.numpy()
-        if return_vecs:
-            w_np, V_np = np.linalg.eigh(a_np)
-            w = torch.from_numpy(w_np)
-            V = torch.from_numpy(V_np)
-        else:
-            w_np = np.linalg.eigvalsh(a_np)
-            w = torch.from_numpy(w_np)
-            V = None
-
-    if cpu:
-        w = w.to(device=dev, dtype=dtype)
-        if V is not None:
-            V = V.to(device=dev, dtype=dtype)
-    return (w, V) if return_vecs else (w, None)
-
-def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
-    """
-    Compute normalized histogram of pairwise distances (upper triangle only).
-    FIXED: moves to CPU for histogram computation.
-    """
-    n = D.shape[0]
-    triu_i, triu_j = torch.triu_indices(n, n, offset=1)
-    d_vec = D[triu_i, triu_j]
+    Compute eigendecomposition on GPU with numerical stability.
     
-    # Move to CPU for histogram (not supported on CUDA)
-    device = d_vec.device
-    d_vec_cpu = d_vec.cpu()
-    bins_cpu = bins.cpu()
+    Args:
+        A: Symmetric matrix (N, N) or (B, N, N)
+        cpu: Ignored (kept for API compatibility)
+        return_vecs: Whether to return eigenvectors
+        regularize: Small value added to diagonal for stability
     
-    # Compute histogram on CPU
-    hist, _ = torch.histogram(d_vec_cpu, bins=bins_cpu)
-    hist = hist.float() / hist.sum().clamp_min(1)
+    Returns:
+        eigvals: Eigenvalues (N,) or (B, N)
+        eigvecs: Eigenvectors if return_vecs=True, else None
+    """
+    # Ensure float32 minimum for numerical stability
+    if A.dtype == torch.float16 or A.dtype == torch.bfloat16:
+        A = A.float()
     
-    # Move back to original device
-    return hist.to(device)
+    # Add small regularization to diagonal for positive definiteness
+    if A.dim() == 2:
+        eye = torch.eye(A.size(0), device=A.device, dtype=A.dtype)
+        A_reg = A + regularize * eye
+    elif A.dim() == 3:
+        B, N, _ = A.shape
+        eye = torch.eye(N, device=A.device, dtype=A.dtype).unsqueeze(0).expand(B, -1, -1)
+        A_reg = A + regularize * eye
+    else:
+        raise ValueError(f"Expected 2D or 3D tensor, got shape {A.shape}")
+    
+    # Compute eigendecomposition on GPU
+    if return_vecs:
+        eigvals, eigvecs = torch.linalg.eigh(A_reg)
+        return eigvals, eigvecs
+    else:
+        eigvals = torch.linalg.eigvalsh(A_reg)
+        return eigvals, None
+
+# def safe_eigh(A: torch.Tensor, return_vecs: bool = True, cpu: bool = True):
+#     """
+#     Robust Hermitian eigensolver:
+#     - symmetrize
+#     - adaptive jitter
+#     - float64 on CPU
+#     - numpy fallback
+#     """
+
+#     A = _symmetrize(A)
+#     n = A.shape[0]
+#     dev, dtype = A.device, A.dtype
+
+#     #adaptive jitter scaled to matrix magnitude
+#     scale = torch.nan_to_num(A.abs().max(), nan=1.0, posinf=1.0, neginf=1.0)
+#     jitter = (1e-8 + 1e-6 * float(scale)) * torch.eye(n, device=dev, dtype=dtype)
+#     A = A + jitter 
+
+#     A64 = A.double().cpu() if cpu else A.double()
+#     try:
+#         if return_vecs:
+#             w, V = torch.linalg.eigh(A64)
+#         else:
+#             w = torch.linalg.eigvalsh(A64)
+#             V = None
+#     except Exception:
+#         import numpy as np
+#         a_np = A64.numpy()
+#         if return_vecs:
+#             w_np, V_np = np.linalg.eigh(a_np)
+#             w = torch.from_numpy(w_np)
+#             V = torch.from_numpy(V_np)
+#         else:
+#             w_np = np.linalg.eigvalsh(a_np)
+#             w = torch.from_numpy(w_np)
+#             V = None
+
+#     if cpu:
+#         w = w.to(device=dev, dtype=dtype)
+#         if V is not None:
+#             V = V.to(device=dev, dtype=dtype)
+#     return (w, V) if return_vecs else (w, None)
+
+# def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+#     """
+#     Compute normalized histogram of pairwise distances (upper triangle only).
+#     FIXED: moves to CPU for histogram computation.
+#     """
+#     n = D.shape[0]
+#     triu_i, triu_j = torch.triu_indices(n, n, offset=1)
+#     d_vec = D[triu_i, triu_j]
+    
+#     # Move to CPU for histogram (not supported on CUDA)
+#     device = d_vec.device
+#     d_vec_cpu = d_vec.cpu()
+#     bins_cpu = bins.cpu()
+    
+#     # Compute histogram on CPU
+#     hist, _ = torch.histogram(d_vec_cpu, bins=bins_cpu)
+#     hist = hist.float() / hist.sum().clamp_min(1)
+    
+#     # Move back to original device
+#     return hist.to(device)
+
+# def compute_distance_hist(D, bins):
+#     """Compute distance histogram entirely on GPU"""
+#     n = D.shape[-1]
+#     iu, ju = torch.triu_indices(n, n, 1, device=D.device)
+#     d = D[iu, ju]
+#     hist, _ = torch.histogram(d, bins=bins)
+#     return hist.float() / hist.sum().clamp_min(1.0)
+
+import torch
+
+# def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor):
+#     """
+#     GPU-only distance histogram using bucketize + bincount.
+#     Matches torch.histogram with explicit bin edges:
+#       - left-inclusive, right-inclusive for last bin
+#       - under/overflow values are ignored (not clamped into edge bins)
+
+#     Args:
+#         D: (N,N) or (B,N,N) distance matrix (CUDA ok)
+#         bins: (nb+1,) sorted bin edges tensor on same device as D
+
+#     Returns:
+#         (nb,) for single, or (B, nb) for batched
+#     """
+#     is_batched = (D.dim() == 3)
+#     if not is_batched:
+#         n = D.shape[0]
+#         iu, ju = torch.triu_indices(n, n, 1, device=D.device)
+#         d = D[iu, ju]  # (M,)
+#     else:
+#         B, n, _ = D.shape
+#         iu, ju = torch.triu_indices(n, n, 1, device=D.device)
+#         d = D[:, iu, ju]  # (B, M)
+
+#     nb = bins.numel() - 1
+
+#     # Keep only in-range values (under/overflow dropped)
+#     if not is_batched:
+#         mask = (d >= bins[0]) & (d <= bins[-1])
+#         d = d[mask]
+#     else:
+#         mask = (d >= bins[0]) & (d <= bins[-1])
+#         # If you expect many out-of-range, compact per batch:
+#         # gather valid per row
+#         # But for simplicity, we keep mask and leave out-of-range with a dummy id
+#         # We'll set those to -1 and ignore them via masking below.
+    
+#     # Compute bin ids (left-inclusive). For rightmost edge, force last bin.
+#     # bucketize returns insertion index; right=False => first idx with edge >= x
+#     if not is_batched:
+#         ids = torch.bucketize(d, bins, right=False) - 1  # [0..nb-1], but safe because d in-range
+#         ids = ids.clamp(0, nb - 1)
+#         counts = torch.bincount(ids, minlength=nb).float()[:nb]
+#         return counts / counts.sum().clamp_min(1.0)
+#     else:
+#         # For batched, do bucketize first then drop masked
+#         ids = torch.bucketize(d, bins, right=False) - 1
+#         ids = ids.clamp(0, nb - 1)
+
+#         # Set out-of-range (mask==False) to a sentinel that will be ignored by bincount trick
+#         # We'll map (invalid) to nothing by not adding it to any real bin via masking.
+#         # Build flat ids only for valid entries.
+#         valid_ids = ids[mask]
+#         # Batch offsets only for rows that contribute
+#         # Compute per-row offsets for valid positions
+#         # Make an index of row for each valid entry
+#         row_idx = torch.arange(B, device=D.device).unsqueeze(1).expand_as(ids)
+#         valid_row = row_idx[mask]
+#         flat_ids = valid_ids + valid_row * nb  # (K,)
+
+#         counts = torch.bincount(flat_ids, minlength=B * nb).float().view(B, nb)
+#         return counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+
+
+# utils_et.py
+import torch
+import torch.nn.functional as F
+from functools import lru_cache
+
+# def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+#     """
+#     CUDA histogram over the upper triangle.
+#     D: (n, n) or (B, n, n) distances; bins: (nb+1,)
+#     Returns: (nb,) or (B, nb) normalized.
+#     """
+#     assert D.is_cuda and bins.is_cuda, "Put D and bins on CUDA"
+#     if D.dim() == 2:
+#         n = D.size(0)
+#         iu, ju = torch.triu_indices(n, n, 1, device=D.device)
+#         d = D[iu, ju]
+#         hist, _ = torch.histogram(d, bins=bins)
+#         return hist.float() / hist.sum().clamp_min(1)
+#     else:
+#         B, n, _ = D.shape
+#         iu, ju = torch.triu_indices(n, n, 1, device=D.device)
+#         d = D[:, iu, ju]                           # (B, M)
+#         nb = bins.numel() - 1
+#         ids = torch.bucketize(d, bins) - 1
+#         ids = ids.clamp(0, nb - 1)
+#         offs = torch.arange(B, device=D.device).unsqueeze(1) * nb
+#         flat = (ids + offs).reshape(-1)
+#         counts = torch.bincount(flat, minlength=B * nb).view(B, nb).float()
+#         return counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
+
+import torch
+
+@torch.no_grad()
+def compute_distance_hist(
+    D: torch.Tensor,
+    bins: torch.Tensor,
+    pair_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Distance histogram over upper triangle using bucketize+bincount.
+    Works on CPU and CUDA; batched (B,n,n) or single (n,n).
+
+    Args
+    ----
+    D : (n,n) or (B,n,n) tensor of distances
+    bins : (nb+1,) monotonically increasing bin edges (on any device)
+    pair_mask : optional (n,n) or (B,n,n) boolean mask over pairs.
+                True means "include". If None, uses upper-tri mask.
+
+    Returns
+    -------
+    hist : (nb,) or (B, nb) normalized histogram (sums to 1, safe-div)
+    """
+    # Ensure tensors are on the same device & contiguous
+    if bins.device != D.device:
+        bins = bins.to(D.device, non_blocking=True)
+    D = D.contiguous()
+    bins = bins.contiguous()
+
+    if D.dim() == 2:
+        n = D.size(0)
+        if n < 2:
+            nb = bins.numel() - 1
+            return torch.zeros(nb, device=D.device, dtype=D.dtype)
+        iu, ju = torch.triu_indices(n, n, offset=1, device=D.device)
+        d = D[iu, ju]  # (M,)
+        if pair_mask is not None:
+            pm = pair_mask.to(torch.bool, non_blocking=True)
+            m = pm[iu, ju]
+            d = d[m]
+        if d.numel() == 0:
+            nb = bins.numel() - 1
+            return torch.zeros(nb, device=D.device, dtype=D.dtype)
+
+        # Map to bins: right-closed last bin behavior
+        nb = bins.numel() - 1
+        ids = torch.bucketize(d, bins, right=True) - 1
+        ids = ids.clamp_(0, nb - 1)
+
+        counts = torch.bincount(ids, minlength=nb).to(dtype=D.dtype)
+        total = counts.sum().clamp_min(1)
+        return counts / total
+
+    elif D.dim() == 3:
+        B, n, _ = D.shape
+        if n < 2:
+            nb = bins.numel() - 1
+            return torch.zeros(B, nb, device=D.device, dtype=D.dtype)
+
+        iu, ju = torch.triu_indices(n, n, offset=1, device=D.device)
+        # (B, M)
+        d = D[:, iu, ju]
+        if pair_mask is not None:
+            pm = pair_mask.to(torch.bool, non_blocking=True)
+            valid = pm[:, iu, ju]
+            # mark invalid as a sentinel outside all bins (we'll drop them)
+            d = torch.where(valid, d, torch.full_like(d, float("nan")))
+
+        nb = bins.numel() - 1
+        # bucketize does not support NaN — mask them before binning
+        if pair_mask is not None:
+            nanmask = torch.isnan(d)
+            d = torch.where(nanmask, torch.full_like(d, bins[0] - 1), d)
+
+        ids = torch.bucketize(d, bins, right=True) - 1  # (B, M)
+        ids = ids.clamp(0, nb - 1)
+
+        if pair_mask is not None:
+            # drop the previously NaN positions
+            ids = torch.where(nanmask, torch.full_like(ids, -1), ids)
+
+        # Batched bincount via offsets
+        offs = (torch.arange(B, device=D.device).unsqueeze(1) * nb)  # (B,1)
+        flat = (ids + offs).reshape(-1)
+        if pair_mask is not None:
+            flat = flat[flat >= 0]
+
+        counts = torch.bincount(flat, minlength=B * nb).view(B, nb).to(dtype=D.dtype)
+        totals = counts.sum(dim=1, keepdim=True).clamp_min(1)
+        return counts / totals
+
+    else:
+        raise ValueError(f"compute_distance_hist: expected D dim 2 or 3, got {D.dim()}")
+
+
+import torch
+import torch.nn.functional as F
+
+def _get_device_for_build(x: torch.Tensor) -> torch.device:
+    if x.is_cuda:
+        return x.device
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+@torch.no_grad()
+def build_topk_index(
+    Z_all: torch.Tensor,
+    K: int = 2048,
+    block: int = 2048,
+    metric: str = "cosine",
+) -> torch.Tensor:
+    """
+    Build a (N, K) top-k neighbor index for embeddings Z_all.
+    - Runs on CUDA if available.
+    - Uses block matmul to bound memory.
+    - Casts to float32 for stable top-k.
+    - If torch.distributed is initialized, rank 0 computes once and broadcasts to all ranks.
+    - Returns a CPU pinned (N, K) LongTensor for fast DataLoader use.
+    """
+    import torch.distributed as dist
+
+    device = _get_device_for_build(Z_all)
+    Z = Z_all.to(device, non_blocking=True).contiguous()
+    Z = Z.float()  # AMP-safe & numerically stable for similarity
+    N, d = Z.shape
+
+    # Clamp args to dataset size
+    K = int(max(1, min(K, N)))          # at least 1, at most N
+    block = int(max(1, min(block, N)))  # at least 1, at most N
+
+    # DDP: compute once on rank 0, broadcast to others
+    ddp = torch.distributed.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if ddp else 0
+
+    if rank == 0:
+        if metric == "cosine":
+            Zn = F.normalize(Z, dim=1)
+            Zt = Zn.t().contiguous()                     # (d, N)
+            chunks = []
+            for s in range(0, N, block):
+                e = min(s + block, N)
+                # (b, N) similarities
+                S = Zn[s:e] @ Zt                         # CUDA GEMM
+                # NOTE: includes self; OK for our sampler
+                _, idx = torch.topk(S, K, dim=1, largest=True, sorted=False)
+                chunks.append(idx)
+            nbr_idx_cuda = torch.cat(chunks, dim=0)      # (N, K) on device
+        else:  # 'l2'
+            nbr_idx_cuda = torch.empty(N, K, dtype=torch.long, device=device)
+            for s in range(0, N, block):
+                e = min(s + block, N)
+                D = torch.cdist(Z[s:e], Z)               # (b, N)
+                _, idx = torch.topk(D, K, dim=1, largest=False, sorted=False)
+                nbr_idx_cuda[s:e] = idx
+
+        # allocate the broadcast buffer on device
+        bcast_buf = nbr_idx_cuda
+    else:
+        # non-src ranks: allocate empty buffer with correct shape/dtype on device
+        bcast_buf = torch.empty(N, K, dtype=torch.long, device=device)
+
+    if ddp:
+        # all ranks participate; src=0 sends
+        dist.broadcast(bcast_buf, src=0)
+
+    # move to CPU pinned for DataLoader workers
+    nbr_idx = bcast_buf.cpu().pin_memory()
+    return nbr_idx
+
+
+
+def cached_triu_idx(n: int, k: int = 1):
+    iu, ju = torch.triu_indices(n, n, k)
+    return iu, ju 
 
 
 def sample_ordinal_triplets(
@@ -613,17 +928,220 @@ def block_diag_mask(slide_ids: torch.Tensor) -> torch.Tensor:
 # PART 6: LOSS FUNCTIONS
 # ==============================================================================
 
+# class HeatKernelLoss(nn.Module):
+#     """
+#     Heat kernel trace matching loss with Hutchinson trace estimation.
+    
+#     Args:
+#         use_hutchinson: Use stochastic Lanczos quadrature (faster)
+#         num_probes: Number of Rademacher probes for Hutchinson
+#         chebyshev_degree: Degree of Chebyshev polynomial approximation
+#         knn_k: k for kNN graph Laplacian
+#         t_list: Heat kernel diffusion times
+#         laplacian: Type of Laplacian ('sym' or 'rw')
+#     """
+    
+#     def __init__(
+#         self,
+#         use_hutchinson: bool = True,
+#         num_probes: int = 8,
+#         chebyshev_degree: int = 10,
+#         knn_k: int = 8,
+#         t_list: Tuple[float, ...] = (0.5, 1.0),
+#         laplacian: str = 'sym'
+#     ):
+#         super().__init__()
+#         self.use_hutchinson = use_hutchinson
+#         self.num_probes = num_probes
+#         self.chebyshev_degree = chebyshev_degree
+#         self.knn_k = knn_k
+#         self.t_list = t_list
+#         self.laplacian = laplacian
+    
+#     def forward(
+#         self,
+#         L_pred: torch.Tensor,
+#         L_target: torch.Tensor,
+#         mask: Optional[torch.Tensor] = None,
+#         t_list: Optional[List[float]] = None
+#     ) -> torch.Tensor:
+#         """
+#         Compute heat kernel trace loss.
+        
+#         Args:
+#             L_pred: (n, n) predicted Laplacian
+#             L_target: (n, n) target Laplacian
+#             mask: (n,) optional mask for valid nodes
+#             t_list: optional override for diffusion times
+            
+#         Returns:
+#             loss: scalar heat kernel trace loss
+#         """
+#         if t_list is None:
+#             t_list = self.t_list
+        
+#         # Apply mask to Laplacians
+#         # if mask is not None:
+#         #     valid_idx = torch.where(mask)[0]
+#         #     L_pred = L_pred[valid_idx][:, valid_idx]
+#         #     L_target = L_target[valid_idx][:, valid_idx]
+
+#         # NEW (GPU-safe)
+#         if mask is not None:
+#             # Ensure boolean 1-D
+#             mask = mask.bool().view(-1)
+
+#             # If sparse, make dense on GPU (mini-sets are small)
+#             if L_pred.layout != torch.strided:
+#                 L_pred = L_pred.to_dense()
+#             if L_target.layout != torch.strided:
+#                 L_target = L_target.to_dense()
+
+#             valid_idx = mask.nonzero(as_tuple=False).squeeze(1)
+#             L_pred   = L_pred.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
+#             L_target = L_target.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
+
+        
+#         if self.use_hutchinson:
+#             # Hutchinson trace estimation
+#             traces_pred = self._hutchinson_heat_trace(L_pred, t_list)
+#             traces_target = self._hutchinson_heat_trace(L_target, t_list)
+#         else:
+#             # Full eigendecomposition (fallback)
+#             eigvals_pred, _ = safe_eigh(L_pred, return_vecs=False)
+#             eigvals_target, _ = safe_eigh(L_target, return_vecs=False)
+#             eigvals_pred = eigvals_pred.clamp(min=0)
+#             eigvals_target = eigvals_target.clamp(min=0)
+            
+#             traces_pred = []
+#             traces_target = []
+#             for t in t_list:
+#                 traces_pred.append(torch.sum(torch.exp(-t * eigvals_pred)))
+#                 traces_target.append(torch.sum(torch.exp(-t * eigvals_target)))
+            
+#             traces_pred = torch.tensor(traces_pred, device=L_pred.device)
+#             traces_target = torch.tensor(traces_target, device=L_target.device)
+        
+#         # Compute loss
+#         loss = torch.mean((traces_pred - traces_target) ** 2)
+#         return loss
+    
+#     def _hutchinson_heat_trace(
+#         self,
+#         L: torch.Tensor,
+#         t_list: List[float]
+#     ) -> torch.Tensor:
+#         """
+#         Hutchinson trace estimation with Chebyshev polynomials.
+        
+#         Args:
+#             L: (n, n) Laplacian matrix
+#             t_list: list of diffusion times
+            
+#         Returns:
+#             traces: (len(t_list),) trace estimates
+#         """
+#         device = L.device
+#         n = L.shape[0]
+        
+#         # Estimate max eigenvalue with power iteration
+#         lambda_max = self._power_iter_max_eig(L, num_iter=20)
+        
+#         # Scale L to [-1, 1]
+#         L_scaled = L / (lambda_max + 1e-8)
+        
+#         # Hutchinson trace estimation
+#         traces = torch.zeros(len(t_list), device=device, dtype=torch.float32)
+        
+#         for _ in range(self.num_probes):
+#             # Rademacher probe
+#             v = torch.empty(n, device=device, dtype=torch.float32).uniform_(-1.0, 1.0).sign()
+#             v = v / (n ** 0.5)
+            
+#             # Lanczos tridiagonalization
+#             T = self._lanczos_tridiag(L_scaled, v, self.chebyshev_degree)
+            
+#             # Compute trace for each t using Chebyshev
+#             for i, t in enumerate(t_list):
+#                 # Scale t by lambda_max
+#                 t_scaled = t * lambda_max
+#                 trace_t = self._chebyshev_exp_trace(T, t_scaled)
+#                 traces[i] += trace_t
+        
+#         traces = traces / float(self.num_probes)
+#         return traces
+    
+#     @torch.no_grad()
+#     def _power_iter_max_eig(self, A: torch.Tensor, num_iter: int = 20) -> torch.Tensor:
+#         """Power iteration to estimate max eigenvalue."""
+#         n = A.shape[0]
+#         v = torch.randn(n, device=A.device, dtype=torch.float32)
+#         v = v / (v.norm() + 1e-12)
+        
+#         for _ in range(num_iter):
+#             v = A @ v
+#             v = v / (v.norm() + 1e-12)
+        
+#         lambda_max = torch.dot(v, A @ v)
+#         return lambda_max.abs()
+    
+#     @torch.no_grad()
+#     def _lanczos_tridiag(
+#         self,
+#         A: torch.Tensor,
+#         v0: torch.Tensor,
+#         m: int,
+#         tol: float = 1e-6
+#     ) -> torch.Tensor:
+#         """Lanczos tridiagonalization."""
+#         device, dtype = A.device, torch.float32
+#         n = v0.numel()
+        
+#         alpha = torch.zeros(m, device=device, dtype=dtype)
+#         beta = torch.zeros(m - 1, device=device, dtype=dtype)
+        
+#         v = v0 / (v0.norm() + 1e-12)
+#         w = A @ v
+#         alpha[0] = torch.dot(v, w)
+#         w = w - alpha[0] * v
+        
+#         for j in range(1, m):
+#             beta[j - 1] = w.norm()
+#             if beta[j - 1] <= tol:
+#                 alpha = alpha[:j]
+#                 beta = beta[:j - 1]
+#                 break
+            
+#             v_next = w / beta[j - 1]
+#             w = A @ v_next - beta[j - 1] * v
+#             alpha[j] = torch.dot(v_next, w)
+#             w = w - alpha[j] * v_next
+#             v = v_next
+        
+#         T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
+#         return T
+    
+#     @torch.no_grad()
+#     def _chebyshev_exp_trace(self, T: torch.Tensor, t: float) -> torch.Tensor:
+#         """Compute e1^T exp(-t*T) e1 using eigendecomposition of small T."""
+#         evals, evecs = torch.linalg.eigh(T)
+#         weights = (evecs[0, :] ** 2)
+#         return (weights * torch.exp(-t * evals)).sum()
+
 class HeatKernelLoss(nn.Module):
     """
-    Heat kernel trace matching loss with Hutchinson trace estimation.
+    Heat kernel trace matching loss with optional Hutchinson trace estimation.
+    
+    For batched inputs (B, N, N), uses fast batched eigendecomposition.
+    For single inputs (N, N), can use Hutchinson for very large graphs.
     
     Args:
-        use_hutchinson: Use stochastic Lanczos quadrature (faster)
+        use_hutchinson: Use Hutchinson trace estimation for single samples
         num_probes: Number of Rademacher probes for Hutchinson
         chebyshev_degree: Degree of Chebyshev polynomial approximation
-        knn_k: k for kNN graph Laplacian
+        knn_k: k for kNN graph Laplacian (unused in loss, kept for API)
         t_list: Heat kernel diffusion times
-        laplacian: Type of Laplacian ('sym' or 'rw')
+        laplacian: Type of Laplacian (unused, kept for API)
     """
     
     def __init__(
@@ -654,62 +1172,96 @@ class HeatKernelLoss(nn.Module):
         Compute heat kernel trace loss.
         
         Args:
-            L_pred: (n, n) predicted Laplacian
-            L_target: (n, n) target Laplacian
-            mask: (n,) optional mask for valid nodes
-            t_list: optional override for diffusion times
+            L_pred: (N, N) or (B, N, N) predicted Laplacian
+            L_target: (N, N) or (B, N, N) target Laplacian  
+            mask: (N,) or (B, N) optional mask for valid nodes
+            t_list: Optional override for diffusion times
             
         Returns:
-            loss: scalar heat kernel trace loss
+            loss: Scalar heat kernel trace loss
         """
         if t_list is None:
             t_list = self.t_list
         
-        # Apply mask to Laplacians
-        # if mask is not None:
-        #     valid_idx = torch.where(mask)[0]
-        #     L_pred = L_pred[valid_idx][:, valid_idx]
-        #     L_target = L_target[valid_idx][:, valid_idx]
-
-        # NEW (GPU-safe)
-        if mask is not None:
-            # Ensure boolean 1-D
-            mask = mask.bool().view(-1)
-
-            # If sparse, make dense on GPU (mini-sets are small)
+        is_batched = L_pred.dim() == 3
+        
+        if not is_batched:
+            # ===== SINGLE SAMPLE PATH =====
+            if mask is not None:
+                mask = mask.bool().view(-1)
+                
+                # Convert sparse to dense if needed
+                if L_pred.layout != torch.strided:
+                    L_pred = L_pred.to_dense()
+                if L_target.layout != torch.strided:
+                    L_target = L_target.to_dense()
+                
+                # Index select valid nodes
+                valid_idx = mask.nonzero(as_tuple=False).squeeze(1)
+                L_pred = L_pred.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
+                L_target = L_target.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
+            
+            # Use Hutchinson or full eigendecomposition
+            if self.use_hutchinson and L_pred.size(0) > 100:
+                traces_pred = self._hutchinson_heat_trace(L_pred, t_list)
+                traces_target = self._hutchinson_heat_trace(L_target, t_list)
+            else:
+                # Full eigendecomposition (fast for small matrices)
+                eigvals_pred, _ = safe_eigh(L_pred, return_vecs=False)
+                eigvals_target, _ = safe_eigh(L_target, return_vecs=False)
+                eigvals_pred = eigvals_pred.clamp(min=0)
+                eigvals_target = eigvals_target.clamp(min=0)
+                
+                traces_pred = torch.stack([torch.sum(torch.exp(-t * eigvals_pred)) for t in t_list])
+                traces_target = torch.stack([torch.sum(torch.exp(-t * eigvals_target)) for t in t_list])
+            
+            loss = torch.mean((traces_pred - traces_target) ** 2)
+            return loss
+        
+        else:
+            # ===== BATCHED PATH (B, N, N) - FULLY VECTORIZED =====
+            B, N, _ = L_pred.shape
+            device = L_pred.device
+            
+            # Convert sparse to dense if needed
             if L_pred.layout != torch.strided:
                 L_pred = L_pred.to_dense()
             if L_target.layout != torch.strided:
                 L_target = L_target.to_dense()
-
-            valid_idx = mask.nonzero(as_tuple=False).squeeze(1)
-            L_pred   = L_pred.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
-            L_target = L_target.index_select(0, valid_idx).index_select(1, valid_idx).contiguous()
-
-        
-        if self.use_hutchinson:
-            # Hutchinson trace estimation
-            traces_pred = self._hutchinson_heat_trace(L_pred, t_list)
-            traces_target = self._hutchinson_heat_trace(L_target, t_list)
-        else:
-            # Full eigendecomposition (fallback)
-            eigvals_pred, _ = safe_eigh(L_pred, return_vecs=False)
-            eigvals_target, _ = safe_eigh(L_target, return_vecs=False)
+            
+            # Apply mask to zero out invalid entries
+            if mask is not None:
+                mask = mask.bool()  # (B, N)
+                mask_2d = mask.unsqueeze(1) & mask.unsqueeze(2)  # (B, N, N)
+                L_pred = L_pred * mask_2d.float()
+                L_target = L_target * mask_2d.float()
+            
+            # Batched eigendecomposition - fast for small N!
+            eigvals_pred, _ = safe_eigh(L_pred, return_vecs=False)  # (B, N)
+            eigvals_target, _ = safe_eigh(L_target, return_vecs=False)  # (B, N)
+            
+            # Clamp negative eigenvalues
             eigvals_pred = eigvals_pred.clamp(min=0)
             eigvals_target = eigvals_target.clamp(min=0)
             
-            traces_pred = []
-            traces_target = []
-            for t in t_list:
-                traces_pred.append(torch.sum(torch.exp(-t * eigvals_pred)))
-                traces_target.append(torch.sum(torch.exp(-t * eigvals_target)))
+            # Compute heat kernel traces: tr(exp(-t*L)) = sum_i exp(-t*lambda_i)
+            # Vectorized over batch and time
+            traces_pred_list = []
+            traces_target_list = []
             
-            traces_pred = torch.tensor(traces_pred, device=L_pred.device)
-            traces_target = torch.tensor(traces_target, device=L_target.device)
-        
-        # Compute loss
-        loss = torch.mean((traces_pred - traces_target) ** 2)
-        return loss
+            for t in t_list:
+                # (B, N) -> (B,) by summing over eigenvalues
+                tr_pred = torch.sum(torch.exp(-t * eigvals_pred), dim=1)
+                tr_target = torch.sum(torch.exp(-t * eigvals_target), dim=1)
+                traces_pred_list.append(tr_pred)
+                traces_target_list.append(tr_target)
+            
+            traces_pred = torch.stack(traces_pred_list, dim=1)  # (B, T)
+            traces_target = torch.stack(traces_target_list, dim=1)  # (B, T)
+            
+            # MSE loss over batch and time points
+            loss = ((traces_pred - traces_target) ** 2).mean()
+            return loss
     
     def _hutchinson_heat_trace(
         self,
@@ -717,11 +1269,12 @@ class HeatKernelLoss(nn.Module):
         t_list: List[float]
     ) -> torch.Tensor:
         """
-        Hutchinson trace estimation with Chebyshev polynomials.
+        Hutchinson trace estimation with Lanczos tridiagonalization.
+        Used for single large matrices only.
         
         Args:
-            L: (n, n) Laplacian matrix
-            t_list: list of diffusion times
+            L: (N, N) Laplacian matrix
+            t_list: List of diffusion times
             
         Returns:
             traces: (len(t_list),) trace estimates
@@ -729,7 +1282,7 @@ class HeatKernelLoss(nn.Module):
         device = L.device
         n = L.shape[0]
         
-        # Estimate max eigenvalue with power iteration
+        # Estimate max eigenvalue
         lambda_max = self._power_iter_max_eig(L, num_iter=20)
         
         # Scale L to [-1, 1]
@@ -738,17 +1291,17 @@ class HeatKernelLoss(nn.Module):
         # Hutchinson trace estimation
         traces = torch.zeros(len(t_list), device=device, dtype=torch.float32)
         
+        # Average over multiple random probes
         for _ in range(self.num_probes):
-            # Rademacher probe
+            # Rademacher probe: random ±1
             v = torch.empty(n, device=device, dtype=torch.float32).uniform_(-1.0, 1.0).sign()
             v = v / (n ** 0.5)
             
             # Lanczos tridiagonalization
             T = self._lanczos_tridiag(L_scaled, v, self.chebyshev_degree)
             
-            # Compute trace for each t using Chebyshev
+            # Compute trace for each diffusion time
             for i, t in enumerate(t_list):
-                # Scale t by lambda_max
                 t_scaled = t * lambda_max
                 trace_t = self._chebyshev_exp_trace(T, t_scaled)
                 traces[i] += trace_t
@@ -758,14 +1311,14 @@ class HeatKernelLoss(nn.Module):
     
     @torch.no_grad()
     def _power_iter_max_eig(self, A: torch.Tensor, num_iter: int = 20) -> torch.Tensor:
-        """Power iteration to estimate max eigenvalue."""
+        """Estimate maximum eigenvalue using power iteration."""
         n = A.shape[0]
         v = torch.randn(n, device=A.device, dtype=torch.float32)
         v = v / (v.norm() + 1e-12)
         
         for _ in range(num_iter):
-            v = A @ v
-            v = v / (v.norm() + 1e-12)
+            Av = A @ v
+            v = Av / (Av.norm() + 1e-12)
         
         lambda_max = torch.dot(v, A @ v)
         return lambda_max.abs()
@@ -778,9 +1331,14 @@ class HeatKernelLoss(nn.Module):
         m: int,
         tol: float = 1e-6
     ) -> torch.Tensor:
-        """Lanczos tridiagonalization."""
-        device, dtype = A.device, torch.float32
-        n = v0.numel()
+        """
+        Lanczos tridiagonalization to reduce A to small tridiagonal matrix T.
+        
+        Returns:
+            T: (m, m) tridiagonal matrix (or smaller if converged early)
+        """
+        device = A.device
+        dtype = torch.float32
         
         alpha = torch.zeros(m, device=device, dtype=dtype)
         beta = torch.zeros(m - 1, device=device, dtype=dtype)
@@ -793,6 +1351,7 @@ class HeatKernelLoss(nn.Module):
         for j in range(1, m):
             beta[j - 1] = w.norm()
             if beta[j - 1] <= tol:
+                # Early termination
                 alpha = alpha[:j]
                 beta = beta[:j - 1]
                 break
@@ -803,16 +1362,46 @@ class HeatKernelLoss(nn.Module):
             w = w - alpha[j] * v_next
             v = v_next
         
+        # Build tridiagonal matrix
         T = torch.diag(alpha) + torch.diag(beta, 1) + torch.diag(beta, -1)
         return T
     
     @torch.no_grad()
     def _chebyshev_exp_trace(self, T: torch.Tensor, t: float) -> torch.Tensor:
-        """Compute e1^T exp(-t*T) e1 using eigendecomposition of small T."""
+        """
+        Compute trace of exp(-t*T) where T is small tridiagonal matrix.
+        Uses eigendecomposition since T is small.
+        """
         evals, evecs = torch.linalg.eigh(T)
-        weights = (evecs[0, :] ** 2)
+        weights = evecs[0, :] ** 2
         return (weights * torch.exp(-t * evals)).sum()
 
+
+# class SlicedWassersteinLoss1D(nn.Module):
+#     """1D Sliced Wasserstein distance for distance histograms."""
+    
+#     def __init__(self):
+#         super().__init__()
+    
+#     def forward(self, hist_pred: torch.Tensor, hist_target: torch.Tensor) -> torch.Tensor:
+#         """
+#         Compute 1D Sliced Wasserstein distance between histograms.
+#         For 1D, this is just the L1 distance between CDFs.
+        
+#         Args:
+#             hist_pred: (num_bins,) predicted histogram (normalized)
+#             hist_target: (num_bins,) target histogram (normalized)
+            
+#         Returns:
+#             loss: scalar SW distance
+#         """
+#         # Compute CDFs
+#         cdf_pred = torch.cumsum(hist_pred, dim=0)
+#         cdf_target = torch.cumsum(hist_target, dim=0)
+        
+#         # L1 distance between CDFs
+#         loss = torch.mean(torch.abs(cdf_pred - cdf_target))
+#         return loss
 
 class SlicedWassersteinLoss1D(nn.Module):
     """1D Sliced Wasserstein distance for distance histograms."""
@@ -826,18 +1415,26 @@ class SlicedWassersteinLoss1D(nn.Module):
         For 1D, this is just the L1 distance between CDFs.
         
         Args:
-            hist_pred: (num_bins,) predicted histogram (normalized)
-            hist_target: (num_bins,) target histogram (normalized)
+            hist_pred: (num_bins,) OR (batch, num_bins) predicted histogram (normalized)
+            hist_target: (num_bins,) OR (batch, num_bins) target histogram (normalized)
             
         Returns:
-            loss: scalar SW distance
+            loss: scalar SW distance (averaged over batch if batched)
         """
-        # Compute CDFs
-        cdf_pred = torch.cumsum(hist_pred, dim=0)
-        cdf_target = torch.cumsum(hist_target, dim=0)
+        # Handle both single and batched inputs
+        if hist_pred.dim() == 1:
+            hist_pred = hist_pred.unsqueeze(0)
+            hist_target = hist_target.unsqueeze(0)
+        
+        # Compute CDFs along the last dimension (bins)
+        cdf_pred = torch.cumsum(hist_pred, dim=-1)      # (B, nb)
+        cdf_target = torch.cumsum(hist_target, dim=-1)  # (B, nb)
         
         # L1 distance between CDFs
+        # torch.mean averages over ALL elements (batch * bins)
+        # This is equivalent to: mean_over_batch(mean_over_bins(|diff|))
         loss = torch.mean(torch.abs(cdf_pred - cdf_target))
+        
         return loss
 
 
@@ -911,6 +1508,21 @@ class FrobeniusGramLoss(nn.Module):
         diff = G_pred - G_target
         loss = torch.mean(diff ** 2)
         return loss
+    
+def masked_frobenius_loss(A, B, mask):
+    '''
+    compute ||a-b||_F^2 only over valid masked entries
+    a, b: (batch, n, n)
+    mask: (batch, n) boolean
+    '''
+
+    #create 2D mask: (batch, n, n)
+    P = mask.unsqueeze(-1) & mask.unsqueeze(-2) #(B, N, N)
+    P = P.float()
+
+    diff_sq = (A - B).pow(2)
+    return (diff_sq * P).sum() / P.sum().clamp_min(1.0)
+
 
 def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):
     """
@@ -1326,3 +1938,114 @@ def create_sc_miniset_pair(
     shared_in_B = pos_map_B[shared_global]
 
     return indices_A, indices_B, shared_in_A, shared_in_B
+
+
+import torch
+import torch.nn.functional as F
+from typing import Dict
+
+@torch.no_grad()
+def build_sc_knn_cache(
+    Z_sc: torch.Tensor,           # [N_sc, D], on CPU or GPU
+    k_pos: int = 25,
+    block_q: int = 2048,
+    device: str = "cuda"
+) -> Dict[str, torch.Tensor]:
+    """
+    Precompute per-cell kNN (positives) once. Tiled matmul -> topk.
+    Returns dict with:
+      - 'pos_idx': int32 [N_sc, k_pos] (global indices of nearest neighbors)
+    """
+    assert Z_sc.dim() == 2
+    N, D = Z_sc.shape
+    dev = torch.device(device)
+
+    Z = Z_sc.to(dev, dtype=torch.float16, non_blocking=True)
+    # Z = F.normalize(Z, dim=1)  # cosine kNN; if you prefer L2, normalize or switch to -L2
+    Z_norm_sq = (Z * Z).sum(dim=1, keepdim=True)  # [N, 1], precompute ||z_i||^2
+
+    pos_idx_cpu = torch.empty((N, k_pos), dtype=torch.int32)
+
+    for start in range(0, N, block_q):
+        end = min(start + block_q, N)
+        bq = end - start
+        Q = Z[start:end]                        # [bq, D]
+        # sims = Q @ Z.t()                        # [bq, N], FP16 GEMM
+        Q_norm_sq = (Q * Q).sum(dim=1, keepdim=True)  # [bq, 1]
+        dist_sq = Q_norm_sq + Z_norm_sq.t() - 2 * (Q @ Z.t())  # [bq, N], squared L2
+
+        # mask self-sim for in-block rows (so we don't pick self)
+        row = torch.arange(bq, device=dev)
+        col = start + row
+        # sims[row, col] = -float("inf")
+
+        # top-k neighbors (positives)
+        # topk = torch.topk(sims, k=k_pos, dim=1, largest=True, sorted=True).indices
+        topk = torch.topk(dist_sq, k=k_pos, dim=1, largest=False, sorted=True).indices
+        pos_idx_cpu[start:end] = topk.to("cpu", dtype=torch.int32)
+
+        # del Q, sims, topk
+        del Q, Q_norm_sq, dist_sq, topk
+        torch.cuda.empty_cache()
+
+    return {"pos_idx": pos_idx_cpu, "k_pos": torch.tensor(k_pos, dtype=torch.int32)}
+
+@torch.no_grad()
+def build_triplets_from_cache_for_set(
+    set_global_idx: torch.Tensor,
+    pos_idx_cpu: torch.Tensor,
+    n_per_anchor: int = 10,
+    triplet_cap: int = 20000
+) -> torch.Tensor:
+    """
+    Assemble triplets (a, p, n) for a single set using precomputed global kNN.
+    Returns LongTensor [T, 3] with LOCAL indices in the set.
+    Negatives sampled from within set but not in positive list or self.
+    """
+    if set_global_idx.is_cuda:
+        set_global_idx_cpu = set_global_idx.detach().to("cpu")
+    else:
+        set_global_idx_cpu = set_global_idx
+
+    n_valid = int(set_global_idx_cpu.numel())
+    if n_valid <= 2:
+        return torch.empty((0, 3), dtype=torch.long)
+
+    N_sc_total = int(pos_idx_cpu.size(0))
+    global_to_local = torch.full((N_sc_total,), -1, dtype=torch.int32)
+    global_to_local[set_global_idx_cpu] = torch.arange(n_valid, dtype=torch.int32)
+
+    pos_glob = pos_idx_cpu[set_global_idx_cpu]
+    pos_loc = global_to_local[pos_glob]
+
+    triplets_cpu = []
+
+    for a_loc in range(n_valid):
+        pl = pos_loc[a_loc]
+        pl = pl[pl >= 0]
+        if pl.numel() == 0:
+            continue
+
+        if pl.numel() > n_per_anchor:
+            sel = torch.randint(0, pl.numel(), (n_per_anchor,))
+            pl = pl[sel]
+
+        neg_mask = torch.ones(n_valid, dtype=torch.bool)
+        neg_mask[a_loc] = False
+        neg_mask[pl.long()] = False
+        neg_candidates = torch.nonzero(neg_mask, as_tuple=False).squeeze(1)
+        if neg_candidates.numel() == 0:
+            continue
+
+        neg_sel = neg_candidates[torch.randint(0, neg_candidates.numel(), (pl.numel(),))]
+        a_col = torch.full((pl.numel(),), a_loc, dtype=torch.long)
+        triplets_cpu.append(torch.stack([a_col, pl.long(), neg_sel.long()], dim=1))
+
+    if len(triplets_cpu) == 0:
+        return torch.empty((0, 3), dtype=torch.long)
+
+    triplets = torch.cat(triplets_cpu, dim=0)
+    if triplets.size(0) > triplet_cap:
+        idx = torch.randperm(triplets.size(0))[:triplet_cap]
+        triplets = triplets[idx]
+    return triplets
