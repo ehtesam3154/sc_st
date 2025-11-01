@@ -1509,19 +1509,21 @@ class FrobeniusGramLoss(nn.Module):
         loss = torch.mean(diff ** 2)
         return loss
     
-def masked_frobenius_loss(A, B, mask):
-    '''
-    compute ||a-b||_F^2 only over valid masked entries
-    a, b: (batch, n, n)
-    mask: (batch, n) boolean
-    '''
+# def masked_frobenius_loss(A, B, mask):
+#     '''
+#     compute ||a-b||_F^2 only over valid masked entries
+#     a, b: (batch, n, n)
+#     mask: (batch, n) boolean
+#     '''
 
-    #create 2D mask: (batch, n, n)
-    P = mask.unsqueeze(-1) & mask.unsqueeze(-2) #(B, N, N)
-    P = P.float()
+#     #create 2D mask: (batch, n, n)
+#     P = mask.unsqueeze(-1) & mask.unsqueeze(-2) #(B, N, N)
+#     P = P.float()
 
-    diff_sq = (A - B).pow(2)
-    return (diff_sq * P).sum() / P.sum().clamp_min(1.0)
+#     diff_sq = (A - B).pow(2)
+#     return (diff_sq * P).sum() / P.sum().clamp_min(1.0)
+
+
 
 
 def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):

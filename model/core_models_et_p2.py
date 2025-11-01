@@ -861,13 +861,33 @@ def train_stageC_diffusion_generator(
                 # ===== ST STEP: Score + Gram + Heat + SW_ST =====
                 
                 # Gram loss (in fp32)
-                with torch.autocast(device_type='cuda', enabled=False):
-                    V_fp32 = V_hat.float()
-                    G_pred = V_fp32 @ V_fp32.transpose(1, 2)
-                    G_targ = G_target.float()
+                # with torch.autocast(device_type='cuda', enabled=False):
+                #     V_fp32 = V_hat.float()
+                #     G_pred = V_fp32 @ V_fp32.transpose(1, 2)
+                #     G_targ = G_target.float()
 
-                    #use masked frob function
-                    L_gram = uet.masked_frobenius_loss(G_pred, G_targ, mask)
+                #     #use masked frob function
+                #     L_gram = uet.masked_frobenius_loss(G_pred, G_targ, mask)
+
+                with torch.autocast(device_type='cuda', enabled=False):
+                    V = V_hat.float()
+                    Gt = G_target.float()
+                    m  = mask
+
+                    # center + scale-match as above
+                    mw   = m.float()
+                    cnt  = mw.sum(dim=1, keepdim=True).clamp_min(1.0)
+                    mean = (V * mw.unsqueeze(-1)).sum(dim=1, keepdim=True) / cnt.unsqueeze(-1)
+                    Vc   = V - mean
+                    Gp   = Vc @ Vc.transpose(1, 2)
+
+                    tr_p = (Gp.diagonal(dim1=1, dim2=2) * mw).sum(dim=1, keepdim=True).clamp_min(1e-8)
+                    tr_t = (Gt.diagonal(dim1=1, dim2=2) * mw).sum(dim=1, keepdim=True).clamp_min(1e-8)
+                    s2   = (tr_t / tr_p)
+                    Gp   = Gp * s2.unsqueeze(-1)
+
+                    L_gram = uet.masked_frobenius_loss(Gp, Gt, m, drop_diag=True)
+
                 
                 # Heat kernel loss (batched)
                 if (global_step % heat_every_k) == 0:
@@ -1016,32 +1036,7 @@ def train_stageC_diffusion_generator(
                         
                         if batch_size_real > 0:
                             L_ordinal_sc = L_ordinal_sc / batch_size_real
-                # with torch.autocast(device_type='cuda', enabled=False):
-                #     with timed("ord_total", sc_prof):
-                #         for i in range(batch_size_real):
-                #             n_valid = int(n_list[i].item())
-                #             Z_i = Z_set[i, :n_valid].float()
-                #             V_i = V_hat[i, :n_valid].float()
 
-                #             with timed("ord_triplet_sample", sc_prof):
-                #                 triplets = uet.sample_ordinal_triplets_from_Z(Z_i, n_per_anchor=10, k_nn=25)
-
-                #             if len(triplets) > triplet_cap:
-                #                 with timed("ord_triplet_cap", sc_prof):
-                #                     sel = torch.randperm(
-                #                         len(triplets),
-                #                         device=(triplets.device if hasattr(triplets, "device") else device)
-                #                     )[:triplet_cap]
-                #                     triplets = triplets[sel]
-
-                #             if len(triplets) > 0:
-                #                 with timed("ord_cdist", sc_prof):
-                #                     D_V = torch.cdist(V_i, V_i)  # (n_valid, n_valid)
-                #                 with timed("ord_loss", sc_prof):
-                #                     L_ordinal_sc = L_ordinal_sc + loss_triplet(D_V, triplets)
-
-                #         if batch_size_real > 0:
-                #             L_ordinal_sc = L_ordinal_sc / batch_size_real
 
                 # ----------------- (2) Z-matched distogram (in fp32) -----------------
                 L_sw_sc = torch.tensor(0.0, device=device)
@@ -1085,50 +1080,48 @@ def train_stageC_diffusion_generator(
                 # ----------------- (3) Distance-only overlap (SC ONLY, every K steps) -----------------
                 L_overlap = torch.tensor(0.0, device=device)
                 if (global_step % EVERY_K_STEPS) == 0:
-                    shared_info = batch.get('shared_info', [])
-                    if len(shared_info) > 0:
+                    need = ("pair_idxA","pair_idxB","shared_A_idx","shared_B_idx")
+                    has_all = all(k in batch for k in need)
+
+                    if has_all and batch["pair_idxA"].numel() > 0:
                         with torch.autocast(device_type='cuda', enabled=False):
-                            if 'pair_idxA' in batch and batch['pair_idxA'].numel() > 0:
-                                with timed("ov_total", sc_prof):
-                                    P = batch['pair_idxA'].size(0)
-                                    Kmax = batch['shared_A_idx'].size(1)
+                            P = batch['pair_idxA'].size(0)
 
-                                    with timed("ov_gather", sc_prof):
-                                        idxA = batch['pair_idxA']  # (P,)
-                                        idxB = batch['pair_idxB']  # (P,)
-                                        VA = V_hat[idxA]          # (P, N, D)
-                                        VB = V_hat[idxB]          # (P, N, D)
+                            # Gather per-pair predicted coordinates
+                            idxA, idxB = batch['pair_idxA'], batch['pair_idxB']     # (P,)
+                            VA, VB = V_hat[idxA].float(), V_hat[idxB].float()       # (P, N, D)
 
-                                        SA = batch['shared_A_idx']  # (P, Kmax)
-                                        SB = batch['shared_B_idx']  # (P, Kmax)
+                            SA, SB = batch['shared_A_idx'], batch['shared_B_idx']   # (P, Kmax)
+                            maskA, maskB = SA.ge(0), SB.ge(0)                       # True where valid
 
-                                        maskA = SA >= 0
-                                        maskB = SB >= 0
+                            SAx = SA.clamp_min(0).unsqueeze(-1).expand(-1, -1, VA.size(-1))
+                            SBx = SB.clamp_min(0).unsqueeze(-1).expand(-1, -1, VB.size(-1))
+                            A = torch.gather(VA, 1, SAx)    # (P, Kmax, D)
+                            B = torch.gather(VB, 1, SBx)    # (P, Kmax, D)
 
-                                        SA_safe = SA.clamp_min(0).unsqueeze(-1).expand(-1, -1, VA.size(-1))
-                                        SB_safe = SB.clamp_min(0).unsqueeze(-1).expand(-1, -1, VB.size(-1))
+                            # Pairwise validity mask built from masks (no ordering assumptions)
+                            pairmask = (maskA.unsqueeze(2) & maskA.unsqueeze(1) &
+                                        maskB.unsqueeze(2) & maskB.unsqueeze(1))    # (P, Kmax, Kmax)
 
-                                        rowA = torch.gather(VA, 1, SA_safe) * maskA.unsqueeze(-1).float()  # (P, Kmax, D)
-                                        rowB = torch.gather(VB, 1, SB_safe) * maskB.unsqueeze(-1).float()  # (P, Kmax, D)
+                            # Remove diagonal
+                            Kmax = SA.size(1)
+                            eye = torch.eye(Kmax, dtype=torch.bool, device=device).unsqueeze(0)
+                            pairmask = pairmask & (~eye)
 
-                                    with timed("ov_cdist", sc_prof):
-                                        DA = torch.cdist(rowA.float(), rowA.float())  # (P, Kmax, Kmax)
-                                        DB = torch.cdist(rowB.float(), rowB.float())  # (P, Kmax, Kmax)
+                            if pairmask.any():
+                                DA = torch.cdist(A, A)  # (P, Kmax, Kmax)
+                                DB = torch.cdist(B, B)
 
-                                    with timed("ov_tri_mask", sc_prof):
-                                        iu, ju = torch.triu_indices(Kmax, Kmax, 1, device=DA.device)
-                                        dA_flat = DA[:, iu, ju]  # (P, M)
-                                        dB_flat = DB[:, iu, ju]  # (P, M)
-                                        shared_lens = batch['shared_len']  # (P,)
-                                        valid_mask = (iu.unsqueeze(0) < shared_lens.unsqueeze(1)) & \
-                                                    (ju.unsqueeze(0) < shared_lens.unsqueeze(1))  # (P, M)
+                                iu, ju = torch.triu_indices(Kmax, Kmax, 1, device=device)
+                                tri_mask = pairmask[:, iu, ju]          # (P, M)
+                                dA = DA[:, iu, ju][tri_mask]            # (total_valid,)
+                                dB = DB[:, iu, ju][tri_mask]
 
-                                    with timed("ov_mse", sc_prof):
-                                        dA_valid = dA_flat[valid_mask]
-                                        dB_valid = dB_flat[valid_mask]
-                                        L_overlap = ((dA_valid - dB_valid) ** 2).mean()
+                                L_overlap = torch.mean((dA - dB) ** 2)
                             else:
+                                # nothing valid this step; leave as 0.0 or skip logging
                                 L_overlap = torch.tensor(0.0, device=device)
+
 
                 # ----------------- (4) Compact timing print -----------------
                 # if PROFILE_SC and (global_step % PROFILE_PRINT_EVERY == 0):
@@ -1393,42 +1386,6 @@ import numpy as np
 from typing import Dict, Optional
 from tqdm import tqdm
 import gc
-
-def infer_sc_coordinates_optimized(model, sc_expr, batch_size=512, device='cuda'):
-    """
-    OPTIMIZED inference wrapper with automatic batch size selection.
-    
-    Args:
-        model: GEMSModel instance
-        sc_expr: (n_sc, n_genes) tensor
-        batch_size: cells per batch (reduce if still getting OOM)
-        device: 'cuda' or 'cpu'
-    """
-    print("\n" + "="*70)
-    print("SC COORDINATE INFERENCE (BATCHED)")
-    print("="*70)
-    print(f"Total cells: {sc_expr.shape[0]}")
-    print(f"Batch size: {batch_size}")
-    
-    # Clear cache before starting
-    if device == 'cuda':
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-    results = sample_sc_edm_batched(
-        sc_gene_expr=sc_expr,
-        encoder=model.encoder,
-        context_encoder=model.context_encoder,
-        score_net=model.score_net,
-        n_timesteps_sample=250,
-        sigma_min=0.01,
-        sigma_max=50.0,
-        return_coords=True,
-        batch_size=batch_size,
-        device=device
-    )
-    
-    return results
 
 import torch
 import torch.nn as nn
