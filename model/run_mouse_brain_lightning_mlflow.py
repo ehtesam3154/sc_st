@@ -6,6 +6,67 @@ import scanpy as sc
 from core_models_et_p3 import GEMSModel
 # from mouse_brain import train_gems_mousebrain  # optional, if you want its helpers
 
+import mlflow
+import mlflow.pytorch
+from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo
+import psutil
+import time
+
+
+class MLFlowLogger:
+    def __init__(self, experiment_name='gems_training', tracking_uri=None, enabled=True):
+        self.enabled = enabled and mlflow is not None
+        self.step = 0
+        self.start_time = time.time()
+
+        if not self.enabled:
+            return
+        
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment(experiment_name)
+        mlflow.start_run()
+
+    def log_metrics(self, metrics_dict, step=None):
+        if not self.enabled:
+            return
+        mlflow.log_metric(metrics_dict, step=(step if step is not None else self.step))
+
+    def log_params(self, params_dict):
+        if not self.enabled:
+            return
+        mlflow.log_params(params_dict)
+
+    def log_artifact(self, filepath):
+        if not self.enabled:
+            return
+        if os.path.exists(filepath):
+            mlflow.log_artifact(filepath)
+
+    def gpu_stats(self, gpu_id=0):
+        stats = {}
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(gpu_id)
+        util = nvmlDeviceGetUtilizationRates(handle)
+        mem = nvmlDeviceGetMemoryInfo(handle)
+        
+        stats["gpu/util_pct"] = util.gpu
+        stats["gpu/mem_used_gb"] = mem.used / (1024**3)
+        stats["gpu/mem_total_gb"] = mem.total / (1024**3)
+        stats["cuda/alloc_gb"] = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+        stats["cpu/ram_gb"] = psutil.Process().memory_info().rss / (1024**3)
+        stats["time/elapsed_min"] = (time.time() - self.start_time) / 60
+        
+        return stats
+    
+    def set_step(self, step):
+        self.step = step
+    
+    def finish(self):
+        if self.enabled:
+            mlflow.end_run()
+
+
 def load_mouse_data():
     # Replace these with your actual file paths
     sc_counts = '/home/ehtesamul/sc_st/data/mousedata_2020/E1z2/simu_sc_counts.csv'
@@ -87,9 +148,30 @@ def main(
     stageC_batch=4,
     lr=1e-4,
     outdir="gems_mousebrain_output",
+    use_mlflow=True,
+    mlflow_uri=None,
+    log_interval=10
 ):
     fabric = Fabric(accelerator="gpu", devices=devices, strategy="ddp", precision=precision)
     fabric.launch()
+
+    # Initialize MLflow logger (only rank 0 logs)
+    logger = None
+    if fabric.is_global_zero and use_mlflow:
+        logger = MLFlowLogger(
+            experiment_name="gems_mousebrain",
+            tracking_uri=mlflow_uri,
+            enabled=True
+        )
+        logger.log_params({
+            "devices": devices,
+            "precision": precision,
+            "stageA_epochs": stageA_epochs,
+            "stageC_epochs": stageC_epochs,
+            "stageC_batch": stageC_batch,
+            "lr": lr,
+            "n_genes": None,  # will update after data load
+        })
 
     # ---------- Load data on all ranks (OK) ----------
     scadata, stadata = load_mouse_data()
@@ -105,6 +187,13 @@ def main(
         isab_m=64,
         device=str(fabric.device),
     )
+
+    if logger:
+        logger.log_params({
+            "n_genes": n_genes,
+            "D_latent": 16,
+            "c_dim": 256,
+        })
 
     # ---------- Stage A & B on rank-0 only ----------
     if fabric.is_global_zero:
@@ -219,6 +308,8 @@ def main(
         outf=outdir,
         fabric=fabric,
         precision=precision,
+        logger=logger,
+        log_interval=log_interval,
     )
 
     fabric.barrier()
@@ -264,6 +355,9 @@ def main(
         results_path = os.path.join(outdir, results_filename)
         torch.save(results, results_path)
         print(f"\n✓ Saved raw results: {results_path}")
+
+        if logger:
+            logger.log_artifact(results_path)
         
         # Save processed results with metadata
         results_processed = {
@@ -363,63 +457,149 @@ def main(
         print(f"✓ Saved matplotlib plot: {plot_path}")
         plt.close()
         
+        # # ============================================================================
+        # # SCANPY VISUALIZATION
+        # # ============================================================================
+        
+        # if 'celltype' in scadata.obs.columns:
+        #     # Create scanpy-style embedding plot
+        #     fig, ax = plt.subplots(figsize=(10, 8))
+            
+        #     import scanpy as sc
+        #     sc.settings.set_figure_params(dpi=150, frameon=False)
+            
+        #     # Use scanpy's embedding plot
+        #     sc.pl.embedding(
+        #         scadata, 
+        #         basis='gems',  # This uses obsm['X_gems']
+        #         color='celltype',
+        #         title='GEMS Embedding (Scanpy)',
+        #         save=False,
+        #         show=False,
+        #         ax=ax,
+        #         size=20,
+        #         alpha=0.8,
+        #         legend_loc='on data',
+        #         legend_fontsize=8
+        #     )
+            
+        #     # Save scanpy plot
+        #     scanpy_plot_filename = f"gems_embedding_scanpy_{timestamp}.png"
+        #     scanpy_plot_path = os.path.join(outdir, scanpy_plot_filename)
+        #     plt.savefig(scanpy_plot_path, dpi=300, bbox_inches='tight')
+        #     print(f"✓ Saved scanpy plot: {scanpy_plot_path}")
+        #     plt.close()
+            
+        #     # Also create a high-quality version with better styling
+        #     fig, ax = plt.subplots(figsize=(12, 10))
+        #     sc.pl.embedding(
+        #         scadata, 
+        #         basis='gems',
+        #         color='celltype',
+        #         title='',
+        #         save=False,
+        #         show=False,
+        #         ax=ax,
+        #         size=30,
+        #         alpha=0.7,
+        #         frameon=True,
+        #         legend_loc='right margin',
+        #         legend_fontsize=10
+        #     )
+        #     ax.set_xlabel('GEMS-1', fontsize=14, fontweight='bold')
+        #     ax.set_ylabel('GEMS-2', fontsize=14, fontweight='bold')
+            
+        #     hq_plot_filename = f"gems_embedding_hq_{timestamp}.png"
+        #     hq_plot_path = os.path.join(outdir, hq_plot_filename)
+        #     plt.savefig(hq_plot_path, dpi=600, bbox_inches='tight')
+        #     print(f"✓ Saved high-quality plot: {hq_plot_path}")
+        #     plt.close()
+
         # ============================================================================
-        # SCANPY VISUALIZATION
+        # CELL TYPE VISUALIZATION (Direct matplotlib - always works)
         # ============================================================================
         
+        print("\n=== Creating cell type visualizations ===")
+        
         if 'celltype' in scadata.obs.columns:
-            # Create scanpy-style embedding plot
+            import seaborn as sns
+            
+            # Get unique cell types and colors
+            celltypes = scadata.obs['celltype'].unique()
+            n_types = len(celltypes)
+            colors = sns.color_palette("tab20", n_colors=max(20, n_types))
+            color_map = {ct: colors[i % len(colors)] for i, ct in enumerate(celltypes)}
+            
+            # Plot 1: Standard quality
             fig, ax = plt.subplots(figsize=(10, 8))
             
-            import scanpy as sc
-            sc.settings.set_figure_params(dpi=150, frameon=False)
+            for ct in celltypes:
+                mask = scadata.obs['celltype'] == ct
+                coords_ct = coords_canon[mask]
+                ax.scatter(
+                    coords_ct[:, 0], 
+                    coords_ct[:, 1], 
+                    c=[color_map[ct]], 
+                    label=ct, 
+                    s=20, 
+                    alpha=0.7,
+                    edgecolors='none'
+                )
             
-            # Use scanpy's embedding plot
-            sc.pl.embedding(
-                scadata, 
-                basis='gems',  # This uses obsm['X_gems']
-                color='celltype',
-                title='GEMS Embedding (Scanpy)',
-                save=False,
-                show=False,
-                ax=ax,
-                size=20,
-                alpha=0.8,
-                legend_loc='on data',
-                legend_fontsize=8
-            )
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8, frameon=False)
+            ax.set_xlabel('GEMS-1', fontsize=12, fontweight='bold')
+            ax.set_ylabel('GEMS-2', fontsize=12, fontweight='bold')
+            ax.set_title('GEMS Embedding by Cell Type', fontsize=14, fontweight='bold')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
             
-            # Save scanpy plot
-            scanpy_plot_filename = f"gems_embedding_scanpy_{timestamp}.png"
-            scanpy_plot_path = os.path.join(outdir, scanpy_plot_filename)
-            plt.savefig(scanpy_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved scanpy plot: {scanpy_plot_path}")
+            plot_filename = f"gems_embedding_celltype_{timestamp}.png"
+            plot_path = os.path.join(outdir, plot_filename)
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved cell type plot: {plot_path}")
+            
+            if logger:
+                logger.log_artifact(plot_path)
+            
             plt.close()
             
-            # Also create a high-quality version with better styling
+            # Plot 2: High quality version
             fig, ax = plt.subplots(figsize=(12, 10))
-            sc.pl.embedding(
-                scadata, 
-                basis='gems',
-                color='celltype',
-                title='',
-                save=False,
-                show=False,
-                ax=ax,
-                size=30,
-                alpha=0.7,
-                frameon=True,
-                legend_loc='right margin',
-                legend_fontsize=10
-            )
+            
+            for ct in celltypes:
+                mask = scadata.obs['celltype'] == ct
+                coords_ct = coords_canon[mask]
+                ax.scatter(
+                    coords_ct[:, 0], 
+                    coords_ct[:, 1], 
+                    c=[color_map[ct]], 
+                    label=ct, 
+                    s=40, 
+                    alpha=0.6,
+                    edgecolors='white',
+                    linewidths=0.5
+                )
+            
+            ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=10, 
+                     frameon=True, fancybox=True, shadow=True)
             ax.set_xlabel('GEMS-1', fontsize=14, fontweight='bold')
             ax.set_ylabel('GEMS-2', fontsize=14, fontweight='bold')
+            ax.set_title('GEMS Embedding (High Quality)', fontsize=16, fontweight='bold')
+            ax.grid(True, alpha=0.2, linestyle='--')
+            ax.set_facecolor('#f8f8f8')
             
             hq_plot_filename = f"gems_embedding_hq_{timestamp}.png"
             hq_plot_path = os.path.join(outdir, hq_plot_filename)
             plt.savefig(hq_plot_path, dpi=600, bbox_inches='tight')
             print(f"✓ Saved high-quality plot: {hq_plot_path}")
+            
+            if logger:
+                logger.log_artifact(hq_plot_path)
+            
             plt.close()
+            
+        else:
+            print("⚠ No 'celltype' column found in scadata.obs - skipping cell type plots")
         
         # ============================================================================
         # SUMMARY STATISTICS
@@ -645,6 +825,9 @@ def main(
         else:
             print(f"⚠ No checkpoint files found in {outdir}")
             print("  Stage C training may not have completed or checkpoints not saved.")
+
+    if logger:
+        logger.finish()
 
 
 if __name__ == "__main__":

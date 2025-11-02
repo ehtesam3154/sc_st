@@ -218,8 +218,9 @@ class GEMSModel:
         outf: str = 'output',
         fabric: Optional['Fabric'] = None,
         precision: str = "16-mixed",
-
-    ):
+        logger = None,
+        log_interval: int = 10,
+):
         """
         Train diffusion generator with mixed ST/SC regimen.
         """
@@ -289,6 +290,8 @@ class GEMSModel:
             outf=outf,
             fabric=fabric,
             precision=precision,
+            logger=logger,
+            log_interval=log_interval,
         )
         
         print("Stage C complete.")

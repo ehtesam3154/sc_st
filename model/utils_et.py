@@ -1523,7 +1523,30 @@ class FrobeniusGramLoss(nn.Module):
 #     diff_sq = (A - B).pow(2)
 #     return (diff_sq * P).sum() / P.sum().clamp_min(1.0)
 
-
+def masked_frobenius_loss(A, B, mask, drop_diag: bool = True):
+    """
+    ||A - B||_F^2 over valid entries.
+    A, B: (B, N, N) or (N, N)
+    mask: (B, N) or (N,) boolean. Valid nodes.
+    """
+    if A.dim() == 3:
+        Bsz, N, _ = A.shape
+        P = (mask.unsqueeze(-1) & mask.unsqueeze(-2))  # (B,N,N) boolean
+        if drop_diag:
+            eye = torch.eye(N, dtype=torch.bool, device=A.device).unsqueeze(0)
+            P = P & (~eye)
+        P = P.float()
+        diff_sq = (A - B).pow(2)
+        return (diff_sq * P).sum() / P.sum().clamp_min(1.0)
+    else:
+        N = A.size(0)
+        P = (mask.unsqueeze(1) & mask.unsqueeze(0))
+        if drop_diag:
+            eye = torch.eye(N, dtype=torch.bool, device=A.device)
+            P = P & (~eye)
+        P = P.float()
+        diff_sq = (A - B).pow(2)
+        return (diff_sq * P).sum() / P.sum().clamp_min(1.0)
 
 
 def build_knn_graph_from_distance(D: torch.Tensor, k: int = 20, device: str = 'cuda'):
