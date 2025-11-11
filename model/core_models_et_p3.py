@@ -51,7 +51,20 @@ class GEMSModel:
         c_dim: int = 256,
         n_heads: int = 4,
         isab_m: int = 64,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        #new params
+        use_canonicalize: bool = True,
+        use_dist_bias: bool = True,
+        dist_bins: int = 16,
+        dist_head_shared: bool = True,
+        use_angle_features: bool = True,
+        angle_bins: int = 8,
+        knn_k: int = 12,
+        self_conditioning: bool = True,
+        sc_feat_mode: str = "concat",
+        lambda_cone: float = 1e-3,
+        landmarks_L: int = 32
+
     ):
         """
         Args:
@@ -70,6 +83,27 @@ class GEMSModel:
         self.n_heads = n_heads
         self.isab_m = isab_m
         self.device = device
+
+        # Store all configuration
+        self.cfg = {
+            'denoiser': {
+                'use_canonicalize': use_canonicalize,
+                'use_dist_bias': use_dist_bias,
+                'dist_bins': dist_bins,
+                'dist_head_shared': dist_head_shared,
+                'use_angle_features': use_angle_features,
+                'angle_bins': angle_bins,
+                'knn_k': knn_k,
+                'self_conditioning': self_conditioning,
+                'sc_feat_mode': sc_feat_mode,
+            },
+            'loss': {
+                'lambda_cone': lambda_cone,
+            },
+            'dataset': {
+                'landmarks_L': landmarks_L,
+            }
+        }
         
         # Stage A: Shared encoder
         self.encoder = SharedEncoder(n_genes, n_embedding).to(device)
@@ -90,9 +124,26 @@ class GEMSModel:
             n_blocks=2, isab_m=isab_m
         ).to(device)
         
+        # self.score_net = DiffusionScoreNet(
+        #     D_latent=D_latent, c_dim=c_dim, n_heads=n_heads,
+        #     n_blocks=4, isab_m=isab_m
+        # ).to(device)
+
         self.score_net = DiffusionScoreNet(
-            D_latent=D_latent, c_dim=c_dim, n_heads=n_heads,
-            n_blocks=4, isab_m=isab_m
+            D_latent=D_latent, 
+            c_dim=c_dim, 
+            n_heads=n_heads,
+            n_blocks=4, 
+            isab_m=isab_m,
+            use_canonicalize=use_canonicalize,
+            use_dist_bias=use_dist_bias,
+            dist_bins=dist_bins,
+            dist_head_shared=dist_head_shared,
+            use_angle_features=use_angle_features,
+            angle_bins=angle_bins,
+            knn_k=knn_k,
+            self_conditioning=self_conditioning,
+            sc_feat_mode=sc_feat_mode
         ).to(device)
         
         print(f"GEMS Model initialized:")
@@ -238,26 +289,49 @@ class GEMSModel:
         }
         sc_gene_expr_cpu = sc_gene_expr.cpu() if torch.is_tensor(sc_gene_expr) else sc_gene_expr
 
+        # st_dataset = STSetDataset(
+        #     targets_dict=self.targets_dict,
+        #     encoder=self.encoder,
+        #     st_gene_expr_dict=st_gene_expr_dict_cpu,  # Use CPU version
+        #     n_min=n_min,
+        #     n_max=n_max,
+        #     D_latent=self.D_latent,
+        #     num_samples=num_st_samples,
+        #     knn_k=12,
+        #     device=self.device
+        # )
+
         st_dataset = STSetDataset(
             targets_dict=self.targets_dict,
             encoder=self.encoder,
-            st_gene_expr_dict=st_gene_expr_dict_cpu,  # Use CPU version
+            st_gene_expr_dict=st_gene_expr_dict_cpu,
             n_min=n_min,
             n_max=n_max,
             D_latent=self.D_latent,
             num_samples=num_st_samples,
             knn_k=12,
-            device=self.device
+            device=self.device,
+            landmarks_L=self.cfg['dataset']['landmarks_L']  # ADD THIS
         )
                 
         # SC dataset
+        # sc_dataset = SCSetDataset(
+        #     sc_gene_expr=sc_gene_expr_cpu,  # Use CPU version
+        #     encoder=self.encoder,
+        #     n_min=n_min,
+        #     n_max=n_max,
+        #     num_samples=num_sc_samples,
+        #     device=self.device
+        # )
+
         sc_dataset = SCSetDataset(
-            sc_gene_expr=sc_gene_expr_cpu,  # Use CPU version
+            sc_gene_expr=sc_gene_expr_cpu,
             encoder=self.encoder,
             n_min=n_min,
             n_max=n_max,
             num_samples=num_sc_samples,
-            device=self.device
+            device=self.device,
+            landmarks_L=self.cfg['dataset']['landmarks_L']  # ADD THIS
         )
 
         
@@ -273,7 +347,7 @@ class GEMSModel:
         
         # Train
         from core_models_et_p2 import train_stageC_diffusion_generator
-        train_stageC_diffusion_generator(
+        history = train_stageC_diffusion_generator(
             context_encoder=self.context_encoder,
             generator=self.generator,
             score_net=self.score_net,
@@ -295,6 +369,8 @@ class GEMSModel:
         )
         
         print("Stage C complete.")
+
+        return history
     
     # ==========================================================================
     # STAGE D: SC INFERENCE
@@ -337,28 +413,18 @@ class GEMSModel:
         )
         
         return results
-    
-    # ==========================================================================
-    # SAVE / LOAD
-    # ==========================================================================
-    
+
+
     def save(self, path: str):
-        """Save all model components."""
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-        torch.save({
+        """Save model checkpoint."""
+        checkpoint = {
             'encoder': self.encoder.state_dict(),
             'context_encoder': self.context_encoder.state_dict(),
             'generator': self.generator.state_dict(),
             'score_net': self.score_net.state_dict(),
-            'config': {
-                'n_genes': self.n_genes,
-                'n_embedding': self.n_embedding,
-                'D_latent': self.D_latent,
-                'c_dim': self.c_dim,
-                'n_heads': self.n_heads,
-                'isab_m': self.isab_m
-            }
-        }, path)
+            'cfg': self.cfg,  # ADD THIS
+        }
+        torch.save(checkpoint, path)
         print(f"Model saved to {path}")
     
     def load(self, path: str):
@@ -368,6 +434,11 @@ class GEMSModel:
         self.context_encoder.load_state_dict(checkpoint['context_encoder'])
         self.generator.load_state_dict(checkpoint['generator'])
         self.score_net.load_state_dict(checkpoint['score_net'])
+        
+        # Load config if available
+        if 'cfg' in checkpoint:
+            self.cfg = checkpoint['cfg']
+            
         print(f"Model loaded from {path}")
     
     # ==========================================================================
@@ -588,29 +659,20 @@ class GEMSModel:
     def infer_sc_anchored(
         self,
         sc_gene_expr: torch.Tensor,
-        n_timesteps_sample: int = 160,
+        n_timesteps_sample: int = 300,
         return_coords: bool = True,
-        anchor_size: int = 384,
+        anchor_size: int = 640,
         batch_size: int = 512,
         eta: float = 0.0,
-        guidance_scale: float = 7.0
+        guidance_scale: float = 7.0,
+        # OPTIONAL: expose stitching knobs if you want to tweak without touching p2.py
+        K_ANCH: int = 112,
+        L2_REG: float = 3e-4,
+        CARRY_K: int = 256,
+        RES_CAP: int = 3500,
     ) -> Dict[str, torch.Tensor]:
         """
-        ANCHOR-CONDITIONED inference for SC data (FIXES GLOBAL GEOMETRY).
-        
-        This is the RECOMMENDED inference method. It ensures all cells
-        are placed in a globally consistent coordinate system.
-        
-        Args:
-            sc_gene_expr: (n_sc, n_genes)
-            n_timesteps_sample: diffusion steps (120-200 recommended for 20GB GPU)
-            return_coords: compute coordinates
-            anchor_size: number of anchor cells (256-384)
-            batch_size: cells per batch excluding anchors (384-512)
-            eta: stochasticity (0.0 = deterministic, safer)
-            
-        Returns:
-            dict with 'D_edm', 'coords', 'coords_canon'
+        Anchored SC inference (structure-first stitching).
         """
         from core_models_et_p2 import sample_sc_edm_anchored
         
@@ -621,12 +683,18 @@ class GEMSModel:
             score_net=self.score_net,
             n_timesteps_sample=n_timesteps_sample,
             sigma_min=0.01,
-            sigma_max=50.0,
+            sigma_max=5.0,            # ← match Stage C training (CHANGE from 50.0)
             return_coords=return_coords,
             anchor_size=anchor_size,
             batch_size=batch_size,
             eta=eta,
-            guidance_scale=guidance_scale,  # <- ADD THIS
-            device=self.device
+            guidance_scale=guidance_scale,
+            device=self.device,
+            # pass-through for the new optional knobs (safe defaults if you omit)
+            K_ANCH=K_ANCH,
+            L2_REG=L2_REG,
+            CARRY_K=CARRY_K,
+            RES_CAP=RES_CAP,
         )
+
 

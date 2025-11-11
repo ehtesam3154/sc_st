@@ -35,6 +35,22 @@ except Exception:
 import time
 from contextlib import contextmanager
 
+#debug tools
+DEBUG = True #master switch for debug logging
+LOG_EVERY = 100 #per-batch prints
+SAVE_EVERY_EPOCH = 5 #extra plots/dumps
+
+#debug tracking variables 
+debug_state = {
+    'score_bins': None,
+    'score_bin_sum': None,
+    'score_bin_cnt': None,
+    'dbg_overlap_seen': 0,
+    'dbg_overlap_pairs': 0,
+    'dbg_k_mean': 0.0,
+    'overlap_count_this_epoch': 0
+}
+
 def _cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -49,6 +65,30 @@ def timed(section_name, bucket):
         _cuda_sync()
         dt = time.perf_counter() - t0
         bucket[section_name] = bucket.get(section_name, 0.0) + dt
+
+def _intersect1d_with_indices(a: torch.Tensor, b: torch.Tensor):
+    """
+    PyTorch-only replacement for torch.intersect1d(..., return_indices=True).
+    Returns (common, idx_a, idx_b) where:
+      common = a[idx_a] = b[idx_b]
+    Keeps the order of 'a' (stable in a).
+    """
+    # a, b: 1D Long tensors on same device
+    a = a.view(-1)
+    b = b.view(-1)
+    # boolean match matrix (sizes here are small: shared ~ O(10^2))
+    M = (a[:, None] == b[None, :])
+    idx_a, idx_b = torch.nonzero(M, as_tuple=True)
+    if idx_a.numel() == 0:
+        empty = a.new_empty((0,), dtype=a.dtype)
+        return empty, idx_a, idx_b
+    # keep a-order stable
+    order = torch.argsort(idx_a)
+    idx_a = idx_a[order]
+    idx_b = idx_b[order]
+    common = a[idx_a]
+    return common, idx_a, idx_b
+
 
 # ==============================================================================
 # STAGE C: SET-EQUIVARIANT CONTEXT ENCODER
@@ -284,6 +324,7 @@ class MetricSetGenerator(nn.Module):
 # ==============================================================================
 # STAGE C: DIFFUSION SCORE NETWORK sψ
 # ==============================================================================
+import math
 
 class DiffusionScoreNet(nn.Module):
     """
@@ -301,7 +342,17 @@ class DiffusionScoreNet(nn.Module):
         n_blocks: int = 4,
         isab_m: int = 64,
         time_emb_dim: int = 128,
-        ln: bool = True
+        ln: bool = True,
+        #new params
+        use_canonicalize: bool = True,
+        use_dist_bias: bool = True,
+        dist_bins: int = 16,
+        dist_head_shared: bool = True,
+        use_angle_features: bool = True,
+        angle_bins: int = 8,
+        knn_k: int = 12,
+        self_conditioning: bool = True,
+        sc_feat_mode: str ='concat'
     ):
         """
         Args:
@@ -317,6 +368,42 @@ class DiffusionScoreNet(nn.Module):
         self.D_latent = D_latent
         self.c_dim = c_dim
         self.time_emb_dim = time_emb_dim
+
+        # Store new config
+        self.use_canonicalize = use_canonicalize
+        self.use_dist_bias = use_dist_bias
+        self.dist_bins = dist_bins
+        self.dist_head_shared = dist_head_shared
+        self.use_angle_features = use_angle_features
+        self.angle_bins = angle_bins
+        self.knn_k = knn_k
+        self.self_conditioning = self_conditioning
+        self.sc_feat_mode = sc_feat_mode
+
+        #distance bias params
+        if use_dist_bias:
+            d_emb = 32
+            self.E_bin = nn.Parameter(torch.randn(dist_bins, d_emb) / math.sqrt(d_emb))
+            out_dim = 1 if dist_head_shared else n_heads
+            self.W_bias = nn.Parameter(torch.randn(d_emb, out_dim) * 0.01)
+            self.alpha_bias = nn.Parameter(torch.tensor(0.1))
+
+        #self conditioning MLP if needed
+        if self.self_conditioning and sc_feat_mode == 'mlp':
+            self.sc_mlp = nn.Sequential(
+                nn.Linear(D_latent, c_dim // 2),
+                nn.ReLU(),
+                nn.Linear(c_dim // 2, D_latent)
+            )
+
+        #update inpiut projection dimension
+        extra_dims = 0
+
+        if self_conditioning:
+            extra_dims += D_latent
+        if use_angle_features:
+            extra_dims += angle_bins
+
         
         # Time embedding (Fourier features)
         self.time_mlp = nn.Sequential(
@@ -326,7 +413,11 @@ class DiffusionScoreNet(nn.Module):
         )
         
         # Input projection: V_t + H → combined features
-        self.input_proj = nn.Linear(D_latent + c_dim, c_dim)
+        # self.input_proj = nn.Linear(D_latent + c_dim, c_dim)
+        # self.input_proj = nn.Linear(c_dim + 128 + extra_dims, c_dim)  # 128 is time_emb dim
+        self.input_proj = nn.Linear(c_dim + c_dim + extra_dims + D_latent, c_dim) 
+        self.bias_sab = SAB(c_dim, c_dim, n_heads, ln=ln)
+
         
         # Denoising blocks (ISAB)
         self.denoise_blocks = nn.ModuleList([
@@ -356,43 +447,108 @@ class DiffusionScoreNet(nn.Module):
         args = t * freqs.unsqueeze(0)
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return emb
-    
-    def forward(self, V_t: torch.Tensor, t: torch.Tensor, H: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+
+    def forward(self, V_t: torch.Tensor, t: torch.Tensor, H: torch.Tensor, 
+           mask: torch.Tensor, self_cond: torch.Tensor = None, 
+           attn_cached: dict = None) -> torch.Tensor:
         """
         Args:
-            V_t: (batch, n, D_latent) noisy factor
-            t: (batch, 1) normalized time
-            H: (batch, n, c_dim) context
-            mask: (batch, n) boolean mask
-            
+            V_t: (B, N, D_latent) noisy coords at time t
+            t: (B,) or (B,1) diffusion time
+            H: (B, N, c_dim) context from SetEncoderContext
+            mask: (B, N)
+            self_cond: optional (B, N, D_latent) predicted V_0 from previous step
+            attn_cached: optional dict to reuse distance bias
+        
         Returns:
-            eps_pred: (batch, n, D_latent) predicted noise
+            eps_hat: (B, N, D_latent)
         """
-        batch_size, n, _ = V_t.shape
+        B, N, D = V_t.shape
         
-        # Time embedding
-        t_emb = self.get_time_embedding(t)
-        t_emb = self.time_mlp(t_emb)
-        t_emb = t_emb.unsqueeze(1).expand(-1, n, -1)
-        
-        # Combine V_t and H
-        V_H = torch.cat([V_t, H], dim=-1)
-        X = self.input_proj(V_H)
-        X = X + t_emb
-        
-        # Apply blocks with gradient checkpointing during training
-        for block in self.denoise_blocks:
-            if self.training:
-                X = torch.utils.checkpoint.checkpoint(block, X, use_reentrant=False)
+        # Step 1: Canonicalization
+        if self.use_canonicalize:
+            V_in, _, _ = uet.canonicalize(V_t, mask)
+            if self_cond is not None:
+                self_cond_canon, _, _ = uet.canonicalize(self_cond, mask)
             else:
-                X = block(X)
+                self_cond_canon = None
+        else:
+            V_in = V_t
+            self_cond_canon = self_cond
+        
+        # Step 2: Compose node features
+        features = [H]  # Start with context
+        
+        # Add time embedding (expanded to all nodes)
+        if t.dim() == 1:
+            t = t.unsqueeze(1)
+        t_emb = self.get_time_embedding(t)  #First get Fourier features
+        t_emb = self.time_mlp(t_emb)  # then pass through MLP
+        # t_emb_expanded = t_emb.expand(-1, N, -1)  # (B, N, c_dim)
+        t_emb_expanded = t_emb.unsqueeze(1).expand(-1, N, -1) 
+        features.append(t_emb_expanded)
+        
+        # Add self-conditioning
+        if self.self_conditioning and self_cond_canon is not None:
+            if self.sc_feat_mode == "mlp":
+                sc_feat = self.sc_mlp(self_cond_canon)
+            else:  # concat
+                sc_feat = self_cond_canon
+            features.append(sc_feat)
+        elif self.self_conditioning:  # No self_cond provided, use zeros
+            sc_feat = torch.zeros(B, N, self.D_latent, device=V_t.device)
+            features.append(sc_feat)
+        
+        # Add angle features
+        if self.use_angle_features:
+            idx = uet.knn_graph(V_in, mask, k=self.knn_k)
+            angle_feat = uet.angle_features(V_in, mask, idx, n_angle_bins=self.angle_bins)
+            features.append(angle_feat)
+        
+        features.append(V_in)
+
+        # Concatenate all features
+        X = torch.cat(features, dim=-1)  # (B, N, c_dim + 128 + extras)
+        X = self.input_proj(X)  # (B, N, c_dim)
+        
+        # Step 3: Distance-bucket attention bias
+        attn_bias = None
+        if self.use_dist_bias:
+            if attn_cached is not None and 'bias' in attn_cached:
+                attn_bias = attn_cached['bias']
+            else:
+                D2 = uet.pairwise_dist2(V_in, mask)
+                attn_bias, _ = uet.make_distance_bias(
+                    D2, mask, 
+                    n_bins=self.dist_bins,
+                    d_emb=32,
+                    share_across_heads=self.dist_head_shared,
+                    E_bin=self.E_bin,
+                    W=self.W_bias,
+                    alpha_bias=self.alpha_bias,
+                    device=V_t.device
+                )
+                if attn_cached is not None:
+                    attn_cached['bias'] = attn_bias
+
+        # Apply X↔X distance-biased attention exactly once
+        if self.use_dist_bias and attn_bias is not None:
+            X = self.bias_sab(X, mask=mask, attn_bias=attn_bias)
+        else:
+            # Even without bias, keep a homogeneous pass for depth
+            X = self.bias_sab(X, mask=mask, attn_bias=None)
+        X = X * mask.unsqueeze(-1).float()
+        
+        # Step 4: Apply ISAB blocks with attention bias
+        for isab in self.denoise_blocks:
+            X = isab(X, mask=mask, attn_bias=None)
             X = X * mask.unsqueeze(-1).float()
         
-        # Predict noise
-        eps_pred = self.output_head(X)
-        eps_pred = eps_pred * mask.unsqueeze(-1).float()
+        # Step 5: Output head
+        eps_hat = self.output_head(X)  # (B, N, D_latent)
+        eps_hat = eps_hat * mask.unsqueeze(-1).float()
         
-        return eps_pred
+        return eps_hat
     
 # ==============================================================================
 # STAGE C: TRAINING FUNCTION
@@ -476,6 +632,19 @@ def train_stageC_diffusion_generator(
     logger = None,
     log_interval: int = 20
 ):
+    
+    # Initialize debug tracking
+    global debug_state
+    debug_state = {
+        'score_bins': None,
+        'score_bin_sum': None,
+        'score_bin_cnt': None,
+        'dbg_overlap_seen': 0,
+        'dbg_overlap_pairs': 0,
+        'dbg_k_mean': 0.0,
+        'overlap_count_this_epoch': 0
+    }
+
     """
     Train diffusion generator with mixed ST/SC regimen.
     OPTIMIZED with: AMP, loss alternation, CFG, reduced overlap computation.
@@ -494,7 +663,10 @@ def train_stageC_diffusion_generator(
     use_bf16 = torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     # scaler = torch.amp.GradScaler(enabled=not use_bf16)  # auto-noop for bf16
-    scaler = torch.amp.GradScaler('cuda', enabled=use_fp16) if fabric is None else None
+    # scaler = torch.amp.GradScaler('cuda', enabled=use_fp16) if fabric is None else None
+    use_fp16 = (precision == '16-mixed')
+    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+
     
     context_encoder = context_encoder.to(device).train()
     score_net = score_net.to(device).train()
@@ -510,6 +682,11 @@ def train_stageC_diffusion_generator(
     
     # VE SDE
     sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), n_timesteps, device=device))
+
+    # DEBUG: First-time sigma info
+    if DEBUG:
+       print(f"[sigma_schedule] min={sigmas.min().item():.4f} max={sigmas.max().item():.4f} "
+             f"n_steps={n_timesteps}")
     
     # Loss modules - OPTIMIZED: Heat loss with Hutchinson
     loss_gram = uet.FrobeniusGramLoss()
@@ -575,21 +752,21 @@ def train_stageC_diffusion_generator(
     #only rank 0 touches the filesystem
     if fabric is None or fabric.is_global_zero:
         os.makedirs(plot_dir, exist_ok=True)
-    
-    # Loss weights
+
     WEIGHTS = {
-        'score': 1.0,
-        'gram': 0.5,
-        'heat': 0.25,
-        'sw_st': 0.5,
+        'score': 0.5,
+        'gram': 8.0,
+        'heat': 0.5,
+        'sw_st': 0.75,
         'sw_sc': 0.3,
         'overlap': 0.25,
-        'ordinal_sc': 0.5
+        'ordinal_sc': 0.5,
+        'cone': 1e-3
     }
     
     # Overlap config - OPTIMIZED
-    EVERY_K_STEPS = 2   # CHANGED from 2
-    MAX_OVERLAP_POINTS = 64  # CHANGED from 64
+    EVERY_K_STEPS = 1   # CHANGED from 2
+    MAX_OVERLAP_POINTS = 128  # CHANGED from 64
     MIN_OVERLAP_ABS = 5
 
     # NEW: compute-heavy loss cadence + subsampling
@@ -598,40 +775,59 @@ def train_stageC_diffusion_generator(
     gram_pair_cap = 8000      # sample up to 8k pairs for Gram (mask upper-tri)
     triplet_cap = 10000       # cap triplets per batch
     hist_bins = 48            # fewer bins → faster histogram distances
+
+    SW_SC_KPROJ = 64     # number of random projections
+    SW_SC_NCAP  = 512    # cap points per set for SW speed
+
     
-    # CFG config (same as original)
-    p_uncond = 0.15  # 10-20% works well
+    # CFG config
+    p_uncond = 0.15
     
     history = {
         'epoch': [],
         'batch_losses': [],
         'epoch_avg': {
-            'total': [], 'score': [], 'gram': [], 'heat': [], 
+            'total': [], 'score': [], 'gram': [], 'heat': [], 'cone': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': []
         }
     }
     
     # Compute sigma_data once at start
     print("Computing sigma_data from data statistics...")
+
+    def sync_scalar(value: float, device: str) -> float:
+        import torch.distributed as dist
+        t = torch.tensor([value], device=device, dtype=torch.float32)
+        if dist.is_initialized():
+            dist.broadcast(t, src=0)
+        return float(t.item())
+
     with torch.no_grad():
-        sample_stds = []
-        for _ in range(min(10, len(st_loader))):
-            sample_batch = next(iter(st_loader))
-            # CRITICAL: Move batch to device first
-            G_batch = sample_batch['G_target']
-            if not G_batch.is_cuda:
-                G_batch = G_batch.to(device)
-            for i in range(min(4, G_batch.shape[0])):
-                V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
-                sample_stds.append(V_temp.std().item())
-        sigma_data = np.median(sample_stds)
-        print(f"Computed sigma_data = {sigma_data:.4f}")
+        if fabric is None or fabric.is_global_zero:
+            sample_stds = []
+            for _ in range(min(10, len(st_loader))):
+                sample_batch = next(iter(st_loader))
+                G_batch = sample_batch['G_target']
+                if not G_batch.is_cuda:
+                    G_batch = G_batch.to(device)
+                for i in range(min(4, G_batch.shape[0])):
+                    V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
+                    sample_stds.append(V_temp.std().item())
+            sigma_data = float(np.median(sample_stds))
+        else:
+            sigma_data = 0.0
+
+    sigma_data = sync_scalar(sigma_data, device)
+    print(f"[synced] sigma_data = {sigma_data:.4f}")
 
     #--amp scaler choice based on precision---
     use_fp16 = (precision == '16-mixed')
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
     
     global_step = 0
+
+    #self conditioning probability
+    p_sc = 0.5 #prob of using self-conditioning in training
     
     for epoch in range(n_epochs):
         st_iter = iter(st_loader)
@@ -640,6 +836,10 @@ def train_stageC_diffusion_generator(
         epoch_losses = {k: 0.0 for k in WEIGHTS.keys()}
         epoch_losses['total'] = 0.0
         n_batches = 0
+        c_overlap = 0
+
+        st_batches = 0
+        sc_batches = 0
         
         # Mixed schedule: [ST, ST, SC] repeat
         schedule = ['ST', 'ST', 'SC'] * (max(len(st_loader), len(sc_loader)) // 3 + 1)
@@ -664,7 +864,12 @@ def train_stageC_diffusion_generator(
                         continue
             
             is_sc = batch.get('is_sc', False)
-            
+
+            if not is_sc:
+                st_batches += 1
+            else:
+                sc_batches += 1
+                
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
             n_list = batch['n']
@@ -693,13 +898,34 @@ def train_stageC_diffusion_generator(
                 eps = torch.randn_like(V_0)
                 V_t = V_0 + sigma_t * eps
                 V_t = V_t * mask.unsqueeze(-1).float()
-                
-                # CFG: Drop context randomly during training (RESTORED)
+
+                # CFG: Drop context randomly during training
                 drop_mask = (torch.rand(batch_size_real, device=device) < p_uncond).float().view(-1, 1, 1)
-                H_train = H * (1 - drop_mask)  # Zero context for random subset
+                H_train = H * (1 - drop_mask)
+
+                # DEBUG: CFG stats (first epoch only)
+                if DEBUG and epoch == 0 and global_step < 10:
+                   n_dropped = drop_mask.sum().item()
+                   print(f"[CFG] step={global_step} dropped={int(n_dropped)}/{batch_size_real} contexts")
+
+                # Self-conditioning logic
+                use_self_cond = torch.rand(1, device=device).item() < p_sc
+
+                if use_self_cond and score_net.self_conditioning:
+                    # First pass without self-conditioning to get V_0 prediction
+                    with torch.no_grad():
+                        eps_hat_0 = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None)
+                        V_pred_0 = V_t - sigma_t * eps_hat_0
+                    
+                    # Second pass with self-conditioning
+                    eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=V_pred_0)
+                else:
+                    # Single pass without self-conditioning
+                    eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None)
+
                 
-                # Predict noise
-                eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask)
+                # # Predict noise
+                # eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask)
             
             # ===== SCORE LOSS (in fp32 for numerical stability) =====
             with torch.autocast(device_type='cuda', enabled=False):
@@ -708,9 +934,49 @@ def train_stageC_diffusion_generator(
                 eps_fp32 = eps.float()
                 mask_fp32 = mask.float()
                 
+
                 # EDM loss weighting
                 w = (sigma_t_fp32**2 + sigma_data**2) / ((sigma_t_fp32 * sigma_data)**2)
-                L_score = (w * (eps_pred_fp32 - eps_fp32)**2 * mask_fp32.unsqueeze(-1)).sum() / mask_fp32.sum()
+
+                # Soften extremes (prevents score from dominating at low sigma)
+                w = w.clamp_max(50.0)  # cap huge weights
+                w = w.sqrt()           # gentler than linear
+
+                # Average over latent dimension to reduce scale by ~D_latent factor
+                err2 = (eps_pred_fp32 - eps_fp32).pow(2).mean(dim=2)  # (B,N)
+                w_squeezed = w.squeeze(-1)  # (B,N,1) → (B,N)
+                L_score = (w_squeezed * err2 * mask_fp32).sum() / mask_fp32.sum()
+
+                # === SANITY CHECK FOR L_SCORE SCALE ===
+                if DEBUG and (global_step % LOG_EVERY == 0) and (not is_sc):
+                    with torch.no_grad():
+                        # Flatten valid entries
+                        m = mask_fp32 > 0
+                        err2_mean = (err2[m]).mean().item()  # should be ~O(1)
+                        w_vals = (w_squeezed.expand_as(err2))[m]
+                        w_min, w_mean, w_max = w_vals.min().item(), w_vals.mean().item(), w_vals.max().item()
+                        approx_L = w_mean * err2_mean  # rough expectation for L_score
+                        
+                        print(f"[score/check] err2_mean={err2_mean:.3e}  "
+                            f"w_min={w_min:.3e} w_mean={w_mean:.3e} w_max={w_max:.3e}  "
+                            f"approx_L={approx_L:.3e}  L_score={L_score.item():.3e}")
+
+            if DEBUG:
+                if debug_state['score_bins'] is None:
+                    edges = torch.linspace(0, 1, 6, device=device)
+                    debug_state['score_bins'] = edges
+                    debug_state['score_bin_sum'] = torch.zeros(5, device=device)
+                    debug_state['score_bin_cnt'] = torch.zeros(5, device=device)
+
+                edges = debug_state['score_bins']
+                b = torch.bucketize(t_norm.squeeze(), edges) - 1
+                with torch.no_grad():
+                    per = ((eps_pred - eps) ** 2).mean(dim=(1,2))
+                    for k in range(5):
+                        m = (b == k)
+                        if m.any():
+                            debug_state['score_bin_sum'][k] += per[m].sum()
+                            debug_state['score_bin_cnt'][k] += m.sum()
             
             # Initialize other losses
             L_gram = torch.tensor(0.0, device=device)
@@ -724,39 +990,169 @@ def train_stageC_diffusion_generator(
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
                 V_hat = V_t - sigma_t * eps_pred
                 V_hat = V_hat * mask.unsqueeze(-1).float()
-            
-            # ===== LOSS ALTERNATION =====
+
+            # EDM-cone penalty (always computed on V_hat)
+            # with torch.autocast(device_type='cuda', enabled=False):
+            #     V_hat_fp32 = V_hat.float()
+            #     mask_fp32 = mask.float()
+            #     cone_penalty = uet.edm_cone_penalty_from_V(V_hat_fp32, mask_fp32)
+            #     lambda_cone = 1e-3
+            #     L_cone = lambda_cone * cone_penalty
+
+            # ----------------- Cone Loss (PSD penalty) for ST -----------------
+            L_cone = torch.tensor(0.0, device=device)
             if not is_sc:
-                # ===== ST STEP: Score + Gram + Heat + SW_ST =====
-                
-                # Gram loss (in fp32)
-                # with torch.autocast(device_type='cuda', enabled=False):
-                #     V_fp32 = V_hat.float()
-                #     G_pred = V_fp32 @ V_fp32.transpose(1, 2)
-                #     G_targ = G_target.float()
-
-                #     #use masked frob function
-                #     L_gram = uet.masked_frobenius_loss(G_pred, G_targ, mask)
-
                 with torch.autocast(device_type='cuda', enabled=False):
-                    V = V_hat.float()
-                    Gt = G_target.float()
-                    m  = mask
+                    for i in range(batch_size_real):
+                        n_valid = int(n_list[i].item())
+                        if n_valid < 3:
+                            continue
 
-                    # center + scale-match as above
-                    mw   = m.float()
-                    cnt  = mw.sum(dim=1, keepdim=True).clamp_min(1.0)
-                    mean = (V * mw.unsqueeze(-1)).sum(dim=1, keepdim=True) / cnt.unsqueeze(-1)
-                    Vc   = V - mean
-                    Gp   = Vc @ Vc.transpose(1, 2)
+                        V_i = V_hat[i, :n_valid].float()
+                        G_i = V_i @ V_i.T + 1e-6 * torch.eye(n_valid, device=V_i.device)
+                        eigs = torch.linalg.eigvalsh(G_i)
+                        L_cone += torch.nn.functional.softplus(-eigs).mean()
 
-                    tr_p = (Gp.diagonal(dim1=1, dim2=2) * mw).sum(dim=1, keepdim=True).clamp_min(1e-8)
-                    tr_t = (Gt.diagonal(dim1=1, dim2=2) * mw).sum(dim=1, keepdim=True).clamp_min(1e-8)
-                    s2   = (tr_t / tr_p)
-                    Gp   = Gp * s2.unsqueeze(-1)
+                L_cone = L_cone / max(1, batch_size_real)
 
-                    L_gram = uet.masked_frobenius_loss(Gp, Gt, m, drop_diag=True)
+                # DEBUG: Cone PSD stats
+                if DEBUG and (global_step % LOG_EVERY == 0) and not is_sc:
+                   print(f"[cone] penalty={L_cone.item():.6f} (should decrease over time)")
 
+                if not is_sc:
+                    # ===== ST STEP: Score + Gram + Heat + SW_ST =====
+
+                    # Canonicalize V_hat before geometric losses
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        V_canon, _, _ = uet.canonicalize(V_hat.float(), mask)  # (B,N,D)
+                        Gt = G_target.float()
+                        m  = mask.bool()
+                        B, N, _ = V_canon.shape
+
+                        # ==================== GRAM LOSS (COSINE-NORMALIZED) ====================
+                        
+                        # Build predicted Gram (raw, before normalization)
+                        Gp_raw = V_canon @ V_canon.transpose(1, 2)   # (B,N,N)
+                        
+                        # Build masks
+                        MM = (m.unsqueeze(-1) & m.unsqueeze(-2)).float()  # (B,N,N) valid pairs
+                        eye = torch.eye(N, dtype=torch.bool, device=Gp_raw.device).unsqueeze(0)
+                        P_off = (MM.bool() & (~eye)).float()  # off-diagonal valid entries
+                        
+                        # --- DEBUG 1: Target checksum (ensure G_target varies across batches) ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            gt_checksum = float(Gt.abs().sum().item())
+                            print(f"[gram/gt] checksum={gt_checksum:.6e} shape={tuple(Gt.shape)}")
+                        
+                        # --- DEBUG 2: Raw statistics (before any normalization) ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            gp_off_raw = Gp_raw[P_off.bool()]
+                            gt_off_raw = Gt[P_off.bool()]
+                            if gp_off_raw.numel() > 0 and gt_off_raw.numel() > 0:
+                                diff_raw = gp_off_raw - gt_off_raw
+                                rel_frob_raw = diff_raw.norm() / (gt_off_raw.norm() + 1e-12)
+                                cos_sim_raw = float(F.cosine_similarity(gp_off_raw, gt_off_raw, dim=0).item()) if (gp_off_raw.norm() > 0 and gt_off_raw.norm() > 0) else float('nan')
+                                print(f"[gram/raw] offdiag stats | "
+                                    f"P(mean={gp_off_raw.mean().item():.3e}, std={gp_off_raw.std().item():.3e})  "
+                                    f"T(mean={gt_off_raw.mean().item():.3e}, std={gt_off_raw.std().item():.3e})  "
+                                    f"ΔF/TF={rel_frob_raw:.3e}  cos={cos_sim_raw:.3f}")
+                        
+                        # --- DEBUG 3: Trace statistics (raw space) ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            tr_p_raw = (Gp_raw.diagonal(dim1=1, dim2=2) * m.float()).sum(dim=1)
+                            tr_t_raw = (Gt.diagonal(dim1=1, dim2=2) * m.float()).sum(dim=1)
+                            print(f"[gram/trace] pred={tr_p_raw.mean().item():.2f} target={tr_t_raw.mean().item():.2f} "
+                                f"ratio={tr_t_raw.mean().item()/(tr_p_raw.mean().item()+1e-8):.2f}")
+                        
+                        # ===== COSINE GRAM NORMALIZATION (diagonal normalization) =====
+                        diag_p = Gp_raw.diagonal(dim1=1, dim2=2).clamp_min(1e-8)  # (B,N)
+                        diag_t = Gt.diagonal(dim1=1, dim2=2).clamp_min(1e-8)      # (B,N)
+                        
+                        # Outer product of sqrt(diagonals) for normalization
+                        scale_p = torch.sqrt(diag_p.unsqueeze(2) * diag_p.unsqueeze(1))  # (B,N,N)
+                        scale_t = torch.sqrt(diag_t.unsqueeze(2) * diag_t.unsqueeze(1))  # (B,N,N)
+                        
+                        # Cosine-normalized Grams (values in [-1,1] range)
+                        Cp = (Gp_raw / scale_p).where(MM.bool(), torch.zeros_like(Gp_raw))
+                        Ct = (Gt / scale_t).where(MM.bool(), torch.zeros_like(Gt))
+                        Cp = Cp.masked_fill(eye, 0.0)  # zero out diagonals
+                        Ct = Ct.masked_fill(eye, 0.0)
+                        
+                        # --- DEBUG 4: Cosine-normalized statistics ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            cp_off = Cp[P_off.bool()]
+                            ct_off = Ct[P_off.bool()]
+                            if cp_off.numel() > 0 and ct_off.numel() > 0:
+                                diff_cos = cp_off - ct_off
+                                rel_frob_cos = diff_cos.norm() / (ct_off.norm() + 1e-12)
+                                cos_sim_cos = float(F.cosine_similarity(cp_off, ct_off, dim=0).item()) if (cp_off.norm() > 0 and ct_off.norm() > 0) else float('nan')
+                                print(f"[gram/cosine] offdiag stats | "
+                                    f"C_P(mean={cp_off.mean().item():.3e}, std={cp_off.std().item():.3e})  "
+                                    f"C_T(mean={ct_off.mean().item():.3e}, std={ct_off.std().item():.3e})  "
+                                    f"ΔF/TF={rel_frob_cos:.3e}  cos={cos_sim_cos:.3f}")
+                        
+                        # ===== RELATIVE FROBENIUS LOSS (per-set, then mean) =====
+                        diff = (Cp - Ct) * P_off
+                        numerator = (diff.pow(2)).sum(dim=(1,2))  # (B,)
+                        denominator = ((Ct.pow(2)) * P_off).sum(dim=(1,2)).clamp_min(1e-12)  # (B,)
+                        per_set_relative_loss = numerator / denominator  # (B,)
+
+                        # Sigma compensation: geometry gradients scale with sigma, so compensate
+                        sigma_vec = sigma_t.view(-1).float()  # (B,)
+                        w_geom = (1.0 / sigma_vec.clamp_min(0.3)).pow(1.0)  # gamma=1.0, floor sigma at 0.3
+                        per_set_relative_loss = per_set_relative_loss * w_geom
+
+                        # Gate geometry to conditional + reasonable sigma samples
+                        low_noise = (sigma_vec <= 1.5)  # geometry meaningful here
+                        cond_only = (drop_mask.view(-1) < 0.5)  # not unconditional
+                        geo_gate = (low_noise & cond_only)  # (B,)
+
+                        if geo_gate.any():
+                            L_gram = per_set_relative_loss[geo_gate].mean()
+                        else:
+                            L_gram = V_hat.new_tensor(0.0)
+                        
+                        # L_gram = per_set_relative_loss.mean()  # scalar, O(1) magnitude
+                        
+                        # --- DEBUG 5: Loss statistics ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            print(f"[gram/loss] L_gram={L_gram.item():.3e} | "
+                                f"per_set: mean={per_set_relative_loss.mean().item():.3e} "
+                                f"med={per_set_relative_loss.median().item():.3e} "
+                                f"min={per_set_relative_loss.min().item():.3e} "
+                                f"max={per_set_relative_loss.max().item():.3e}")
+                            
+                            # Mask coverage
+                            denom_per_set = P_off.sum(dim=(1,2))
+                            n_valid = m.sum(dim=1).float()
+                            print(f"[gram/mask] offdiag_counts: min={denom_per_set.min().item():.0f} "
+                                f"mean={denom_per_set.mean().item():.0f} max={denom_per_set.max().item():.0f} | "
+                                f"n_valid: mean={n_valid.mean().item():.1f}")
+                        
+                        # --- DEBUG 6: Gradient flow check ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            g_probe = torch.autograd.grad(L_gram, V_hat, retain_graph=True, allow_unused=True)[0]
+                            gnorm = float(g_probe.norm().item()) if g_probe is not None else 0.0
+                            print(f"[gram/grad] ||∂L_gram/∂V_hat||={gnorm:.3e}")
+                        
+                        # --- DEBUG 7: Comparison with no-canonicalization (diagnostic only) ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            V_nocanon = V_hat.float() * m.unsqueeze(-1).float()
+                            Gp_nocanon = V_nocanon @ V_nocanon.transpose(1,2)
+                            diff_nocanon_raw = (Gp_nocanon[P_off.bool()] - Gt[P_off.bool()])
+                            rel_frob_nocanon = diff_nocanon_raw.norm() / (Gt[P_off.bool()].norm() + 1e-12)
+                            print(f"[gram/nocanon-probe] ΔF/TF(without_canon)={rel_frob_nocanon:.3e}")
+                        
+                        # --- DEBUG 8: Old unit-trace normalization (for comparison) ---
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            tr_p_ut = (Gp_raw.diagonal(dim1=1, dim2=2) * m.float()).sum(dim=1, keepdim=True).clamp_min(1e-8)
+                            tr_t_ut = (Gt.diagonal(dim1=1, dim2=2) * m.float()).sum(dim=1, keepdim=True).clamp_min(1e-8)
+                            Gp_ut = Gp_raw / tr_p_ut.unsqueeze(-1)
+                            Gt_ut = Gt / tr_t_ut.unsqueeze(-1)
+                            diff_sq_ut = (Gp_ut - Gt_ut).pow(2)
+                            per_set_mse_ut = (diff_sq_ut * P_off).sum(dim=(1,2)) / P_off.sum(dim=(1,2)).clamp_min(1.0)
+                            L_gram_ut_probe = per_set_mse_ut.mean()
+                            print(f"[gram/unit-trace-probe] L_old={L_gram_ut_probe.item():.3e} (for comparison)")
                 
                 # Heat kernel loss (batched)
                 if (global_step % heat_every_k) == 0:
@@ -796,45 +1192,57 @@ def train_stageC_diffusion_generator(
                             #SINGLE BATCHED LOSS CALL
                             t_list = L_info_batch[0].get('t_list', [0.5, 1.0])
                             L_heat = loss_heat(L_pred_batch, L_targ_batch, mask=mask, t_list=t_list)
-                
-                # Distance histogram SW (in fp32)
+
+                L_sw_st = torch.zeros((), device=device)
                 if (global_step % sw_every_k) == 0:
-                    D_target = batch['D_target'].to(device)
-                    H_target = batch['H_target'].to(device)
-                    H_bins = batch['H_bins'][0].to(device)
-                    
                     with torch.autocast(device_type='cuda', enabled=False):
-                        V_fp32 = V_hat.float() #(B, N, D)
-                        D_all = torch.cdist(V_fp32, V_fp32) 
+                        # build a paired batch: (pred_i, tgt_i) for each i
+                        B2, N, D = V_hat.shape  # B2 is your current batch_size_real
+                        # pre-alloc
+                        VT = torch.zeros(B2, N, D, device=device, dtype=torch.float32)
+                        mask_st = mask.clone()
 
-                        #extract upper triangualr distances per sample
-                        n_max = D_all.size(1)
-                        iu, ju = torch.triu_indices(n_max, n_max, 1, device=D_all.device)
-                        d_batch = D_all[:, iu, ju]
+                        for i in range(batch_size_real):
+                            n_valid = int(n_list[i].item())
+                            if n_valid < 3:
+                                continue
 
-                        #mask for valid pairs
-                        mask_2d = mask.unsqueeze(-1) & mask.unsqueeze(-2) #(B, N, N)
-                        valid_pairs = mask_2d[:, iu, ju]
+                            # reconstruct a D-dim embedding from Gram target
+                            G_i = batch['G_target'][i, :n_valid, :n_valid].to(device).float()
+                            V_tgt_i = uet.factor_from_gram(G_i, D).to(device)  # (n_valid, D)
 
-                        #batch histogram computation
-                        nb = H_bins.numel() - 1
-                        bin_ids = torch.bucketize(d_batch, H_bins) - 1
-                        bin_ids = bin_ids.clamp(0, nb-1)
-                        bin_ids = bin_ids.masked_fill(~valid_pairs, -1)
+                            VT[i, :n_valid] = V_tgt_i
 
-                        #vectorized bincount
-                        batch_offsets = torch.arange(batch_size_real, device=device).unsqueeze(1) * nb
-                        flat_ids = (bin_ids + batch_offsets).view(-1)
-                        flat_ids = flat_ids[flat_ids >= 0]
+                        # stack (pred, tgt) as pairs: (0,1), (2,3), ...
+                        V_pairs = torch.zeros(batch_size_real * 2, N, D, device=device, dtype=torch.float32)
+                        M_pairs = torch.zeros(batch_size_real * 2, N, device=device, dtype=torch.bool)
 
-                        counts = torch.bincount(flat_ids, minlength=batch_size_real * nb)
-                        counts = counts.view(batch_size_real, nb).float()
+                        for i in range(batch_size_real):
+                            n_valid = int(n_list[i].item())
+                            if n_valid < 3:
+                                continue
+                            # predicted
+                            V_pairs[2*i, :n_valid] = V_hat[i, :n_valid].float()
+                            M_pairs[2*i, :n_valid] = True
+                            # target (from Gram)
+                            V_pairs[2*i+1, :n_valid] = VT[i, :n_valid]
+                            M_pairs[2*i+1, :n_valid] = True
 
-                        H_pred = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
+                        pairA = torch.arange(0, 2*batch_size_real, 2, device=device, dtype=torch.long)
+                        pairB = torch.arange(1, 2*batch_size_real, 2, device=device, dtype=torch.long)
 
-                        L_sw_st = loss_sw(H_pred, H_target)
+                        L_sw_st = uet.sliced_wasserstein_sc(
+                            V_pairs, M_pairs,
+                            pair_idxA=pairA,
+                            pair_idxB=pairB,
+                            K_proj=64,
+                            N_cap=512,
+                            use_canon=True,   # center + unit-RMS per set
+                        )
 
-                
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
+          
             else:
                 # ========================= SC STEP (INSTRUMENTED) =========================
                 PROFILE_SC = True
@@ -906,115 +1314,275 @@ def train_stageC_diffusion_generator(
                         if batch_size_real > 0:
                             L_ordinal_sc = L_ordinal_sc / batch_size_real
 
-
-                # ----------------- (2) Z-matched distogram (in fp32) -----------------
-                L_sw_sc = torch.tensor(0.0, device=device)
+                # ---- (2) Sliced Wasserstein between paired SC sets (A,B) ----
+                L_sw_sc = torch.zeros((), device=device)
                 if (global_step % sw_every_k) == 0:
                     with torch.autocast(device_type='cuda', enabled=False):
-                        with timed("dist_total", sc_prof):
-                            with timed("dist_target_match", sc_prof):
-                                H_target_sc = match_prototypes_batched(Z_set, mask, prototype_bank)  # (B, nb)
+                        # predicted embeddings + mask for ALL sets in this SC batch
+                        V_sc    = V_hat.float()   # shape: (2B, N, D)
+                        mask_sc = mask            # shape: (2B, N), bool
 
-                            with timed("dist_cdist", sc_prof):
-                                V_fp32 = V_hat.float()
-                                D_all = torch.cdist(V_fp32, V_fp32)
+                        # pair indices from collate; fallback to (0,1), (2,3), ...
+                        pairA = batch.get('pair_idxA', None)
+                        pairB = batch.get('pair_idxB', None)
+                        if (pairA is None) or (pairB is None):
+                            # fallback if you haven't added these to collate yet
+                            pairA = torch.arange(0, V_sc.size(0), 2, device=device, dtype=torch.long)
+                            pairB = torch.arange(1, V_sc.size(0), 2, device=device, dtype=torch.long)
 
-                            with timed("dist_triu", sc_prof):
-                                n_max = D_all.size(1)
-                                iu, ju = torch.triu_indices(n_max, n_max, 1, device=D_all.device)
-                                d_batch = D_all[:, iu, ju]
-                                mask_2d = mask.unsqueeze(-1) & mask.unsqueeze(-2)
-                                valid_pairs = mask_2d[:, iu, ju]
+                        L_sw_sc = uet.sliced_wasserstein_sc(
+                            V_sc, mask_sc,
+                            pair_idxA=pairA,
+                            pair_idxB=pairB,
+                            K_proj=SW_SC_KPROJ,
+                            N_cap=SW_SC_NCAP,
+                            use_canon=True,
+                        )
 
-                            with timed("dist_bucketize", sc_prof):
-                                proto_bins = prototype_bank['bins']
-                                bin_ids = torch.bucketize(d_batch, proto_bins) - 1
-                                bin_ids = bin_ids.clamp(0, proto_bins.numel() - 2)
-                                bin_ids = bin_ids.masked_fill(~valid_pairs, -1)
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            print(f"[sw_sc] step={global_step} val={float(L_sw_sc.item()):.6f} "
+                                f"K={SW_SC_KPROJ} cap={SW_SC_NCAP} pairs={int(pairA.numel())}")
+                else:
+                    L_sw_sc = torch.zeros((), device=device)
 
-                            with timed("dist_bincount", sc_prof):
-                                nb = proto_bins.numel() - 1
-                                batch_offsets = torch.arange(batch_size_real, device=device).unsqueeze(1) * nb
-                                flat_ids = (bin_ids + batch_offsets).view(-1)
-                                flat_ids = flat_ids[flat_ids >= 0]
-                                counts = torch.bincount(flat_ids, minlength=batch_size_real * nb)
-                                counts = counts.view(batch_size_real, nb).float()
 
-                            with timed("dist_norm", sc_prof):
-                                H_pred_sc = counts / counts.sum(dim=1, keepdim=True).clamp_min(1.0)
-
-                            with timed("dist_loss", sc_prof):
-                                L_sw_sc = loss_sw(H_pred_sc, H_target_sc)
 
                 # ----------------- (3) Distance-only overlap (SC ONLY, every K steps) -----------------
+
+                # ----------------- (3) Distance-only overlap (SC ONLY) -----------------
                 L_overlap = torch.tensor(0.0, device=device)
-                if (global_step % EVERY_K_STEPS) == 0:
-                    need = ("pair_idxA","pair_idxB","shared_A_idx","shared_B_idx")
-                    has_all = all(k in batch for k in need)
+                overlap_pairs = 0
 
-                    if has_all and batch["pair_idxA"].numel() > 0:
-                        with torch.autocast(device_type='cuda', enabled=False):
-                            P = batch['pair_idxA'].size(0)
+                # DEBUG: Check if overlap keys exist (first 10 steps only)
+                if DEBUG and global_step < 10 and (global_step % EVERY_K_STEPS) == 0:
+                   has_keys = all(k in batch for k in ["pair_idxA","pair_idxB","shared_A_idx","shared_B_idx"])
+                   if has_keys:
+                       print(f"[overlap_check] step={global_step} pair_idxA.shape={batch['pair_idxA'].shape} "
+                             f"shared_A_idx.shape={batch['shared_A_idx'].shape}")
+                   else:
+                       print(f"[overlap_check] step={global_step} ⚠️ MISSING OVERLAP KEYS - dataloader broken!")
 
-                            # Gather per-pair predicted coordinates
-                            idxA, idxB = batch['pair_idxA'], batch['pair_idxB']     # (P,)
-                            VA, VB = V_hat[idxA].float(), V_hat[idxB].float()       # (P, N, D)
+                need = ("pair_idxA","pair_idxB","shared_A_idx","shared_B_idx")
+                has_all = all(k in batch for k in need)
 
-                            SA, SB = batch['shared_A_idx'], batch['shared_B_idx']   # (P, Kmax)
-                            maskA, maskB = SA.ge(0), SB.ge(0)                       # True where valid
+                if has_all and batch["pair_idxA"].numel() > 0:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        P = batch['pair_idxA'].size(0)
 
-                            SAx = SA.clamp_min(0).unsqueeze(-1).expand(-1, -1, VA.size(-1))
-                            SBx = SB.clamp_min(0).unsqueeze(-1).expand(-1, -1, VB.size(-1))
-                            A = torch.gather(VA, 1, SAx)    # (P, Kmax, D)
-                            B = torch.gather(VB, 1, SBx)    # (P, Kmax, D)
+                        idxA, idxB = batch['pair_idxA'], batch['pair_idxB']
+                        VA_raw, VB_raw = V_hat[idxA].float(), V_hat[idxB].float()
+                        maskA, maskB   = mask[idxA], mask[idxB]
 
-                            # Pairwise validity mask built from masks (no ordering assumptions)
-                            pairmask = (maskA.unsqueeze(2) & maskA.unsqueeze(1) &
-                                        maskB.unsqueeze(2) & maskB.unsqueeze(1))    # (P, Kmax, Kmax)
+                        SA, SB = batch['shared_A_idx'], batch['shared_B_idx']
+                        validA, validB = SA.ge(0), SB.ge(0)
+                        P, Kmax = SA.size(0), SA.size(1)
 
-                            # Remove diagonal
-                            Kmax = SA.size(1)
-                            eye = torch.eye(Kmax, dtype=torch.bool, device=device).unsqueeze(0)
-                            pairmask = pairmask & (~eye)
+                        is_lmk = batch.get('is_landmark', None)
+                        if is_lmk is not None:
+                            is_lmkA = is_lmk[idxA]; is_lmkB = is_lmk[idxB]
 
-                            if pairmask.any():
-                                DA = torch.cdist(A, A)  # (P, Kmax, Kmax)
-                                DB = torch.cdist(B, B)
+                        L_overlap = V_hat.new_tensor(0.0)
+                        overlap_pairs = 0
 
-                                iu, ju = torch.triu_indices(Kmax, Kmax, 1, device=device)
-                                tri_mask = pairmask[:, iu, ju]          # (P, M)
-                                dA = DA[:, iu, ju][tri_mask]            # (total_valid,)
-                                dB = DB[:, iu, ju][tri_mask]
+                        for p in range(P):
+                            mA = validA[p]; mB = validB[p]
+                            if not (mA.any() and mB.any()):
+                                continue
 
-                                L_overlap = torch.mean((dA - dB) ** 2)
-                            else:
-                                # nothing valid this step; leave as 0.0 or skip logging
-                                L_overlap = torch.tensor(0.0, device=device)
+                            gA_all = batch['sc_global_indices'][idxA[p]]
+                            gB_all = batch['sc_global_indices'][idxB[p]]
+                            gA = gA_all[SA[p].clamp_min(0)][mA]
+                            gB = gB_all[SB[p].clamp_min(0)][mB]
+
+                            if is_lmk is not None:
+                                keepA = ~is_lmkA[p, SA[p].clamp_min(0)][mA]
+                                keepB = ~is_lmkB[p, SB[p].clamp_min(0)][mB]
+                                gA = gA[keepA]; gB = gB[keepB]
+
+                            common, a_pos, b_pos = _intersect1d_with_indices(gA, gB)
+                            k = common.numel()
+                            if k < 5:
+                                continue
+
+                            if k > MAX_OVERLAP_POINTS:
+                                sel = torch.randperm(k, device=V_hat.device)[:MAX_OVERLAP_POINTS]
+                                a_pos = a_pos[sel]; b_pos = b_pos[sel]
+                                k = a_pos.numel()
+
+                            A_all = VA_raw[p]; B_all = VB_raw[p]
+                            A_sel = SA[p].clamp_min(0)[mA]
+                            B_sel = SB[p].clamp_min(0)[mB]
+                            A_pts = A_all[A_sel[a_pos]].float()
+                            B_pts = B_all[B_sel[b_pos]].float()
+
+                            muA = A_pts.mean(0, keepdim=True)
+                            muB = B_pts.mean(0, keepdim=True)
+                            Ac = A_pts - muA
+                            Bc = B_pts - muB
+
+                            U, S, Vh = torch.linalg.svd(Ac.t() @ Bc, full_matrices=False)
+                            R = (U @ Vh).detach()
+                            denom = (Ac.pow(2).sum() + 1e-12)
+                            s = (S.sum() / denom).detach()
+
+                            A_aligned = s * (Ac @ R)
+                            L_pair = (A_aligned - Bc).pow(2).mean()
+
+                            L_overlap = L_overlap + L_pair
+                            overlap_pairs += 1
+
+                            if DEBUG:
+                                debug_state['dbg_k_mean'] += float(k)
+                                debug_state['dbg_overlap_pairs'] += 1
+
+                        if overlap_pairs > 0:
+                            L_overlap = L_overlap / overlap_pairs
+                            if DEBUG:
+                                debug_state['dbg_overlap_seen'] += 1
+                                debug_state['overlap_count_this_epoch'] += 1
 
 
-                # ----------------- (4) Compact timing print -----------------
-                # if PROFILE_SC and (global_step % PROFILE_PRINT_EVERY == 0):
-                #     g = lambda k: sc_prof.get(k, 0.0)
-                #     print(
-                #         f"[SC-PROFILE] step={global_step} "
-                #         f"| ord: total={g('ord_total'):.4f}s samp={g('ord_triplet_sample'):.4f} "
-                #         f"cap={g('ord_triplet_cap'):.4f} cdist={g('ord_cdist'):.4f} loss={g('ord_loss'):.4f} "
-                #         f"| dist: total={g('dist_total'):.4f}s tgt={g('dist_target_match'):.4f} "
-                #         f"cdist={g('dist_cdist'):.4f} triu={g('dist_triu'):.4f} bucket={g('dist_bucketize'):.4f} "
-                #         f"bincount={g('dist_bincount'):.4f} norm={g('dist_norm'):.4f} loss={g('dist_loss'):.4f} "
-                #         f"| ov: total={g('ov_total'):.4f}s gather={g('ov_gather'):.4f} "
-                #         f"cdist={g('ov_cdist'):.4f} tri={g('ov_tri_mask'):.4f} mse={g('ov_mse'):.4f}"
-                #     )
+                            if DEBUG:
+                                debug_state['dbg_overlap_seen'] += 1
+                                debug_state['dbg_overlap_pairs'] += overlap_pairs
+                                debug_state['overlap_count_this_epoch'] += 1
+
                     sc_prof.clear()
             
-            # Total loss
-            L_total = (WEIGHTS['score'] * L_score +
-                      WEIGHTS['gram'] * L_gram +
-                      WEIGHTS['heat'] * L_heat +
-                      WEIGHTS['sw_st'] * L_sw_st +
-                      WEIGHTS['sw_sc'] * L_sw_sc +
-                      WEIGHTS['overlap'] * L_overlap +
-                      WEIGHTS['ordinal_sc'] * L_ordinal_sc)
+            
+            # Total loss with optional score deprioritization on geometry-heavy batches
+            score_multiplier = 1.0
+            if not is_sc:
+                if 'geo_gate' in locals() and geo_gate.float().mean() > 0.5:
+                    score_multiplier = 0.25
+
+            L_total = (WEIGHTS['score'] * score_multiplier * L_score +
+                    WEIGHTS['cone'] * L_cone +
+                    WEIGHTS['gram'] * L_gram +
+                    WEIGHTS['heat'] * L_heat +
+                    WEIGHTS['sw_st'] * L_sw_st +
+                    WEIGHTS['sw_sc'] * L_sw_sc +
+                    WEIGHTS['overlap'] * L_overlap +
+                    WEIGHTS['ordinal_sc'] * L_ordinal_sc)
+            
+            # ==================== GRADIENT PROBE (IMPROVED) ====================
+            # ==================== GRADIENT PROBE (IMPROVED) ====================
+            if DEBUG and (global_step % LOG_EVERY == 0):
+                def vhat_gn(loss):
+                    if not isinstance(loss, torch.Tensor) or not loss.requires_grad:
+                        return 0.0
+                    g = torch.autograd.grad(loss, V_hat, retain_graph=True, allow_unused=True)[0]
+                    return 0.0 if (g is None) else float(g.norm().item())
+
+                # Score: interface-equivalent grad via eps_pred (chain rule: dL/dV = dL/deps / sigma)
+                def vhat_gn_from_eps(loss, eps_pred_tensor, sigma_tensor):
+                    if not (isinstance(loss, torch.Tensor) and loss.requires_grad):
+                        return 0.0
+                    g_eps = torch.autograd.grad(loss, eps_pred_tensor, retain_graph=True, allow_unused=True)[0]
+                    if g_eps is None:
+                        return 0.0
+                    inv_sigma = (1.0 / sigma_tensor.float()).expand_as(g_eps)  # (B,1,1) -> (B,N,D)
+                    g_vhat_equiv = g_eps * inv_sigma  # ||∂L/∂V_hat|| = ||∂L/∂eps|| / σ
+                    return float(g_vhat_equiv.norm().item())
+
+                vgn_score = vhat_gn_from_eps(L_score, eps_pred, sigma_t)
+                vgn_gram = vhat_gn(L_gram) if not is_sc else 0.0
+                vgn_heat = vhat_gn(L_heat) if not is_sc else 0.0
+                vgn_swst = vhat_gn(L_sw_st) if not is_sc else 0.0
+                vgn_cone = vhat_gn(L_cone) if not is_sc else 0.0
+                vgn_swsc = vhat_gn(L_sw_sc) if is_sc else 0.0
+                vgn_ord = vhat_gn(L_ordinal_sc) if is_sc else 0.0
+                
+                # Add batch type label
+                batch_type = 'SC' if is_sc else 'ST'
+                
+                print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} gram={vgn_gram:.3e} heat={vgn_heat:.3e} "
+                    f"cone={vgn_cone:.3e} sw_st={vgn_swst:.3e} sw_sc={vgn_swsc:.3e} ord={vgn_ord:.3e}")
+                
+                # Param probe - better parameter selection, skip on SC to avoid confusing zeros
+                if not is_sc:
+                    # Pick evenly-spaced parameters across the network
+                    def pick_probe_params(model, k=8):
+                        params = [p for p in model.parameters() if p.requires_grad]
+                        if len(params) <= k:
+                            return params
+                        # Even spread over the parameter list to hit early/mid/late layers
+                        idx = torch.linspace(0, len(params)-1, steps=k).round().long().tolist()
+                        return [params[i] for i in idx]
+                    
+                    probe_params = pick_probe_params(score_net, k=8)
+                    
+                    def grad_norm(loss):
+                        if not isinstance(loss, torch.Tensor) or (not loss.requires_grad):
+                            return 0.0
+                        g = torch.autograd.grad(loss, probe_params, retain_graph=True, allow_unused=True)
+                        s = torch.tensor(0.0, device=device)
+                        for gi in g:
+                            if gi is not None:
+                                s = s + gi.norm().pow(2)
+                        return float(s.sqrt().item()) if s.item() > 0 else 0.0
+                    
+                    gn_score = grad_norm(L_score)
+                    gn_gram = grad_norm(L_gram)
+                    gn_heat = grad_norm(L_heat)
+                    gn_swst = grad_norm(L_sw_st)
+                    gn_cone = grad_norm(L_cone)
+                    gn_swsc = 0.0
+                    gn_ord = 0.0
+                    
+                    print(f"[gradprobe][{batch_type}] score={gn_score:.3e} gram={gn_gram:.3e} heat={gn_heat:.3e} "
+                        f"cone={gn_cone:.3e} sw_st={gn_swst:.3e} sw_sc={gn_swsc:.3e} ord={gn_ord:.3e}")
+                else:
+                    # Skip param probe on SC batches to avoid confusion
+                    print(f"[gradprobe][{batch_type}] (skipped on SC batches)")
+
+                # ---- autobalance (guarded) ----
+                LOW, HIGH = 0.03, 0.20
+                PWR = 0.5
+                CLAMP = (0.5, 2.0)
+                COOLDOWN_STEPS = 50
+                UPDATE_EVERY = 20        # update every 20 ST steps to reduce oscillation
+                
+                # Print gram/score ratio (always)
+                ratio_gs = vgn_gram / max(vgn_score, 1e-12)
+                print(f"[ratio] gram/score={ratio_gs:.3e}  w_gram={WEIGHTS['gram']:.3g}")
+                
+                # Adjust weights only if outside good range AND at update interval
+                if (not is_sc) and (vgn_score > 0) and (global_step > COOLDOWN_STEPS) and (global_step % UPDATE_EVERY == 0):
+                    r_gram = vgn_gram / (vgn_score + 1e-12)
+                    
+                    # Gram adjustment with hysteresis
+                    if r_gram < LOW:
+                        # Gram too weak - increase it
+                        fac = (LOW / (r_gram + 1e-12)) ** PWR
+                        fac = float(max(CLAMP[0], min(CLAMP[1], fac)))
+                        WEIGHTS['gram'] *= fac
+                        print(f"[autobalance] gram too weak ({r_gram:.3e}<{LOW}) → gram={WEIGHTS['gram']:.3g}")
+                    elif r_gram > HIGH:
+                        # Gram too strong - decrease it
+                        fac = (HIGH / r_gram) ** PWR
+                        fac = float(max(CLAMP[0], min(CLAMP[1], fac)))
+                        WEIGHTS['gram'] *= fac
+                        print(f"[autobalance] gram too strong ({r_gram:.3e}>{HIGH}) → gram={WEIGHTS['gram']:.3g}")
+                    # else: in good range (LOW <= r_gram <= HIGH), don't adjust
+                    
+                    # Heat adjustment (optional, less aggressive)
+                    r_heat = vgn_heat / (vgn_score + 1e-12)
+                    if r_heat < 0.01:  # only if very weak
+                        fac = (0.01 / (r_heat + 1e-12)) ** PWR
+                        fac = float(max(CLAMP[0], min(CLAMP[1], fac)))
+                        WEIGHTS['heat'] *= fac
+                        print(f"[autobalance] heat={WEIGHTS['heat']:.3g}")
+                    
+                    # SW_ST adjustment (optional, less aggressive)
+                    r_swst = vgn_swst / (vgn_score + 1e-12)
+                    if r_swst < 0.005:  # only if very weak
+                        fac = (0.005 / (r_swst + 1e-12)) ** PWR
+                        fac = float(max(CLAMP[0], min(CLAMP[1], fac)))
+                        WEIGHTS['sw_st'] *= fac
+                        print(f"[autobalance] sw_st={WEIGHTS['sw_st']:.3g}")
+                # =========================================================
+
             
             # Backward with gradient scaling
             optimizer.zero_grad(set_to_none=True)
@@ -1035,20 +1603,44 @@ def train_stageC_diffusion_generator(
             # Log
             epoch_losses['total'] += L_total.item()
             epoch_losses['score'] += L_score.item()
+            epoch_losses['cone'] += L_cone.item()
             epoch_losses['gram'] += L_gram.item()
             epoch_losses['heat'] += L_heat.item()
             epoch_losses['sw_st'] += L_sw_st.item()
             epoch_losses['sw_sc'] += L_sw_sc.item()
             epoch_losses['overlap'] += L_overlap.item()
             epoch_losses['ordinal_sc'] += L_ordinal_sc.item()
+
+            import torch.distributed as dist
+
+            def _is_rank0():
+                return (not dist.is_initialized()) or dist.get_rank() == 0
+
+            if L_overlap.item() > 0:  
+                c_overlap += 1       
             
             n_batches += 1
             global_step += 1
             # batch_pbar.update(1)
+
+            # Adjust weights after initial epochs
+            if epoch == 5:
+                print("\n⚡ [Weight Adjustment] Reducing overlap weight from 0.25 → 0.15")
+                WEIGHTS['overlap'] = 0.15
+
         
             # (optional) metrics logging
             if fabric is None or fabric.is_global_zero:
                 pass  # print / tqdm here if you want
+
+            # DEBUG: Per-batch logging
+            if DEBUG and (global_step % LOG_EVERY == 0):
+                Vn = float(V_hat.norm().item()) / (mask.sum().item()**0.5 * D_latent**0.5 + 1e-8)
+                print(f"[step {global_step}] ||V_hat||_rms={Vn:.3f} "
+                    f"score={L_score.item():.4f} gram={L_gram.item():.3e} "
+                    f"sw_st={L_sw_st.item():.4f} sw_sc={L_sw_sc.item():.4f} "
+                    f"overlap={L_overlap.item():.4f} cone={L_cone.item():.4f}")
+
         
         scheduler.step()
 
@@ -1070,17 +1662,106 @@ def train_stageC_diffusion_generator(
                 logger.log_metrics(metrics, step=global_step)
                 logger.set_step(global_step)
 
+
+
         # Epoch averages
-        for k in epoch_losses:
-            epoch_losses[k] /= max(n_batches, 1)
-            history['epoch_avg'][k].append(epoch_losses[k])
-        
-        history['epoch'].append(epoch)
-        
-        if (epoch + 1) % 10 == 0:
-            tqdm.write(f"Epoch {epoch+1}/{n_epochs} | Loss: {epoch_losses['total']:.4f} | "
-                  f"Score: {epoch_losses['score']:.4f} | Gram: {epoch_losses['gram']:.4f} | "
-                  f"SW_ST: {epoch_losses['sw_st']:.4f} | Ord_SC: {epoch_losses['ordinal_sc']:.4f}")
+
+        if False:
+            for k in epoch_losses:
+                epoch_losses[k] /= max(n_batches, 1)
+                history['epoch_avg'][k].append(epoch_losses[k])
+            
+            history['epoch'].append(epoch)
+
+
+        # -------------------- END-OF-EPOCH AVERAGING (FIXED) --------------------
+        import torch.distributed as dist
+
+        # sum losses across ranks
+        sum_losses = {k: torch.tensor([v], device=device, dtype=torch.float32) for k, v in epoch_losses.items()}
+        for k in sum_losses:
+            if dist.is_initialized():
+                dist.all_reduce(sum_losses[k], op=dist.ReduceOp.SUM)
+
+        # sum batch counts across ranks
+        sum_batches = torch.tensor([float(n_batches)], device=device, dtype=torch.float32)
+        cnt_st = torch.tensor([float(st_batches)], device=device, dtype=torch.float32)
+        cnt_sc = torch.tensor([float(sc_batches)], device=device, dtype=torch.float32)
+
+        if dist.is_initialized():
+            dist.all_reduce(sum_batches, op=dist.ReduceOp.SUM)
+            dist.all_reduce(cnt_st, op=dist.ReduceOp.SUM)
+            dist.all_reduce(cnt_sc, op=dist.ReduceOp.SUM)
+
+        # sum overlap batch count
+        sum_overlap_batches = torch.tensor([float(debug_state['overlap_count_this_epoch'])], device=device, dtype=torch.float32)
+        if dist.is_initialized():
+            dist.all_reduce(sum_overlap_batches, op=dist.ReduceOp.SUM)
+
+        # Determine denominator per loss type
+        def _denom_for(key):
+            if key in ('gram', 'heat', 'sw_st', 'cone'):
+                return cnt_st
+            if key in ('sw_sc', 'ordinal_sc'):
+                return cnt_sc
+            if key == 'overlap':
+                return sum_overlap_batches
+            return sum_batches  # 'total' and 'score'
+
+        # compute true epoch means
+        epoch_means = {}
+        for k in sum_losses:
+            denom = _denom_for(k).clamp_min(1.0)
+            epoch_means[k] = (sum_losses[k] / denom).item()
+
+        # store + history
+        epoch_losses = epoch_means
+        for k, v in epoch_losses.items():
+            history['epoch_avg'][k].append(v)
+        history['epoch'].append(epoch + 1)
+
+        # reset overlap batch counter for next epoch
+        debug_state['overlap_count_this_epoch'] = 0
+        # -----------------------------------------------------------------------
+
+        # DEBUG: Epoch summary
+        if DEBUG:
+            # Score by sigma
+            if debug_state['score_bin_cnt'].sum() > 0:
+                msg = " | ".join([f"s{k}:{(debug_state['score_bin_sum'][k]/(debug_state['score_bin_cnt'][k].clamp_min(1))).item():.4f}"
+                                   for k in range(5)])
+                print(f"[epoch {epoch+1}] score_by_sigma: {msg}")
+                debug_state['score_bin_sum'].zero_()
+                debug_state['score_bin_cnt'].zero_()
+            
+            # Overlap stats
+            if debug_state['dbg_overlap_pairs'] > 0:
+                avg_k = debug_state['dbg_k_mean'] / debug_state['dbg_overlap_pairs']
+                print(f"[epoch {epoch+1}] overlap_batches={debug_state['dbg_overlap_seen']} "
+                    f"pairs={debug_state['dbg_overlap_pairs']} avg_shared={avg_k:.1f}")
+            else:
+                print(f"[epoch {epoch+1}] overlap_batches=0 (check dataloader plumbing)")
+            
+            # Reset for next epoch
+            debug_state['dbg_overlap_seen'] = 0
+            debug_state['dbg_overlap_pairs'] = 0
+            debug_state['dbg_k_mean'] = 0.0
+            debug_state['overlap_count_this_epoch'] = 0
+
+
+        if _is_rank0() and (epoch) % 2 == 0:
+            tqdm.write(
+                f"Epoch {epoch+1}/{n_epochs} | "
+                f"Total: {epoch_losses['total']:.4f} | "
+                f"Score: {epoch_losses['score']:.4f} | "
+                f"Cone: {epoch_losses['cone']:.4f} | "
+                f"Gram: {epoch_losses['gram']:.4f} | "
+                f"Heat: {epoch_losses['heat']:.4f} | "
+                f"SW_ST: {epoch_losses['sw_st']:.4f} | "
+                f"SW_SC: {epoch_losses['sw_sc']:.4f} | "
+                f"Overlap: {epoch_losses['overlap']:.4f} | "
+                f"Ord_SC: {epoch_losses['ordinal_sc']:.4f}"
+            )
             
         # Log epoch averages to MLflow
         if logger and (fabric is None or fabric.is_global_zero):
@@ -1108,6 +1789,8 @@ def train_stageC_diffusion_generator(
     
     if fabric is None or fabric.is_global_zero:
         print("Training complete!")
+
+    return history if _is_rank0() else None
 
 # ==============================================================================
 # STAGE D: SC INFERENCE
@@ -1236,9 +1919,18 @@ def sample_sc_edm_anchored(
     
     V_A = V_t.squeeze(0).detach()
     print(f"Anchor coordinates sampled: {V_A.shape}")
+
+    #init reservoir with anchors
+    RES_CAP = 2000 #total mem budget
+    CARRY_K = 256 # how many to carry each batch
+
+    reservoir_idx = anchor_idx.clone().cpu().tolist()
+    reservoir_V = [V_A.cpu()]
+
+    print(f'reservoir carry: {CARRY_K} cells')
     
     # Batch remaining cells with frozen anchors
-    print("\nStep 3: Processing remaining cells with frozen anchors...")
+    print("\nStep 3: Processing remaining cells with frozen anchors and reservoir carry...")
     
     all_V = [V_A.cpu()]
     order = [anchor_idx.tolist()]
@@ -1252,21 +1944,46 @@ def sample_sc_edm_anchored(
             idx_B = non_anchor_idx[start_idx:end_idx]
             
             Z_B = Z_all[idx_B].to(device).unsqueeze(0)
-            Z_C = torch.cat([Z_A, Z_B], dim=1)
+
+            #select carry-over subset from reservoir
+            carry_idx = []
+            carry_coords = None
+            kcarry = 0
+
+            if len(reservoir_idx) > 0:
+                sel = np.random.choice(len(reservoir_idx),
+                                       size=min(CARRY_K, len(reservoir_idx)),
+                                       replace=False)
+                carry_idx = [reservoir_idx[s] for s in sel]
+                carry_coords = torch.cat(reservoir_V, dim=0)[sel]
+                kcarry = len(carry_idx)
+
+                #add carry-over to context
+                Z_carry = Z_all[carry_idx].to(device).unsqueeze(0)
+                Z_C = torch.cat([Z_A, Z_carry, Z_B], dim=1)
+            else:
+                Z_C = torch.cat([Z_A, Z_B], dim=1)
+
+            # Z_C = torch.cat([Z_A, Z_B], dim=1)
             mask_C = torch.ones(1, Z_C.shape[1], dtype=torch.bool, device=device)
             
             H_C = context_encoder(Z_C, mask_C)
             
-            # Initialize: anchors fixed, new cells noisy
+            # Initialize: anchors fixed, carry fixed, new cells noisy
             V_t = torch.empty(1, Z_C.shape[1], D_latent, device=device)
             V_t[:, :V_A.shape[0], :] = V_A.to(device)
-            V_t[:, V_A.shape[0]:, :] = torch.randn(
-                1, Z_C.shape[1] - V_A.shape[0], D_latent, device=device
-            ) * sigmas[0]
+            if kcarry > 0:
+                V_t[:, V_A.shape[0]:V_A.shape[0]+kcarry, :] = carry_coords.to(device)
+            V_t[:, V_A.shape[0]+kcarry:, :] = torch.randn(1, Z_C.shape[1]-V_A.shape[0]-kcarry, D_latent, device=device) * sigmas[0]
+
+            # V_t[:, V_A.shape[0]:, :] = torch.randn(
+            #     1, Z_C.shape[1] - V_A.shape[0], D_latent, device=device
+            # ) * sigmas[0]
             
             # Freeze mask (0 = frozen anchors, 1 = update new cells)
             upd_mask = torch.ones_like(V_t)
-            upd_mask[:, :V_A.shape[0], :] = 0.0
+            upd_mask[:, :V_A.shape[0]+kcarry, :] = 0.0
+            # upd_mask[:, :V_A.shape[0], :] = 0.0
             
             # Reverse diffusion
             for t_idx in range(n_timesteps_sample):
@@ -1292,14 +2009,30 @@ def sample_sc_edm_anchored(
                 else:
                     V_new = V_t - sigma_t * eps
                 
+                #masked update
+                update = (sigma_t - sigma_next if t_idx < n_timesteps_sample - 1 else sigma_t) * eps * upd_mask
+                V_t = V_t - update
+
                 # Apply freeze mask
-                V_t = upd_mask * V_new + (1.0 - upd_mask) * V_t
+                # V_t = upd_mask * V_new + (1.0 - upd_mask) * V_t
             
             # Extract new cells only
-            V_B_only = V_t.squeeze(0)[V_A.shape[0]:, :].detach().cpu()
-            
+            # V_B_only = V_t.squeeze(0)[V_A.shape[0]:, :].detach().cpu()
+            V_B_only = V_t.squeeze(0)[V_A.shape[0]+kcarry:, :].detach().cpu()
+
+            #update reservoir
             all_V.append(V_B_only)
             order.append(idx_B.tolist())
+
+            reservoir_idx.extend(idx_B.cpu().tolist())
+            reservoir_V.append(V_B_only)
+
+            #cap reservoir size
+            if len(reservoir_idx) > RES_CAP:
+                keep = np.random.choice(len(reservoir_idx), size=RES_CAP, replace=False)
+                reservoir_idx = [reservoir_idx[i] for i in keep]
+                bigV = torch.cat(reservoir_V, dim=0)
+                reservoir_V = [bigV[keep]]
             
             del Z_B, Z_C, H_C, V_t, eps_uncond, eps_cond, eps
             if device == 'cuda':
@@ -1346,4 +2079,3 @@ def sample_sc_edm_anchored(
     
     print("SC inference complete!")
     return result
-    

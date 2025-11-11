@@ -6,6 +6,36 @@ import scanpy as sc
 from core_models_et_p3 import GEMSModel
 # from mouse_brain import train_gems_mousebrain  # optional, if you want its helpers
 
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='GEMS Training with Lightning Fabric')
+    
+    # Training config
+    parser.add_argument('--devices', type=int, default=2)
+    parser.add_argument('--precision', type=str, default='16-mixed')
+    parser.add_argument('--stageA_epochs', type=int, default=1000)
+    parser.add_argument('--stageC_epochs', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--outdir', type=str, default='gems_mousebrain_output')
+    parser.add_argument('--num_st_samples', type=int, default=4000)  # ADD THIS
+    parser.add_argument('--num_sc_samples', type=int, default=9000)  # ADD THIS
+    
+    # Geometry-aware diffusion parameters
+    parser.add_argument('--use_canonicalize', action='store_true', default=True)
+    parser.add_argument('--use_dist_bias', action='store_true', default=True)
+    parser.add_argument('--dist_bins', type=int, default=24)
+    parser.add_argument('--dist_head_shared', action='store_true', default=True)
+    parser.add_argument('--use_angle_features', action='store_true', default=True)
+    parser.add_argument('--angle_bins', type=int, default=8)
+    parser.add_argument('--knn_k', type=int, default=12)
+    parser.add_argument('--self_conditioning', action='store_true', default=True)
+    parser.add_argument('--sc_feat_mode', type=str, default='concat', choices=['concat', 'mlp'])
+    parser.add_argument('--landmarks_L', type=int, default=32)
+    
+    return parser.parse_args()
+
 def load_mouse_data():
     # Replace these with your actual file paths
     sc_counts = '/home/ehtesamul/sc_st/data/mousedata_2020/E1z2/simu_sc_counts.csv'
@@ -78,16 +108,21 @@ def load_mouse_data():
     
     return scadata, stadata
 
-def main(
-    devices=2,
-    precision="16-mixed",
-    stageA_epochs=100,
-    stageB_outdir="gems_stageB_cache",
-    stageC_epochs=200,
-    stageC_batch=4,
-    lr=1e-4,
-    outdir="gems_mousebrain_output",
-):
+def main(args=None):
+    # Parse args if not provided
+    if args is None:
+        args = parse_args()
+    
+    # Extract parameters
+    devices = args.devices
+    precision = args.precision
+    stageA_epochs = args.stageA_epochs
+    stageB_outdir = "gems_stageB_cache"
+    stageC_epochs = args.stageC_epochs
+    stageC_batch = args.batch_size
+    lr = args.lr
+    outdir = args.outdir
+
     fabric = Fabric(accelerator="gpu", devices=devices, strategy="ddp", precision=precision)
     fabric.launch()
 
@@ -96,6 +131,15 @@ def main(
 
     # ---------- Build model (same across ranks) ----------
     n_genes = len(sorted(list(set(scadata.var_names) & set(stadata.var_names))))
+    # model = GEMSModel(
+    #     n_genes=n_genes,
+    #     n_embedding=[512, 256, 128],
+    #     D_latent=16,
+    #     c_dim=256,
+    #     n_heads=4,
+    #     isab_m=64,
+    #     device=str(fabric.device),
+    # )
     model = GEMSModel(
         n_genes=n_genes,
         n_embedding=[512, 256, 128],
@@ -104,6 +148,17 @@ def main(
         n_heads=4,
         isab_m=64,
         device=str(fabric.device),
+        # New geometry-aware parameters
+        use_canonicalize=args.use_canonicalize,
+        use_dist_bias=args.use_dist_bias,
+        dist_bins=args.dist_bins,
+        dist_head_shared=args.dist_head_shared,
+        use_angle_features=args.use_angle_features,
+        angle_bins=args.angle_bins,
+        knn_k=args.knn_k,
+        self_conditioning=args.self_conditioning,
+        sc_feat_mode=args.sc_feat_mode,
+        landmarks_L=args.landmarks_L,
     )
 
     # ---------- Stage A & B on rank-0 only ----------
@@ -143,15 +198,6 @@ def main(
             slides=slides_dict,
             outdir=stageB_outdir,
         )
-
-        # Save a checkpoint after Stage A/B for other ranks to load
-        # ckpt_ab = {
-        #     "encoder": model.encoder.state_dict(),
-        #     "precomputer": model.precomputer.state_dict() if hasattr(model, "precomputer") else {},
-        #     "context_encoder": model.context_encoder.state_dict(),
-        #     "generator": model.generator.state_dict(),
-        #     "score_net": model.score_net.state_dict(),
-        # }
 
         # Save a checkpoint after Stage A/B for other ranks to load
         ckpt_ab = {
@@ -204,12 +250,12 @@ def main(
 
     st_gene_expr_dict = {0: st_expr}
 
-    model.train_stageC(
+    training_history = model.train_stageC(
         st_gene_expr_dict=st_gene_expr_dict,
         sc_gene_expr=sc_expr,
         n_min=128, n_max=256,
-        num_st_samples=4000,
-        num_sc_samples=9000,
+        num_st_samples=args.num_st_samples,
+        num_sc_samples=args.num_sc_samples,
         n_epochs=stageC_epochs,
         batch_size=stageC_batch,   # per-GPU batch; global batch = this * #GPUs
         lr=lr,
@@ -234,26 +280,135 @@ def main(
         
         # Create timestamp for all outputs
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+        print("\n=== Inference (rank-0) with Multi-Sample Ranking ===")
+
+        if True:
+
+            # Multi-sample inference with quality ranking
+            K_samples = 1  # Number of samples to generate
+            all_results = []
+            all_scores = []
+
+            import utils_et as uet
+
+            for k in range(K_samples):
+                print(f"\n  Generating sample {k+1}/{K_samples}...")
+                
+                # Set different seed for each sample
+                torch.manual_seed(42 + k)
+                
+                sample_results = model.infer_sc_anchored(
+                    sc_gene_expr=sc_expr,
+                    n_timesteps_sample=300,
+                    return_coords=True,
+                    anchor_size=640,
+                    batch_size=512,
+                    eta=0.0,
+                    guidance_scale=7.0,
+                )
+                
+                # Compute EDM cone penalty as quality score (lower is better)
+                coords_sample = sample_results['coords_canon']
+                mask = torch.ones(coords_sample.shape[0], dtype=torch.bool, device=coords_sample.device)
+                cone_penalty = uet.edm_cone_penalty_from_V(
+                    coords_sample.unsqueeze(0), 
+                    mask.unsqueeze(0)
+                ).item()
+                # cone_penalty = uet.edm_cone_penalty_from_V(coords_sample.unsqueeze(0), mask.unsqueeze(0))
+                
+                all_results.append(sample_results)
+                all_scores.append(cone_penalty)
+                
+                print(f"  Sample {k+1} EDM cone penalty: {cone_penalty:.6f}")
+
+            # Select best sample (lowest penalty)
+            best_idx = int(np.argmin(all_scores))
+            results = all_results[best_idx]
+
+            print(f"\n✓ Selected sample {best_idx+1} with lowest cone penalty: {all_scores[best_idx]:.6f}")
+            print(f"  Mean penalty: {np.mean(all_scores):.6f} ± {np.std(all_scores):.6f}")
+
+            # Extract results from best sample
+            D_edm = results['D_edm'].cpu().numpy()
+            coords = results['coords'].cpu().numpy()
+            coords_canon = results['coords_canon'].cpu().numpy()
+            
+            # Extract results
+            D_edm = results['D_edm'].cpu().numpy()
+            coords = results['coords'].cpu().numpy()
+            coords_canon = results['coords_canon'].cpu().numpy()
+            
+            print(f"\nInference complete!")
+            print(f"  D_edm shape: {D_edm.shape}")
+            print(f"  Coordinates shape: {coords_canon.shape}")
+
+        if False:
+            print("\n=== Inference (rank-0) with Multi-Sample Ranking [RANDOM MODE] ===")
+
+            # Get number of cells from sc_expr
+            n_cells = sc_expr.shape[0]
+            D_latent = 16  # matches your model config
+
+            # Multi-sample inference with quality ranking
+            K_samples = 1  # Number of samples to generate
+            all_results = []
+            all_scores = []
+            import utils_et as uet
+
+            for k in range(K_samples):
+                print(f"\n  Generating sample {k+1}/{K_samples}...")
+                
+                # Set different seed for each sample
+                torch.manual_seed(42 + k)
+                
+                # ===== RANDOM RESULTS INSTEAD OF INFERENCE =====
+                # Generate random coordinates in latent space
+                coords_random = torch.randn(n_cells, D_latent, device=fabric.device)
+                
+                # Generate random canonicalized coordinates
+                coords_canon_random = torch.randn(n_cells, D_latent, device=fabric.device)
+                
+                # Generate random distance matrix
+                D_edm_random = torch.cdist(coords_canon_random.unsqueeze(0), 
+                                        coords_canon_random.unsqueeze(0)).squeeze(0)
+                
+                # Create fake results dictionary matching expected format
+                sample_results = {
+                    'D_edm': D_edm_random,
+                    'coords': coords_random,
+                    'coords_canon': coords_canon_random
+                }
+                # ===== END RANDOM RESULTS =====
+                
+                # Compute EDM cone penalty as quality score (lower is better)
+                coords_sample = sample_results['coords_canon']
+                mask = torch.ones(coords_sample.shape[0], dtype=torch.bool, device=coords_sample.device)
+                cone_penalty = uet.edm_cone_penalty_from_V(
+                    coords_sample.unsqueeze(0), 
+                    mask.unsqueeze(0)
+                ).item()
+                
+                all_results.append(sample_results)
+                all_scores.append(cone_penalty)
+                print(f"  Sample {k+1} EDM cone penalty: {cone_penalty:.6f}")
+
+            # Select best sample (lowest penalty)
+            best_idx = int(np.argmin(all_scores))
+            results = all_results[best_idx]
+            print(f"\n✓ Selected sample {best_idx+1} with lowest cone penalty: {all_scores[best_idx]:.6f}")
+            print(f"  Mean penalty: {np.mean(all_scores):.6f} ± {np.std(all_scores):.6f}")
+
+            # Extract results from best sample
+            D_edm = results['D_edm'].cpu().numpy()
+            coords = results['coords'].cpu().numpy()
+            coords_canon = results['coords_canon'].cpu().numpy()
+
+            print(f"\nInference complete!")
+            print(f"  D_edm shape: {D_edm.shape}")
+            print(f"  Coordinates shape: {coords_canon.shape}")
         
-        print("\n=== Inference (rank-0) ===")
-        results = model.infer_sc_anchored(
-            sc_gene_expr=sc_expr,
-            n_timesteps_sample=300,
-            return_coords=True,
-            anchor_size=384,
-            batch_size=512,
-            eta=0.0,
-            guidance_scale=7.0,
-        )
-        
-        # Extract results
-        D_edm = results['D_edm'].cpu().numpy()
-        coords = results['coords'].cpu().numpy()
-        coords_canon = results['coords_canon'].cpu().numpy()
-        
-        print(f"\nInference complete!")
-        print(f"  D_edm shape: {D_edm.shape}")
-        print(f"  Coordinates shape: {coords_canon.shape}")
         
         # ============================================================================
         # SAVE RESULTS WITH DATETIME
@@ -476,179 +631,175 @@ def main(
         
         print("\n=== Loading and plotting Stage C training losses ===")
         
-        # Find the latest checkpoint
-        import glob
-        ckpt_files = glob.glob(os.path.join(outdir, "ckpt_epoch_*.pt"))
-        
-        if len(ckpt_files) > 0:
-            # Sort by epoch number and get the latest
-            ckpt_files.sort(key=lambda x: int(x.split('_')[-1].replace('.pt', '')))
-            latest_ckpt = ckpt_files[-1]
-            print(f"Loading training history from: {latest_ckpt}")
+        # ============================================================================
+        # PLOT STAGE C TRAINING LOSSES (NO CHECKPOINT NEEDED)
+        # ============================================================================
+
+        if fabric.is_global_zero:
+            print("\n=== Plotting Stage C training losses ===")
             
-            # Load checkpoint
-            ckpt = torch.load(latest_ckpt, map_location='cpu')
-            history = ckpt['history']
-            
-            epochs = history['epoch']
-            losses = history['epoch_avg']
-            
-            print(f"Found {len(epochs)} epochs of training history")
-            
-            # ============================================================================
-            # CREATE COMPREHENSIVE LOSS PLOTS
-            # ============================================================================
-            
-            # Plot 1: All losses on separate subplots (detailed view)
-            fig, axes = plt.subplots(3, 3, figsize=(20, 15))
-            fig.suptitle('Stage C Training Losses (All Components)', fontsize=18, fontweight='bold', y=0.995)
-            
-            loss_names = ['total', 'score', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
-            colors = ['black', 'blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
-            
-            for idx, (name, color) in enumerate(zip(loss_names, colors)):
-                if name in losses and len(losses[name]) > 0:
-                    ax = axes[idx // 3, idx % 3]
-                    ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
-                    ax.set_xlabel('Epoch', fontsize=12)
-                    ax.set_ylabel('Loss', fontsize=12)
-                    ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
-                    ax.grid(True, alpha=0.3)
+            if training_history is not None and len(training_history['epoch']) > 0:
+                epochs = training_history['epoch']
+                losses = training_history['epoch_avg']
+                
+                print(f"Found {len(epochs)} epochs of training history")
+                
+                # ============================================================================
+                # CREATE COMPREHENSIVE LOSS PLOTS
+                # ============================================================================
+                
+                # Plot 1: All losses on separate subplots (detailed view)
+                fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+                fig.suptitle('Stage C Training Losses (All Components)', fontsize=18, fontweight='bold', y=0.995)
+                
+                loss_names = ['total', 'score', 'cone', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
+                colors = ['black', 'blue', 'cyan', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
+                
+                for idx, (name, color) in enumerate(zip(loss_names, colors)):
+                    if name in losses and len(losses[name]) > 0:
+                        ax = axes[idx // 3, idx % 3]
+                        ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
+                        ax.set_xlabel('Epoch', fontsize=12)
+                        ax.set_ylabel('Loss', fontsize=12)
+                        ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
+                        ax.grid(True, alpha=0.3)
+                        
+                        # Add smoothed trend line if enough data
+                        if len(epochs) > 10:
+                            from scipy.ndimage import gaussian_filter1d
+                            smoothed = gaussian_filter1d(losses[name], sigma=2)
+                            ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
+                            ax.legend(fontsize=10)
+                
+                # Hide empty subplot
+                if len(loss_names) < 9:
+                    axes[2, 2].axis('off')
+                
+                plt.tight_layout()
+                detailed_plot_filename = f"stageC_losses_detailed_{timestamp}.png"
+                detailed_plot_path = os.path.join(outdir, detailed_plot_filename)
+                plt.savefig(detailed_plot_path, dpi=300, bbox_inches='tight')
+                print(f"✓ Saved detailed loss plot: {detailed_plot_path}")
+                plt.close()
+                
+                # ============================================================================
+                # Plot 2: All losses on ONE plot (log scale for comparison)
+                # ============================================================================
+                
+                fig, ax = plt.subplots(figsize=(14, 8))
+                
+                loss_components = ['score', 'cone', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
+                colors_comp = ['blue', 'cyan', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
+                
+                for name, color in zip(loss_components, colors_comp):
+                    if name in losses and len(losses[name]) > 0:
+                        ax.plot(epochs, losses[name], color=color, linewidth=2.5, 
+                            label=name.upper(), marker='o', markersize=5, 
+                            markevery=max(1, len(epochs)//20), alpha=0.8)
+                
+                ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
+                ax.set_ylabel('Loss', fontsize=14, fontweight='bold')
+                ax.set_title('Stage C Training - All Loss Components', fontsize=16, fontweight='bold')
+                ax.set_yscale('log')
+                ax.grid(True, alpha=0.3, which='both')
+                ax.legend(fontsize=12, loc='best', framealpha=0.9)
+                
+                plt.tight_layout()
+                combined_plot_filename = f"stageC_losses_combined_{timestamp}.png"
+                combined_plot_path = os.path.join(outdir, combined_plot_filename)
+                plt.savefig(combined_plot_path, dpi=300, bbox_inches='tight')
+                print(f"✓ Saved combined loss plot: {combined_plot_path}")
+                plt.close()
+                
+                # ============================================================================
+                # Plot 3: Total loss only (clean view)
+                # ============================================================================
+                
+                fig, ax = plt.subplots(figsize=(12, 6))
+                
+                if 'total' in losses and len(losses['total']) > 0:
+                    ax.plot(epochs, losses['total'], color='black', linewidth=3, 
+                        marker='o', markersize=6, markevery=max(1, len(epochs)//20), 
+                        alpha=0.8, label='Total Loss')
                     
-                    # Add smoothed trend line if enough data
+                    # Add smoothed trend
                     if len(epochs) > 10:
                         from scipy.ndimage import gaussian_filter1d
-                        smoothed = gaussian_filter1d(losses[name], sigma=2)
-                        ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
-                        ax.legend(fontsize=10)
-            
-            # Hide empty subplot
-            if len(loss_names) < 9:
-                axes[2, 2].axis('off')
-            
-            plt.tight_layout()
-            detailed_plot_filename = f"stageC_losses_detailed_{timestamp}.png"
-            detailed_plot_path = os.path.join(outdir, detailed_plot_filename)
-            plt.savefig(detailed_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved detailed loss plot: {detailed_plot_path}")
-            plt.close()
-            
-            # ============================================================================
-            # Plot 2: All losses on ONE plot (log scale for comparison)
-            # ============================================================================
-            
-            fig, ax = plt.subplots(figsize=(14, 8))
-            
-            # Plot all loss components except total
-            loss_components = ['score', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
-            colors_comp = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
-            
-            for name, color in zip(loss_components, colors_comp):
-                if name in losses and len(losses[name]) > 0:
-                    ax.plot(epochs, losses[name], color=color, linewidth=2.5, 
-                           label=name.upper(), marker='o', markersize=5, 
-                           markevery=max(1, len(epochs)//20), alpha=0.8)
-            
-            ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
-            ax.set_ylabel('Loss', fontsize=14, fontweight='bold')
-            ax.set_title('Stage C Training - All Loss Components', fontsize=16, fontweight='bold')
-            ax.set_yscale('log')  # Log scale to see all components
-            ax.grid(True, alpha=0.3, which='both')
-            ax.legend(fontsize=12, loc='best', framealpha=0.9)
-            
-            plt.tight_layout()
-            combined_plot_filename = f"stageC_losses_combined_{timestamp}.png"
-            combined_plot_path = os.path.join(outdir, combined_plot_filename)
-            plt.savefig(combined_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved combined loss plot: {combined_plot_path}")
-            plt.close()
-            
-            # ============================================================================
-            # Plot 3: Total loss only (clean view)
-            # ============================================================================
-            
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            if 'total' in losses and len(losses['total']) > 0:
-                ax.plot(epochs, losses['total'], color='black', linewidth=3, 
-                       marker='o', markersize=6, markevery=max(1, len(epochs)//20), 
-                       alpha=0.8, label='Total Loss')
+                        smoothed = gaussian_filter1d(losses['total'], sigma=3)
+                        ax.plot(epochs, smoothed, '--', color='red', linewidth=2.5, 
+                            alpha=0.6, label='Trend (smoothed)')
+                    
+                    # Add min/max annotations
+                    min_loss = min(losses['total'])
+                    min_epoch = epochs[losses['total'].index(min_loss)]
+                    ax.axhline(y=min_loss, color='green', linestyle=':', linewidth=2, alpha=0.5)
+                    ax.text(0.02, 0.98, f'Min Loss: {min_loss:.4f} (Epoch {min_epoch})', 
+                        transform=ax.transAxes, fontsize=12, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
                 
-                # Add smoothed trend
-                if len(epochs) > 10:
-                    from scipy.ndimage import gaussian_filter1d
-                    smoothed = gaussian_filter1d(losses['total'], sigma=3)
-                    ax.plot(epochs, smoothed, '--', color='red', linewidth=2.5, 
-                           alpha=0.6, label='Trend (smoothed)')
+                ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
+                ax.set_ylabel('Total Loss', fontsize=14, fontweight='bold')
+                ax.set_title('Stage C Training - Total Loss', fontsize=16, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=12, loc='best')
                 
-                # Add min/max annotations
-                min_loss = min(losses['total'])
-                min_epoch = epochs[losses['total'].index(min_loss)]
-                ax.axhline(y=min_loss, color='green', linestyle=':', linewidth=2, alpha=0.5)
-                ax.text(0.02, 0.98, f'Min Loss: {min_loss:.4f} (Epoch {min_epoch})', 
-                       transform=ax.transAxes, fontsize=12, verticalalignment='top',
-                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            
-            ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
-            ax.set_ylabel('Total Loss', fontsize=14, fontweight='bold')
-            ax.set_title('Stage C Training - Total Loss', fontsize=16, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=12, loc='best')
-            
-            plt.tight_layout()
-            total_plot_filename = f"stageC_loss_total_{timestamp}.png"
-            total_plot_path = os.path.join(outdir, total_plot_filename)
-            plt.savefig(total_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved total loss plot: {total_plot_path}")
-            plt.close()
-            
-            # ============================================================================
-            # Save loss history as JSON for easy access
-            # ============================================================================
-            
-            history_json = {
-                'epochs': epochs,
-                'losses': {k: [float(x) for x in v] for k, v in losses.items()},
-                'n_epochs': len(epochs),
-                'final_total_loss': float(losses['total'][-1]) if 'total' in losses else None,
-                'min_total_loss': float(min(losses['total'])) if 'total' in losses else None,
-                'timestamp': timestamp
-            }
-            
-            json_filename = f"stageC_training_history_{timestamp}.json"
-            json_path = os.path.join(outdir, json_filename)
-            
-            import json
-            with open(json_path, 'w') as f:
-                json.dump(history_json, f, indent=2)
-            
-            print(f"✓ Saved training history JSON: {json_path}")
-            
-            # ============================================================================
-            # Print loss summary
-            # ============================================================================
-            
-            print("\n" + "="*70)
-            print("STAGE C TRAINING SUMMARY")
-            print("="*70)
-            print(f"Total epochs trained: {len(epochs)}")
-            print(f"Final total loss: {losses['total'][-1]:.4f}")
-            print(f"Minimum total loss: {min(losses['total']):.4f} (Epoch {epochs[losses['total'].index(min(losses['total']))]})") 
-            
-            print("\nFinal loss components:")
-            for name in loss_components:
-                if name in losses and len(losses[name]) > 0:
-                    print(f"  {name}: {losses[name][-1]:.4f}")
-            
-            print("="*70)
-            
-        else:
-            print(f"⚠ No checkpoint files found in {outdir}")
-            print("  Stage C training may not have completed or checkpoints not saved.")
+                plt.tight_layout()
+                total_plot_filename = f"stageC_loss_total_{timestamp}.png"
+                total_plot_path = os.path.join(outdir, total_plot_filename)
+                plt.savefig(total_plot_path, dpi=300, bbox_inches='tight')
+                print(f"✓ Saved total loss plot: {total_plot_path}")
+                plt.close()
+                
+                # ============================================================================
+                # Save loss history as JSON for easy access
+                # ============================================================================
+                
+                history_json = {
+                    'epochs': epochs,
+                    'losses': {k: [float(x) for x in v] for k, v in losses.items()},
+                    'n_epochs': len(epochs),
+                    'final_total_loss': float(losses['total'][-1]) if 'total' in losses else None,
+                    'min_total_loss': float(min(losses['total'])) if 'total' in losses else None,
+                    'timestamp': timestamp
+                }
+                
+                json_filename = f"stageC_training_history_{timestamp}.json"
+                json_path = os.path.join(outdir, json_filename)
+                
+                import json
+                with open(json_path, 'w') as f:
+                    json.dump(history_json, f, indent=2)
+                
+                print(f"✓ Saved training history JSON: {json_path}")
+                
+                # ============================================================================
+                # Print loss summary
+                # ============================================================================
+                
+                print("\n" + "="*70)
+                print("STAGE C TRAINING SUMMARY")
+                print("="*70)
+                print(f"Total epochs trained: {len(epochs)}")
+                print(f"Final total loss: {losses['total'][-1]:.4f}")
+                print(f"Minimum total loss: {min(losses['total']):.4f} (Epoch {epochs[losses['total'].index(min(losses['total']))]})") 
+                
+                print("\nFinal loss components:")
+                for name in loss_components:
+                    if name in losses and len(losses[name]) > 0:
+                        print(f"  {name}: {losses[name][-1]:.4f}")
+                
+                print("="*70)
+                
+            else:
+                print("⚠ No training history available (training may have failed)")
 
 
+# if __name__ == "__main__":
+#     # Example: 2 GPUs, fp16
+#     main(devices=2, precision="16-mixed",
+#          stageA_epochs=1000, stageC_epochs=600, stageC_batch=64,
+#          lr=1e-4, outdir="gems_mousebrain_output")
+    
 if __name__ == "__main__":
-    # Example: 2 GPUs, fp16
-    main(devices=2, precision="16-mixed",
-         stageA_epochs=1000, stageC_epochs=600, stageC_batch=64,
-         lr=1e-4, outdir="gems_mousebrain_output")
+    args = parse_args()
+    main(args)

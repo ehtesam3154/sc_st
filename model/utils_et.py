@@ -41,6 +41,313 @@ def normalize_coordinates_isotropic(coords: torch.Tensor) -> Tuple[torch.Tensor,
     coords_norm = coords_centered / radius
     return coords_norm, center, radius
 
+def canonicalize(V, mask, eps=1e-8):
+    '''
+    center and scale V to unit RMS per set
+    V: (B, N, D_latent), mask: (B, N) in {0,1}
+    returns V_centered_sacled, mean, scale
+    '''
+    B, N, D = V.shape
+    mask_expanded = mask.unsqueeze(-1) #(B, N, 1)
+
+    #compute mean over valid rows
+    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+    mean = (V * mask_expanded).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1) #(B, 1, D)
+
+    #center 
+    V_centered = V - mean
+    V_centered = V_centered * mask_expanded
+
+    #compute rms scale
+    sq_norms = (V_centered ** 2).sum(dim=-1) #(B, N)
+    rms_sq = (sq_norms * mask).sum(dim=1) / valid_counts.squeeze(-1)
+    scale = torch.sqrt(rms_sq + eps).unsqueeze(1).unsqueeze(2)
+
+    #scale
+    V_scaled = V_centered / scale
+    V_scaled = V_scaled * mask_expanded
+
+    return V_scaled, mean, scale
+
+def pairwise_dist2(V, mask):
+    '''
+    squared pairwise distances
+    V: (B, N, D), mask: (B, N)
+    returns D2: (B, N, N) with masked pairs set to 0
+    '''
+    B, N, D = V.shape
+
+    #compute squared distances
+    V_norm = (V ** 2).sum(dim=-1, keepdim=True) # (B, N, 1)
+    D2 = V_norm + V_norm.transpose(1, 2) - 2 * torch.bmm(V, V.transpose(1, 2))
+
+    #mask invalid pairs
+    mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)
+    D2 = D2 * mask_2d 
+
+    return D2
+
+def make_distance_bias(D2, mask, n_bins=16, d_emb=32, share_across_heads=True,
+                       E_bin=None, W=None, alpha_bias=None, device=None):
+    '''
+    convert squared distances to attention bias
+    returns attn_bias: (B, 1, N, N) if share_across_heads else (B, H, N, N)
+    also returns params if they weren't provided (for init)
+    '''
+    B, N, _ = D2.shape
+    device= D2.device if device is None else device
+
+    # Init learnable params if not provided
+    if E_bin is None:
+        E_bin = nn.Parameter(torch.randn(n_bins, d_emb, device=device) / math.sqrt(d_emb))
+    if W is None:
+        out_dim = 1 if share_across_heads else 8  # assuming 8 heads
+        W = nn.Parameter(torch.randn(d_emb, out_dim, device=device) * 0.01)
+    if alpha_bias is None:
+        alpha_bias = nn.Parameter(torch.tensor(0.1, device=device))
+
+    #compute distances and bucketize
+    D = torch.sqrt(D2. clamp(min=1e-8))
+
+    #define bin edges (linear spacing from 0 to 3)
+    edges = torch.linspace(0, 3.0, n_bins, device=device)
+
+    #assign to bins
+    bin_ids = torch.searchsorted(edges, D.flatten()).reshape(B, N, N)
+    bin_ids = torch.clamp(bin_ids, 0, n_bins - 1)
+
+    #embed bins
+    bin_embeddings = E_bin[bin_ids]
+
+    # Project to bias
+    bias_raw = torch.matmul(bin_embeddings, W)  # (B, N, N, out_dim)
+    
+    # Apply mask
+    mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)  # (B, N, N)
+    
+    if share_across_heads:
+        bias = bias_raw.squeeze(-1) * mask_2d  # (B, N, N)
+        attn_bias = alpha_bias * bias.unsqueeze(1)  # (B, 1, N, N)
+    else:
+        bias = bias_raw.permute(0, 3, 1, 2) * mask_2d.unsqueeze(1)
+        attn_bias = alpha_bias * bias
+    
+    return attn_bias, (E_bin, W, alpha_bias)
+
+def knn_graph(V, mask, k=12):
+    """
+    Build kNN graph on coordinates.
+    Returns idx: (B, N, k) with -1 for invalid neighbors
+    """
+    B, N, D = V.shape
+    device = V.device
+    
+    # Compute distances
+    D2 = pairwise_dist2(V, mask)
+    
+    # Mask self-connections
+    D2 = D2 + torch.eye(N, device=device).unsqueeze(0) * 1e10
+    
+    # Mask invalid nodes
+    invalid_mask = (~mask).unsqueeze(1).float() * 1e10
+    D2 = D2 + invalid_mask
+    
+    # Find k nearest neighbors
+    _, idx = torch.topk(D2, k, dim=-1, largest=False)  # (B, N, k)
+    
+    # Mark invalid neighbors as -1
+    valid_neighbors = mask.unsqueeze(2).expand(-1, -1, k)  # (B, N, k)
+    neighbor_mask = torch.gather(mask.unsqueeze(1).expand(-1, N, -1), 2, idx)  # (B, N, k)
+    idx = torch.where(valid_neighbors & neighbor_mask, idx, torch.tensor(-1, device=device))
+    
+    return idx
+
+from functools import lru_cache
+
+@lru_cache(maxsize=64)
+def _triu_indices_cached(k: int, device: torch.device):
+    #upper-triangular pair indices (j>k) once per k
+    return torch.triu_indices(k, k, offset=1, device=device)
+
+
+# def angle_features(V, mask, idx, n_angle_bins=8):
+#     """
+#     Compute angle features for each node based on triangles with neighbors.
+#     Returns A: (B, N, n_angle_bins)
+#     """
+#     B, N, D = V.shape
+#     k = idx.shape[2]
+#     device = V.device
+    
+#     # Initialize angle histogram
+#     angle_hist = torch.zeros(B, N, n_angle_bins, device=device)
+    
+#     # Bin edges for cos(theta) from -1 to 1
+#     bin_edges = torch.linspace(-1, 1, n_angle_bins + 1, device=device)
+    
+#     for b in range(B):
+#         for i in range(N):
+#             if not mask[b, i]:
+#                 continue
+                
+#             valid_neighbors = []
+#             for j_idx in range(k):
+#                 j = idx[b, i, j_idx]
+#                 if j >= 0 and mask[b, j]:
+#                     valid_neighbors.append(j.item())
+            
+#             if len(valid_neighbors) < 2:
+#                 continue
+            
+#             # Compute angles for all pairs of neighbors
+#             for ji, j in enumerate(valid_neighbors):
+#                 for ki in range(ji + 1, len(valid_neighbors)):
+#                     k_node = valid_neighbors[ki]
+                    
+#                     # Vectors from i to j and i to k
+#                     v_ij = V[b, j] - V[b, i]
+#                     v_ik = V[b, k_node] - V[b, i]
+                    
+#                     # Cosine of angle
+#                     cos_theta = torch.dot(v_ij, v_ik) / (torch.norm(v_ij) * torch.norm(v_ik) + 1e-8)
+#                     cos_theta = torch.clamp(cos_theta, -1, 1)
+                    
+#                     # Assign to bin
+#                     bin_idx = torch.searchsorted(bin_edges, cos_theta) - 1
+#                     bin_idx = torch.clamp(bin_idx, 0, n_angle_bins - 1)
+#                     angle_hist[b, i, bin_idx] += 1
+    
+#     # Normalize histograms
+#     hist_sums = angle_hist.sum(dim=-1, keepdim=True).clamp(min=1)
+#     angle_hist = angle_hist / hist_sums
+    
+#     return angle_hist
+
+
+def angle_features(V, mask, idx, n_angle_bins: int = 8, eps: float = 1e-8):
+    """
+    Vectorized angle histogram per node from neighbor triangles (no Python loops).
+
+    Args
+    ----
+    V   : (B, N, D) latent coordinates
+    mask: (B, N) bool, True = valid node
+    idx : (B, N, k) long, neighbor indices per node, -1 indicates missing
+    n_angle_bins: number of bins for cos(theta) in [-1,1]
+    eps : numerical epsilon
+
+    Returns
+    -------
+    angle_hist : (B, N, n_angle_bins), rows sum to 1 for valid nodes (0 for pads)
+    """
+    B, N, D = V.shape
+    k = idx.shape[-1]
+    device = V.device
+
+    # Clamp negative indices so we can safely index, but remember validity
+    idx_clamped = idx.clamp_min(0)                              # (B, N, k)
+    # Build neighbor validity: (neighbor exists) & (neighbor not padded)
+    # Gather neighbor-node masks with advanced indexing
+    b_ix = torch.arange(B, device=device)[:, None, None].expand(B, N, k)
+    nb_mask_from_nodes = mask[b_ix, idx_clamped]                # (B, N, k)
+    neighbor_valid = (idx >= 0) & nb_mask_from_nodes            # (B, N, k)
+
+    # Gather neighbor coordinates: V_neighbors[b,i,j,:] = V[b, idx[b,i,j], :]
+    V_neighbors = V[b_ix, idx_clamped, :]                       # (B, N, k, D)
+
+    # Centered neighbor rays U = V_j - V_i
+    V_center = V.unsqueeze(2)                                   # (B, N, 1, D)
+    U = V_neighbors - V_center                                  # (B, N, k, D)
+
+    # Normalize rays to unit length
+    U_norm = torch.linalg.norm(U, dim=-1).clamp_min(eps)        # (B, N, k)
+    U_unit = U / U_norm.unsqueeze(-1)                           # (B, N, k, D)
+
+    # Zero-out invalid neighbors to avoid polluting Gram
+    U_unit = U_unit * neighbor_valid.unsqueeze(-1).to(U.dtype)
+
+    # Neighbor–neighbor Gram per node: all cosines at once
+    # G[b,n,j,k] = <u_j, u_k>; shape (B, N, k, k)
+    G = torch.matmul(U_unit, U_unit.transpose(-1, -2))
+
+    # Select upper-triangular pairs j<k (each is an angle at node center)
+    i_idx, j_idx = _triu_indices_cached(k, device)
+    # Cosines for all pairs at once: (B, N, P)
+    cos_all = G[:, :, i_idx, j_idx]
+
+    # Valid-pair mask: both neighbors must be valid
+    pair_valid = neighbor_valid[:, :, i_idx] & neighbor_valid[:, :, j_idx]  # (B, N, P)
+
+    # Bin edges and bucketize cos(theta) in [-1,1]
+    bin_edges = torch.linspace(-1.0, 1.0, n_angle_bins + 1, device=device)
+    BN = B * N
+    P = cos_all.shape[-1]
+
+    cos_flat = cos_all.reshape(BN, P)
+    valid_flat = pair_valid.reshape(BN, P).to(cos_flat.dtype)
+
+    # Bucketize (no grad needed for histogramming)
+    bin_idx = torch.bucketize(cos_flat, bin_edges) - 1          # (BN, P) in [-1, n_bins-1]
+    bin_idx = bin_idx.clamp_(0, n_angle_bins - 1)
+
+    # Scatter-add into per-node histograms
+    # Map (row r, bin b) -> flat index r*n_bins + b
+    row_offsets = (torch.arange(BN, device=device) * n_angle_bins).unsqueeze(1)  # (BN,1)
+    flat_idx = (row_offsets + bin_idx).reshape(-1)                                # (BN*P,)
+    weights = valid_flat.reshape(-1)                                              # (BN*P,)
+
+    hist_flat = torch.zeros(BN * n_angle_bins, device=device, dtype=cos_flat.dtype)
+    hist_flat.index_add_(0, flat_idx, weights)
+    hist = hist_flat.view(BN, n_angle_bins)
+
+    # Normalize per node; zeros for padded rows
+    hist = hist / hist.sum(dim=1, keepdim=True).clamp_min(1.0)
+    hist = hist.view(B, N, n_angle_bins)
+
+    # Zero-out padded nodes explicitly
+    hist = hist * mask.unsqueeze(-1).to(hist.dtype)
+
+    return hist
+
+
+def edm_cone_penalty_from_V(V, mask, min_eigs=8):
+    """
+    Compute EDM cone penalty (sum of negative eigenvalues).
+    V: (B, N, D_latent), mask: (B, N)
+    Returns scalar penalty averaged over batch
+    """
+    B = V.shape[0]
+    penalties = []
+    
+    for b in range(B):
+        valid_idx = torch.where(mask[b])[0]
+        n_valid = len(valid_idx)
+        
+        if n_valid < 2:
+            penalties.append(torch.tensor(0.0, device=V.device))
+            continue
+        
+        # Extract valid subset
+        V_valid = V[b, valid_idx]  # (n_valid, D)
+        
+        # Compute squared distances
+        D2 = torch.cdist(V_valid, V_valid, p=2) ** 2
+        
+        # Double-center to get Gram
+        ones = torch.ones(n_valid, 1, device=V.device)
+        J = torch.eye(n_valid, device=V.device) - ones @ ones.T / n_valid
+        G = -0.5 * J @ D2 @ J
+        
+        # Compute eigenvalues
+        eigvals = torch.linalg.eigvalsh(G)
+        
+        # Sum negative eigenvalues
+        neg_eigvals = torch.clamp(-eigvals, min=0)
+        penalty = neg_eigvals.sum()
+        penalties.append(penalty)
+    
+    return torch.stack(penalties).mean()
+
 
 def normalize_pose_scale(y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
@@ -1709,13 +2016,48 @@ def _upper_tri_vec(D):
     iu = torch.triu_indices(n, n, offset=1, device=D.device)
     return D[iu[0], iu[1]]  # (n*(n-1)/2,)
 
-def wasserstein_1d_quantile_loss(D_pred, D_tgt, m_pairs=4096, p=1, norm="p95"):
+# def wasserstein_1d_quantile_loss(D_pred, D_tgt, m_pairs=4096, p=1, norm="p95"):
+#     """
+#     Differentiable 1D OT on distances. Returns scalar loss.
+#     D_pred, D_tgt: (n,n), symmetric with zeros on diag.
+#     m_pairs: subsample count for speed.
+#     p: 1 -> W1 (L1), 2 -> W2 (MSE on quantiles).
+#     norm: 'none' | 'median' | 'p95' (normalize by target scale).
+#     """
+#     dp = _upper_tri_vec(D_pred)
+#     dt = _upper_tri_vec(D_tgt)
+
+#     # optional subsample (same indices for both)
+#     if dp.numel() > m_pairs:
+#         idx = torch.randperm(dp.numel(), device=dp.device)[:m_pairs]
+#         dp = dp.index_select(0, idx)
+#         dt = dt.index_select(0, idx)
+
+#     # robust normalization (decouples global scale from shape)
+#     if norm != "none":
+#         if norm == "median":
+#             s = dt.median().clamp_min(1e-6)
+#         else:  # p95
+#             s = torch.quantile(dt, 0.95).clamp_min(1e-6)
+#         dp = dp / s
+#         dt = dt / s
+
+#     dp_sorted = torch.sort(dp).values
+#     dt_sorted = torch.sort(dt).values
+#     if p == 1:
+#         return F.l1_loss(dp_sorted, dt_sorted)
+#     else:
+#         return F.mse_loss(dp_sorted, dt_sorted)
+
+def wasserstein_1d_quantile_loss(
+    D_pred, D_tgt, m_pairs=8192, p=1, norm="p95", rescale_back=True
+):
     """
-    Differentiable 1D OT on distances. Returns scalar loss.
-    D_pred, D_tgt: (n,n), symmetric with zeros on diag.
-    m_pairs: subsample count for speed.
-    p: 1 -> W1 (L1), 2 -> W2 (MSE on quantiles).
-    norm: 'none' | 'median' | 'p95' (normalize by target scale).
+    Differentiable 1D OT on pairwise distances (upper-triangle).
+    Returns scalar loss on the SAME device/dtype as inputs.
+    - p=1 gives stronger, less-squashed gradients than p=2 early on.
+    - norm in {"none","median","p95"} rescales *both* by a robust target scale s.
+    - rescale_back=True multiplies loss by s**p to put it back in distance units.
     """
     dp = _upper_tri_vec(D_pred)
     dt = _upper_tri_vec(D_tgt)
@@ -1727,21 +2069,31 @@ def wasserstein_1d_quantile_loss(D_pred, D_tgt, m_pairs=4096, p=1, norm="p95"):
         dt = dt.index_select(0, idx)
 
     # robust normalization (decouples global scale from shape)
+    s = dp.new_tensor(1.0)
     if norm != "none":
         if norm == "median":
             s = dt.median().clamp_min(1e-6)
-        else:  # p95
+        else:  # "p95"
             s = torch.quantile(dt, 0.95).clamp_min(1e-6)
         dp = dp / s
         dt = dt / s
 
     dp_sorted = torch.sort(dp).values
     dt_sorted = torch.sort(dt).values
-    if p == 1:
-        return F.l1_loss(dp_sorted, dt_sorted)
-    else:
-        return F.mse_loss(dp_sorted, dt_sorted)
 
+    if p == 1:
+        diff = (dp_sorted - dt_sorted).abs()
+    else:
+        diff = (dp_sorted - dt_sorted).pow(2)
+
+    # restore physical units so the magnitude isn't microscopic
+    if rescale_back:
+        if p == 1:
+            diff = diff * s
+        else:
+            diff = diff * (s * s)
+
+    return diff.mean()
 
 import torch
 
@@ -2074,3 +2426,104 @@ def build_triplets_from_cache_for_set(
         idx = torch.randperm(triplets.size(0))[:triplet_cap]
         triplets = triplets[idx]
     return triplets
+
+
+def sliced_wasserstein_sc(
+    V: torch.Tensor,             # (B2, N, D) batched embeddings (A and B interleaved)
+    mask: torch.Tensor,          # (B2, N) boolean mask
+    pair_idxA: torch.Tensor,     # (P=B, ) indices into dim0 of V for A-sets: 0,2,4...
+    pair_idxB: torch.Tensor,     # (P=B, ) indices into dim0 of V for B-sets: 1,3,5...
+    *,
+    K_proj: int = 64,            # number of random projections
+    N_cap: int = 512,            # cap elements per set for speed
+    eps: float = 1e-8,
+    use_canon: bool = True,
+) -> torch.Tensor:
+    
+    """
+    Differentiable SW2 between paired SC sets (A_p, B_p) across p in [0..B-1].
+    Returns mean SW2 over pairs (scalar tensor).
+    """
+
+    device = V.device
+    P = pair_idxA.numel()
+    if P == 0:
+        return V.sum() * 0.0  # scalar zero on same device/dtype
+
+    # optional: canonicalize each set (center + unit RMS) to remove scale
+    if use_canon:
+        # canonicalize per set using the same function you use elsewhere
+        from utils_et import canonicalize as _canon
+        Vc, _, _ = _canon(V.float(), mask)  # do math in fp32
+    else:
+        Vc = V.float()
+
+    B2, N, D = Vc.shape
+    # random Gaussian projections, shared across pairs for variance reduction
+    # shape: (K_proj, D)
+    proj = torch.randn(K_proj, D, device=device, dtype=Vc.dtype)
+    proj = F.normalize(proj, dim=1)  # unit vectors
+
+    sw_total = Vc.new_tensor(0.0)
+
+    # loop pairs (P is batch size of pairs, usually small); proj is vectorized
+    for a, b in zip(pair_idxA.tolist(), pair_idxB.tolist()):
+        ma = mask[a]  # (N,)
+        mb = mask[b]  # (N,)
+        Va = Vc[a, ma]  # (Na, D)
+        Vb = Vc[b, mb]  # (Nb, D)
+
+        # (optional) subsample for speed if very large
+        Na = Va.shape[0]
+        Nb = Vb.shape[0]
+        if Na == 0 or Nb == 0:
+            continue
+        if Na > N_cap:
+            idx = torch.randperm(Na, device=device)[:N_cap]
+            Va = Va[idx]
+            Na = N_cap
+        if Nb > N_cap:
+            idx = torch.randperm(Nb, device=device)[:N_cap]
+            Vb = Vb[idx]
+            Nb = N_cap
+
+        # project to 1D for all K at once: (K, Na)/(K, Nb)
+        Pa = Va @ proj.t()  # (Na, K)
+        Pb = Vb @ proj.t()  # (Nb, K)
+        Pa = Pa.transpose(0, 1)  # (K, Na)
+        Pb = Pb.transpose(0, 1)  # (K, Nb)
+
+        # sort along the set dimension
+        Pa_sorted, _ = torch.sort(Pa, dim=1)  # (K, Na)
+        Pb_sorted, _ = torch.sort(Pb, dim=1)  # (K, Nb)
+
+        # match by quantiles: take the smaller length and interpolate the longer
+        n = min(Na, Nb)
+        if n == 0:
+            continue
+
+        q = torch.linspace(0.0, 1.0, n, device=device, dtype=Vc.dtype)
+        # index helper
+        def _interp_rows(X):
+            # X: (K, Nrow)
+            Nrow = X.shape[1]
+            if Nrow == n:
+                return X
+            # positions in [0, Nrow-1]
+            pos = q * (Nrow - 1)
+            lo = pos.floor().long()
+            hi = (lo + 1).clamp_max(Nrow - 1)
+            w = (pos - lo.to(pos.dtype)).unsqueeze(0)  # (1, n)
+            Xlo = X.gather(1, lo.unsqueeze(0).expand(X.size(0), -1))
+            Xhi = X.gather(1, hi.unsqueeze(0).expand(X.size(0), -1))
+            return Xlo * (1 - w) + Xhi * w
+
+        A_q = _interp_rows(Pa_sorted)  # (K, n)
+        B_q = _interp_rows(Pb_sorted)  # (K, n)
+
+        # SW2 over K projections: mean_k mean_i (A_q - B_q)^2
+        sw_pair = (A_q - B_q).pow(2).mean()
+        sw_total = sw_total + sw_pair
+
+    # average over existing pairs
+    return sw_total / max(P, 1)

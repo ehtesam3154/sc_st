@@ -34,7 +34,7 @@ class MAB(nn.Module):
             self.ln1 = nn.LayerNorm(dim_V)
         self.fc_o = nn.Linear(dim_V, dim_V)
 
-    def forward(self, Q, K, key_mask=None):
+    def forward(self, Q, K, key_mask=None, attn_bias=None):
         """
         Args:
             Q: Query tensor of shape (batch_size, n_queries, dim_Q)
@@ -51,19 +51,50 @@ class MAB(nn.Module):
         K_ = torch.cat(K.split(dim_split, 2), 0)
         V_ = torch.cat(V.split(dim_split, 2), 0)
 
-        # A = torch.softmax(Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.dim_V), 2)
-        d_k = self.dim_V // self.num_heads
-        attn_logits = Q_.bmm(K_.transpose(1,2)) / math.sqrt(max(d_k, 1))
+        #compute attention scores
+        # A = Q_.bmm(K_.transpose(1,2)) / math.sqrt(self.dim_V)
+        d_h = max(self.dim_V // self.num_heads, 1)
+        A = Q_.bmm(K_.transpose(1,2)) / math.sqrt(d_h)
 
-        #apply mask if provided
+
+        #add attention bias if provided
+        if attn_bias is not None:
+            #attn_bias is (B, H, N, N) or (B, 1, N, N)
+            #current A shape after split/cat is (B*H, N, N)
+            B = Q.size(0)
+            H = self.num_heads
+            if attn_bias.size(1) == 1: #shared across heads
+                attn_bias_expanded = attn_bias.expand(B, H, -1, -1)
+            else:
+                attn_bias_expanded = attn_bias 
+            
+            #reshape to match A's shape
+            attn_bias_flat = attn_bias_expanded.transpose(0, 1).reshape(B * H, attn_bias_expanded.size(2), attn_bias_expanded.size(3))
+            A = A + attn_bias_flat
+
+        #apply key mask if provided
         if key_mask is not None:
-            #key mask: (batch, n_leys) -> expand to (batch * heads, 1, n_keys)
-            mask = (~key_mask).unsqueeze(1) # true where invalid
-            mask = mask.repeat(self.num_heads, 1, 1) #repeat for each head
-            attn_logits = attn_logits.masked_fill(mask, -1e-9)
+            #key_mask is (B, N)
+            B = Q.size(0)
+            H = self.num_heads
+            mask_expanded = key_mask.unsqueeze(1).expand(B, H, -1).reshape(B * H, 1, key_mask.size(1))
+            mask_value = -torch.finfo(A.dtype).max
+            A.masked_fill_(~mask_expanded, mask_value)
 
-        A = torch.softmax(attn_logits, dim=2)
 
+
+        # # A = torch.softmax(Q_.bmm(K_.transpose(1, 2)) / math.sqrt(self.dim_V), 2)
+        # d_k = self.dim_V // self.num_heads
+        # attn_logits = Q_.bmm(K_.transpose(1,2)) / math.sqrt(max(d_k, 1))
+
+        # #apply mask if provided
+        # if key_mask is not None:
+        #     #key mask: (batch, n_leys) -> expand to (batch * heads, 1, n_keys)
+        #     mask = (~key_mask).unsqueeze(1) # true where invalid
+        #     mask = mask.repeat(self.num_heads, 1, 1) #repeat for each head
+        #     attn_logits = attn_logits.masked_fill(mask, -1e-9)
+
+        A = torch.softmax(A, 2)
         O = torch.cat((Q_ + A.bmm(V_)).split(Q.size(0), 0), 2)
         O = O if getattr(self, 'ln0', None) is None else self.ln0(O)
         O = O + F.relu(self.fc_o(O))
@@ -86,7 +117,7 @@ class SAB(nn.Module):
         super(SAB, self).__init__()
         self.mab = MAB(dim_in, dim_in, dim_out, num_heads, ln=ln)
 
-    def forward(self, X, mask=None):
+    def forward(self, X, mask=None, attn_bias=None):
         """
         Args:
             X: Input tensor of shape (batch_size, n_points, dim_in)
@@ -94,7 +125,8 @@ class SAB(nn.Module):
         Returns:
             Output tensor of shape (batch_size, n_points, dim_out)
         """
-        return self.mab(X, X, key_mask=mask)
+        # return self.mab(X, X, key_mask=mask)
+        return self.mab(X, X, key_mask=mask, attn_bias=attn_bias)
 
 
 class ISAB(nn.Module):
@@ -117,7 +149,7 @@ class ISAB(nn.Module):
         self.mab0 = MAB(dim_out, dim_in, dim_out, num_heads, ln=ln)
         self.mab1 = MAB(dim_in, dim_out, dim_out, num_heads, ln=ln)
 
-    def forward(self, X, mask=None):
+    def forward(self, X, mask=None, attn_bias=None):
         """
         Args:
             X: Input tensor of shape (batch_size, n_points, dim_in)
@@ -125,8 +157,10 @@ class ISAB(nn.Module):
         Returns:
             Output tensor of shape (batch_size, n_points, dim_out)
         """
-        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X, key_mask=mask)
-        return self.mab1(X, H)
+        H = self.mab0(self.I.repeat(X.size(0), 1, 1), X, key_mask=mask, attn_bias=None)
+        # return self.mab1(X, H, key_mask=None, attn_bias=attn_bias)
+        return self.mab1(X, H, key_mask=None, attn_bias=None)
+
 
 
 class PMA(nn.Module):
