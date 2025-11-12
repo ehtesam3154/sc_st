@@ -37,7 +37,7 @@ from contextlib import contextmanager
 
 #debug tools
 DEBUG = True #master switch for debug logging
-LOG_EVERY = 100 #per-batch prints
+LOG_EVERY = 20 #per-batch prints
 SAVE_EVERY_EPOCH = 5 #extra plots/dumps
 
 #debug tracking variables 
@@ -725,6 +725,37 @@ def train_stageC_diffusion_generator(
         pin_memory=False
     )
 
+
+    # ============================================================================
+    # DEBUG: MINISETS SANITY CHECK
+    # ============================================================================
+    from utils_debug_minisets import sample_dataloader_and_report
+    import os
+
+    def _is_rank0():
+        try:
+            import torch.distributed as dist
+            return (not dist.is_initialized()) or (dist.get_rank() == 0)
+        except Exception:
+            return True
+
+    if _is_rank0():
+        print("\n" + "="*80)
+        print("MINISETS DRY CHECK (BEFORE TRAINING)")
+        print("="*80 + "\n")
+        sample_dataloader_and_report(
+            st_loader=st_loader,
+            sc_loader=sc_loader,
+            batches=3,
+            device=device,
+            is_global_zero=_is_rank0(),
+            save_json_path=os.path.join(outf, "minisets_check.json")
+        )
+        print("\n" + "="*80)
+        print("MINISETS CHECK COMPLETE - CHECK OUTPUT ABOVE")
+        print("="*80 + "\n")
+    # ============================================================================
+
     from utils_et import build_sc_knn_cache
 
     # Build kNN cache from SC dataset embeddings
@@ -876,6 +907,11 @@ def train_stageC_diffusion_generator(
             batch_size_real = Z_set.shape[0]
             
             D_latent = score_net.D_latent
+
+            if DEBUG and epoch == 0:
+                if fabric is None or fabric.is_global_zero:
+                    print("\n[WEIGHTS]", {k: float(v) for k, v in WEIGHTS.items()})
+                    print()
             
             # ===== FORWARD PASS WITH AMP =====
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -991,29 +1027,34 @@ def train_stageC_diffusion_generator(
                 V_hat = V_t - sigma_t * eps_pred
                 V_hat = V_hat * mask.unsqueeze(-1).float()
 
-            # EDM-cone penalty (always computed on V_hat)
-            # with torch.autocast(device_type='cuda', enabled=False):
-            #     V_hat_fp32 = V_hat.float()
-            #     mask_fp32 = mask.float()
-            #     cone_penalty = uet.edm_cone_penalty_from_V(V_hat_fp32, mask_fp32)
-            #     lambda_cone = 1e-3
-            #     L_cone = lambda_cone * cone_penalty
-
             # ----------------- Cone Loss (PSD penalty) for ST -----------------
             L_cone = torch.tensor(0.0, device=device)
             if not is_sc:
                 with torch.autocast(device_type='cuda', enabled=False):
+                    BATCH_SUB_M = 64  # sub-miniset size
                     for i in range(batch_size_real):
                         n_valid = int(n_list[i].item())
-                        if n_valid < 3:
+                        if n_valid < 8:
                             continue
 
+                        # Sample a sub-miniset S ⊂ {1..n_valid}
+                        m = min(BATCH_SUB_M, n_valid)
+                        idx = torch.randperm(n_valid, device=device)[:m]
                         V_i = V_hat[i, :n_valid].float()
-                        G_i = V_i @ V_i.T + 1e-6 * torch.eye(n_valid, device=V_i.device)
-                        eigs = torch.linalg.eigvalsh(G_i)
-                        L_cone += torch.nn.functional.softplus(-eigs).mean()
+                        V_sub = V_i[idx]  # (m, D)
 
-                L_cone = L_cone / max(1, batch_size_real)
+                        # Build distances, center, compute B = -1/2 J D^2 J
+                        D_sub = torch.cdist(V_sub, V_sub)
+                        Jm = torch.eye(m, device=device) - torch.ones(m, m, device=device) / m
+                        B = -0.5 * (Jm @ (D_sub**2) @ Jm)
+
+                        # PSD hinge on negative eigenvalues only
+                        eigs = torch.linalg.eigvalsh(B)
+                        neg = torch.relu(-eigs)  # only negative parts
+                        if neg.numel() > 0:
+                            L_cone += neg.mean()
+
+                    L_cone = L_cone / max(1, batch_size_real)
 
                 # DEBUG: Cone PSD stats
                 if DEBUG and (global_step % LOG_EVERY == 0) and not is_sc:
@@ -1242,6 +1283,222 @@ def train_stageC_diffusion_generator(
 
                         if DEBUG and (global_step % LOG_EVERY == 0):
                             print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
+
+                # ============================================================================
+                # DEBUG: RIGID TRANSFORM INVARIANCE TEST (ST batch only)
+                # ============================================================================
+                if DEBUG and (global_step % 50 == 0):
+                    with torch.no_grad():
+                        i_test = 0
+                        n_test = int(n_list[i_test].item())
+                        if n_test >= 3:
+                            print("\n" + "="*80)
+                            print(f"[RIGID_INVARIANCE_TEST] step={global_step}")
+                            print("="*80)
+
+                            Vf32 = V_hat[i_test, :n_test].detach().float()
+                            V = Vf32.double()  # fp64 for numerical headroom
+                            D = V.shape[1]
+
+                            # Stable SO(D) rotation via SVD (orthonormal to machine precision)
+                            M = torch.randn(D, D, device=V.device, dtype=torch.float64)
+                            U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+                            R = U @ Vh
+                            if torch.linalg.det(R) < 0:  # force determinant +1
+                                R[:, 0] = -R[:, 0]
+
+                            # Translation scaled to data spread to avoid huge magnitudes
+                            t = torch.randn(D, device=V.device, dtype=torch.float64) * (V.std() + 1e-6)
+
+                            Vt = (V @ R.T) + t
+
+                            # Translation/rotation-invariant distance computation in fp64
+                            def _pdist(X):
+                                x2 = (X * X).sum(dim=1, keepdim=True)
+                                D2 = (x2 + x2.T - 2.0 * (X @ X.T)).clamp_min(0.0)
+                                return D2.sqrt()
+
+                            D0 = _pdist(V)
+                            D1 = _pdist(Vt)
+
+                            diff = (D1 - D0)
+                            abs_max = diff.abs().max().item()
+                            rel = (diff.norm() / (D0.norm().clamp_min(1e-12))).item()
+
+                            print(f"[rigid] abs_max={abs_max:.3e}  rel={rel:.3e}")
+
+                            # Use relaxed, numerically sane tolerances
+                            tol_abs = 5e-4
+                            tol_rel = 1e-8
+                            if not (abs_max < tol_abs or rel < tol_rel):
+                                print("⚠ rigid check not within tolerance; continuing (diagnostic only)")
+                            else:
+                                print("✓ rigid distances preserved within tolerance")
+
+                            print("="*80 + "\n")
+
+                # if DEBUG:
+                #     with torch.no_grad():
+                #         # Pick first valid set from batch
+                #         i_test = 0
+                #         n_test = int(n_list[i_test].item())
+                #         if n_test >= 3:
+                #             print(f"\n{'='*80}")
+                #             print(f"[RIGID_INVARIANCE_TEST] step={global_step}")
+                #             print(f"{'='*80}")
+                            
+                #             # Get original coordinates
+                #             V_orig = V_hat[i_test, :n_test].clone().float()
+                #             G_tgt = G_target[i_test, :n_test, :n_test].float()
+                            
+                #             # Apply random 2D rigid transform
+                #             theta = torch.rand(1, device=device).item() * 2 * np.pi
+                #             c, s = float(np.cos(theta)), float(np.sin(theta))
+                #             R = torch.tensor([[c, -s], [s, c]], device=device, dtype=torch.float32)
+                #             t = torch.randn(2, device=device, dtype=torch.float32) * 5.0
+                            
+                #             # Apply random full-dimensional rigid transform
+                #             D_latent = V_orig.shape[1]
+                #             Q, _ = torch.linalg.qr(torch.randn(D_latent, D_latent, device=device, dtype=torch.float32))
+                #             R = Q  # orthonormal rotation matrix
+                #             t = torch.randn(D_latent, device=device, dtype=torch.float32) * 5.0
+
+                #             V_trans = (V_orig @ R.T) + t
+
+                #             print(f"  Transform: {D_latent}D rigid (rotation + translation)")
+                #             print(f"  Translation norm: {t.norm():.2f}")
+                            
+                #             # ==================== Test 1: Gram Loss (training-style) ====================
+                #             # Helper: cosine-normalized Gram (diagonal = 0)
+                #             def cos_gram(V):
+                #                 G = V @ V.T
+                #                 d = G.diag().clamp_min(1e-8)
+                #                 S = torch.sqrt(d[:, None] * d[None, :])
+                #                 C = G / S
+                #                 C.fill_diagonal_(0.0)
+                #                 return C
+
+                #             # Build target coords from Gram target, then canonicalize all
+                #             V_tgt = uet.factor_from_gram(G_tgt, D_latent).to(device)
+                #             mask_i = torch.ones(n_test, dtype=torch.bool, device=device)
+                #             V_orig_can, _, _ = uet.canonicalize(V_orig.unsqueeze(0), mask_i.unsqueeze(0))
+                #             V_orig_can = V_orig_can.squeeze(0)
+                #             V_trans_can, _, _ = uet.canonicalize(V_trans.unsqueeze(0), mask_i.unsqueeze(0))
+                #             V_trans_can = V_trans_can.squeeze(0)
+                #             V_tgt_can, _, _ = uet.canonicalize(V_tgt.unsqueeze(0), mask_i.unsqueeze(0))
+                #             V_tgt_can = V_tgt_can.squeeze(0)
+
+                #             C_orig = cos_gram(V_orig_can)
+                #             C_trans = cos_gram(V_trans_can)
+                #             C_tgt = cos_gram(V_tgt_can)
+
+                #             # Relative Frobenius, like training L_gram
+                #             def rel_frob(A, B):
+                #                 diff = A - B
+                #                 return diff.norm() / (B.norm().clamp_min(1e-12))
+
+                #             L_gram_orig = rel_frob(C_orig, C_tgt)
+                #             L_gram_trans = rel_frob(C_trans, C_tgt)
+
+                #             print(f"\n  [Gram Loss - training-style (canon + cosine), IS invariant]")
+                #             print(f"    Original:    {L_gram_orig:.8f}")
+                #             print(f"    Transformed: {L_gram_trans:.8f}")
+                #             print(f" Δ: {abs(L_gram_orig - L_gram_trans):.8f} (should be ~0)") 
+                #             assert abs(L_gram_orig - L_gram_trans) < 1e-4, "Gram training-style not invariant!"
+                #             print(f" ✓ Gram loss is frame-invariant")
+                            
+                #             # ==================== Test 2: Sliced Wasserstein ====================
+                #             # ==================== Test 2: Sliced Wasserstein (with shared projections) ====================
+                #             # Helper functions for deterministic SW test
+                #             def _pca_frame(V: torch.Tensor) -> torch.Tensor:
+                #                 X = V - V.mean(0, keepdim=True)
+                #                 U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+                #                 R = Vh  # D x D
+                #                 # Deterministic sign fix per axis
+                #                 idx = torch.argmax(R.abs(), dim=0)
+                #                 signs = torch.sign(R[idx, torch.arange(R.shape[1], device=R.device)])
+                #                 R = R * signs
+                #                 return X @ R.T
+
+                #             def _make_proj(K, D, device, seed=0):
+                #                 g = torch.Generator(device=device).manual_seed(seed)
+                #                 Q = torch.randn(K, D, generator=g, device=device)
+                #                 Q = Q / (Q.norm(dim=1, keepdim=True) + 1e-12)
+                #                 return Q  # K x D
+
+                #             def _sw_fixed(VA, VB, Q, n_cap=512):
+                #                 # Center+scale, then PCA-align to fix rotation
+                #                 mask1 = torch.ones(VA.size(0), dtype=torch.bool, device=VA.device)
+                #                 mask2 = torch.ones(VB.size(0), dtype=torch.bool, device=VB.device)
+                #                 VA, _, _ = uet.canonicalize(VA.unsqueeze(0), mask1.unsqueeze(0))
+                #                 VA = VA[0]
+                #                 VB, _, _ = uet.canonicalize(VB.unsqueeze(0), mask2.unsqueeze(0))
+                #                 VB = VB[0]
+                #                 VA = _pca_frame(VA)
+                #                 VB = _pca_frame(VB)
+                #                 # Cap for speed
+                #                 ia = torch.randperm(VA.size(0), device=VA.device)[:min(n_cap, VA.size(0))]
+                #                 ib = torch.randperm(VB.size(0), device=VB.device)[:min(n_cap, VB.size(0))]
+                #                 XA = torch.sort(VA[ia] @ Q.T, dim=0).values
+                #                 XB = torch.sort(VB[ib] @ Q.T, dim=0).values
+                #                 return (XA - XB).abs().mean()
+
+                #             V_target = uet.factor_from_gram(G_tgt, D_latent).to(device)
+                #             Q = _make_proj(K=256, D=D_latent, device=device, seed=123)
+                #             L_sw_orig = _sw_fixed(V_orig, V_target, Q)
+                #             L_sw_trans = _sw_fixed(V_trans, V_target, Q)
+
+                #             print(f"\n  [SW Loss - with shared projections and PCA alignment]")
+                #             print(f"    Original:    {L_sw_orig:.8f}")
+                #             print(f"    Transformed: {L_sw_trans:.8f}")
+                #             print(f"    Δ:           {abs(L_sw_orig - L_sw_trans):.8f}")
+                #             if abs(L_sw_orig - L_sw_trans) < 1e-5:
+                #                 print(f"    ✓ SW loss is frame-invariant (with PCA alignment)")
+                #             else:
+                #                 print(f"    ⚠️  Small difference expected without perfect alignment")
+                            
+                #             # ==================== Test 3: Ordinal Loss ====================
+                #             # Ordinal IS invariant (uses distances) - should be SAME
+                #             trips = batch.get('triplets', None)
+                #             if trips is not None:
+                #                 trips_i = trips[i_test]
+                #                 valid_mask = trips_i[:, 0] >= 0
+                #                 valid_trips = trips_i[valid_mask][:100]  # Subsample for speed
+                                
+                #                 if valid_trips.numel() > 0:
+                #                     D_orig = torch.cdist(V_orig, V_orig, p=2)
+                #                     D_trans = torch.cdist(V_trans, V_trans, p=2)
+                                    
+                #                     # Instantiate the loss module once
+                #                     ordinal_loss_fn = uet.OrdinalTripletLoss(margin=0.05)
+                #                     L_ord_orig = ordinal_loss_fn(D_orig, valid_trips)
+                #                     L_ord_trans = ordinal_loss_fn(D_trans, valid_trips)
+                                    
+                #                     print(f"\n  [Ordinal Loss - IS invariant, Δ should ≈ 0]")
+                #                     print(f"    Original:    {L_ord_orig:.8f}")
+                #                     print(f"    Transformed: {L_ord_trans:.8f}")
+                #                     print(f"    Δ:           {abs(L_ord_orig - L_ord_trans):.8f}")
+                #                     if abs(L_ord_orig - L_ord_trans) > 1e-4:
+                #                         print(f"    ⚠️  WARNING: Ordinal loss not invariant!")
+                #                     else:
+                #                         print(f"    ✓ Ordinal loss is frame-invariant")
+                            
+                #             # ==================== Distance preservation check ====================
+                #             D_orig = torch.cdist(V_orig, V_orig, p=2)
+                #             D_trans = torch.cdist(V_trans, V_trans, p=2)
+                #             D_diff = (D_orig - D_trans).abs()
+
+                #             assert D_diff.max() < 1e-5, "Rigid transform did not preserve distances!"
+                            
+                #             print(f"\n  [Distance Matrix Preservation]")
+                #             print(f"    Max |D_orig - D_trans|: {D_diff.max():.8f}")
+                #             print(f"    Mean |D_orig - D_trans|: {D_diff.mean():.8f}")
+                #             if D_diff.max() > 1e-4:
+                #                 print(f"    ⚠️  Distances NOT preserved by transform!")
+                #             else:
+                #                 print(f"    ✓ Distances preserved (rigid transform is correct)")
+                            
+                #             print(f"{'='*80}\n")
           
             else:
                 # ========================= SC STEP (INSTRUMENTED) =========================

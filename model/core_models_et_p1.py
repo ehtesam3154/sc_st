@@ -683,8 +683,14 @@ class SCSetDataset(Dataset):
         non_sharedA_pos = torch.arange(n_set)
         if n_overlap > 0:
             non_sharedA_pos = non_sharedA_pos[~torch.isin(non_sharedA_pos, ov_pos)]
-        non_shared_A = A[non_sharedA_pos]
-        mask = ~torch.isin(cand, non_shared_A)
+        # non_shared_A = A[non_sharedA_pos]
+        # mask = ~torch.isin(cand, non_shared_A)
+        # cand = cand[mask]
+
+        # n_new = n_set - n_overlap
+        # new_B = cand[:n_new]
+        # B = torch.cat([shared_global, new_B])[:n_set]
+        mask = ~torch.isin(cand, A)
         cand = cand[mask]
 
         n_new = n_set - n_overlap
@@ -699,11 +705,11 @@ class SCSetDataset(Dataset):
 
         #add landmarks from union
         if self.landmarks_L > 0:
-            #get union of A and B
+            # Get union of A and B
             union = torch.unique(torch.cat([A, B]))
             Z_union = self.Z_cpu[union]
 
-            #FPS on union to select landmarks
+            # FPS on union to select landmarks
             landmark_local = uet.farthest_point_sampling(
                 Z_union, 
                 min(self.landmarks_L, len(union)),
@@ -711,10 +717,14 @@ class SCSetDataset(Dataset):
             )
 
             landmark_global = union[landmark_local]
+            
+            # Remove any landmarks already in A or B (prevent duplicates)
+            new_landmarks_A = landmark_global[~torch.isin(landmark_global, A)]
+            new_landmarks_B = landmark_global[~torch.isin(landmark_global, B)]
 
-            #append same landmarks to both sets
-            A = torch.cat([A, landmark_global])
-            B = torch.cat([B, landmark_global])
+            # Append only NEW landmarks to both sets
+            A = torch.cat([A, new_landmarks_A])
+            B = torch.cat([B, new_landmarks_B])
 
             #update shared indices to include landmarks
             # landmarks are at the end of the both sets
@@ -738,6 +748,10 @@ class SCSetDataset(Dataset):
         Z_A = self.Z_cpu[A]
         Z_B = self.Z_cpu[B]
 
+        # Duplicate guards
+        assert A.numel() == A.unique().numel(), f"Set A has duplicates: {A.numel()} vs {A.unique().numel()}"
+        assert B.numel() == B.unique().numel(), f"Set B has duplicates: {B.numel()} vs {B.unique().numel()}"
+
         return {
             "Z_A": Z_A, "Z_B": Z_B,
             "n_A": int(A.numel()), "n_B": int(B.numel()),
@@ -752,87 +766,6 @@ class SCSetDataset(Dataset):
 
 from typing import List, Dict
 
-# def collate_sc_minisets(batch: List[Dict]) -> Dict:
-#     """
-#     Collate SC pairs: moves Z_* from CPU pinned -> CUDA (non_blocking),
-#     builds a (2B, n_max, h) tensor, and emits padded overlap tensors for batched loss.
-#     """
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     B = len(batch)
-#     n_max_A = max(x["n_A"] for x in batch)
-#     n_max_B = max(x["n_B"] for x in batch)
-#     n_max = max(n_max_A, n_max_B)
-#     h_dim = batch[0]["Z_A"].shape[1]
-
-#     Z_batch = torch.zeros(B * 2, n_max, h_dim, device=device)
-#     mask = torch.zeros(B * 2, n_max, dtype=torch.bool, device=device)
-#     n_vec = torch.zeros(B * 2, dtype=torch.long, device=device)
-
-#     # ADD THIS: Global indices tensor (padded with -1)
-#     global_indices = torch.full((B * 2, n_max), -1, dtype=torch.long, device=device)
-    
-
-#     # Overlap tensors (padded)
-#     Kmax = max((len(x["shared_A"]) for x in batch), default=0)
-#     shared_A_idx = torch.full((B, Kmax), -1, dtype=torch.long, device=device)
-#     shared_B_idx = torch.full((B, Kmax), -1, dtype=torch.long, device=device)
-#     shared_len   = torch.zeros(B, dtype=torch.long, device=device)
-#     idx_A_pairs  = torch.arange(0, 2 * B, 2, device=device, dtype=torch.long)
-#     idx_B_pairs  = torch.arange(1, 2 * B, 2, device=device, dtype=torch.long)
-
-#     for i, item in enumerate(batch):
-#         nA, nB = item["n_A"], item["n_B"]
-
-#         # move CPU pinned -> CUDA
-#         ZA = item["Z_A"].to(device, non_blocking=True)
-#         ZB = item["Z_B"].to(device, non_blocking=True)
-
-#         # place & pad
-#         Z_batch[2*i, :nA] = ZA
-#         Z_batch[2*i+1, :nB] = ZB
-#         mask[2*i, :nA] = True
-#         mask[2*i+1, :nB] = True
-#         n_vec[2*i] = nA
-#         n_vec[2*i+1] = nB
-
-#         # Copy global indices
-#         global_indices[2*i, :nA] = item["global_indices_A"].to(device, non_blocking=True)
-#         global_indices[2*i+1, :nB] = item["global_indices_B"].to(device, non_blocking=True)
-
-#         # overlaps
-#         k = len(item["shared_A"])
-#         if k > 0:
-#             shared_A_idx[i, :k] = item["shared_A"].to(device, non_blocking=True)
-#             shared_B_idx[i, :k] = item["shared_B"].to(device, non_blocking=True)
-#             shared_len[i] = k
-
-#     # Landmark masks (combine A and B into single tensor)
-#     if 'is_landmark_A' in batch[0]:
-#         is_landmark_batch = torch.zeros(B * 2, n_max, dtype=torch.bool, device=device)
-        
-#         for i, item in enumerate(batch):
-#             nA = item["n_A"]
-#             nB = item["n_B"]
-            
-#             # Copy landmark masks for A and B
-#             is_landmark_batch[2*i, :nA] = item["is_landmark_A"].to(device, non_blocking=True)
-#             is_landmark_batch[2*i+1, :nB] = item["is_landmark_B"].to(device, non_blocking=True)
-#     else:
-#         is_landmark_batch = torch.zeros(B * 2, n_max, dtype=torch.bool, device=device)
-
-#     return {
-#         "Z_set": Z_batch,          # (2B, n_max, h)
-#         "mask": mask,              # (2B, n_max)
-#         "n": n_vec,                # (2B,)
-#         "idx_A_pairs": idx_A_pairs,         # (B,)
-#         "idx_B_pairs": idx_B_pairs,         # (B,)
-#         "shared_A_idx": shared_A_idx,       # (B, Kmax) padded -1
-#         "shared_B_idx": shared_B_idx,       # (B, Kmax) padded -1
-#         "shared_len": shared_len,           # (B,)
-#         "sc_global_indices": global_indices,  # ADD THIS LINE
-#         "is_sc": True,
-#         "is_landmark": is_landmark_batch
-#     }
 
 def collate_sc_minisets(batch: List[Dict]) -> Dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
