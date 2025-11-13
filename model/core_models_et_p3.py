@@ -97,9 +97,6 @@ class GEMSModel:
                 'self_conditioning': self_conditioning,
                 'sc_feat_mode': sc_feat_mode,
             },
-            'loss': {
-                'lambda_cone': lambda_cone,
-            },
             'dataset': {
                 'landmarks_L': landmarks_L,
             }
