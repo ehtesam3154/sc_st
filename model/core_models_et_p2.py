@@ -1961,6 +1961,28 @@ def train_stageC_diffusion_generator(
                     early_stop_best = val_metric
                     print(f"[Early Stop] Warmup: best={early_stop_best:.4f} (min_epochs not reached)")
 
+        
+        # ADD THIS DEBUG - BOTH RANKS SHOULD PRINT THIS
+        print(f"[DEBUG train_stageC EPOCH END] Rank {fabric.global_rank if fabric else 0} - after early stop check, should_stop={should_stop}")
+        
+        # Broadcast stop decision to ALL ranks
+        if fabric is not None:
+            print(f"[DEBUG train_stageC BROADCAST] Rank {fabric.global_rank} - BEFORE broadcast")
+            should_stop_tensor = torch.tensor([1.0 if should_stop else 0.0], device=fabric.device)
+            fabric.broadcast(should_stop_tensor, src=0)
+            should_stop = should_stop_tensor.item() > 0.5
+            print(f"[DEBUG train_stageC BROADCAST] Rank {fabric.global_rank} - AFTER broadcast, should_stop={should_stop}")
+
+        # ALL ranks break together
+        if should_stop:
+            print(f"[DEBUG train_stageC BREAK] Rank {fabric.global_rank if fabric else 0} - about to break from loop")
+            # Delete iterator references to allow clean exit
+            del st_iter
+            if sc_iter is not None:
+                del sc_iter
+            print(f"[DEBUG train_stageC BREAK] Rank {fabric.global_rank if fabric else 0} - deleted iterators, breaking now")
+            break
+
         # Broadcast stop decision to ALL ranks
         if fabric is not None:
             should_stop_tensor = torch.tensor([1.0 if should_stop else 0.0], device=fabric.device)
@@ -2192,7 +2214,10 @@ def train_stageC_diffusion_generator(
         # Save checkpoint
         # if (epoch + 1) % 100 == 0:
         if fabric is not None:
+            print(f"[DEBUG train_stageC CKPT] Rank {fabric.global_rank} - BEFORE checkpoint barrier (epoch {epoch+1})")
             fabric.barrier()
+            print(f"[DEBUG train_stageC CKPT] Rank {fabric.global_rank} - AFTER checkpoint barrier")
+
 
         # --- save checkpoints only on rank-0 ---
         if (epoch + 1) % 50 == 0:
@@ -2229,6 +2254,13 @@ def train_stageC_diffusion_generator(
         print(f"[DEBUG train_stageC] Rank {fabric.global_rank} - passed barrier, syncing CUDA again")
         torch.cuda.synchronize()
         print(f"[DEBUG train_stageC] Rank {fabric.global_rank} - about to return")
+
+    print(f"[DEBUG train_stageC LOOP EXIT] Rank {fabric.global_rank if fabric else 0} - exited epoch loop")
+    
+    if fabric is not None:
+        print(f"[DEBUG train_stageC POST-LOOP] Rank {fabric.global_rank} - BEFORE post-loop barrier")
+        fabric.barrier()
+        print(f"[DEBUG train_stageC POST-LOOP] Rank {fabric.global_rank} - AFTER post-loop barrier")
 
 
     return history if _is_rank0() else None
