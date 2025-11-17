@@ -2210,15 +2210,26 @@ def train_stageC_diffusion_generator(
         fabric.barrier()
 
     if fabric is None or fabric.is_global_zero:
-        print("Training complete!")
+            print("Training complete!")
 
+    print(f"[DEBUG train_stageC] Rank {fabric.global_rank if fabric else 0} - deleting loaders")
     del st_loader
     if use_sc:
         del sc_loader
-    
+
+    # CRITICAL: Force CUDA synchronization before exiting training
+    print(f"[DEBUG train_stageC] Rank {fabric.global_rank if fabric else 0} - syncing CUDA")
+    torch.cuda.synchronize()
+    print(f"[DEBUG train_stageC] Rank {fabric.global_rank if fabric else 0} - CUDA synced")
+
     # Sync before exit
     if fabric is not None:
+        print(f"[DEBUG train_stageC] Rank {fabric.global_rank} - hitting barrier")
         fabric.barrier()
+        print(f"[DEBUG train_stageC] Rank {fabric.global_rank} - passed barrier, syncing CUDA again")
+        torch.cuda.synchronize()
+        print(f"[DEBUG train_stageC] Rank {fabric.global_rank} - about to return")
+
 
     return history if _is_rank0() else None
 

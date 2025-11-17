@@ -257,19 +257,51 @@ def main(args=None):
         early_stop_threshold=args.early_stop_threshold,
     )
 
+    # Single barrier after training
     fabric.barrier()
 
-    # Print early stop info
-    if fabric.is_global_zero and training_history.get('early_stopped', False):
+    # Debug prints
+    if fabric.is_global_zero:
+        print(f"[DEBUG Rank-0] Training complete, got history")
+    else:
+        print(f"[DEBUG Rank-{fabric.global_rank}] Training complete, waiting")
+
+    # Early stop info (only once!)
+    if fabric.is_global_zero and training_history and training_history.get('early_stopped', False):
         info = training_history['early_stop_info']
         print(f"\n{'='*80}")
         print(f"Training stopped early at epoch {info['epoch']}")
         print(f"Best validation metric: {info['best_metric']:.4f}")
         print(f"{'='*80}\n")
 
-    
+    # Sync before inference (only once!)
+    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] About to sync CUDA")
+    torch.cuda.synchronize()
+    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] CUDA synced, hitting barrier")
+    fabric.barrier()
+    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Passed barrier before inference")
+
+
     # ---------- Inference (rank-0 only, single GPU) ----------
     if fabric.is_global_zero:
+        print("[DEBUG Rank-0] Starting inference...")
+        
+        # CRITICAL: Unwrap DDP before single-GPU inference
+        # fabric.setup() wraps models in DistributedDataParallel
+        # DDP triggers collective ops even in eval/no_grad mode
+        # This causes rank-1 to hang waiting for ops it shouldn't participate in
+        try:
+            # Check if wrapped and unwrap to raw PyTorch module
+            if hasattr(model.context_encoder, 'module'):
+                print("[DEBUG Rank-0] Unwrapping context_encoder from DDP...")
+                model.context_encoder = model.context_encoder.module
+            if hasattr(model.score_net, 'module'):
+                print("[DEBUG Rank-0] Unwrapping score_net from DDP...")
+                model.score_net = model.score_net.module
+            print("[DEBUG Rank-0] Models unwrapped, ready for single-GPU inference")
+        except Exception as e:
+            print(f"[DEBUG Rank-0] Unwrap failed (maybe not wrapped?): {e}")
+
         from datetime import datetime
         import matplotlib.pyplot as plt
         import seaborn as sns
@@ -622,6 +654,11 @@ def main(args=None):
                     f.write(f"  {ct}: {count} cells ({count/len(scadata)*100:.1f}%)\n")
         
         print(f"✓ Saved summary: {summary_path}")
+        print("[DEBUG Rank-0] Inference complete!")
+
+    # Add this right after the inference block
+    if not fabric.is_global_zero:
+        print(f"[DEBUG Rank-{fabric.global_rank}] Reached post-inference point")
 
 
         # ============================================================================
@@ -792,6 +829,15 @@ def main(args=None):
             else:
                 print("⚠ No training history available (training may have failed)")
 
+    # CRITICAL: Synchronize before final cleanup
+    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Before final sync")
+    torch.cuda.synchronize()
+    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] After CUDA sync, hitting barrier")
+    fabric.barrier()
+    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Passed final barrier")
+
+
+    torch.cuda.synchronize()
     fabric.barrier()
 
     if fabric.is_global_zero:
@@ -799,6 +845,7 @@ def main(args=None):
 
     import torch.distributed as dist
     if dist.is_initialized():
+        torch.cuda.synchronize()
         dist.barrier()  # One more barrier to ensure all ranks ready
         dist.destroy_process_group()
     
