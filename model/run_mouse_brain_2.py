@@ -5,9 +5,30 @@ from lightning.fabric import Fabric
 import scanpy as sc
 from core_models_et_p3 import GEMSModel
 # from mouse_brain import train_gems_mousebrain  # optional, if you want its helpers
+import sys
 
 import argparse
 
+import shutil
+from pathlib import Path
+
+def ensure_disk_space(path, min_gb=10.0):
+    """Check free space, raise error if below threshold."""
+    path = Path(path)
+    if not path.exists():
+        path = Path.home()
+
+    stat = shutil.disk_usage(str(path))
+    avail_gb = stat.free / (1024**3)
+
+    print(f"[disk] Available space on {path.anchor or path}: {avail_gb:.1f} GB")
+
+    if avail_gb < min_gb:
+        raise RuntimeError(
+            f"Only {avail_gb:.1f} GB free on filesystem for {path}. "
+            f"Please delete old checkpoints/plots/logs before running inference."
+        )
+    
 def parse_args():
     parser = argparse.ArgumentParser(description='GEMS Training with Lightning Fabric')
     
@@ -116,15 +137,7 @@ def main(args=None):
 
     # ---------- Build model (same across ranks) ----------
     n_genes = len(sorted(list(set(scadata.var_names) & set(stadata.var_names))))
-    # model = GEMSModel(
-    #     n_genes=n_genes,
-    #     n_embedding=[512, 256, 128],
-    #     D_latent=16,
-    #     c_dim=256,
-    #     n_heads=4,
-    #     isab_m=64,
-    #     device=str(fabric.device),
-    # )
+
     model = GEMSModel(
         n_genes=n_genes,
         n_embedding=[512, 256, 128],
@@ -133,7 +146,6 @@ def main(args=None):
         n_heads=4,
         isab_m=64,
         device=str(fabric.device),
-        # New geometry-aware parameters
         use_canonicalize=args.use_canonicalize,
         use_dist_bias=args.use_dist_bias,
         dist_bins=args.dist_bins,
@@ -238,7 +250,7 @@ def main(args=None):
     training_history = model.train_stageC(
         st_gene_expr_dict=st_gene_expr_dict,
         sc_gene_expr=sc_expr,
-        n_min=128, n_max=256,
+        n_min=64, n_max=160,
         num_st_samples=args.num_st_samples,
         num_sc_samples=args.num_sc_samples,
         n_epochs=stageC_epochs,
@@ -246,7 +258,7 @@ def main(args=None):
         lr=lr,
         n_timesteps=500,
         sigma_min=0.01,
-        sigma_max=5.0,
+        sigma_max=7.0,
         outf=outdir,
         fabric=fabric,
         precision=precision,
@@ -274,24 +286,17 @@ def main(args=None):
         print(f"Best validation metric: {info['best_metric']:.4f}")
         print(f"{'='*80}\n")
 
-    # Sync before inference (only once!)
-    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] About to sync CUDA")
-    torch.cuda.synchronize()
-    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] CUDA synced, hitting barrier")
-    fabric.barrier()
-    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Passed barrier before inference")
-
+    if not fabric.is_global_zero:
+        return
 
     # ---------- Inference (rank-0 only, single GPU) ----------
     if fabric.is_global_zero:
         print("[DEBUG Rank-0] Starting inference...")
         
-        # CRITICAL: Unwrap DDP before single-GPU inference
-        # fabric.setup() wraps models in DistributedDataParallel
-        # DDP triggers collective ops even in eval/no_grad mode
-        # This causes rank-1 to hang waiting for ops it shouldn't participate in
         try:
             # Check if wrapped and unwrap to raw PyTorch module
+            if hasattr(model.encoder, 'module'):
+                model.encoder = model.encoder.module
             if hasattr(model.context_encoder, 'module'):
                 print("[DEBUG Rank-0] Unwrapping context_encoder from DDP...")
                 model.context_encoder = model.context_encoder.module
@@ -310,6 +315,7 @@ def main(args=None):
         # Create timestamp for all outputs
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        ensure_disk_space(outdir, min_gb=10.0)
 
         print("\n=== Inference (rank-0) with Multi-Sample Ranking ===")
 
@@ -328,16 +334,30 @@ def main(args=None):
                 # Set different seed for each sample
                 torch.manual_seed(42 + k)
 
-                sample_results = model.infer_sc_anchored(
+                # sample_results = model.infer_sc_anchored(
+                #     sc_gene_expr=sc_expr,
+                #     n_timesteps_sample=300,
+                #     return_coords=True,
+                #     anchor_size=640,
+                #     batch_size=512,      # ← REDUCED from 512 to avoid OOM
+                #     eta=0.0,
+                #     guidance_scale=7.0,
+                #     sigma_min=0.01,      # ← ADD THIS
+                #     sigma_max=5.0,      # ← MATCH TRAINING (was 5.0, should be 53.0)
+                # )
+
+
+                sample_results = model.infer_sc_patchwise(
                     sc_gene_expr=sc_expr,
                     n_timesteps_sample=300,
                     return_coords=True,
-                    anchor_size=640,
-                    batch_size=512,      # ← REDUCED from 512 to avoid OOM
+                    patch_size=512,          # was batch_size; also your Stage D batch size
+                    coverage_per_cell=5.0,   # you can tune 3–6
+                    n_align_iters=10,        # can tune 5–15
                     eta=0.0,
-                    guidance_scale=7.0,
-                    sigma_min=0.01,      # ← ADD THIS
-                    sigma_max=5.0,      # ← MATCH TRAINING (was 5.0, should be 53.0)
+                    guidance_scale=2.0,
+                    sigma_min=0.01,
+                    sigma_max=7.0,
                 )
                 
                 # Compute EDM cone penalty as quality score (lower is better)
@@ -656,204 +676,251 @@ def main(args=None):
         print(f"✓ Saved summary: {summary_path}")
         print("[DEBUG Rank-0] Inference complete!")
 
+    # # === CLEAN SYNC POINT ===
+    # # === FINAL SYNC POINT ===
+    # # Rank-1 has been waiting here while rank-0 did inference
+    # print(f"[DEBUG Rank-{fabric.global_rank}] Reaching final sync point", flush=True)
+    # torch.cuda.synchronize()
+    # if fabric.world_size > 1:
+    #     fabric.barrier()
+    # print(f"[DEBUG Rank-{fabric.global_rank}] Passed final sync point", flush=True)
+
     # Add this right after the inference block
-    if not fabric.is_global_zero:
-        print(f"[DEBUG Rank-{fabric.global_rank}] Reached post-inference point")
+    # if not fabric.is_global_zero:
+    #     print(f"[DEBUG Rank-{fabric.global_rank}] Inference skipped, ready for sync", flush=True)
+    #     print(f"[DEBUG Rank-{fabric.global_rank}] Reached post-inference point")
 
 
-        # ============================================================================
-        # PLOT STAGE C TRAINING LOSSES
-        # ============================================================================
+    #     # ============================================================================
+    #     # PLOT STAGE C TRAINING LOSSES
+    #     # ============================================================================
         
-        print("\n=== Loading and plotting Stage C training losses ===")
+    #     print("\n=== Loading and plotting Stage C training losses ===")
         
-        # ============================================================================
-        # PLOT STAGE C TRAINING LOSSES (NO CHECKPOINT NEEDED)
-        # ============================================================================
-
-        if fabric.is_global_zero:
-            print("\n=== Plotting Stage C training losses ===")
-            
-            if training_history is not None and len(training_history['epoch']) > 0:
-                epochs = training_history['epoch']
-                losses = training_history['epoch_avg']
-                
-                print(f"Found {len(epochs)} epochs of training history")
-                
-                # ============================================================================
-                # CREATE COMPREHENSIVE LOSS PLOTS
-                # ============================================================================
-                
-                # Plot 1: All losses on separate subplots (detailed view)
-                fig, axes = plt.subplots(3, 3, figsize=(20, 15))
-                fig.suptitle('Stage C Training Losses (All Components)', fontsize=18, fontweight='bold', y=0.995)
-                
-                loss_names = ['total', 'score', 'cone', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
-                colors = ['black', 'blue', 'cyan', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
-                
-                for idx, (name, color) in enumerate(zip(loss_names, colors)):
-                    if name in losses and len(losses[name]) > 0:
-                        ax = axes[idx // 3, idx % 3]
-                        ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
-                        ax.set_xlabel('Epoch', fontsize=12)
-                        ax.set_ylabel('Loss', fontsize=12)
-                        ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
-                        ax.grid(True, alpha=0.3)
-                        
-                        # Add smoothed trend line if enough data
-                        if len(epochs) > 10:
-                            from scipy.ndimage import gaussian_filter1d
-                            smoothed = gaussian_filter1d(losses[name], sigma=2)
-                            ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
-                            ax.legend(fontsize=10)
-                
-                # Hide empty subplot
-                if len(loss_names) < 9:
-                    axes[2, 2].axis('off')
-                
-                plt.tight_layout()
-                detailed_plot_filename = f"stageC_losses_detailed_{timestamp}.png"
-                detailed_plot_path = os.path.join(outdir, detailed_plot_filename)
-                plt.savefig(detailed_plot_path, dpi=300, bbox_inches='tight')
-                print(f"✓ Saved detailed loss plot: {detailed_plot_path}")
-                plt.close()
-                
-                # ============================================================================
-                # Plot 2: All losses on ONE plot (log scale for comparison)
-                # ============================================================================
-                
-                fig, ax = plt.subplots(figsize=(14, 8))
-                
-                loss_components = ['score', 'cone', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
-                colors_comp = ['blue', 'cyan', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
-                
-                for name, color in zip(loss_components, colors_comp):
-                    if name in losses and len(losses[name]) > 0:
-                        ax.plot(epochs, losses[name], color=color, linewidth=2.5, 
-                            label=name.upper(), marker='o', markersize=5, 
-                            markevery=max(1, len(epochs)//20), alpha=0.8)
-                
-                ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
-                ax.set_ylabel('Loss', fontsize=14, fontweight='bold')
-                ax.set_title('Stage C Training - All Loss Components', fontsize=16, fontweight='bold')
-                ax.set_yscale('log')
-                ax.grid(True, alpha=0.3, which='both')
-                ax.legend(fontsize=12, loc='best', framealpha=0.9)
-                
-                plt.tight_layout()
-                combined_plot_filename = f"stageC_losses_combined_{timestamp}.png"
-                combined_plot_path = os.path.join(outdir, combined_plot_filename)
-                plt.savefig(combined_plot_path, dpi=300, bbox_inches='tight')
-                print(f"✓ Saved combined loss plot: {combined_plot_path}")
-                plt.close()
-                
-                # ============================================================================
-                # Plot 3: Total loss only (clean view)
-                # ============================================================================
-                
-                fig, ax = plt.subplots(figsize=(12, 6))
-                
-                if 'total' in losses and len(losses['total']) > 0:
-                    ax.plot(epochs, losses['total'], color='black', linewidth=3, 
-                        marker='o', markersize=6, markevery=max(1, len(epochs)//20), 
-                        alpha=0.8, label='Total Loss')
-                    
-                    # Add smoothed trend
-                    if len(epochs) > 10:
-                        from scipy.ndimage import gaussian_filter1d
-                        smoothed = gaussian_filter1d(losses['total'], sigma=3)
-                        ax.plot(epochs, smoothed, '--', color='red', linewidth=2.5, 
-                            alpha=0.6, label='Trend (smoothed)')
-                    
-                    # Add min/max annotations
-                    min_loss = min(losses['total'])
-                    min_epoch = epochs[losses['total'].index(min_loss)]
-                    ax.axhline(y=min_loss, color='green', linestyle=':', linewidth=2, alpha=0.5)
-                    ax.text(0.02, 0.98, f'Min Loss: {min_loss:.4f} (Epoch {min_epoch})', 
-                        transform=ax.transAxes, fontsize=12, verticalalignment='top',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-                
-                ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
-                ax.set_ylabel('Total Loss', fontsize=14, fontweight='bold')
-                ax.set_title('Stage C Training - Total Loss', fontsize=16, fontweight='bold')
-                ax.grid(True, alpha=0.3)
-                ax.legend(fontsize=12, loc='best')
-                
-                plt.tight_layout()
-                total_plot_filename = f"stageC_loss_total_{timestamp}.png"
-                total_plot_path = os.path.join(outdir, total_plot_filename)
-                plt.savefig(total_plot_path, dpi=300, bbox_inches='tight')
-                print(f"✓ Saved total loss plot: {total_plot_path}")
-                plt.close()
-                
-                # ============================================================================
-                # Save loss history as JSON for easy access
-                # ============================================================================
-                
-                history_json = {
-                    'epochs': epochs,
-                    'losses': {k: [float(x) for x in v] for k, v in losses.items()},
-                    'n_epochs': len(epochs),
-                    'final_total_loss': float(losses['total'][-1]) if 'total' in losses else None,
-                    'min_total_loss': float(min(losses['total'])) if 'total' in losses else None,
-                    'timestamp': timestamp
-                }
-                
-                json_filename = f"stageC_training_history_{timestamp}.json"
-                json_path = os.path.join(outdir, json_filename)
-                
-                import json
-                with open(json_path, 'w') as f:
-                    json.dump(history_json, f, indent=2)
-                
-                print(f"✓ Saved training history JSON: {json_path}")
-                
-                # ============================================================================
-                # Print loss summary
-                # ============================================================================
-                
-                print("\n" + "="*70)
-                print("STAGE C TRAINING SUMMARY")
-                print("="*70)
-                print(f"Total epochs trained: {len(epochs)}")
-                print(f"Final total loss: {losses['total'][-1]:.4f}")
-                print(f"Minimum total loss: {min(losses['total']):.4f} (Epoch {epochs[losses['total'].index(min(losses['total']))]})") 
-                
-                print("\nFinal loss components:")
-                for name in loss_components:
-                    if name in losses and len(losses[name]) > 0:
-                        print(f"  {name}: {losses[name][-1]:.4f}")
-                
-                print("="*70)
-                
-            else:
-                print("⚠ No training history available (training may have failed)")
-
-    # CRITICAL: Synchronize before final cleanup
-    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Before final sync")
-    torch.cuda.synchronize()
-    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] After CUDA sync, hitting barrier")
-    fabric.barrier()
-    print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Passed final barrier")
-
-
-    torch.cuda.synchronize()
-    fabric.barrier()
+    #     # ============================================================================
+    #     # PLOT STAGE C TRAINING LOSSES (NO CHECKPOINT NEEDED)
+    #     # ============================================================================
 
     if fabric.is_global_zero:
-        print("\n✓ All ranks synchronized - program complete")
+        print("\n=== Plotting Stage C training losses ===")
+        
+        if training_history is not None and len(training_history['epoch']) > 0:
+            epochs = training_history['epoch']
+            losses = training_history['epoch_avg']
+            
+            print(f"Found {len(epochs)} epochs of training history")
+            
+            # ============================================================================
+            # CREATE COMPREHENSIVE LOSS PLOTS
+            # ============================================================================
+            
+            # Plot 1: All losses on separate subplots (detailed view)
+            fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+            fig.suptitle('Stage C Training Losses (All Components)', fontsize=18, fontweight='bold', y=0.995)
+            
+            # loss_names = ['total', 'score', 'cone', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
+            loss_names = ['total', 'score', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc', 'st_dist']
+            # colors = ['black', 'blue', 'cyan', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
+            colors = ['black', 'blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'magenta']
+            
+            for idx, (name, color) in enumerate(zip(loss_names, colors)):
+                if name in losses and len(losses[name]) > 0:
+                    ax = axes[idx // 3, idx % 3]
+                    ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
+                    ax.set_xlabel('Epoch', fontsize=12)
+                    ax.set_ylabel('Loss', fontsize=12)
+                    ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Add smoothed trend line if enough data
+                    if len(epochs) > 10:
+                        from scipy.ndimage import gaussian_filter1d
+                        smoothed = gaussian_filter1d(losses[name], sigma=2)
+                        ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
+                        ax.legend(fontsize=10)
+            
+            # Hide empty subplot
+            if len(loss_names) < 9:
+                axes[2, 2].axis('off')
+            
+            plt.tight_layout()
+            detailed_plot_filename = f"stageC_losses_detailed_{timestamp}.png"
+            detailed_plot_path = os.path.join(outdir, detailed_plot_filename)
+            plt.savefig(detailed_plot_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved detailed loss plot: {detailed_plot_path}")
+            plt.close()
+            
+            # ============================================================================
+            # Plot 2: All losses on ONE plot (log scale for comparison)
+            # ============================================================================
+            
+            fig, ax = plt.subplots(figsize=(14, 8))
+            
+            # loss_components = ['score', 'cone', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc']
+            loss_components = ['score', 'gram', 'heat', 'sw_st', 'sw_sc', 'overlap', 'ordinal_sc', 'st_dist']
+            # colors_comp = ['blue', 'cyan', 'red', 'green', 'orange', 'purple', 'brown', 'pink']
+            colors_comp = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'magenta']
+            
+            for name, color in zip(loss_components, colors_comp):
+                if name in losses and len(losses[name]) > 0:
+                    ax.plot(epochs, losses[name], color=color, linewidth=2.5, 
+                        label=name.upper(), marker='o', markersize=5, 
+                        markevery=max(1, len(epochs)//20), alpha=0.8)
+            
+            ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Loss', fontsize=14, fontweight='bold')
+            ax.set_title('Stage C Training - All Loss Components', fontsize=16, fontweight='bold')
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3, which='both')
+            ax.legend(fontsize=12, loc='best', framealpha=0.9)
+            
+            plt.tight_layout()
+            combined_plot_filename = f"stageC_losses_combined_{timestamp}.png"
+            combined_plot_path = os.path.join(outdir, combined_plot_filename)
+            plt.savefig(combined_plot_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved combined loss plot: {combined_plot_path}")
+            plt.close()
+            
+            # ============================================================================
+            # Plot 3: Total loss only (clean view)
+            # ============================================================================
+            
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            if 'total' in losses and len(losses['total']) > 0:
+                ax.plot(epochs, losses['total'], color='black', linewidth=3, 
+                    marker='o', markersize=6, markevery=max(1, len(epochs)//20), 
+                    alpha=0.8, label='Total Loss')
+                
+                # Add smoothed trend
+                if len(epochs) > 10:
+                    from scipy.ndimage import gaussian_filter1d
+                    smoothed = gaussian_filter1d(losses['total'], sigma=3)
+                    ax.plot(epochs, smoothed, '--', color='red', linewidth=2.5, 
+                        alpha=0.6, label='Trend (smoothed)')
+                
+                # Add min/max annotations
+                min_loss = min(losses['total'])
+                min_epoch = epochs[losses['total'].index(min_loss)]
+                ax.axhline(y=min_loss, color='green', linestyle=':', linewidth=2, alpha=0.5)
+                ax.text(0.02, 0.98, f'Min Loss: {min_loss:.4f} (Epoch {min_epoch})', 
+                    transform=ax.transAxes, fontsize=12, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Total Loss', fontsize=14, fontweight='bold')
+            ax.set_title('Stage C Training - Total Loss', fontsize=16, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=12, loc='best')
+            
+            plt.tight_layout()
+            total_plot_filename = f"stageC_loss_total_{timestamp}.png"
+            total_plot_path = os.path.join(outdir, total_plot_filename)
+            plt.savefig(total_plot_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved total loss plot: {total_plot_path}")
+            plt.close()
+            
+            # ============================================================================
+            # Save loss history as JSON for easy access
+            # ============================================================================
+            
+            history_json = {
+                'epochs': epochs,
+                'losses': {k: [float(x) for x in v] for k, v in losses.items()},
+                'n_epochs': len(epochs),
+                'final_total_loss': float(losses['total'][-1]) if 'total' in losses else None,
+                'min_total_loss': float(min(losses['total'])) if 'total' in losses else None,
+                'timestamp': timestamp
+            }
+            
+            json_filename = f"stageC_training_history_{timestamp}.json"
+            json_path = os.path.join(outdir, json_filename)
+            
+            import json
+            with open(json_path, 'w') as f:
+                json.dump(history_json, f, indent=2)
+            
+            print(f"✓ Saved training history JSON: {json_path}")
+            
+            # ============================================================================
+            # Print loss summary
+            # ============================================================================
+            
+            print("\n" + "="*70)
+            print("STAGE C TRAINING SUMMARY")
+            print("="*70)
+            print(f"Total epochs trained: {len(epochs)}")
+            print(f"Final total loss: {losses['total'][-1]:.4f}")
+            print(f"Minimum total loss: {min(losses['total']):.4f} (Epoch {epochs[losses['total'].index(min(losses['total']))]})") 
+            
+            print("\nFinal loss components:")
+            for name in loss_components:
+                if name in losses and len(losses[name]) > 0:
+                    print(f"  {name}: {losses[name][-1]:.4f}")
+            
+            print("="*70)
+            
+        else:
+            print("⚠ No training history available (training may have failed)")
 
-    import torch.distributed as dist
-    if dist.is_initialized():
-        torch.cuda.synchronize()
-        dist.barrier()  # One more barrier to ensure all ranks ready
-        dist.destroy_process_group()
+    # CRITICAL: Synchronize before final cleanup
+    # print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Before final sync")
+    # torch.cuda.synchronize()
+    # print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] After CUDA sync, hitting barrier")
+    # fabric.barrier()
+    # print(f"[DEBUG Rank-{fabric.global_rank if not fabric.is_global_zero else 0}] Passed final barrier")
+
+
+    # torch.cuda.synchronize()
+    # fabric.barrier()
+
+    # # Rank-1: just wait here, do nothing
+    # if not fabric.is_global_zero:
+    #     print(f"[DEBUG Rank-{fabric.global_rank}] Waiting for rank-0 inference to complete...")
+    #     torch.cuda.synchronize()
+    #     torch.cuda.empty_cache()
+
+    # # Single final sync so both ranks leave Stage D at the same point
+    # print(f"[DEBUG Rank-{fabric.global_rank}] Final sync before exit", flush=True)
+    # torch.cuda.synchronize()
+    # # if fabric.world_size > 1:
+    # #     fabric.barrier()
+    # print(f"[DEBUG Rank-{fabric.global_rank}] Final sync passed", flush=True)
+
+    # if fabric.is_global_zero:
+    #     print("\n✓ All ranks synchronized - program complete")
+
+    # No destroy_process_group and no os._exit() here.
+    # Let main() just return; global __main__ block will handle hard exit.
+
+
+    # if fabric.is_global_zero:
+    #     print("\n✓ All ranks synchronized - program complete")
     
-    # Force CUDA synchronization and cleanup
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    # # 1. Sync CUDA to ensure all GPU work (like the patchwise loop) is 100% done
+    # torch.cuda.synchronize()
+    
+    # # 2. Barrier FIRST (while process group is still alive)
+    # # This ensures Rank 1 doesn't get stuck waiting for a destroyed Rank 0
+    # if fabric.world_size > 1:
+    #     print(f"[DEBUG Rank-{fabric.global_rank}] Hitting final barrier", flush=True)
+    #     fabric.barrier() 
+    #     print(f"[DEBUG Rank-{fabric.global_rank}] Passed final barrier", flush=True)
+
+    # # 3. Destroy process group
+    # import torch.distributed as dist
+    # if dist.is_initialized():
+    #     dist.destroy_process_group()
+
+    # # 4. Hard Exit
+    # # This forces the script to close even if background threads (dataloaders) remain
+    # print(f"[DEBUG Rank-{fabric.global_rank}] Force exiting...", flush=True)
+    # os._exit(0)
 
 
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+
+    import os
+    os._exit(0)

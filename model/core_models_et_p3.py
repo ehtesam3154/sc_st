@@ -140,7 +140,8 @@ class GEMSModel:
             angle_bins=angle_bins,
             knn_k=knn_k,
             self_conditioning=self_conditioning,
-            sc_feat_mode=sc_feat_mode
+            sc_feat_mode=sc_feat_mode,
+            use_st_dist_head=True
         ).to(device)
         
         print(f"GEMS Model initialized:")
@@ -268,6 +269,11 @@ class GEMSModel:
         precision: str = "16-mixed",
         logger = None,
         log_interval: int = 10,
+        # Early stopping
+        enable_early_stop: bool = True,
+        early_stop_min_epochs: int = 12,
+        early_stop_patience: int = 6,
+        early_stop_threshold: float = 0.01,
 ):
         """
         Train diffusion generator with mixed ST/SC regimen.
@@ -286,18 +292,6 @@ class GEMSModel:
         }
         sc_gene_expr_cpu = sc_gene_expr.cpu() if torch.is_tensor(sc_gene_expr) else sc_gene_expr
 
-        # st_dataset = STSetDataset(
-        #     targets_dict=self.targets_dict,
-        #     encoder=self.encoder,
-        #     st_gene_expr_dict=st_gene_expr_dict_cpu,  # Use CPU version
-        #     n_min=n_min,
-        #     n_max=n_max,
-        #     D_latent=self.D_latent,
-        #     num_samples=num_st_samples,
-        #     knn_k=12,
-        #     device=self.device
-        # )
-
         st_dataset = STSetDataset(
             targets_dict=self.targets_dict,
             encoder=self.encoder,
@@ -311,25 +305,21 @@ class GEMSModel:
             landmarks_L=self.cfg['dataset']['landmarks_L']  # ADD THIS
         )
                 
-        # SC dataset
-        # sc_dataset = SCSetDataset(
-        #     sc_gene_expr=sc_gene_expr_cpu,  # Use CPU version
-        #     encoder=self.encoder,
-        #     n_min=n_min,
-        #     n_max=n_max,
-        #     num_samples=num_sc_samples,
-        #     device=self.device
-        # )
-
-        sc_dataset = SCSetDataset(
-            sc_gene_expr=sc_gene_expr_cpu,
-            encoder=self.encoder,
-            n_min=n_min,
-            n_max=n_max,
-            num_samples=num_sc_samples,
-            device=self.device,
-            landmarks_L=self.cfg['dataset']['landmarks_L']  # ADD THIS
-        )
+        # SC dataset (optional - can be None if num_sc_samples=0)
+        if num_sc_samples > 0:
+            sc_dataset = SCSetDataset(
+                sc_gene_expr=sc_gene_expr_cpu,
+                encoder=self.encoder,
+                n_min=n_min,
+                n_max=n_max,
+                num_samples=num_sc_samples,
+                device=self.device,
+                landmarks_L=self.cfg['dataset']['landmarks_L']
+            )
+            print(f"[SC Dataset] Created with {num_sc_samples} samples")
+        else:
+            sc_dataset = None
+            print("[SC Dataset] DISABLED (num_sc_samples=0)")
 
         
         # Precompute ST prototypes
@@ -363,54 +353,17 @@ class GEMSModel:
             precision=precision,
             logger=logger,
             log_interval=log_interval,
+            # Early stopping
+            enable_early_stop=enable_early_stop,
+            early_stop_min_epochs=early_stop_min_epochs,
+            early_stop_patience=early_stop_patience,
+            early_stop_threshold=early_stop_threshold,
         )
         
         print("Stage C complete.")
 
         return history
     
-    # ==========================================================================
-    # STAGE D: SC INFERENCE
-    # ==========================================================================
-    
-    def infer_sc(
-        self,
-        sc_gene_expr: torch.Tensor,
-        n_samples: int = 1,
-        n_timesteps_sample: int = 250,
-        return_coords: bool = True
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Infer EDM (and coordinates) for SC data.
-        
-        Args:
-            sc_gene_expr: (n_sc, n_genes)
-            n_samples: number of samples (currently only 1 supported)
-            n_timesteps_sample: reverse diffusion steps
-            return_coords: whether to compute coordinates
-            
-        Returns:
-            dict with 'D_edm', optionally 'coords', 'coords_canon'
-        """
-        print("\n" + "="*60)
-        print("STAGE D: SC Inference")
-        print("="*60)
-        
-        results = sample_sc_edm(
-            sc_gene_expr=sc_gene_expr,
-            encoder=self.encoder,
-            context_encoder=self.context_encoder,
-            score_net=self.score_net,
-            n_samples=n_samples,
-            n_timesteps_sample=n_timesteps_sample,
-            sigma_min=0.01,
-            sigma_max=50.0,
-            return_coords=return_coords,
-            device=self.device
-        )
-        
-        return results
-
 
     def save(self, path: str):
         """Save model checkpoint."""
@@ -498,179 +451,22 @@ class GEMSModel:
         print("\n" + "="*60)
         print("GEMS TRAINING COMPLETE!")
         print("="*60)
-
-
-    def infer_sc_batched(
-        self,
-        sc_gene_expr: torch.Tensor,
-        n_timesteps_sample: int = 250,
-        return_coords: bool = True,
-        batch_size: int = 512
-    ) -> Dict[str, torch.Tensor]:
-        """
-        MEMORY-OPTIMIZED batched inference for SC data.
-        
-        Processes cells in batches to avoid OOM errors.
-        
-        Args:
-            sc_gene_expr: (n_sc, n_genes)
-            n_timesteps_sample: reverse diffusion steps
-            return_coords: whether to compute coordinates
-            batch_size: cells per batch (reduce if OOM)
-            
-        Returns:
-            dict with 'D_edm', optionally 'coords', 'coords_canon'
-        """
-        print("\n" + "="*60)
-        print("STAGE D: SC Inference (BATCHED)")
-        print("="*60)
-        
-        self.encoder.eval()
-        self.context_encoder.eval()
-        self.score_net.eval()
-        
-        n_sc = sc_gene_expr.shape[0]
-        D_latent = self.D_latent
-        
-        print(f"Processing {n_sc} cells in batches of {batch_size}...")
-        
-        n_batches = (n_sc + batch_size - 1) // batch_size
-        all_V_0 = []
-        
-        with torch.no_grad():
-            for batch_idx in range(n_batches):
-                if batch_idx % 5 == 0:
-                    print(f"  Batch {batch_idx+1}/{n_batches}...")
-                
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, n_sc)
-                batch_size_actual = end_idx - start_idx
-                
-                sc_batch = sc_gene_expr[start_idx:end_idx].to(self.device)
-                
-                # Encode
-                Z_sc_batch = self.encoder(sc_batch)
-                Z_sc_input = Z_sc_batch.unsqueeze(0)
-                mask = torch.ones(1, batch_size_actual, dtype=torch.bool, device=self.device)
-                
-                # Context
-                H = self.context_encoder(Z_sc_input, mask)
-                
-                # Initialize noise
-                V_t = torch.randn(1, batch_size_actual, D_latent, device=self.device) * 50.0
-                V_t = V_t - V_t.mean(dim=1, keepdim=True)
-                
-                if not torch.isfinite(V_t).all():
-                    print(f"WARNING: NaNs in batch {batch_idx+1}/{n_batches}")
-                    V_t = torch.nan_to_num(V_t, nan=0.0, posinf=0.0, neginf=0.0)
-
-                # Reverse diffusion
-                sigmas = torch.exp(torch.linspace(
-                    np.log(50.0), np.log(0.01), n_timesteps_sample, device=self.device
-                ))
-                
-                for t_idx in reversed(range(n_timesteps_sample)):
-                    t_norm = torch.tensor([[t_idx / (n_timesteps_sample - 1)]], device=self.device)
-                    sigma_t = sigmas[t_idx]
-                    
-                    eps_pred = self.score_net(V_t, t_norm, H, mask)
-                    s_hat = -eps_pred / (sigma_t + 1e-8)  # Convert eps to score
-
-                    if t_idx > 0:
-                        sigma_prev = sigmas[t_idx - 1]
-                        d_sigma = sigma_prev - sigma_t
-                        V_t = V_t + d_sigma * s_hat
-                        
-                        # Optional stochasticity
-                        eta = 0.2  # Start deterministic
-                        if eta > 0:
-                            noise_std = ((sigma_prev**2 - sigma_t**2).clamp(min=0)).sqrt()
-                            V_t = V_t + eta * noise_std * torch.randn_like(V_t)
-                    else:
-                        V_t = V_t - sigma_t * s_hat
-                    
-                    V_t = V_t - V_t.mean(dim=1, keepdim=True)
-                
-                # Store on CPU
-                all_V_0.append(V_t.squeeze(0).cpu())
-                
-                # Clear cache
-                del Z_sc_batch, Z_sc_input, H, V_t, eps_pred, sc_batch, mask
-                if self.device == 'cuda':
-                    torch.cuda.empty_cache()
-        
-        # Concatenate
-        V_0_full = torch.cat(all_V_0, dim=0)
-        print(f"Concatenated V_0: {V_0_full.shape}")
-        
-        # Compute distances on CPU
-        print("Computing Gram and distances...")
-        G = V_0_full @ V_0_full.t()
-        diag = torch.diag(G).unsqueeze(1)
-        D = torch.sqrt(torch.clamp(diag + diag.t() - 2 * G, min=0))
-        
-        # EDM projection
-        print("EDM projection...")
-        try:
-            D_gpu = D.to(self.device)
-            D_edm = uet.edm_project(D_gpu).cpu()
-            del D_gpu
-            if self.device == 'cuda':
-                torch.cuda.empty_cache()
-        except:
-            D_edm = uet.edm_project(D)
-
-        if not torch.isfinite(D).all():
-            print("WARNING: Non-finite distances before EDM projection!")
-            D = torch.nan_to_num(D, nan=1e-3, posinf=1e3, neginf=0.0)
-        
-        result = {'D_edm': D_edm}
-        
-        if return_coords:
-            print("Computing MDS coordinates...")
-            try:
-                D_edm_gpu = D_edm.to(self.device)
-                n = D_edm_gpu.shape[0]
-                J = torch.eye(n, device=self.device) - torch.ones(n, n, device=self.device) / n
-                B = -0.5 * J @ (D_edm_gpu ** 2) @ J
-                coords = uet.classical_mds(B, d_out=2)
-                coords_canon = uet.canonicalize_coords(coords)
-                result['coords'] = coords.cpu()
-                result['coords_canon'] = coords_canon.cpu()
-                del D_edm_gpu, J, B, coords, coords_canon
-                if self.device == 'cuda':
-                    torch.cuda.empty_cache()
-            except:
-                print("  (using CPU for MDS)")
-                n = D_edm.shape[0]
-                J = torch.eye(n) - torch.ones(n, n) / n
-                B = -0.5 * J @ (D_edm ** 2) @ J
-                coords = uet.classical_mds(B, d_out=2)
-                coords_canon = uet.canonicalize_coords(coords)
-                result['coords'] = coords
-                result['coords_canon'] = coords_canon
-        
-        print("SC inference complete!")
-        return result
     
+
+
     def infer_sc_anchored(
         self,
         sc_gene_expr: torch.Tensor,
-        n_timesteps_sample: int = 300,
+        n_timesteps_sample: int = 160,
+        sigma_min: float = 0.01,
+        sigma_max: float = 5.0,
         return_coords: bool = True,
-        anchor_size: int = 640,
+        anchor_size: int = 384,
         batch_size: int = 512,
         eta: float = 0.0,
-        guidance_scale: float = 7.0,
-        # OPTIONAL: expose stitching knobs if you want to tweak without touching p2.py
-        K_ANCH: int = 112,
-        L2_REG: float = 3e-4,
-        CARRY_K: int = 256,
-        RES_CAP: int = 3500,
+        guidance_scale: float = 8.0,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Anchored SC inference (structure-first stitching).
-        """
+        
         from core_models_et_p2 import sample_sc_edm_anchored
         
         return sample_sc_edm_anchored(
@@ -679,19 +475,63 @@ class GEMSModel:
             context_encoder=self.context_encoder,
             score_net=self.score_net,
             n_timesteps_sample=n_timesteps_sample,
-            sigma_min=0.01,
-            sigma_max=5.0,            # ← match Stage C training (CHANGE from 50.0)
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
             return_coords=return_coords,
             anchor_size=anchor_size,
             batch_size=batch_size,
             eta=eta,
-            guidance_scale=guidance_scale,
             device=self.device,
-            # pass-through for the new optional knobs (safe defaults if you omit)
-            K_ANCH=K_ANCH,
-            L2_REG=L2_REG,
-            CARRY_K=CARRY_K,
-            RES_CAP=RES_CAP,
+            guidance_scale=guidance_scale,
+            DEBUG_FLAG=True,
+            DEBUG_EVERY=10,
         )
+    
+    def infer_sc_patchwise(
+        self,
+        sc_gene_expr: torch.Tensor,
+        n_timesteps_sample: int = 160,
+        sigma_min: float = 0.01,
+        sigma_max: float = 5.0,
+        return_coords: bool = True,
+        patch_size: int = 384,
+        coverage_per_cell: float = 4.0,
+        n_align_iters: int = 10,
+        eta: float = 0.0,
+        guidance_scale: float = 3.0,
+        debug_flag: bool = True,
+        debug_every: int = 10,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        SC inference using patch-based global alignment (no masked/frozen points).
+        """
+        from core_models_et_p2 import sample_sc_edm_patchwise
+
+        # If you have a stored ST scale, you can pass it; otherwise None
+        target_st_p95 = getattr(self, "target_st_p95", None)
+
+        res = sample_sc_edm_patchwise(
+            sc_gene_expr=sc_gene_expr,
+            encoder=self.encoder,
+            context_encoder=self.context_encoder,
+            score_net=self.score_net,
+            target_st_p95=target_st_p95,
+            n_timesteps_sample=n_timesteps_sample,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            guidance_scale=guidance_scale,
+            eta=eta,
+            device=self.device,
+            patch_size=patch_size,
+            coverage_per_cell=coverage_per_cell,
+            n_align_iters=n_align_iters,
+            return_coords=return_coords,
+            DEBUG_FLAG=debug_flag,
+            DEBUG_EVERY=debug_every,
+        )
+
+        return res
+
+
 
 

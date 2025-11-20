@@ -69,6 +69,43 @@ def canonicalize(V, mask, eps=1e-8):
 
     return V_scaled, mean, scale
 
+def canonicalize_unit_rms(V, mask, eps=1e-8):
+    """
+    Center and scale V to unit RMS per set.
+    Used ONLY for scale-invariant losses (SW losses).
+    """
+    B, N, D = V.shape
+    mask_expanded = mask.unsqueeze(-1)
+    
+    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+    mean = (V * mask_expanded).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+    
+    V_centered = (V - mean) * mask_expanded
+    
+    sq_norms = (V_centered ** 2).sum(dim=-1)
+    rms_sq = (sq_norms * mask).sum(dim=1) / valid_counts.squeeze(-1)
+    scale = torch.sqrt(rms_sq + eps).unsqueeze(1).unsqueeze(2)
+    
+    V_scaled = V_centered / scale
+    V_scaled = V_scaled * mask_expanded
+    
+    return V_scaled, mean, scale
+
+
+def center_only(V, mask, eps=1e-8):
+    """
+    Center V per set, DO NOT rescale.
+    This is what diffusion + Gram + heat should use.
+    """
+    B, N, D = V.shape
+    mask_expanded = mask.unsqueeze(-1)
+    
+    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+    mean = (V * mask_expanded).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+    
+    V_centered = (V - mean) * mask_expanded
+    return V_centered, mean
+
 def pairwise_dist2(V, mask):
     '''
     squared pairwise distances
@@ -88,51 +125,53 @@ def pairwise_dist2(V, mask):
     return D2
 
 def make_distance_bias(D2, mask, n_bins=16, d_emb=32, share_across_heads=True,
-                       E_bin=None, W=None, alpha_bias=None, device=None):
+                       E_bin=None, W=None, alpha_bias=None, device=None, bin_edges=None):
     '''
     convert squared distances to attention bias
     returns attn_bias: (B, 1, N, N) if share_across_heads else (B, H, N, N)
-    also returns params if they weren't provided (for init)
+    also returns bin_ids for distogram supervision
     '''
+
+    #set bin edges to None to not have distogram loss
+    
     B, N, _ = D2.shape
-    device= D2.device if device is None else device
+    device = D2.device if device is None else device
 
     # Init learnable params if not provided
     if E_bin is None:
         E_bin = nn.Parameter(torch.randn(n_bins, d_emb, device=device) / math.sqrt(d_emb))
     if W is None:
-        out_dim = 1 if share_across_heads else 8  # assuming 8 heads
+        out_dim = 1 if share_across_heads else 8
         W = nn.Parameter(torch.randn(d_emb, out_dim, device=device) * 0.01)
     if alpha_bias is None:
         alpha_bias = nn.Parameter(torch.tensor(0.1, device=device))
 
-    #compute distances and bucketize
-    D = torch.sqrt(D2. clamp(min=1e-8))
+    D = torch.sqrt(D2.clamp(min=1e-8))
 
-    #define bin edges (linear spacing from 0 to 3)
-    edges = torch.linspace(0, 3.0, n_bins, device=device)
+    # Use provided bin_edges or fall back to linear spacing
+    if bin_edges is not None:
+        edges = bin_edges.to(device)
+        bin_ids = torch.bucketize(D.contiguous(), edges.contiguous()) - 1
+        bin_ids = bin_ids.clamp(min=0, max=n_bins - 1)
+    else:
+        edges = torch.linspace(0, 3.0, n_bins, device=device)
+        bin_ids = torch.searchsorted(edges, D.flatten()).reshape(B, N, N)
+        bin_ids = torch.clamp(bin_ids, 0, n_bins - 1)
 
-    #assign to bins
-    bin_ids = torch.searchsorted(edges, D.flatten()).reshape(B, N, N)
-    bin_ids = torch.clamp(bin_ids, 0, n_bins - 1)
-
-    #embed bins
     bin_embeddings = E_bin[bin_ids]
 
-    # Project to bias
-    bias_raw = torch.matmul(bin_embeddings, W)  # (B, N, N, out_dim)
+    bias_raw = torch.matmul(bin_embeddings, W)
     
-    # Apply mask
-    mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)  # (B, N, N)
+    mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)
     
     if share_across_heads:
-        bias = bias_raw.squeeze(-1) * mask_2d  # (B, N, N)
-        attn_bias = alpha_bias * bias.unsqueeze(1)  # (B, 1, N, N)
+        bias = bias_raw.squeeze(-1) * mask_2d
+        attn_bias = alpha_bias * bias.unsqueeze(1)
     else:
         bias = bias_raw.permute(0, 3, 1, 2) * mask_2d.unsqueeze(1)
         attn_bias = alpha_bias * bias
     
-    return attn_bias, (E_bin, W, alpha_bias)
+    return attn_bias, (E_bin, W, alpha_bias), bin_ids
 
 def knn_graph(V, mask, k=12):
     """
@@ -1984,10 +2023,18 @@ def sliced_wasserstein_sc(
     if P == 0:
         return V.sum() * 0.0  # scalar zero on same device/dtype
 
+    # # optional: canonicalize each set (center + unit RMS) to remove scale
+    # if use_canon:
+    #     # canonicalize per set using the same function you use elsewhere
+    #     from utils_et import canonicalize as _canon
+    #     Vc, _, _ = _canon(V.float(), mask)  # do math in fp32
+    # else:
+    #     Vc = V.float()
+
     # optional: canonicalize each set (center + unit RMS) to remove scale
     if use_canon:
         # canonicalize per set using the same function you use elsewhere
-        from utils_et import canonicalize as _canon
+        from utils_et import canonicalize_unit_rms as _canon
         Vc, _, _ = _canon(V.float(), mask)  # do math in fp32
     else:
         Vc = V.float()
@@ -2061,3 +2108,47 @@ def sliced_wasserstein_sc(
 
     # average over existing pairs
     return sw_total / max(P, 1)
+
+def init_st_dist_bins_from_data(
+    coords: np.ndarray,   # (N, 2) or (N, d)
+    n_bins: int = 24,
+    mode: str = "log",    # or "quantile" / "linear"
+    max_quantile: float = 0.99,
+):
+    """
+    Build distance bin edges automatically from ST coordinates.
+    Returns: torch.tensor of shape (n_bins+1,) = bin edges (increasing).
+    """
+    from scipy.spatial.distance import pdist
+    
+    # coords: use a random subset if huge
+    if coords.shape[0] > 2000:
+        idx = np.random.choice(coords.shape[0], 2000, replace=False)
+        coords = coords[idx]
+
+    D = pdist(coords, metric="euclidean")
+    D = torch.from_numpy(D.astype(np.float32))
+
+    D_pos = D[D > 0]
+
+    if mode == "quantile":
+        qs = torch.linspace(0., max_quantile, n_bins + 1)
+        edges = torch.quantile(D_pos, qs)
+        edges[0] = 0.0
+    elif mode == "log":
+        eps = 1e-3
+        d_min = torch.quantile(D_pos, 0.01).item()
+        d_max = torch.quantile(D_pos, max_quantile).item()
+        edges = torch.exp(
+            torch.linspace(
+                np.log(d_min + eps),
+                np.log(d_max + eps),
+                n_bins + 1
+            )
+        )
+        edges[0] = 0.0
+    else:  # "linear"
+        d_max = torch.quantile(D_pos, max_quantile).item()
+        edges = torch.linspace(0.0, d_max, n_bins + 1)
+
+    return edges
