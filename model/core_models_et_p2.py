@@ -912,7 +912,7 @@ def train_stageC_diffusion_generator(
 
     
     # CFG config
-    p_uncond = 0.15
+    p_uncond = 0.25
     
     history = {
         'epoch': [],
@@ -951,9 +951,11 @@ def train_stageC_diffusion_generator(
     # print(f"[synced] sigma_data = {sigma_data:.4f}")
 
     # For now, force sigma_data to match canonicalized V_0 scale.
-    sigma_data = 1.0
-    print("[StageC] Overriding sigma_data → 1.0 (V_0 is unit-RMS)")
+    # sigma_data = 1.0
+    # print("[StageC] Overriding sigma_data → 1.0 (V_0 is unit-RMS)")
+
     sigma_data = sync_scalar(sigma_data, device)
+    print(f"[StageC] sigma_data (from ST Gram factors) = {sigma_data:.4f}")
 
 
     #--amp scaler choice based on precision---
@@ -1068,8 +1070,25 @@ def train_stageC_diffusion_generator(
                 sigma_t = sigmas[t_idx].view(-1, 1, 1)
                 
                 # Generate V_0 using generator (works for both ST and SC)
+                # Generate V_0 using generator (works for both ST and SC)
                 V_0 = generator(H, mask)
-                V_0, _, _ = uet.canonicalize_unit_rms(V_0, mask)
+                # NEW: Only mask out padded entries, DO NOT normalize scale per mini-set
+                # V_0 = V_0 * mask.unsqueeze(-1).float()
+                
+                # Debug: Check V_0 scale variation (first 10 steps only)
+                if DEBUG and global_step < 10:
+                    with torch.no_grad():
+                        rms_per_set = []
+                        for b in range(V_0.shape[0]):
+                            m = mask[b]
+                            if m.sum() > 0:
+                                v = V_0[b, m]
+                                rms = v.pow(2).mean().sqrt().item()
+                                rms_per_set.append(rms)
+                        if rms_per_set:
+                            print(f"[V_0 scale] step={global_step} RMS range: [{min(rms_per_set):.3f}, \
+                                  {max(rms_per_set):.3f}], \
+                                  mean={sum(rms_per_set)/len(rms_per_set):.3f}")
 
                 # For ST: still load G_target (needed for Gram loss later)
                 if not is_sc:
@@ -2567,14 +2586,23 @@ def sample_sc_edm_patchwise(
                 else:
                     V_t = V_t - sigma_t * eps
 
-            # Canonicalize patch
-            V_final = V_t  # (1, m_k, D)
-            V_canon, _, _ = uet.canonicalize_unit_rms(V_final, mask_k)
-            V_canon = V_canon.squeeze(0).detach().cpu()   # (m_k, D)
-            patch_coords.append(V_canon)
+            # # Canonicalize patch
+            # V_final = V_t  # (1, m_k, D)
+            # V_canon, _, _ = uet.canonicalize_unit_rms(V_final, mask_k)
+            # V_canon = V_canon.squeeze(0).detach().cpu()   # (m_k, D)
+            # patch_coords.append(V_canon)
+
+            # if DEBUG_FLAG and (k % max(1, K // 5) == 0):
+            #     rms = V_canon.pow(2).mean().sqrt().item()
+            # NEW: Only center, do NOT apply unit RMS (matches training)
+            V_final = V_t.squeeze(0)  # (m_k, D)
+            V_centered = V_final - V_final.mean(dim=0, keepdim=True)
+            patch_coords.append(V_centered.detach().cpu())
 
             if DEBUG_FLAG and (k % max(1, K // 5) == 0):
-                rms = V_canon.pow(2).mean().sqrt().item()
+                rms = V_centered.pow(2).mean().sqrt().item()
+                print(f"  [PATCH {k}/{K}] RMS={rms:.3f} (centered, natural scale)")
+
                 mean_norm = V_canon.mean(dim=0).norm().item()
                 print(f"[PATCH] k={k}/{K} m_k={m_k} "
                       f"coords_rms={rms:.3f} center_norm={mean_norm:.3e}")
