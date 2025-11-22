@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument('--knn_k', type=int, default=12)
     parser.add_argument('--self_conditioning', action='store_true', default=True)
     parser.add_argument('--sc_feat_mode', type=str, default='concat', choices=['concat', 'mlp'])
-    parser.add_argument('--landmarks_L', type=int, default=32)
+    parser.add_argument('--landmarks_L', type=int, default=16)
 
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
@@ -141,7 +141,7 @@ def main(args=None):
     model = GEMSModel(
         n_genes=n_genes,
         n_embedding=[512, 256, 128],
-        D_latent=16,
+        D_latent=32,
         c_dim=256,
         n_heads=4,
         isab_m=64,
@@ -162,6 +162,8 @@ def main(args=None):
     if fabric.is_global_zero:
         # Extract tensors like mouse_brain.py does
         import numpy as np
+        import utils_et as uet
+        
         common = sorted(list(set(scadata.var_names) & set(stadata.var_names)))
         X_sc = scadata[:, common].X
         X_st = stadata[:, common].X
@@ -169,8 +171,22 @@ def main(args=None):
         if hasattr(X_st, "toarray"): X_st = X_st.toarray()
         sc_expr = torch.tensor(X_sc, dtype=torch.float32, device=fabric.device)
         st_expr = torch.tensor(X_st, dtype=torch.float32, device=fabric.device)
-        st_coords = torch.tensor(stadata.obsm["spatial"], dtype=torch.float32, device=fabric.device)
+        
+        # NEW: Per-slide canonicalization BEFORE Stage A/B
+        st_coords_raw = torch.tensor(stadata.obsm["spatial"], dtype=torch.float32, device=fabric.device)
         slide_ids = torch.zeros(st_expr.shape[0], dtype=torch.long, device=fabric.device)
+        
+        st_coords, st_mu, st_scale = uet.canonicalize_st_coords_per_slide(
+            st_coords_raw, slide_ids
+        )
+        
+        # Save canonicalization stats for later denormalization
+        os.makedirs(outdir, exist_ok=True)
+        torch.save(
+            {"mu": st_mu.cpu(), "scale": st_scale.cpu()},
+            os.path.join(outdir, "st_slide_canon_stats.pt"),
+        )
+        print(f"[Rank-0] Per-slide canonicalization: scale={st_scale[0].item():.4f}")
 
         print("\n=== Stage A (single GPU, rank-0) ===")
         model.train_stageA(
@@ -220,13 +236,24 @@ def main(args=None):
         # CRITICAL: Non-rank-0 processes need to recompute Stage B
         # because targets_dict is not serializable (has sparse tensors, etc.)
         print(f"[Rank {fabric.global_rank}] Recomputing Stage B targets...")
+        import utils_et as uet
+        
         common = sorted(list(set(scadata.var_names) & set(stadata.var_names)))
         X_st = stadata[:, common].X
         if hasattr(X_st, "toarray"): X_st = X_st.toarray()
         st_expr_rank = torch.tensor(X_st, dtype=torch.float32)
-        st_coords_rank = torch.tensor(stadata.obsm["spatial"], dtype=torch.float32)
+        
+        # NEW: Same per-slide canonicalization as rank-0
+        st_coords_raw_rank = torch.tensor(stadata.obsm["spatial"], dtype=torch.float32)
+        slide_ids_rank = torch.zeros(st_expr_rank.shape[0], dtype=torch.long)
+        
+        st_coords_rank, _, _ = uet.canonicalize_st_coords_per_slide(
+            st_coords_raw_rank, slide_ids_rank
+        )
+        print(f"[Rank {fabric.global_rank}] Applied per-slide canonicalization")
         
         slides_dict_rank = {0: (st_coords_rank, st_expr_rank)}
+
         model.train_stageB(
             slides=slides_dict_rank,
             outdir=stageB_outdir,
@@ -235,6 +262,8 @@ def main(args=None):
     # ---------- Stage C (multi-GPU with Fabric) ----------
     print("\n=== Stage C (DDP across GPUs) ===")
     # Rebuild tensors on each rank (cheap)
+    import utils_et as uet
+    
     common = sorted(list(set(scadata.var_names) & set(stadata.var_names)))
     X_sc = scadata[:, common].X
     X_st = stadata[:, common].X
@@ -242,15 +271,22 @@ def main(args=None):
     if hasattr(X_st, "toarray"): X_st = X_st.toarray()
     sc_expr = torch.tensor(X_sc, dtype=torch.float32, device=fabric.device)
     st_expr = torch.tensor(X_st, dtype=torch.float32, device=fabric.device)
-    st_coords = torch.tensor(stadata.obsm["spatial"], dtype=torch.float32, device=fabric.device)
+    
+    # NEW: Use same per-slide canonicalization for Stage C
+    st_coords_raw = torch.tensor(stadata.obsm["spatial"], dtype=torch.float32, device=fabric.device)
     slide_ids = torch.zeros(st_expr.shape[0], dtype=torch.long, device=fabric.device)
+    
+    st_coords, _, _ = uet.canonicalize_st_coords_per_slide(
+        st_coords_raw, slide_ids
+    )
+    print(f"[Rank {fabric.global_rank}] Stage C: Applied per-slide canonicalization")
 
     st_gene_expr_dict = {0: st_expr}
 
     training_history = model.train_stageC(
         st_gene_expr_dict=st_gene_expr_dict,
         sc_gene_expr=sc_expr,
-        n_min=64, n_max=160,
+        n_min=64, n_max=384,
         num_st_samples=args.num_st_samples,
         num_sc_samples=args.num_sc_samples,
         n_epochs=stageC_epochs,

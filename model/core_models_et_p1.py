@@ -119,7 +119,10 @@ def train_encoder(
         slide_ids = slide_ids.to(device)
 
     # Normalize ST coordinates (pose-invariant)
-    st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
+    # st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
+    # NEW: Coords are already normalized from run_mouse_brain_2.py
+    st_coords_norm = st_coords
+    print("[Stage A] Using pre-normalized coordinates")
     
     # Auto-compute sigma if not provided
     if sigma is None:
@@ -311,7 +314,12 @@ class STStageBPrecomputer:
         st_coords = st_coords.to(device)
         
         # 1. Pose normalization
-        y_hat, center, scale = uet.normalize_pose_scale(st_coords)
+        # y_hat, center, scale = uet.normalize_pose_scale(st_coords)
+        # 1. Coords already normalized from run_mouse_brain_2.py
+        y_hat = st_coords
+        center = torch.zeros(2, device=device)
+        scale = 1.0
+        print(f"[Stage B] Using pre-normalized coordinates for slide {slide_id}")
         
         # 2. Pairwise distances & Gram
         D = torch.cdist(y_hat, y_hat, p=2)
@@ -364,11 +372,16 @@ class STStageBPrecomputer:
             print(f"Computing targets for slide {slide_id} (n={st_coords.shape[0]})")
             
             # Normalize coordinates
-            if use_affine_whitening:
-                y_hat, scale = uet.affine_whitening(st_coords, eps=1e-6)
-            else:
-                y_hat = uet.normalize_coordinates_isotropic(st_coords)
-                scale = 1.0
+            # if use_affine_whitening:
+            #     y_hat, scale = uet.affine_whitening(st_coords, eps=1e-6)
+            # else:
+            #     y_hat = uet.normalize_coordinates_isotropic(st_coords)
+            #     scale = 1.0
+
+            # NEW: Coords already normalized from run_mouse_brain_2.py
+            y_hat = st_coords
+            scale = 1.0
+            print(f"[Stage B] Using pre-normalized coordinates for slide {slide_id}")
             
             n = y_hat.shape[0]
             
@@ -495,7 +508,13 @@ class STSetDataset(Dataset):
         # All indexing on CPU (Z_dict is now CPU, targets are CPU)
         Z_set = self.Z_dict[slide_id][indices]
         y_hat_subset = targets.y_hat[indices]
-        G_subset = targets.G[indices][:, indices]
+
+        # NEW: Center mini-set coords before computing G (for translation invariance)
+        # This matches what Stage C does: per-miniset centering
+        y_hat_centered = y_hat_subset - y_hat_subset.mean(dim=0, keepdim=True)
+        G_subset = y_hat_centered @ y_hat_centered.t()
+        
+        # Distance matrix can use non-centered coords (distance is translation-invariant)
         D_subset = targets.D[indices][:, indices]
 
         # Factor / graphs / hist / triplets all on CPU

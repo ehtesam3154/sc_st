@@ -133,7 +133,7 @@ def make_distance_bias(D2, mask, n_bins=16, d_emb=32, share_across_heads=True,
     '''
 
     #set bin edges to None to not have distogram loss
-    
+
     B, N, _ = D2.shape
     device = D2.device if device is None else device
 
@@ -2152,3 +2152,49 @@ def init_st_dist_bins_from_data(
         edges = torch.linspace(0.0, d_max, n_bins + 1)
 
     return edges
+
+def canonicalize_st_coords_per_slide(
+    coords: torch.Tensor,      # (N, d), typically d=2
+    slide_ids: torch.Tensor,   # (N,) long, slide index per spot
+    eps: float = 1e-8,
+) -> tuple:
+    """
+    Per-slide canonicalization for ST coordinates:
+      - center each slide by its mean,
+      - scale each slide by a single isotropic factor (RMS radius).
+
+    Args:
+        coords   : (N, d) raw spatial coords for all spots
+        slide_ids: (N,) slide index for each spot (0..S-1)
+        eps      : minimum allowed scale
+
+    Returns:
+        coords_canon : (N, d) canonicalized coordinates
+        mu_per_slide : (S, d) mean per slide in original units
+        scale_per_slide : (S,) RMS radius per slide in original units
+    """
+    assert coords.shape[0] == slide_ids.shape[0]
+    device = coords.device
+    N, d = coords.shape
+    S = int(slide_ids.max().item()) + 1
+
+    coords_canon = coords.clone()
+    mu_per_slide = torch.zeros(S, d, device=device, dtype=coords.dtype)
+    scale_per_slide = torch.zeros(S, device=device, dtype=coords.dtype)
+
+    for s in range(S):
+        mask = (slide_ids == s)
+        if not mask.any():
+            continue
+
+        xs = coords[mask]                        # (n_s, d)
+        mu = xs.mean(dim=0, keepdim=True)        # (1, d)
+        xc = xs - mu
+        # RMS radius over points
+        rms = (xc.pow(2).sum(dim=1).mean().sqrt()).clamp_min(eps)
+
+        coords_canon[mask] = xc / rms
+        mu_per_slide[s] = mu.squeeze(0)
+        scale_per_slide[s] = rms
+
+    return coords_canon, mu_per_slide, scale_per_slide
