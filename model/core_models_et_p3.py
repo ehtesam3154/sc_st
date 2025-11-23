@@ -295,18 +295,22 @@ class GEMSModel:
         }
         sc_gene_expr_cpu = sc_gene_expr.cpu() if torch.is_tensor(sc_gene_expr) else sc_gene_expr
 
-        st_dataset = STSetDataset(
-            targets_dict=self.targets_dict,
-            encoder=self.encoder,
-            st_gene_expr_dict=st_gene_expr_dict_cpu,
-            n_min=n_min,
-            n_max=n_max,
-            D_latent=self.D_latent,
-            num_samples=num_st_samples,
-            knn_k=12,
-            device=self.device,
-            landmarks_L=self.cfg['dataset']['landmarks_L']  # ADD THIS
-        )
+        # ST dataset (conditional - can be None if num_st_samples=0)
+        if num_st_samples > 0:
+            st_dataset = STSetDataset(
+                targets_dict=self.targets_dict,
+                encoder=self.encoder,
+                st_gene_expr_dict=st_gene_expr_dict_cpu,
+                n_min=n_min,
+                n_max=n_max,
+                D_latent=self.D_latent,
+                num_samples=num_st_samples,
+                knn_k=12,
+                device=self.device,
+                landmarks_L=self.cfg['dataset']['landmarks_L']
+            )
+        else:
+            st_dataset = None
                 
         # SC dataset (optional - can be None if num_sc_samples=0)
         if num_sc_samples > 0:

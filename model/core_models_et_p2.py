@@ -661,7 +661,7 @@ def train_stageC_diffusion_generator(
     context_encoder: 'SetEncoderContext',
     generator: 'MetricSetGenerator',
     score_net: 'DiffusionScoreNet',
-    st_dataset: 'STSetDataset',
+    st_dataset: Optional['STSetDataset'],
     sc_dataset: Optional['SCSetDataset'],
     prototype_bank: Dict,
     n_epochs: int = 1000,
@@ -766,28 +766,28 @@ def train_stageC_diffusion_generator(
         device = str(fabric.device)
     
     #compute data deriven bin edges form ST coords
-    all_st_coords = []
-    for slide_id in st_dataset.targets_dict:
-        y_hat = st_dataset.targets_dict[slide_id].y_hat
-        all_st_coords.append(y_hat.cpu().numpy() if torch.is_tensor(y_hat) else y_hat)
-
-    #concatenate all slides
-    st_coords_np = np.concatenate(all_st_coords, axis=0)
-
-    st_dist_bin_edges = uet.init_st_dist_bins_from_data(
-        st_coords_np, n_bins = score_net.dist_bins,
-        mode='log'
-    ).to(device)
-
-    #register in score_net
-    score_net.st_dist_bin_edges = st_dist_bin_edges
-    print(f"[Stage C] Computed ST distance bin edges from {len(all_st_coords)} slides, {st_coords_np.shape[0]} total spots")
-    print(f"[Stage C] Bin edges: min={st_dist_bin_edges[0].item():.4f}, max={st_dist_bin_edges[-1].item():.4f}")
-
-
-    # ST loader (conditional - handle empty datasets)
-    use_st = (len(st_dataset) > 0)
+    # ST loader (conditional)
+    use_st = (st_dataset is not None)
     if use_st:
+        #compute data deriven bin edges form ST coords
+        all_st_coords = []
+        for slide_id in st_dataset.targets_dict:
+            y_hat = st_dataset.targets_dict[slide_id].y_hat
+            all_st_coords.append(y_hat.cpu().numpy() if torch.is_tensor(y_hat) else y_hat)
+
+        #concatenate all slides
+        st_coords_np = np.concatenate(all_st_coords, axis=0)
+
+        st_dist_bin_edges = uet.init_st_dist_bins_from_data(
+            st_coords_np, n_bins = score_net.dist_bins,
+            mode='log'
+        ).to(device)
+
+        #register in score_net
+        score_net.st_dist_bin_edges = st_dist_bin_edges
+        print(f"[Stage C] Computed ST distance bin edges from {len(all_st_coords)} slides, {st_coords_np.shape[0]} total spots")
+        print(f"[Stage C] Bin edges: min={st_dist_bin_edges[0].item():.4f}, max={st_dist_bin_edges[-1].item():.4f}")
+
         st_loader = DataLoader(
             st_dataset, 
             batch_size=batch_size, 
@@ -796,8 +796,10 @@ def train_stageC_diffusion_generator(
             num_workers=0,
             pin_memory=False
         )
+        print(f"[ST Loader] {len(st_dataset)} samples, {len(st_loader)} batches/epoch")
     else:
         st_loader = None
+        print("[ST Loader] DISABLED (st_dataset=None)")
         print("[WARNING] ST dataset is empty - ST training disabled!")
 
     # SC loader (conditional)
@@ -816,10 +818,14 @@ def train_stageC_diffusion_generator(
         sc_loader = None
         print("[SC Loader] DISABLED (sc_dataset=None)")
 
-    if use_sc:
-        steps_per_epoch = len(st_loader) + len(sc_loader)  # rough estimate
-    else:
+    if use_st and use_sc:
+        steps_per_epoch = len(st_loader) + len(sc_loader)
+    elif use_st:
         steps_per_epoch = len(st_loader)
+    elif use_sc:
+        steps_per_epoch = len(sc_loader)
+    else:
+        steps_per_epoch = 1  # fallback
 
     LOG_EVERY = steps_per_epoch  # Print once per epoch
 
@@ -880,7 +886,8 @@ def train_stageC_diffusion_generator(
 
     #wrap dataloaders for ddp sharding
     if fabric is not None:
-        st_loader = fabric.setup_dataloaders(st_loader)
+        if use_st:
+            st_loader = fabric.setup_dataloaders(st_loader)
         if use_sc:
             sc_loader = fabric.setup_dataloaders(sc_loader)
     
@@ -962,15 +969,16 @@ def train_stageC_diffusion_generator(
     with torch.no_grad():
         if fabric is None or fabric.is_global_zero:
             sample_stds = []
-            it = iter(st_loader)  # Create iterator ONCE
-            for _ in range(min(10, len(st_loader))):
-                sample_batch = next(it, None)
-                if sample_batch is None:
-                    break
-                G_batch = sample_batch['G_target'].to(device, non_blocking=True)
-                for i in range(min(4, G_batch.shape[0])):
-                    V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
-                    sample_stds.append(V_temp.std().item())
+            if use_st:
+                it = iter(st_loader)  # Create iterator ONCE
+                for _ in range(min(10, len(st_loader))):
+                    sample_batch = next(it, None)
+                    if sample_batch is None:
+                        break
+                    G_batch = sample_batch['G_target'].to(device, non_blocking=True)
+                    for i in range(min(4, G_batch.shape[0])):
+                        V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
+                        sample_stds.append(V_temp.std().item())
             sigma_data = float(np.median(sample_stds)) if sample_stds else 1.0
         else:
             sigma_data = 0.0
@@ -1027,7 +1035,7 @@ def train_stageC_diffusion_generator(
             f"patience={early_stop_patience}, threshold={early_stop_threshold:.1%}")
     
     for epoch in range(n_epochs):
-        st_iter = iter(st_loader)
+        st_iter = iter(st_loader) if use_st else None
         sc_iter = iter(sc_loader) if use_sc else None
         
         epoch_losses = {k: 0.0 for k in WEIGHTS.keys()}
@@ -1060,6 +1068,8 @@ def train_stageC_diffusion_generator(
         
         for batch_type in batch_pbar:
             if batch_type == 'ST':
+                if not use_st:
+                    continue
                 batch = next(st_iter, None)
                 if batch is None:
                     st_iter = iter(st_loader)
