@@ -64,6 +64,10 @@ def parse_args():
                         help='Epochs to wait without improvement before stopping')
     parser.add_argument('--early_stop_threshold', type=float, default=0.01,
                         help='Relative improvement threshold (e.g., 0.01 = 1%)')
+
+    parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
+                        help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
+
     
     return parser.parse_args()
 
@@ -334,25 +338,76 @@ def main(args=None):
     
     fabric.barrier()
     
+    # ========== SAVE ST CHECKPOINT (Phase 1 complete) ==========
+    if fabric.is_global_zero:
+        # Extract best epoch from history
+        if history_st and history_st.get('early_stopped', False):
+            E_ST_best = history_st['early_stop_info']['epoch']
+            print(f"\n[Phase 1] Early stopped at epoch {E_ST_best}")
+        else:
+            E_ST_best = len(history_st['epoch']) if history_st else stageC_epochs
+            print(f"\n[Phase 1] Completed all {E_ST_best} epochs")
+        
+        # Save Phase 1 checkpoint
+        checkpoint_path = os.path.join(outdir, "phase1_st_checkpoint.pt")
+        checkpoint = {
+            'encoder': model.encoder.state_dict(),
+            'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
+            'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
+            'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
+            'E_ST_best': E_ST_best,
+            'lr_ST': lr,
+            'history_st': history_st,
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"✓ Saved Phase 1 checkpoint: {checkpoint_path}")
+        print(f"  - Best ST epoch: {E_ST_best}")
+        print(f"  - ST learning rate: {lr:.2e}")
+    
+    fabric.barrier()
+    
     # ========== PHASE 2: SC FINE-TUNING (OPTIONAL) ==========
     if args.num_sc_samples > 0:
         print("\n" + "="*70)
         print("PHASE 2: Fine-tuning with SC data (inherit ST geometry)")
         print("="*70)
         
-        # Use lower LR for fine-tuning
-        lr_finetune = lr * 0.3
-        epochs_finetune = max(50, stageC_epochs // 4)  # 25% of ST epochs
+        # Derive SC hyperparameters from ST results
+        if fabric.is_global_zero:
+            if history_st and history_st.get('early_stopped', False):
+                E_ST_best = history_st['early_stop_info']['epoch']
+            else:
+                E_ST_best = len(history_st['epoch']) if history_st else stageC_epochs
+        else:
+            E_ST_best = stageC_epochs  # fallback for non-rank0
+        
+        # Auto-compute SC epochs if not provided
+        if args.sc_finetune_epochs is None:
+            # GPT's formula: 50% of ST best, clamped [10, 50]
+            epochs_finetune = int(0.5 * E_ST_best)
+            epochs_finetune = max(10, min(50, epochs_finetune))
+        else:
+            epochs_finetune = args.sc_finetune_epochs
+        
+        # SC learning rate: 1/3 of ST LR
+        lr_finetune = lr / 3.0
+        
+        if fabric.is_global_zero:
+            print(f"[Phase 2] SC fine-tune config:")
+            print(f"  - Epochs: {epochs_finetune} (auto: 50% of {E_ST_best}, clamped [10,50])")
+            print(f"  - Learning rate: {lr_finetune:.2e} (ST_LR / 3)")
+            print(f"  - ST samples: 0 (SC-only)")
+            print(f"  - SC samples: {args.num_sc_samples}")
         
         training_history = model.train_stageC(
             st_gene_expr_dict=st_gene_expr_dict,
             sc_gene_expr=sc_expr,
             n_min=64, n_max=384,
-            num_st_samples=args.num_st_samples // 2,  # Reduce ST samples
-            num_sc_samples=args.num_sc_samples,         # Enable SC
+            num_st_samples=0,  # NO ST samples during fine-tuning
+            num_sc_samples=args.num_sc_samples,
             n_epochs=epochs_finetune,
             batch_size=stageC_batch,
-            lr=lr_finetune,
+            lr=lr_finetune,  # Lower LR
             n_timesteps=500,
             sigma_min=0.01,
             sigma_max=7.0,

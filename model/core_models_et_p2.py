@@ -933,8 +933,10 @@ def train_stageC_diffusion_generator(
         'batch_losses': [],
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
-            'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': []
+            'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
+            'edm_tail': [], 'gen_align': []
         }
+
     }
     
     # Compute sigma_data once at start
