@@ -478,27 +478,69 @@ class STSetDataset(Dataset):
         n = min(n, m)  # don't exceed slide size
 
         # --- Sample on CPU ---
-        indices = torch.randperm(m)[:n]
+        # indices = torch.randperm(m)[:n]
+
+        # --- Multi-scale sampling: local kNN + random far points ---
+        # Pick a random center point
+        center_idx = np.random.randint(0, m)
+        
+        # Decide split: 70% local, 30% far
+        n_local = int(0.7 * n)
+        n_far = n - n_local
+        
+        # Get local kNN neighbors (using coordinates y_hat)
+        y_hat_all = targets.y_hat  # (m, 2) - all ST coords for this slide
+        center_coord = y_hat_all[center_idx:center_idx+1]  # (1, 2)
+        
+        # Compute distances from center to all points
+        dists = torch.cdist(center_coord, y_hat_all).squeeze(0)  # (m,)
+        
+        # Get k nearest neighbors (excluding self if center is in top-k)
+        k_neighbors = min(n_local + 1, m)  # +1 in case center is included
+        _, knn_indices = torch.topk(dists, k=k_neighbors, largest=False)
+        
+        # Remove center from knn if present, then take first n_local
+        knn_indices = knn_indices[knn_indices != center_idx][:n_local]
+        
+        # Get random far points (exclude already selected knn points)
+        all_indices = torch.arange(m)
+        mask = torch.ones(m, dtype=torch.bool)
+        mask[knn_indices] = False
+        far_pool = all_indices[mask]
+        
+        if len(far_pool) >= n_far:
+            far_indices = far_pool[torch.randperm(len(far_pool))[:n_far]]
+        else:
+            # Not enough far points, just take what we have
+            far_indices = far_pool
+        
+        # Combine local + far
+        indices = torch.cat([knn_indices, far_indices])
+        
+        # Shuffle to avoid any ordering bias
+        indices = indices[torch.randperm(len(indices))]
+        
+        # Store actual base size BEFORE adding landmarks
+        base_n = indices.shape[0]
 
         #add landmarks with FPS
         if self.landmarks_L > 0:
             Z_subset = self.Z_dict[slide_id][indices]
-            landmark_indices = uet.farthest_point_sampling(
-                Z_subset, min(self.landmarks_L, n)
-            )
+            # FIX: Use actual base_n, not requested n
+            n_landmarks = min(self.landmarks_L, base_n)
+            landmark_indices = uet.farthest_point_sampling(Z_subset, n_landmarks)
 
             #map back to original indices
             landmark_global = indices[landmark_indices]
 
             #append landmarks to indices
             indices = torch.cat([indices, landmark_global])
-            n_with_landmarks = indices.shape[0]
 
-            #create is_landmark mask
-            is_landmark = torch.zeros(n_with_landmarks, dtype=torch.bool)
-            is_landmark[n:] = True
+            #create is_landmark mask - FIX: use base_n, not n
+            is_landmark = torch.zeros(indices.shape[0], dtype=torch.bool)
+            is_landmark[base_n:] = True
         else:
-            is_landmark = torch.zeros(n, dtype=torch.bool)
+            is_landmark = torch.zeros(base_n, dtype=torch.bool)
 
         overlap_info = {
             'slide_id': slide_id,
@@ -527,7 +569,10 @@ class STSetDataset(Dataset):
         bins = torch.linspace(0, float(d_95), 64)
         H_subset = uet.compute_distance_hist(D_subset, bins)
 
-        triplets_subset = uet.sample_ordinal_triplets(D_subset, n_triplets=min(500, n), margin_ratio=0.05)
+        # FIX: Use actual number of nodes, not requested n
+        n_nodes = len(indices)
+        triplets_subset = uet.sample_ordinal_triplets(D_subset, n_triplets=min(500, n_nodes), margin_ratio=0.05)
+
 
         L_info = {
             'L': L_subset,

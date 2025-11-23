@@ -2198,3 +2198,148 @@ def canonicalize_st_coords_per_slide(
         scale_per_slide[s] = rms
 
     return coords_canon, mu_per_slide, scale_per_slide
+
+
+# =========================================
+# EDM TAIL LOSS & GENERATOR ALIGNMENT
+# =========================================
+
+def compute_edm_tail_loss(
+    V_pred: torch.Tensor,      # (B, N, D_latent) predicted coordinates
+    V_target: torch.Tensor,    # (B, N, D_latent) target coordinates from factor_from_gram
+    mask: torch.Tensor,        # (B, N) validity mask
+    tail_quantile: float = 0.80,  # pairs above this quantile are "tail"
+    weight_tail: float = 2.0,     # weight for tail pairs vs others
+) -> torch.Tensor:
+    """
+    EDM tail loss: penalize distance compression, especially for far pairs.
+    
+    For each sample in batch:
+      1. Compute pairwise distances D_pred and D_target
+      2. Identify "tail" pairs (distances > quantile in D_target)
+      3. Apply weighted MSE on distances, heavier on tail
+    
+    Args:
+        V_pred: predicted latent coordinates (centered)
+        V_target: target latent coordinates (centered)
+        mask: (B, N) boolean mask
+        tail_quantile: quantile threshold for "far" pairs (0.8 = top 20%)
+        weight_tail: extra weight for tail pairs
+    
+    Returns:
+        scalar loss
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    
+    total_loss = torch.tensor(0.0, device=device)
+    valid_samples = 0
+    
+    for b in range(B):
+        m = mask[b]  # (N,)
+        n_valid = m.sum().item()
+        if n_valid < 2:
+            continue
+        
+        # Extract valid points
+        V_p = V_pred[b, m]  # (n_valid, D)
+        V_t = V_target[b, m]  # (n_valid, D)
+        
+        # Pairwise distances
+        D_pred = torch.cdist(V_p, V_p)  # (n_valid, n_valid)
+        D_target = torch.cdist(V_t, V_t)  # (n_valid, n_valid)
+        
+        # Get upper triangular (exclude diagonal)
+        triu_mask = torch.triu(torch.ones_like(D_target, dtype=torch.bool), diagonal=1)
+        d_pred_flat = D_pred[triu_mask]
+        d_target_flat = D_target[triu_mask]
+        
+        if d_target_flat.numel() == 0:
+            continue
+        
+        # Identify tail pairs
+        threshold = torch.quantile(d_target_flat, tail_quantile)
+        is_tail = d_target_flat >= threshold
+        
+        # Weighted MSE
+        diff_sq = (d_pred_flat - d_target_flat) ** 2
+        weights = torch.where(is_tail, 
+                             torch.tensor(weight_tail, device=device), 
+                             torch.tensor(1.0, device=device))
+        loss_b = (weights * diff_sq).mean()
+        total_loss = total_loss + loss_b
+        valid_samples += 1
+    
+    if valid_samples == 0:
+        return torch.tensor(0.0, device=device)
+    
+    return total_loss / valid_samples
+
+
+def procrustes_alignment_loss(
+    V_pred: torch.Tensor,      # (B, N, D_latent) from generator
+    V_target: torch.Tensor,    # (B, N, D_latent) from factor_from_gram
+    mask: torch.Tensor,        # (B, N)
+) -> torch.Tensor:
+    """
+    Generator alignment loss using Procrustes.
+    
+    For each sample:
+      1. Center both V_pred and V_target
+      2. Find optimal rotation R via SVD: C = V_pred^T @ V_target, R = U @ V^T
+      3. Compute MSE between V_pred @ R and V_target
+    
+    This encourages generator to produce geometry isometric to the target Gram matrix.
+    
+    Args:
+        V_pred: generator output (should already be centered per-miniset)
+        V_target: target from factor_from_gram (already centered)
+        mask: validity mask
+    
+    Returns:
+        scalar loss
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    
+    total_loss = torch.tensor(0.0, device=device)
+    valid_samples = 0
+    
+    for b in range(B):
+        m = mask[b]  # (N,)
+        n_valid = m.sum().item()
+        if n_valid < D:  # need at least D points for meaningful Procrustes
+            continue
+        
+        # Extract valid points
+        Vp = V_pred[b, m]  # (n_valid, D)
+        Vt = V_target[b, m]  # (n_valid, D)
+        
+        # Center (should already be centered, but ensure it)
+        Vp_c = Vp - Vp.mean(dim=0, keepdim=True)
+        Vt_c = Vt - Vt.mean(dim=0, keepdim=True)
+        
+        # Compute cross-covariance
+        C = Vp_c.t() @ Vt_c  # (D, D)
+        
+        # SVD
+        try:
+            U, S, Vh = torch.linalg.svd(C, full_matrices=False)
+            R = U @ Vh  # Optimal rotation
+            
+            # Align V_pred to V_target
+            Vp_aligned = Vp_c @ R
+            
+            # MSE loss
+            loss_b = ((Vp_aligned - Vt_c) ** 2).mean()
+            total_loss = total_loss + loss_b
+            valid_samples += 1
+        except:
+            # SVD failed (rare), skip this sample
+            continue
+    
+    if valid_samples == 0:
+        return torch.tensor(0.0, device=device)
+    
+    return total_loss / valid_samples
+

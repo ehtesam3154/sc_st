@@ -883,16 +883,30 @@ def train_stageC_diffusion_generator(
     if fabric is None or fabric.is_global_zero:
         os.makedirs(plot_dir, exist_ok=True)
 
+    # WEIGHTS = {
+    #     'score': 1.0,
+    #     'gram': 4.0,
+    #     'gram_scale': 0.25,
+    #     'heat': 0.5,
+    #     'sw_st': 0.5,
+    #     'sw_sc': 0.6,
+    #     'overlap': 0.1,
+    #     'ordinal_sc': 0.5,
+    #     'st_dist': 0.3
+    # }
+
     WEIGHTS = {
         'score': 1.0,
         'gram': 4.0,
         'gram_scale': 0.25,
         'heat': 0.5,
-        'sw_st': 0.5,
+        'sw_st': 0.05,        # REDUCED from 0.5 (scale-free, weakens tail)
         'sw_sc': 0.6,
         'overlap': 0.1,
         'ordinal_sc': 0.5,
-        'st_dist': 0.3
+        'st_dist': 0.3,
+        'edm_tail': 2.0,      # NEW: EDM tail loss (prioritize far distances)
+        'gen_align': 1.0      # NEW: Generator alignment to factor_from_gram
     }
     
     # Overlap config - OPTIMIZED
@@ -1206,6 +1220,8 @@ def train_stageC_diffusion_generator(
             L_overlap = torch.tensor(0.0, device=device)
             L_ordinal_sc = torch.tensor(0.0, device=device)
             L_st_dist = torch.tensor(0.0, device=device)
+            L_edm_tail = torch.tensor(0.0, device=device)
+            L_gen_align = torch.tensor(0.0, device=device)
             
             # Denoise to get V_hat
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -1488,6 +1504,47 @@ def train_stageC_diffusion_generator(
                             use_canon=True,   # center + unit-RMS per set
                         )
 
+                        # ==================== NEW: EDM TAIL LOSS ====================
+                        # Penalize compression of far distances
+                        with torch.autocast(device_type='cuda', enabled=False):
+                            # We already have V_geom (centered V_hat) from Gram loss above
+                            # Need to build V_target from G_target for each sample
+                            V_target_batch = torch.zeros_like(V_geom)  # (B, N, D)
+                            
+                            for i in range(batch_size_real):
+                                n_valid = int(n_list[i].item())
+                                if n_valid < 3:
+                                    continue
+                                G_i = G_target[i, :n_valid, :n_valid].float()
+                                V_tgt_i = uet.factor_from_gram(G_i, D_latent)  # (n_valid, D)
+                                V_target_batch[i, :n_valid] = V_tgt_i
+                            
+                            # Compute EDM tail loss
+                            L_edm_tail = uet.compute_edm_tail_loss(
+                                V_pred=V_geom,           # centered V_hat
+                                V_target=V_target_batch,  # from factor_from_gram
+                                mask=mask,
+                                tail_quantile=0.80,       # top 20% distances
+                                weight_tail=2.0
+                            )
+                        
+                        # ==================== NEW: GENERATOR ALIGNMENT LOSS ====================
+                        # Align generator output V_0 to target geometry via Procrustes
+                        with torch.autocast(device_type='cuda', enabled=False):
+                            # Center V_0 (generator output before noise)
+                            V_0_f32 = V_0.float()
+                            m_float = mask.float().unsqueeze(-1)
+                            valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+                            mean_V0 = (V_0_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+                            V_0_centered = (V_0_f32 - mean_V0) * m_float
+                            
+                            # V_target_batch already computed above for EDM tail loss
+                            L_gen_align = uet.procrustes_alignment_loss(
+                                V_pred=V_0_centered,
+                                V_target=V_target_batch,
+                                mask=mask
+                            )
+
                         if DEBUG and (global_step % LOG_EVERY == 0):
                             print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
 
@@ -1759,7 +1816,9 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['sw_sc'] * L_sw_sc +
                                 WEIGHTS['overlap'] * L_overlap +
                                 WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
-                                WEIGHTS['st_dist'] * L_st_dist)
+                                WEIGHTS['st_dist'] * L_st_dist +
+                                WEIGHTS['edm_tail'] * L_edm_tail +      
+                                WEIGHTS['gen_align'] * L_gen_align)     
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
             # if DEBUG and (global_step % LOG_EVERY == 0):
@@ -1981,6 +2040,8 @@ def train_stageC_diffusion_generator(
             epoch_losses['sw_sc'] += L_sw_sc.item()
             epoch_losses['overlap'] += L_overlap.item()
             epoch_losses['ordinal_sc'] += L_ordinal_sc.item()
+            epoch_losses['edm_tail'] += L_edm_tail.item()
+            epoch_losses['gen_align'] += L_gen_align.item()
 
 
             def _is_rank0():
@@ -2189,6 +2250,17 @@ def train_stageC_diffusion_generator(
         history['epoch'].append(epoch + 1)
 
         # Recompute weighted total from means (don't use the raw 'total' sum)
+        # epoch_losses['total'] = (
+        #     WEIGHTS['score'] * epoch_losses['score'] +
+        #     WEIGHTS['gram'] * epoch_losses['gram'] +
+        #     WEIGHTS['gram_scale'] * epoch_losses['gram_scale'] +
+        #     WEIGHTS['heat'] * epoch_losses['heat'] +
+        #     WEIGHTS['sw_st'] * epoch_losses['sw_st'] +
+        #     WEIGHTS['sw_sc'] * epoch_losses['sw_sc'] +
+        #     WEIGHTS['overlap'] * epoch_losses['overlap'] +
+        #     WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc']
+        # )
+
         epoch_losses['total'] = (
             WEIGHTS['score'] * epoch_losses['score'] +
             WEIGHTS['gram'] * epoch_losses['gram'] +
@@ -2197,7 +2269,9 @@ def train_stageC_diffusion_generator(
             WEIGHTS['sw_st'] * epoch_losses['sw_st'] +
             WEIGHTS['sw_sc'] * epoch_losses['sw_sc'] +
             WEIGHTS['overlap'] * epoch_losses['overlap'] +
-            WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc']
+            WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc'] +
+            WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
+            WEIGHTS['gen_align'] * epoch_losses['gen_align']
         )
 
         # Override the history['epoch_avg']['total'] with correct value
@@ -2603,11 +2677,13 @@ def sample_sc_edm_patchwise(
                 rms = V_centered.pow(2).mean().sqrt().item()
                 print(f"  [PATCH {k}/{K}] RMS={rms:.3f} (centered, natural scale)")
 
-                mean_norm = V_canon.mean(dim=0).norm().item()
+                # mean_norm = V_canon.mean(dim=0).norm().item()
+                mean_norm = V_centered.mean(dim=0).norm().item()
                 print(f"[PATCH] k={k}/{K} m_k={m_k} "
                       f"coords_rms={rms:.3f} center_norm={mean_norm:.3e}")
 
-            del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final, V_canon
+            # del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final, V_canon
+            del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final
 
             if 'cuda' in device:
                 torch.cuda.empty_cache()

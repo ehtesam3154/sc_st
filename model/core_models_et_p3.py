@@ -274,12 +274,15 @@ class GEMSModel:
         early_stop_min_epochs: int = 12,
         early_stop_patience: int = 6,
         early_stop_threshold: float = 0.01,
+        phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
 ):
         """
         Train diffusion generator with mixed ST/SC regimen.
         """
         print("\n" + "="*60)
-        print("STAGE C: Training Diffusion Generator (Mixed ST/SC)")
+        # print("STAGE C: Training Diffusion Generator (Mixed ST/SC)")
+        print(f"STAGE C: Training Diffusion Generator ({phase_name})")
+
         print("="*60)
         
         # ST dataset
