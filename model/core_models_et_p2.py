@@ -785,14 +785,21 @@ def train_stageC_diffusion_generator(
     print(f"[Stage C] Bin edges: min={st_dist_bin_edges[0].item():.4f}, max={st_dist_bin_edges[-1].item():.4f}")
 
 
-    st_loader = DataLoader(
-        st_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        collate_fn=collate_minisets, 
-        num_workers=0,          # CHANGED from 0
-        pin_memory=False
-    )
+    # ST loader (conditional - handle empty datasets)
+    use_st = (len(st_dataset) > 0)
+    if use_st:
+        st_loader = DataLoader(
+            st_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            collate_fn=collate_minisets, 
+            num_workers=0,
+            pin_memory=False
+        )
+    else:
+        st_loader = None
+        print("[WARNING] ST dataset is empty - ST training disabled!")
+
     # SC loader (conditional)
     use_sc = (sc_dataset is not None)
     if use_sc:
@@ -1033,13 +1040,19 @@ def train_stageC_diffusion_generator(
 
         
         # Mixed schedule: [ST, ST, SC] repeat (or ST-only if no SC)
-        if use_sc:
+        # Mixed schedule: [ST, ST, SC] repeat
+        if use_st and use_sc:
             max_len = max(len(st_loader), len(sc_loader))
             schedule = ['ST', 'ST', 'SC'] * (max_len // 3 + 1)
             mode_str = "ST+SC"
+        elif use_sc:
+            max_len = len(sc_loader)
+            schedule = ['SC'] * max_len
+            mode_str = "SC-only"
         else:
             schedule = ['ST'] * len(st_loader)
             mode_str = "ST-only"
+
                 
         # Batch progress bar
         # batch_pbar = tqdm(schedule, desc=f"Epoch {epoch+1}/{n_epochs}", leave=True)
@@ -2205,8 +2218,8 @@ def train_stageC_diffusion_generator(
         scheduler.step()
 
         if epoch + 1 == HEAT_WARMUP_EPOCHS:
-            if rank == 0:
-                print(f"\n[Schedule] Enabling heat loss at epoch {epoch+1}")
+            # if rank == 0:
+            #     print(f"\n[Schedule] Enabling heat loss at epoch {epoch+1}")
             WEIGHTS['heat'] = HEAT_TARGET_WEIGHT
 
         # Adjust weights after initial epochs
@@ -2863,7 +2876,7 @@ def sample_sc_edm_patchwise(
         if DEBUG_FLAG:
             rms_new = new_X.pow(2).mean().sqrt().item()
             print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (not normalized)")
-            
+
         # rms_new = new_X.pow(2).mean().sqrt().item()
         # if rms_new > 0:
         #     new_X = new_X / rms_new
