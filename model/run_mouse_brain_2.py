@@ -498,12 +498,14 @@ def main(args=None):
                 #     sigma_max=5.0,      # ← MATCH TRAINING (was 5.0, should be 53.0)
                 # )
 
+                n_cells = sc_expr.shape[0]
 
                 sample_results = model.infer_sc_patchwise(
                     sc_gene_expr=sc_expr,
                     n_timesteps_sample=300,
                     return_coords=True,
-                    patch_size=512,          # was batch_size; also your Stage D batch size
+                    # patch_size=512,          # was batch_size; also your Stage D batch size
+                    patch_size=n_cells,
                     coverage_per_cell=5.0,   # you can tune 3–6
                     n_align_iters=10,        # can tune 5–15
                     eta=0.0,

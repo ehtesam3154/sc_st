@@ -485,7 +485,7 @@ class STSetDataset(Dataset):
         center_idx = np.random.randint(0, m)
         
         # Decide split: 70% local, 30% far
-        n_local = int(0.7 * n)
+        n_local = int(0.65 * n)
         n_far = n - n_local
         
         # Get local kNN neighbors (using coordinates y_hat)

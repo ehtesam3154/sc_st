@@ -752,7 +752,7 @@ def train_stageC_diffusion_generator(
         num_probes=64,
         chebyshev_degree=30,
         knn_k=12,
-        t_list=(0.5, 1.0),
+        t_list=(0.25, 0.75),
         laplacian='sym'
     )
     loss_sw = uet.SlicedWassersteinLoss1D()
@@ -899,7 +899,7 @@ def train_stageC_diffusion_generator(
         'score': 1.0,
         'gram': 4.0,
         'gram_scale': 0.25,
-        'heat': 0.5,
+        'heat': 0.0,          # START AT ZERO - warmup later
         'sw_st': 0.05,        # REDUCED from 0.5 (scale-free, weakens tail)
         'sw_sc': 0.6,
         'overlap': 0.1,
@@ -908,6 +908,10 @@ def train_stageC_diffusion_generator(
         'edm_tail': 2.0,      # NEW: EDM tail loss (prioritize far distances)
         'gen_align': 1.0      # NEW: Generator alignment to factor_from_gram
     }
+    
+    # Heat warmup schedule
+    HEAT_WARMUP_EPOCHS = 10
+    HEAT_TARGET_WEIGHT = 0.5
     
     # Overlap config - OPTIMIZED
     EVERY_K_STEPS = 1   # CHANGED from 2
@@ -1437,8 +1441,9 @@ def train_stageC_diffusion_generator(
                                 
                                 # Build predicted Laplacian
                                 D_V = torch.cdist(V_i, V_i)
+                                knn_k = getattr(st_dataset, 'knn_k', 12)  # Match dataset k
                                 edge_index, edge_weight = uet.build_knn_graph_from_distance(
-                                    D_V, k=8, device=device
+                                    D_V, k=knn_k, device=device
                                 )
                                 L_pred_i = uet.compute_graph_laplacian(edge_index, edge_weight, n_valid)
                                 
@@ -1458,6 +1463,12 @@ def train_stageC_diffusion_generator(
                             #SINGLE BATCHED LOSS CALL
                             t_list = L_info_batch[0].get('t_list', [0.5, 1.0])
                             L_heat = loss_heat(L_pred_batch, L_targ_batch, mask=mask, t_list=t_list)
+
+                            # # Gate heat loss to low-noise, conditional samples
+                            # if geo_gate.sum() > 0:
+                            #     L_heat = L_heat_raw
+                            # else:
+                            #     L_heat = V_hat.new_tensor(0.0)
 
                 L_sw_st = torch.zeros((), device=device)
                 if (global_step % sw_every_k) == 0:
@@ -1522,12 +1533,22 @@ def train_stageC_diffusion_generator(
                                 V_target_batch[i, :n_valid] = V_tgt_i
                             
                             # Compute EDM tail loss
+                            # L_edm_tail = uet.compute_edm_tail_loss(
+                            #     V_pred=V_geom,           # centered V_hat
+                            #     V_target=V_target_batch,  # from factor_from_gram
+                            #     mask=mask,
+                            #     tail_quantile=0.80,       # top 20% distances
+                            #     weight_tail=2.0
+                            # )
+
                             L_edm_tail = uet.compute_edm_tail_loss(
                                 V_pred=V_geom,           # centered V_hat
                                 V_target=V_target_batch,  # from factor_from_gram
                                 mask=mask,
-                                tail_quantile=0.80,       # top 20% distances
-                                weight_tail=2.0
+                                tail_quantile=0.80,       # top 20% = far tail, bottom 20% = near tail
+                                weight_tail=3.0,          # INCREASED: weight both tails heavily
+                                mid_weight=1.0,           # NEW: weight for mid-range pairs
+                                margin_frac=0.05          # NEW: 5% tolerance band before hinge activates
                             )
                         
                         # ==================== NEW: GENERATOR ALIGNMENT LOSS ====================
@@ -2183,6 +2204,11 @@ def train_stageC_diffusion_generator(
         
         scheduler.step()
 
+        if epoch + 1 == HEAT_WARMUP_EPOCHS:
+            if rank == 0:
+                print(f"\n[Schedule] Enabling heat loss at epoch {epoch+1}")
+            WEIGHTS['heat'] = HEAT_TARGET_WEIGHT
+
         # Adjust weights after initial epochs
         if epoch == 5:
             print("\n⚡ [Weight Adjustment] Reducing overlap weight from 0.25 → 0.15")
@@ -2715,11 +2741,16 @@ def sample_sc_edm_patchwise(
 
     X_global = X_global - X_global.mean(dim=0, keepdim=True)
     rms = X_global.pow(2).mean().sqrt().item()
-    if rms > 0:
-        X_global = X_global / rms
 
     if DEBUG_FLAG:
-        print(f"[ALIGN] Init X_global: coords_rms={rms:.3f}")
+        rms = X_global.pow(2).mean().sqrt().item()
+        print(f"[ALIGN] Init X_global: coords_rms={rms:.3f} (not normalized)")
+    
+    # if rms > 0:
+    #     X_global = X_global / rms
+
+    # if DEBUG_FLAG:
+    #     print(f"[ALIGN] Init X_global: coords_rms={rms:.3f}")
 
     # 5.2 Alternating Procrustes alignment
     for it in range(n_align_iters):
@@ -2825,14 +2856,22 @@ def sample_sc_edm_patchwise(
         new_X[~mask_seen2] = X_global[~mask_seen2]
 
         new_X = new_X - new_X.mean(dim=0, keepdim=True)
-        rms_new = new_X.pow(2).mean().sqrt().item()
-        if rms_new > 0:
-            new_X = new_X / rms_new
-
+        # RMS normalization removed - preserve learned scale
+        
         X_global = new_X
 
         if DEBUG_FLAG:
-            print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f}")
+            rms_new = new_X.pow(2).mean().sqrt().item()
+            print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (not normalized)")
+            
+        # rms_new = new_X.pow(2).mean().sqrt().item()
+        # if rms_new > 0:
+        #     new_X = new_X / rms_new
+
+        # X_global = new_X
+
+        # if DEBUG_FLAG:
+        #     print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f}")
 
     # ------------------------------------------------------------------
     # 6) Compute EDM and optional ST-scale alignment

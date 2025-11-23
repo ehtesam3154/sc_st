@@ -1167,7 +1167,14 @@ class HeatKernelLoss(nn.Module):
                 traces_pred = torch.stack([torch.sum(torch.exp(-t * eigvals_pred)) for t in t_list])
                 traces_target = torch.stack([torch.sum(torch.exp(-t * eigvals_target)) for t in t_list])
             
-            loss = torch.mean((traces_pred - traces_target) ** 2)
+            # loss = torch.mean((traces_pred - traces_target) ** 2)
+            # return loss
+        
+            # Relative error (scale-invariant)
+            diff = traces_pred - traces_target
+            num = (diff ** 2).sum()
+            den = (traces_target ** 2).sum().clamp_min(1e-12)
+            loss = num / den
             return loss
         
         else:
@@ -1212,7 +1219,14 @@ class HeatKernelLoss(nn.Module):
             traces_target = torch.stack(traces_target_list, dim=1)  # (B, T)
             
             # MSE loss over batch and time points
-            loss = ((traces_pred - traces_target) ** 2).mean()
+            # loss = ((traces_pred - traces_target) ** 2).mean()
+            # return loss
+            
+            # Relative Frobenius error (scale-invariant)
+            diff = traces_pred - traces_target  # (B, T)
+            num = (diff ** 2).sum(dim=1)  # (B,)
+            den = (traces_target ** 2).sum(dim=1).clamp_min(1e-12)  # (B,)
+            loss = (num / den).mean()
             return loss
     
     def _hutchinson_heat_trace(
@@ -2204,76 +2218,201 @@ def canonicalize_st_coords_per_slide(
 # EDM TAIL LOSS & GENERATOR ALIGNMENT
 # =========================================
 
+# def compute_edm_tail_loss(
+#     V_pred: torch.Tensor,      # (B, N, D_latent) predicted coordinates
+#     V_target: torch.Tensor,    # (B, N, D_latent) target coordinates from factor_from_gram
+#     mask: torch.Tensor,        # (B, N) validity mask
+#     tail_quantile: float = 0.80,  # pairs above this quantile are "tail"
+#     weight_tail: float = 2.0,     # weight for tail pairs vs others
+# ) -> torch.Tensor:
+#     """
+#     EDM tail loss: penalize distance compression, especially for far pairs.
+    
+#     For each sample in batch:
+#       1. Compute pairwise distances D_pred and D_target
+#       2. Identify "tail" pairs (distances > quantile in D_target)
+#       3. Apply weighted MSE on distances, heavier on tail
+    
+#     Args:
+#         V_pred: predicted latent coordinates (centered)
+#         V_target: target latent coordinates (centered)
+#         mask: (B, N) boolean mask
+#         tail_quantile: quantile threshold for "far" pairs (0.8 = top 20%)
+#         weight_tail: extra weight for tail pairs
+    
+#     Returns:
+#         scalar loss
+#     """
+#     B, N, D = V_pred.shape
+#     device = V_pred.device
+    
+#     total_loss = torch.tensor(0.0, device=device)
+#     valid_samples = 0
+    
+#     for b in range(B):
+#         m = mask[b]  # (N,)
+#         n_valid = m.sum().item()
+#         if n_valid < 2:
+#             continue
+        
+#         # Extract valid points
+#         V_p = V_pred[b, m]  # (n_valid, D)
+#         V_t = V_target[b, m]  # (n_valid, D)
+        
+#         # Pairwise distances
+#         D_pred = torch.cdist(V_p, V_p)  # (n_valid, n_valid)
+#         D_target = torch.cdist(V_t, V_t)  # (n_valid, n_valid)
+        
+#         # Get upper triangular (exclude diagonal)
+#         triu_mask = torch.triu(torch.ones_like(D_target, dtype=torch.bool), diagonal=1)
+#         d_pred_flat = D_pred[triu_mask]
+#         d_target_flat = D_target[triu_mask]
+        
+#         if d_target_flat.numel() == 0:
+#             continue
+        
+#         # Identify tail pairs
+#         threshold = torch.quantile(d_target_flat, tail_quantile)
+#         is_tail = d_target_flat >= threshold
+        
+#         # Weighted MSE
+#         diff_sq = (d_pred_flat - d_target_flat) ** 2
+#         weights = torch.where(is_tail, 
+#                              torch.tensor(weight_tail, device=device), 
+#                              torch.tensor(1.0, device=device))
+#         loss_b = (weights * diff_sq).mean()
+#         total_loss = total_loss + loss_b
+#         valid_samples += 1
+    
+#     if valid_samples == 0:
+#         return torch.tensor(0.0, device=device)
+    
+#     return total_loss / valid_samples
+
+
+import torch
+
 def compute_edm_tail_loss(
     V_pred: torch.Tensor,      # (B, N, D_latent) predicted coordinates
-    V_target: torch.Tensor,    # (B, N, D_latent) target coordinates from factor_from_gram
-    mask: torch.Tensor,        # (B, N) validity mask
-    tail_quantile: float = 0.80,  # pairs above this quantile are "tail"
-    weight_tail: float = 2.0,     # weight for tail pairs vs others
+    V_target: torch.Tensor,    # (B, N, D_latent) target coords from factor_from_gram
+    mask: torch.Tensor,        # (B, N) validity mask (bool)
+    tail_quantile: float = 0.80,  # top-q for "far" pairs; low tail is (1-q)
+    weight_tail: float = 2.0,     # extra weight on both tails
+    mid_weight: float = 1.0,      # weight on mid-range pairs
+    margin_frac: float = 0.02,    # 5% tolerance band
 ) -> torch.Tensor:
     """
-    EDM tail loss: penalize distance compression, especially for far pairs.
-    
-    For each sample in batch:
-      1. Compute pairwise distances D_pred and D_target
-      2. Identify "tail" pairs (distances > quantile in D_target)
-      3. Apply weighted MSE on distances, heavier on tail
-    
+    Bidirectional EDM tail loss.
+
+    - Uses *all* pairs.
+    - Near tail (small target distances): penalize only if predicted
+      distance is too *large* (neighbors pulled apart).
+    - Far tail (large target distances): penalize only if predicted
+      distance is too *small* (far cells collapsed).
+    - Mid-range pairs: standard MSE.
+
     Args:
         V_pred: predicted latent coordinates (centered)
         V_target: target latent coordinates (centered)
         mask: (B, N) boolean mask
-        tail_quantile: quantile threshold for "far" pairs (0.8 = top 20%)
-        weight_tail: extra weight for tail pairs
-    
+        tail_quantile: far-tail quantile in target distances (e.g. 0.8 → top 20%)
+        weight_tail: weight multiplier for both tails
+        mid_weight: weight multiplier for mid-range pairs
+        margin_frac: relative slack around target distances before hinge activates
+
     Returns:
         scalar loss
     """
     B, N, D = V_pred.shape
     device = V_pred.device
-    
-    total_loss = torch.tensor(0.0, device=device)
+
+    total_loss = V_pred.new_tensor(0.0)
     valid_samples = 0
-    
+
     for b in range(B):
-        m = mask[b]  # (N,)
-        n_valid = m.sum().item()
+        m = mask[b]          # (N,)
+        n_valid = int(m.sum().item())
         if n_valid < 2:
             continue
-        
-        # Extract valid points
-        V_p = V_pred[b, m]  # (n_valid, D)
-        V_t = V_target[b, m]  # (n_valid, D)
-        
+
+        Vp = V_pred[b, m]    # (n_valid, D)
+        Vt = V_target[b, m]  # (n_valid, D)
+
         # Pairwise distances
-        D_pred = torch.cdist(V_p, V_p)  # (n_valid, n_valid)
-        D_target = torch.cdist(V_t, V_t)  # (n_valid, n_valid)
-        
-        # Get upper triangular (exclude diagonal)
-        triu_mask = torch.triu(torch.ones_like(D_target, dtype=torch.bool), diagonal=1)
-        d_pred_flat = D_pred[triu_mask]
-        d_target_flat = D_target[triu_mask]
-        
-        if d_target_flat.numel() == 0:
+        D_pred = torch.cdist(Vp, Vp)    # (n_valid, n_valid)
+        D_tgt  = torch.cdist(Vt, Vt)    # (n_valid, n_valid)
+
+        # Upper triangle only (no self-pairs)
+        triu = torch.triu(torch.ones_like(D_tgt, dtype=torch.bool), diagonal=1)
+        d_pred = D_pred[triu]           # (K,)
+        d_tgt  = D_tgt[triu]            # (K,)
+
+        if d_tgt.numel() == 0:
             continue
-        
-        # Identify tail pairs
-        threshold = torch.quantile(d_target_flat, tail_quantile)
-        is_tail = d_target_flat >= threshold
-        
-        # Weighted MSE
-        diff_sq = (d_pred_flat - d_target_flat) ** 2
-        weights = torch.where(is_tail, 
-                             torch.tensor(weight_tail, device=device), 
-                             torch.tensor(1.0, device=device))
-        loss_b = (weights * diff_sq).mean()
+
+        # Define near and far tails from target distances
+        q_hi = torch.quantile(d_tgt, tail_quantile)
+        q_lo = torch.quantile(d_tgt, 1.0 - tail_quantile)  # e.g. 0.2 if tail_quantile=0.8
+
+        near_mask = d_tgt <= q_lo
+        far_mask  = d_tgt >= q_hi
+        mid_mask  = ~(near_mask | far_mask)
+
+        # Safety: if one of the tails is empty, fall back to using mid for it
+        if near_mask.sum() == 0:
+            near_mask = d_tgt <= q_lo
+        if far_mask.sum() == 0:
+            far_mask = d_tgt >= q_hi
+
+        # --- Near tail: "should be very close" ---
+        # Penalize only if we push them too far apart:
+        # d_pred > (1 + margin) * d_tgt
+        if near_mask.any():
+            d_pred_near = d_pred[near_mask]
+            d_tgt_near  = d_tgt[near_mask]
+            thresh_near = (1.0 + margin_frac) * d_tgt_near
+            err_near = torch.relu(d_pred_near - thresh_near)  # overestimation only
+            loss_near = (err_near ** 2).mean()
+        else:
+            loss_near = d_pred.new_tensor(0.0)
+
+        # --- Far tail: "should be very far" ---
+        # Penalize only if we make them too close:
+        # d_pred < (1 - margin) * d_tgt
+        if far_mask.any():
+            d_pred_far = d_pred[far_mask]
+            d_tgt_far  = d_tgt[far_mask]
+            thresh_far = (1.0 - margin_frac) * d_tgt_far
+            err_far = torch.relu(thresh_far - d_pred_far)     # underestimation only
+            loss_far = (err_far ** 2).mean()
+        else:
+            loss_far = d_pred.new_tensor(0.0)
+
+        # --- Mid-range: plain MSE on distances ---
+        if mid_mask.any():
+            d_pred_mid = d_pred[mid_mask]
+            d_tgt_mid  = d_tgt[mid_mask]
+            loss_mid = ((d_pred_mid - d_tgt_mid) ** 2).mean()
+        else:
+            loss_mid = d_pred.new_tensor(0.0)
+
+        # Combine with weights
+        # Both tails get weight_tail, mid gets mid_weight
+        # Normalize by (tail + mid) so magnitude is stable
+        w_tail = weight_tail
+        w_mid  = mid_weight
+
+        # If a tail is empty its loss is zero so it doesn't matter
+        loss_b = (w_tail * (loss_near + loss_far) + w_mid * loss_mid) / (2 * w_tail + w_mid)
+
         total_loss = total_loss + loss_b
         valid_samples += 1
-    
+
     if valid_samples == 0:
-        return torch.tensor(0.0, device=device)
-    
+        return V_pred.new_tensor(0.0)
+
     return total_loss / valid_samples
+
 
 
 def procrustes_alignment_loss(
