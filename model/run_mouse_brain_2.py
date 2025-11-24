@@ -373,6 +373,15 @@ def main(args=None):
         print("="*70)
         
         # Derive SC hyperparameters from ST results
+        # if fabric.is_global_zero:
+        #     if history_st and history_st.get('early_stopped', False):
+        #         E_ST_best = history_st['early_stop_info']['epoch']
+        #     else:
+        #         E_ST_best = len(history_st['epoch']) if history_st else stageC_epochs
+        # else:
+        #     E_ST_best = stageC_epochs  # fallback for non-rank0
+
+        # Derive SC hyperparameters from ST results
         if fabric.is_global_zero:
             if history_st and history_st.get('early_stopped', False):
                 E_ST_best = history_st['early_stop_info']['epoch']
@@ -380,17 +389,29 @@ def main(args=None):
                 E_ST_best = len(history_st['epoch']) if history_st else stageC_epochs
         else:
             E_ST_best = stageC_epochs  # fallback for non-rank0
+ 
+        # CRITICAL FIX: Broadcast E_ST_best to all ranks to ensure sync
+        E_ST_best_tensor = torch.tensor([E_ST_best], dtype=torch.long, device=fabric.device)
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.broadcast(E_ST_best_tensor, src=0)
+        E_ST_best = int(E_ST_best_tensor.item())
+ 
+        if fabric.is_global_zero:
+            print(f"[Phase 2] Synchronized E_ST_best={E_ST_best} across all ranks")
         
         # Auto-compute SC epochs if not provided
         if args.sc_finetune_epochs is None:
             # GPT's formula: 50% of ST best, clamped [10, 50]
             epochs_finetune = int(0.5 * E_ST_best)
             epochs_finetune = max(10, min(50, epochs_finetune))
+
         else:
             epochs_finetune = args.sc_finetune_epochs
         
         # SC learning rate: 1/3 of ST LR
         lr_finetune = lr / 3.0
+
         
         if fabric.is_global_zero:
             print(f"[Phase 2] SC fine-tune config:")

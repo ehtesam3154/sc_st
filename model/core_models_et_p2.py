@@ -1047,19 +1047,23 @@ def train_stageC_diffusion_generator(
         sc_batches = 0
 
         
-        # Mixed schedule: [ST, ST, SC] repeat (or ST-only if no SC)
-        # Mixed schedule: [ST, ST, SC] repeat
+        # Schedule based on what loaders we have
         if use_st and use_sc:
             max_len = max(len(st_loader), len(sc_loader))
             schedule = ['ST', 'ST', 'SC'] * (max_len // 3 + 1)
             mode_str = "ST+SC"
-        elif use_sc:
-            max_len = len(sc_loader)
-            schedule = ['SC'] * max_len
-            mode_str = "SC-only"
-        else:
+        elif use_st:
             schedule = ['ST'] * len(st_loader)
             mode_str = "ST-only"
+        elif use_sc:
+            schedule = ['SC'] * len(sc_loader)
+            mode_str = "SC-only"
+        else:
+            raise ValueError("Must have at least one of ST or SC data")
+        
+        # Ensure all ranks use same schedule length
+        if fabric is not None:
+            fabric.barrier()
 
                 
         # Batch progress bar
@@ -2218,12 +2222,12 @@ def train_stageC_diffusion_generator(
             should_stop = should_stop_tensor.item() > 0.5
 
         # ALL ranks break together
-        if should_stop:
-            # CDelete iterator references to allow clean exit
-            del st_iter
-            if sc_iter is not None:
-                del sc_iter
-            break
+        # if should_stop:
+        #     # CDelete iterator references to allow clean exit
+        #     del st_iter
+        #     if sc_iter is not None:
+        #         del sc_iter
+        #     break
         
         scheduler.step()
 
