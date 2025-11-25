@@ -1219,15 +1219,15 @@ class HeatKernelLoss(nn.Module):
             traces_target = torch.stack(traces_target_list, dim=1)  # (B, T)
             
             # MSE loss over batch and time points
-            loss = ((traces_pred - traces_target) ** 2).mean()
-            return loss
+            # loss = ((traces_pred - traces_target) ** 2).mean()
+            # return loss
 
             # Relative Frobenius error (scale-invariant)
-            # diff = traces_pred - traces_target  # (B, T)
-            # num = (diff ** 2).sum(dim=1)  # (B,)
-            # den = (traces_target ** 2).sum(dim=1).clamp_min(1e-12)  # (B,)
-            # loss = (num / den).mean()
-            # return loss
+            diff = traces_pred - traces_target  # (B, T)
+            num = (diff ** 2).sum(dim=1)  # (B,)
+            den = (traces_target ** 2).sum(dim=1).clamp_min(1e-12)  # (B,)
+            loss = (num / den).mean()
+            return loss
     
     def _hutchinson_heat_trace(
         self,

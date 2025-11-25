@@ -366,21 +366,12 @@ def main(args=None):
     
     fabric.barrier()
     
-    # ========== PHASE 2: SC FINE-TUNING (OPTIONAL) ==========
+    # ========== PHASE 2: SC FINE-TUNING WITH MIXED ST+SC BATCHES ==========
     if args.num_sc_samples > 0:
         print("\n" + "="*70)
-        print("PHASE 2: Fine-tuning with SC data (inherit ST geometry)")
+        print("PHASE 2: Fine-tuning with SC data (mixed ST+SC regime)")
         print("="*70)
         
-        # Derive SC hyperparameters from ST results
-        # if fabric.is_global_zero:
-        #     if history_st and history_st.get('early_stopped', False):
-        #         E_ST_best = history_st['early_stop_info']['epoch']
-        #     else:
-        #         E_ST_best = len(history_st['epoch']) if history_st else stageC_epochs
-        # else:
-        #     E_ST_best = stageC_epochs  # fallback for non-rank0
-
         # Derive SC hyperparameters from ST results
         if fabric.is_global_zero:
             if history_st and history_st.get('early_stopped', False):
@@ -402,32 +393,45 @@ def main(args=None):
         
         # Auto-compute SC epochs if not provided
         if args.sc_finetune_epochs is None:
-            # GPT's formula: 50% of ST best, clamped [10, 50]
             epochs_finetune = int(0.5 * E_ST_best)
             epochs_finetune = max(10, min(50, epochs_finetune))
         else:
             epochs_finetune = args.sc_finetune_epochs
         
-        # SC learning rate: 1/3 of ST LR
+        # Lower learning rate for fine-tuning
         lr_finetune = lr / 3.0
-
+        
+        # Keep some ST samples to anchor geometry (1/3 of Phase 1)
+        num_st_finetune = args.num_st_samples // 2
         
         if fabric.is_global_zero:
-            print(f"[Phase 2] SC fine-tune config:")
-            print(f"  - Epochs: {epochs_finetune} (auto: 50% of {E_ST_best}, clamped [10,50])")
-            print(f"  - Learning rate: {lr_finetune:.2e} (ST_LR / 3)")
-            print(f"  - ST samples: 0 (SC-only)")
+            print(f"[Phase 2] Config:")
+            print(f"  - Epochs: {epochs_finetune}")
+            print(f"  - Learning rate: {lr_finetune:.2e} (1/3 of Phase 1)")
+            print(f"  - ST samples: {num_st_finetune} (1/3 of Phase 1, to anchor geometry)")
             print(f"  - SC samples: {args.num_sc_samples}")
+        
+        # ========== FREEZE GENERATOR ONLY ==========
+        if fabric.is_global_zero:
+            print(f"\n[Phase 2] Freezing generator...")
+        
+        for param in model.generator.parameters():
+            param.requires_grad = False
+        
+        if fabric.is_global_zero:
+            print(f"  ✓ Generator frozen")
+            print(f"  ✓ Score_net trainable")
+            print(f"  ✓ Context_encoder trainable")
         
         training_history = model.train_stageC(
             st_gene_expr_dict=st_gene_expr_dict,
             sc_gene_expr=sc_expr,
             n_min=64, n_max=384,
-            num_st_samples=0,  # NO ST samples during fine-tuning
+            num_st_samples=num_st_finetune,  # ← CHANGED from 0
             num_sc_samples=args.num_sc_samples,
             n_epochs=epochs_finetune,
             batch_size=stageC_batch,
-            lr=lr_finetune,  # Lower LR
+            lr=lr_finetune,
             n_timesteps=500,
             sigma_min=0.01,
             sigma_max=7.0,
@@ -435,14 +439,14 @@ def main(args=None):
             fabric=fabric,
             precision=precision,
             phase_name="SC Fine-tune",
-            enable_early_stop=False,  # No early stop in fine-tuning
+            enable_early_stop=False,
         )
-        # ========== SAVE SC FINE-TUNED CHECKPOINT (Phase 2 complete) ==========
-        fabric.barrier()  # Sync before saving
+        
+        fabric.barrier()
         
         if fabric.is_global_zero:
             print("\n" + "="*70)
-            print("PHASE 2 COMPLETE - Saving SC fine-tuned checkpoint")
+            print("PHASE 2 COMPLETE")
             print("="*70)
             
             checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
@@ -458,10 +462,7 @@ def main(args=None):
                 'history_sc': training_history,
             }
             torch.save(checkpoint, checkpoint_path)
-            print(f"✓ Saved Phase 2 checkpoint: {checkpoint_path}")
-            print(f"  - SC fine-tune epochs: {epochs_finetune}")
-            print(f"  - SC learning rate: {lr_finetune:.2e}")
-            print(f"  - Model is now trained on ST+SC data")
+            print(f"✓ Saved checkpoint: {checkpoint_path}")
         
         fabric.barrier()
     else:

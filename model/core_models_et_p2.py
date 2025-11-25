@@ -916,7 +916,7 @@ def train_stageC_diffusion_generator(
         'heat': 0.5,          # START AT ZERO - warmup later
         'sw_st': 0.05,        # REDUCED from 0.5 (scale-free, weakens tail)
         'sw_sc': 0.6,
-        'overlap': 0.1,
+        'overlap': 0.2,
         'ordinal_sc': 0.5,
         'st_dist': 0.3,
         'edm_tail': 1.0,      # NEW: EDM tail loss (prioritize far distances)
@@ -1050,7 +1050,8 @@ def train_stageC_diffusion_generator(
         # Schedule based on what loaders we have
         if use_st and use_sc:
             max_len = max(len(st_loader), len(sc_loader))
-            schedule = ['ST', 'ST', 'SC'] * (max_len // 3 + 1)
+            # schedule = ['ST', 'ST', 'SC'] * (max_len // 3 + 1)
+            schedule = ['SC', 'SC', 'ST'] * (max_len // 3 + 1)
             mode_str = "ST+SC"
         elif use_st:
             schedule = ['ST'] * len(st_loader)
@@ -2311,7 +2312,7 @@ def train_stageC_diffusion_generator(
         # Adjust weights after initial epochs
         if epoch == 5:
             print("\n⚡ [Weight Adjustment] Reducing overlap weight from 0.25 → 0.15")
-            WEIGHTS['overlap'] = 0.15
+            # WEIGHTS['overlap'] = 0.15
 
         # MLflow logging
         if logger and (fabric is None or fabric.is_global_zero):
