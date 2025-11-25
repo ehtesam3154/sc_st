@@ -467,76 +467,116 @@ class STSetDataset(Dataset):
     
     def __len__(self):
         return self.num_samples
-        
+    
     def __getitem__(self, idx):
         # Pick a slide and subset size
-        slide_id = np.random.choice(list(self.targets_dict.keys()))
+        slide_id = np.random.choice(self.slide_ids)
         targets = self.targets_dict[slide_id]
 
         n = np.random.randint(self.n_min, self.n_max + 1)
         m = targets.y_hat.shape[0]
         n = min(n, m)  # don't exceed slide size
 
-        # --- Sample on CPU ---
-        # indices = torch.randperm(m)[:n]
-
-        # --- Multi-scale sampling: local kNN + random far points ---
-        # Pick a random center point
+        # ------------------------------------------------------------------
+        # New sampling: center-based near / mid / far using true distances
+        # ------------------------------------------------------------------
+        # Pick a random center
         center_idx = np.random.randint(0, m)
-        
-        # Decide split: 70% local, 30% far
-        n_local = int(0.65 * n)
-        n_far = n - n_local
-        
-        # Get local kNN neighbors (using coordinates y_hat)
-        y_hat_all = targets.y_hat  # (m, 2) - all ST coords for this slide
-        center_coord = y_hat_all[center_idx:center_idx+1]  # (1, 2)
-        
-        # Compute distances from center to all points
-        dists = torch.cdist(center_coord, y_hat_all).squeeze(0)  # (m,)
-        
-        # Get k nearest neighbors (excluding self if center is in top-k)
-        k_neighbors = min(n_local + 1, m)  # +1 in case center is included
-        _, knn_indices = torch.topk(dists, k=k_neighbors, largest=False)
-        
-        # Remove center from knn if present, then take first n_local
-        knn_indices = knn_indices[knn_indices != center_idx][:n_local]
-        
-        # Get random far points (exclude already selected knn points)
-        all_indices = torch.arange(m)
-        mask = torch.ones(m, dtype=torch.bool)
-        mask[knn_indices] = False
-        far_pool = all_indices[mask]
-        
-        if len(far_pool) >= n_far:
-            far_indices = far_pool[torch.randperm(len(far_pool))[:n_far]]
+
+        # Full distance row for this center (true ST nuclear distances)
+        D_row = targets.D[center_idx]  # (m,)
+
+        # Exclude the center itself
+        all_idx = torch.arange(m)
+        mask_self = all_idx != center_idx
+        dists = D_row[mask_self]           # (m-1,)
+        idx_no_self = all_idx[mask_self]   # (m-1,)
+
+        # Safeguard for tiny slides
+        if idx_no_self.numel() == 0:
+            indices = all_idx[:n]
         else:
-            # Not enough far points, just take what we have
-            far_indices = far_pool
-        
-        # Combine local + far
-        indices = torch.cat([knn_indices, far_indices])
-        
+            # Compute distance quantiles (on CPU tensors)
+            # You can tune these
+            q_near = torch.quantile(dists, 0.2)
+            q_mid  = torch.quantile(dists, 0.6)
+            q_far  = torch.quantile(dists, 0.9)
+
+            # Define buckets
+            near_mask = dists <= q_near
+            mid_mask  = (dists > q_near) & (dists <= q_mid)
+            far_mask  = dists >= q_far
+
+            near_idx_all = idx_no_self[near_mask]
+            mid_idx_all  = idx_no_self[mid_mask]
+            far_idx_all  = idx_no_self[far_mask]
+
+            # Allocate counts per tier (you can tune these ratios)
+            n_near = int(0.4 * n)
+            n_mid  = int(0.3 * n)
+            n_far  = n - n_near - n_mid
+
+            # Helper to sample from a bucket with fallback
+            def sample_from_bucket(bucket, k, fallback_pool):
+                bucket = bucket
+                if bucket.numel() >= k:
+                    # random sample without replacement
+                    perm = torch.randperm(bucket.numel())
+                    return bucket[perm[:k]]
+                else:
+                    # take what we have, fill remaining from fallback_pool
+                    taken = bucket
+                    remaining = k - bucket.numel()
+                    if remaining > 0 and fallback_pool.numel() > 0:
+                        # exclude already taken
+                        mask_fp = ~torch.isin(fallback_pool, taken)
+                        pool2 = fallback_pool[mask_fp]
+                        if pool2.numel() > 0:
+                            perm = torch.randperm(pool2.numel())
+                            add = pool2[perm[:min(remaining, pool2.numel())]]
+                            taken = torch.cat([taken, add])
+                    return taken
+
+            # Global fallback pool (all non-center indices)
+            fallback_pool = idx_no_self
+
+            # Sample from each bucket
+            near_idx = sample_from_bucket(near_idx_all, n_near, fallback_pool)
+            mid_idx  = sample_from_bucket(mid_idx_all,  n_mid,  fallback_pool)
+            far_idx  = sample_from_bucket(far_idx_all,  n_far,  fallback_pool)
+
+            # Combine, maybe shuffle
+            indices = torch.cat([near_idx, mid_idx, far_idx])
+            # If, due to fallbacks, we got more than n, trim
+            if indices.numel() > n:
+                perm = torch.randperm(indices.numel())
+                indices = indices[perm[:n]]
+            # If we got fewer, pad with random others (unlikely but safe)
+            elif indices.numel() < n:
+                missing = n - indices.numel()
+                mask_extra = ~torch.isin(all_idx, indices)
+                extra_pool = all_idx[mask_extra]
+                if extra_pool.numel() > 0:
+                    perm = torch.randperm(extra_pool.numel())
+                    add = extra_pool[perm[:min(missing, extra_pool.numel())]]
+                    indices = torch.cat([indices, add])
+
         # Shuffle to avoid any ordering bias
-        indices = indices[torch.randperm(len(indices))]
-        
+        indices = indices[torch.randperm(indices.numel())]
+
         # Store actual base size BEFORE adding landmarks
         base_n = indices.shape[0]
 
-        #add landmarks with FPS
+        # ------------------------------------------------------------------
+        # Landmarks via FPS in embedding space (unchanged)
+        # ------------------------------------------------------------------
         if self.landmarks_L > 0:
             Z_subset = self.Z_dict[slide_id][indices]
-            # FIX: Use actual base_n, not requested n
             n_landmarks = min(self.landmarks_L, base_n)
             landmark_indices = uet.farthest_point_sampling(Z_subset, n_landmarks)
-
-            #map back to original indices
             landmark_global = indices[landmark_indices]
-
-            #append landmarks to indices
             indices = torch.cat([indices, landmark_global])
 
-            #create is_landmark mask - FIX: use base_n, not n
             is_landmark = torch.zeros(indices.shape[0], dtype=torch.bool)
             is_landmark[base_n:] = True
         else:
@@ -544,22 +584,20 @@ class STSetDataset(Dataset):
 
         overlap_info = {
             'slide_id': slide_id,
-            'indices': indices,  # keep CPU bookkeeping
+            'indices': indices,
         }
 
-        # All indexing on CPU (Z_dict is now CPU, targets are CPU)
+        # ------------------------------------------------------------------
+        # Rest of your code: unchanged
+        # ------------------------------------------------------------------
         Z_set = self.Z_dict[slide_id][indices]
         y_hat_subset = targets.y_hat[indices]
 
-        # NEW: Center mini-set coords before computing G (for translation invariance)
-        # This matches what Stage C does: per-miniset centering
         y_hat_centered = y_hat_subset - y_hat_subset.mean(dim=0, keepdim=True)
         G_subset = y_hat_centered @ y_hat_centered.t()
-        
-        # Distance matrix can use non-centered coords (distance is translation-invariant)
+
         D_subset = targets.D[indices][:, indices]
 
-        # Factor / graphs / hist / triplets all on CPU
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
         edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n_nodes=len(indices))
@@ -569,10 +607,8 @@ class STSetDataset(Dataset):
         bins = torch.linspace(0, float(d_95), 64)
         H_subset = uet.compute_distance_hist(D_subset, bins)
 
-        # FIX: Use actual number of nodes, not requested n
         n_nodes = len(indices)
         triplets_subset = uet.sample_ordinal_triplets(D_subset, n_triplets=min(500, n_nodes), margin_ratio=0.05)
-
 
         L_info = {
             'L': L_subset,
@@ -592,6 +628,132 @@ class STSetDataset(Dataset):
             'n': len(indices),
             'overlap_info': overlap_info
         }
+
+        
+    # def __getitem__(self, idx):
+    #     # Pick a slide and subset size
+    #     slide_id = np.random.choice(list(self.targets_dict.keys()))
+    #     targets = self.targets_dict[slide_id]
+
+    #     n = np.random.randint(self.n_min, self.n_max + 1)
+    #     m = targets.y_hat.shape[0]
+    #     n = min(n, m)  # don't exceed slide size
+
+    #     # --- Sample on CPU ---
+    #     # indices = torch.randperm(m)[:n]
+
+    #     # --- Multi-scale sampling: local kNN + random far points ---
+    #     # Pick a random center point
+    #     center_idx = np.random.randint(0, m)
+        
+    #     # Decide split: 70% local, 30% far
+    #     n_local = int(0.65 * n)
+    #     n_far = n - n_local
+        
+    #     # Get local kNN neighbors (using coordinates y_hat)
+    #     y_hat_all = targets.y_hat  # (m, 2) - all ST coords for this slide
+    #     center_coord = y_hat_all[center_idx:center_idx+1]  # (1, 2)
+        
+    #     # Compute distances from center to all points
+    #     dists = torch.cdist(center_coord, y_hat_all).squeeze(0)  # (m,)
+        
+    #     # Get k nearest neighbors (excluding self if center is in top-k)
+    #     k_neighbors = min(n_local + 1, m)  # +1 in case center is included
+    #     _, knn_indices = torch.topk(dists, k=k_neighbors, largest=False)
+        
+    #     # Remove center from knn if present, then take first n_local
+    #     knn_indices = knn_indices[knn_indices != center_idx][:n_local]
+        
+    #     # Get random far points (exclude already selected knn points)
+    #     all_indices = torch.arange(m)
+    #     mask = torch.ones(m, dtype=torch.bool)
+    #     mask[knn_indices] = False
+    #     far_pool = all_indices[mask]
+        
+    #     if len(far_pool) >= n_far:
+    #         far_indices = far_pool[torch.randperm(len(far_pool))[:n_far]]
+    #     else:
+    #         # Not enough far points, just take what we have
+    #         far_indices = far_pool
+        
+    #     # Combine local + far
+    #     indices = torch.cat([knn_indices, far_indices])
+        
+    #     # Shuffle to avoid any ordering bias
+    #     indices = indices[torch.randperm(len(indices))]
+        
+    #     # Store actual base size BEFORE adding landmarks
+    #     base_n = indices.shape[0]
+
+    #     #add landmarks with FPS
+    #     if self.landmarks_L > 0:
+    #         Z_subset = self.Z_dict[slide_id][indices]
+    #         # FIX: Use actual base_n, not requested n
+    #         n_landmarks = min(self.landmarks_L, base_n)
+    #         landmark_indices = uet.farthest_point_sampling(Z_subset, n_landmarks)
+
+    #         #map back to original indices
+    #         landmark_global = indices[landmark_indices]
+
+    #         #append landmarks to indices
+    #         indices = torch.cat([indices, landmark_global])
+
+    #         #create is_landmark mask - FIX: use base_n, not n
+    #         is_landmark = torch.zeros(indices.shape[0], dtype=torch.bool)
+    #         is_landmark[base_n:] = True
+    #     else:
+    #         is_landmark = torch.zeros(base_n, dtype=torch.bool)
+
+    #     overlap_info = {
+    #         'slide_id': slide_id,
+    #         'indices': indices,  # keep CPU bookkeeping
+    #     }
+
+    #     # All indexing on CPU (Z_dict is now CPU, targets are CPU)
+    #     Z_set = self.Z_dict[slide_id][indices]
+    #     y_hat_subset = targets.y_hat[indices]
+
+    #     # NEW: Center mini-set coords before computing G (for translation invariance)
+    #     # This matches what Stage C does: per-miniset centering
+    #     y_hat_centered = y_hat_subset - y_hat_subset.mean(dim=0, keepdim=True)
+    #     G_subset = y_hat_centered @ y_hat_centered.t()
+        
+    #     # Distance matrix can use non-centered coords (distance is translation-invariant)
+    #     D_subset = targets.D[indices][:, indices]
+
+    #     # Factor / graphs / hist / triplets all on CPU
+    #     V_target = uet.factor_from_gram(G_subset, self.D_latent)
+    #     edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)
+    #     L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n_nodes=len(indices))
+
+    #     triu_mask = torch.triu(torch.ones_like(D_subset, dtype=torch.bool), diagonal=1)
+    #     d_95 = torch.quantile(D_subset[triu_mask], 0.95)
+    #     bins = torch.linspace(0, float(d_95), 64)
+    #     H_subset = uet.compute_distance_hist(D_subset, bins)
+
+    #     # FIX: Use actual number of nodes, not requested n
+    #     n_nodes = len(indices)
+    #     triplets_subset = uet.sample_ordinal_triplets(D_subset, n_triplets=min(500, n_nodes), margin_ratio=0.05)
+
+
+    #     L_info = {
+    #         'L': L_subset,
+    #         't_list': targets.t_list
+    #     }
+
+    #     return {
+    #         'Z_set': Z_set,
+    #         'is_landmark': is_landmark,
+    #         'V_target': V_target,
+    #         'G_target': G_subset,
+    #         'D_target': D_subset,
+    #         'H_target': H_subset,
+    #         'H_bins': bins,
+    #         'L_info': L_info,
+    #         'triplets': triplets_subset,
+    #         'n': len(indices),
+    #         'overlap_info': overlap_info
+    #     }
 
             
 def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -657,7 +819,6 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'is_sc': False 
     }
 
-
 class SCSetDataset(Dataset):
     """
     SC mini-sets with intentional overlap, using a prebuilt K-NN index.
@@ -688,7 +849,7 @@ class SCSetDataset(Dataset):
         self.overlap_max = overlap_max
         self.num_samples = num_samples
         self.device = device
-        self.landmarks_L = landmarks_L
+        self.landmarks_L = 0
 
         # Encode all SC cells once (CUDA), then keep a CPU pinned copy
         print("encoding SC cells....")

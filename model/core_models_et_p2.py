@@ -752,7 +752,7 @@ def train_stageC_diffusion_generator(
         num_probes=64,
         chebyshev_degree=30,
         knn_k=12,
-        t_list=(0.25, 0.75),
+        t_list=(0.25, 1.0),
         laplacian='sym'
     )
     loss_sw = uet.SlicedWassersteinLoss1D()
@@ -913,19 +913,19 @@ def train_stageC_diffusion_generator(
         'score': 1.0,
         'gram': 4.0,
         'gram_scale': 0.25,
-        'heat': 0.0,          # START AT ZERO - warmup later
+        'heat': 0.5,          # START AT ZERO - warmup later
         'sw_st': 0.05,        # REDUCED from 0.5 (scale-free, weakens tail)
         'sw_sc': 0.6,
         'overlap': 0.1,
         'ordinal_sc': 0.5,
         'st_dist': 0.3,
-        'edm_tail': 2.0,      # NEW: EDM tail loss (prioritize far distances)
+        'edm_tail': 1.0,      # NEW: EDM tail loss (prioritize far distances)
         'gen_align': 1.0      # NEW: Generator alignment to factor_from_gram
     }
     
     # Heat warmup schedule
     HEAT_WARMUP_EPOCHS = 10
-    HEAT_TARGET_WEIGHT = 0.5
+    HEAT_TARGET_WEIGHT = 0.05
     
     # Overlap config - OPTIMIZED
     EVERY_K_STEPS = 1   # CHANGED from 2
@@ -1489,7 +1489,50 @@ def train_stageC_diffusion_generator(
                             
                             #SINGLE BATCHED LOSS CALL
                             t_list = L_info_batch[0].get('t_list', [0.5, 1.0])
+
                             L_heat = loss_heat(L_pred_batch, L_targ_batch, mask=mask, t_list=t_list)
+
+                            # Heat loss with FIXED adjacency
+                            # L_heat = torch.tensor(0.0, device=device)
+                            
+                            # if 'miniset_graphs' in batch and WEIGHTS['heat'] > 0:
+                            #     # Build Laplacians with fixed adjacency
+                            #     B_actual = V_hat.shape[0]
+                            #     n_max = V_hat.shape[1]
+                                
+                            #     L_pred_batch = torch.zeros(B_actual, n_max, n_max, device=device)
+                            #     L_gt_batch = torch.zeros(B_actual, n_max, n_max, device=device)
+                                
+                            #     for b in range(B_actual):
+                            #         m = mask[b]
+                            #         n_valid = int(m.sum())
+                            #         if n_valid < 2:
+                            #             continue
+                                    
+                            #         miniset_graph = batch['miniset_graphs'][b]
+                            #         edges_local = miniset_graph['edges_local'].to(device)
+                            #         w_gt = miniset_graph['w_gt'].to(device)
+                            #         sigma = miniset_graph['sigma']
+                                    
+                            #         # Get predicted coordinates for this sample
+                            #         Vb = V_hat[b, m]  # (n_valid, D)
+                                    
+                            #         # Compute predicted weights on FIXED edges
+                            #         li = edges_local[0]
+                            #         lj = edges_local[1]
+                            #         d_ij = (Vb[li] - Vb[lj]).norm(dim=-1)  # (E_sub,)
+                            #         w_pred = torch.exp(-(d_ij**2) / (2 * sigma**2 + 1e-8))
+                                    
+                            #         # Build Laplacians from fixed edges
+                            #         L_gt = uet.build_laplacian_from_edges(n_valid, edges_local, w_gt, laplacian_type='sym')
+                            #         L_pred = uet.build_laplacian_from_edges(n_valid, edges_local, w_pred, laplacian_type='sym')
+                                    
+                            #         # Place in padded batch tensors
+                            #         L_gt_batch[b, :n_valid, :n_valid] = L_gt
+                            #         L_pred_batch[b, :n_valid, :n_valid] = L_pred
+                                
+                            #     # Use existing HeatKernelLoss class
+                            #     L_heat = loss_heat(L_pred_batch, L_gt_batch, mask=mask)
 
                             # # Gate heat loss to low-noise, conditional samples
                             # if geo_gate.sum() > 0:
@@ -1560,23 +1603,32 @@ def train_stageC_diffusion_generator(
                                 V_target_batch[i, :n_valid] = V_tgt_i
                             
                             # Compute EDM tail loss
-                            # L_edm_tail = uet.compute_edm_tail_loss(
-                            #     V_pred=V_geom,           # centered V_hat
-                            #     V_target=V_target_batch,  # from factor_from_gram
-                            #     mask=mask,
-                            #     tail_quantile=0.80,       # top 20% distances
-                            #     weight_tail=2.0
-                            # )
-
                             L_edm_tail = uet.compute_edm_tail_loss(
                                 V_pred=V_geom,           # centered V_hat
                                 V_target=V_target_batch,  # from factor_from_gram
                                 mask=mask,
-                                tail_quantile=0.80,       # top 20% = far tail, bottom 20% = near tail
-                                weight_tail=3.0,          # INCREASED: weight both tails heavily
-                                mid_weight=1.0,           # NEW: weight for mid-range pairs
-                                margin_frac=0.05          # NEW: 5% tolerance band before hinge activates
+                                tail_quantile=0.85,       # top 20% distances
+                                weight_tail=2.0
                             )
+
+                            # L_edm_tail = uet.compute_edm_tail_loss(
+                            #     V_geom,           # centered V_hat
+                            #     V_target_batch,   # from factor_from_gram
+                            #     mask,
+                            #     tail_quantile=0.80,
+                            #     weight_tail=1.0,      # Reduced from 2.0
+                            #     clip_quantile=0.995   # New: clip extreme outliers
+                            # )
+
+                            # L_edm_tail = uet.compute_edm_tail_loss(
+                            #     V_pred=V_geom,           # centered V_hat
+                            #     V_target=V_target_batch,  # from factor_from_gram
+                            #     mask=mask,
+                            #     tail_quantile=0.80,       # top 20% = far tail, bottom 20% = near tail
+                            #     weight_tail=3.0,          # INCREASED: weight both tails heavily
+                            #     mid_weight=1.0,           # NEW: weight for mid-range pairs
+                            #     margin_frac=0.05          # NEW: 5% tolerance band before hinge activates
+                            # )
                         
                         # ==================== NEW: GENERATOR ALIGNMENT LOSS ====================
                         # Align generator output V_0 to target geometry via Procrustes
@@ -2137,7 +2189,27 @@ def train_stageC_diffusion_generator(
             avg_gram = epoch_losses['gram'] / max(n_batches, 1)
             avg_total = epoch_losses['total'] / max(n_batches, 1)
             
-            print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
+            # print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
+            
+            # Print detailed losses every 5 epochs, simple summary otherwise
+            if (epoch + 1) % 5 == 0:
+                avg_gram_scale = epoch_losses['gram_scale'] / max(n_batches, 1)
+                avg_heat = epoch_losses['heat'] / max(n_batches, 1)
+                avg_sw_st = epoch_losses['sw_st'] / max(n_batches, 1)
+                avg_sw_sc = epoch_losses['sw_sc'] / max(n_batches, 1)
+                avg_overlap = epoch_losses['overlap'] / max(n_batches, 1)
+                avg_ordinal_sc = epoch_losses['ordinal_sc'] / max(n_batches, 1)
+                avg_st_dist = epoch_losses['st_dist'] / max(n_batches, 1)
+                avg_edm_tail = epoch_losses['edm_tail'] / max(n_batches, 1)
+                avg_gen_align = epoch_losses['gen_align'] / max(n_batches, 1)
+                
+                print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
+                print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
+                print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f}")
+                print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
+                print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
+            else:
+                print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
             # ============ EARLY STOPPING CHECK ============
             if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
@@ -2384,14 +2456,14 @@ def train_stageC_diffusion_generator(
             ovl_pct = 100.0 * ovl_share
             
             # Print health metrics
-            print(f"\n{'='*70}")
-            print(f"HEALTH METRICS (Epoch {epoch+1})")
-            print(f"{'='*70}")
-            print(f"1. Heat Share:           {heat_pct:.1f}%  (healthy: 25-50%)")
-            print(f"2. Hi-Noise Inflation:   {r_hi:.2f}   (healthy: ≤1.3)")
-            print(f"3. Gram Trace Ratio:     {gram_trace_ratio:.1f}%  (healthy: 85-92%)")
-            print(f"4. Ordinal_SC Share:     {ord_pct:.1f}%  (healthy: ~5-15%)")
-            print(f"5. Overlap Share:        {ovl_pct:.1f}%  (healthy: ~2-10%)")
+            # print(f"\n{'='*70}")
+            # print(f"HEALTH METRICS (Epoch {epoch+1})")
+            # print(f"{'='*70}")
+            # print(f"1. Heat Share:           {heat_pct:.1f}%  (healthy: 25-50%)")
+            # print(f"2. Hi-Noise Inflation:   {r_hi:.2f}   (healthy: ≤1.3)")
+            # print(f"3. Gram Trace Ratio:     {gram_trace_ratio:.1f}%  (healthy: 85-92%)")
+            # print(f"4. Ordinal_SC Share:     {ord_pct:.1f}%  (healthy: ~5-15%)")
+            # print(f"5. Overlap Share:        {ovl_pct:.1f}%  (healthy: ~2-10%)")
             
             # Warning triggers
             # warnings = []

@@ -405,7 +405,6 @@ def main(args=None):
             # GPT's formula: 50% of ST best, clamped [10, 50]
             epochs_finetune = int(0.5 * E_ST_best)
             epochs_finetune = max(10, min(50, epochs_finetune))
-
         else:
             epochs_finetune = args.sc_finetune_epochs
         
@@ -438,6 +437,33 @@ def main(args=None):
             phase_name="SC Fine-tune",
             enable_early_stop=False,  # No early stop in fine-tuning
         )
+        # ========== SAVE SC FINE-TUNED CHECKPOINT (Phase 2 complete) ==========
+        fabric.barrier()  # Sync before saving
+        
+        if fabric.is_global_zero:
+            print("\n" + "="*70)
+            print("PHASE 2 COMPLETE - Saving SC fine-tuned checkpoint")
+            print("="*70)
+            
+            checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
+            checkpoint = {
+                'encoder': model.encoder.state_dict(),
+                'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
+                'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
+                'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
+                'E_ST_best': E_ST_best,
+                'epochs_finetune': epochs_finetune,
+                'lr_finetune': lr_finetune,
+                'history_st': history_st,
+                'history_sc': training_history,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            print(f"✓ Saved Phase 2 checkpoint: {checkpoint_path}")
+            print(f"  - SC fine-tune epochs: {epochs_finetune}")
+            print(f"  - SC learning rate: {lr_finetune:.2e}")
+            print(f"  - Model is now trained on ST+SC data")
+        
+        fabric.barrier()
     else:
         print("\n[INFO] Skipping Phase 2 (num_sc_samples=0)")
         training_history = history_st
