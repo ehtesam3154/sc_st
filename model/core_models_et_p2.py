@@ -762,6 +762,37 @@ def train_stageC_diffusion_generator(
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
     loss_radial = uet.RadialHistogramLoss(num_bins=20)
 
+    # ========== COMPUTE TRIANGLE EPSILON FOR ST ONLY ==========
+    print("\n[Triangle Loss] Computing ST-specific threshold (ST batches only)...")
+    
+    triangle_refs = []
+    with torch.no_grad():
+        for _ in range(20):
+            try:
+                batch = next(iter(st_loader))
+            except:
+                st_loader_temp = DataLoader(
+                    st_dataset, batch_size=4, shuffle=True,
+                    collate_fn=collate_minisets, num_workers=0
+                )
+                batch = next(iter(st_loader_temp))
+            
+            V_target = batch['V_target'].to(device)
+            mask = batch['mask'].to(device)
+            A_ref = loss_triangle._compute_avg_triangle_area(V_target, mask)
+            triangle_refs.extend(A_ref.cpu().tolist())
+    
+    triangle_epsilon_st = 0.6 * float(torch.tensor(triangle_refs).median())
+    
+    # SC uses FIXED small epsilon (ST-independent)
+    triangle_epsilon_sc = 0.01  # Just "don't collapse to line", no ST bias
+    
+    print(f"[Triangle Loss] ST epsilon (60% of median): {triangle_epsilon_st:.4f}")
+    print(f"[Triangle Loss] SC epsilon (fixed, ST-independent): {triangle_epsilon_sc:.4f}")
+    print(f"[Triangle Loss] → ST: Hinge mode with ST-derived threshold")
+    print(f"[Triangle Loss] → SC: Weak guardrail, no ST influence\n")
+    # =============================================================
+
     
     # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
@@ -938,11 +969,11 @@ def train_stageC_diffusion_generator(
         'overlap': 0.25,
         'ordinal_sc': 0.5,
         'st_dist': 0.0,
-        'edm_tail': 0.5,
+        'edm_tail': 0.3,
         'gen_align': 0.3,
         'dim': 0.1,
-        'triangle': 0.1,
-        'radial': 0.2
+        'triangle': 0.5,
+        'radial': 1.0
     }
 
     
@@ -1695,15 +1726,17 @@ def train_stageC_diffusion_generator(
                                 use_target=True
                             )
                         
-                        # B2: Triangle area regularizer
+                        # B2: Triangle area regularizer (ST: hinge with ST-derived epsilon)
                         with torch.autocast(device_type='cuda', enabled=False):
                             L_triangle = loss_triangle(
                                 V_pred=V_geom,
-                                V_target=V_target_batch,
+                                V_target=None,
                                 mask=mask,
-                                use_target=True,
-                                hinge_mode=False
+                                use_target=False,
+                                hinge_mode=True,
+                                epsilon=triangle_epsilon_st  # ST-specific threshold
                             )
+
                         
                         # B3: Radial histogram loss
                         with torch.autocast(device_type='cuda', enabled=False):
@@ -1874,6 +1907,35 @@ def train_stageC_diffusion_generator(
                 else:
                     L_sw_sc = torch.zeros((), device=device)
 
+
+                # ===== SC MANIFOLD REGULARIZER: Weak dimension prior =====
+                L_dim_sc = torch.tensor(0.0, device=device)
+                with torch.autocast(device_type='cuda', enabled=False):
+                    # Apply weak dimension regularizer to SC (no ground truth, use target_dim=2)
+                    L_dim_sc = loss_dim(
+                        V_pred=V_hat.float(),
+                        V_target=None,
+                        mask=mask,
+                        use_target=False
+                    )
+                    L_dim_sc = L_dim_sc * 0.3
+
+                # ===== SC TRIANGLE REGULARIZER: Weak guardrail (ST-independent) =====
+                L_triangle_sc = torch.tensor(0.0, device=device)
+                with torch.autocast(device_type='cuda', enabled=False):
+                    # Use FIXED small epsilon (not ST-derived) for SC
+                    L_triangle_sc = loss_triangle(
+                        V_pred=V_hat.float(),
+                        V_target=None,
+                        mask=mask,
+                        use_target=False,
+                        hinge_mode=True,
+                        epsilon=triangle_epsilon_sc  # Fixed, ST-independent
+                    )
+                    # Scale down further for SC (very weak guardrail)
+                    L_triangle_sc = L_triangle_sc * 0.1
+
+
                 # ----------------- (3) Distance-only overlap (SC ONLY) -----------------
                 L_overlap = torch.tensor(0.0, device=device)
                 overlap_pairs = 0
@@ -2004,6 +2066,10 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['dim'] * L_dim +
                                 WEIGHTS['triangle'] * L_triangle +
                                 WEIGHTS['radial'] * L_radial)
+            
+            # Add SC dimension prior if this is an SC batch
+            if is_sc:
+                L_total = L_total + WEIGHTS['dim'] * L_dim_sc + WEIGHTS['triangle'] * L_triangle_sc
     
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
@@ -2305,22 +2371,28 @@ def train_stageC_diffusion_generator(
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
             # ============ EARLY STOPPING CHECK ============
-            if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
-                # Compute validation metric (use score + gram as proxy)
-                # Use mid-sigma score if available from debug_state
-                if 'score_bin_sum' in debug_state and debug_state.get('score_bin_cnt') is not None:
-                    bins_sum = debug_state['score_bin_sum']
-                    bins_cnt = debug_state['score_bin_cnt']
-                    if bins_cnt.sum() > 0:
-                        score_bins = bins_sum / bins_cnt.clamp(min=1)
-                        score_mid = score_bins[2].item()  # Middle bin (index 2 out of 0-4)
-                    else:
-                        score_mid = avg_score
-                else:
-                    score_mid = avg_score
+            # if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
+            #     # Compute validation metric (use score + gram as proxy)
+            #     # Use mid-sigma score if available from debug_state
+            #     if 'score_bin_sum' in debug_state and debug_state.get('score_bin_cnt') is not None:
+            #         bins_sum = debug_state['score_bin_sum']
+            #         bins_cnt = debug_state['score_bin_cnt']
+            #         if bins_cnt.sum() > 0:
+            #             score_bins = bins_sum / bins_cnt.clamp(min=1)
+            #             score_mid = score_bins[2].item()  # Middle bin (index 2 out of 0-4)
+            #         else:
+            #             score_mid = avg_score
+            #     else:
+            #         score_mid = avg_score
                 
-                w_gram = 1.0
-                val_metric = score_mid + w_gram * avg_gram
+            #     w_gram = 1.0
+            #     val_metric = score_mid + w_gram * avg_gram
+
+            if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
+                # Use total weighted loss as validation metric
+                # This includes all geometry regularizers (dim, triangle, radial)
+                val_metric = avg_total
+
                 
                 # Check for improvement
                 if val_metric < early_stop_best:
@@ -2353,16 +2425,22 @@ def train_stageC_diffusion_generator(
                     print(f"[Early Stop] No improvement for {early_stop_patience} epochs")
                     print(f"{'='*80}\n")
             
+            # elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
+            #     # Just track best, don't stop yet
+            #     score_mid = avg_score
+            #     w_gram = 1.0
+            #     val_metric = score_mid + w_gram * avg_gram
+            #     if val_metric < early_stop_best:
+            #         early_stop_best = val_metric
+            #         print(f"[Early Stop] Warmup: best={early_stop_best:.4f} (min_epochs not reached)")
+
             elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
                 # Just track best, don't stop yet
-                score_mid = avg_score
-                w_gram = 1.0
-                val_metric = score_mid + w_gram * avg_gram
+                val_metric = avg_total
                 if val_metric < early_stop_best:
                     early_stop_best = val_metric
                     print(f"[Early Stop] Warmup: best={early_stop_best:.4f} (min_epochs not reached)")
-
-                
+          
         # Broadcast stop decision to ALL ranks
         if fabric is not None:
             # print(f"[DEBUG train_stageC BROADCAST] Rank {fabric.global_rank} - BEFORE broadcast, local should_stop={should_stop}")

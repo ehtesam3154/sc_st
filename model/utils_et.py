@@ -2669,38 +2669,56 @@ class IntrinsicDimensionLoss(nn.Module):
         # Apply mask if provided
         if mask is not None:
             mask_expanded = mask.unsqueeze(-1).expand(-1, -1, k)
-            r_k = r_k.where(mask_expanded, torch.full_like(r_k, float('inf')))
+            r_k = r_k.where(mask_expanded, torch.full_like(r_k, 1.0))  # Use 1.0 instead of inf
         
         # Levina-Bickel MLE estimator: m_i = [1/(k-1) * sum_{j=1}^{k-1} log(r_k / r_j)]^{-1}
         r_k_outer = r_k[:, :, -1:]  # (B, N, 1) - largest distance
         r_j = r_k[:, :, :-1]  # (B, N, k-1) - all but largest
         
-        # Avoid log(0) and division by zero
-        ratio = (r_k_outer + 1e-8) / (r_j + 1e-8)
-        log_ratio = torch.log(ratio + 1e-8)
+        # CRITICAL FIX: Avoid log(0), log(negative), and division by zero
+        # Add larger epsilon to prevent near-zero ratios
+        eps = 1e-6
+        ratio = (r_k_outer.clamp(min=eps)) / (r_j.clamp(min=eps))
+        
+        # Clamp ratio to reasonable range before log
+        ratio = ratio.clamp(min=1.0 + eps, max=100.0)  # Ensure ratio > 1
+        
+        log_ratio = torch.log(ratio)
         
         # Average log ratios per point
         mean_log_ratio = log_ratio.mean(dim=-1)  # (B, N)
         
+        # CRITICAL FIX: Clamp mean_log_ratio away from zero before inversion
+        mean_log_ratio = mean_log_ratio.clamp(min=1e-3)
+        
         # Inverse gives dimension estimate per point
-        m_i = 1.0 / (mean_log_ratio + 1e-8)
+        m_i = 1.0 / mean_log_ratio
         
         # Clamp to reasonable range [0.5, 10] to avoid numerical issues
         m_i = m_i.clamp(min=0.5, max=10.0)
         
+        # CRITICAL FIX: Check for NaN and replace with default
+        m_i = torch.where(torch.isnan(m_i), torch.tensor(2.0, device=device), m_i)
+        
         # Apply mask and average over points
         if mask is not None:
-            m_patch = (m_i * mask.float()).sum(dim=1) / mask.float().sum(dim=1).clamp(min=1.0)
+            valid_counts = mask.float().sum(dim=1).clamp(min=1.0)
+            m_patch = (m_i * mask.float()).sum(dim=1) / valid_counts
         else:
             m_patch = m_i.mean(dim=1)
         
+        # Final NaN check
+        m_patch = torch.where(torch.isnan(m_patch), torch.tensor(2.0, device=device), m_patch)
+        
         return m_patch  # (B,)
+
 
 class TriangleAreaLoss(nn.Module):
     """
-    Local triangle area regularizer using Cayley-Menger determinant.
+    Local triangle area regularizer using Heron's formula.
     
     Penalizes degenerate (1-D) manifolds by enforcing non-zero triangle areas.
+    FULLY DIFFERENTIABLE - all operations keep gradient graph intact.
     
     Args:
         num_triangles_per_sample: number of triangles to sample per point cloud
@@ -2729,7 +2747,7 @@ class TriangleAreaLoss(nn.Module):
             V_target: (B, N, D) target coordinates (for ST) or None
             mask: (B, N) boolean mask
             use_target: if True, match to V_target areas; else use hinge
-            hinge_mode: if True, enforce A^2 >= epsilon; else match to target
+            hinge_mode: if True, enforce A >= epsilon; else match to target
             epsilon: minimum triangle area for hinge mode
             
         Returns:
@@ -2743,20 +2761,20 @@ class TriangleAreaLoss(nn.Module):
             V_target = V_target.float()
         
         # Compute average triangle area for predictions
-        A2_pred = self._compute_avg_triangle_area(V_pred, mask)
+        A_pred = self._compute_avg_triangle_area(V_pred, mask)
         
         if use_target and V_target is not None:
             # Match to ground truth areas
-            A2_true = self._compute_avg_triangle_area(V_target, mask)
-            loss = (A2_pred - A2_true).pow(2).mean()
+            A_true = self._compute_avg_triangle_area(V_target, mask)
+            loss = (A_pred - A_true).pow(2).mean()
         elif hinge_mode:
-            # Hinge: enforce A^2_pred >= epsilon
-            violation = torch.clamp(epsilon - A2_pred, min=0.0)
+            # Hinge: enforce A_pred >= epsilon
+            violation = torch.clamp(epsilon - A_pred, min=0.0)
             loss = violation.pow(2).mean()
         else:
             # Default: match to a reasonable target area
-            A2_target = torch.tensor(0.1, device=device, dtype=torch.float32)
-            loss = (A2_pred - A2_target).pow(2).mean()
+            A_target = torch.tensor(0.1, device=device, dtype=torch.float32)
+            loss = (A_pred - A_target).pow(2).mean()
         
         return loss
     
@@ -2766,14 +2784,14 @@ class TriangleAreaLoss(nn.Module):
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute average squared triangle area for each sample.
+        Compute average triangle area for each sample.
         
         Args:
             V: (B, N, D) coordinates
             mask: (B, N) boolean mask
             
         Returns:
-            A2_avg: (B,) average squared area per sample
+            A_avg: (B,) average area per sample
         """
         B, N, D = V.shape
         device = V.device
@@ -2793,8 +2811,9 @@ class TriangleAreaLoss(nn.Module):
             else:
                 n_valid = N
             
-            # Sample triangles from knn neighborhoods
+            # Sample triangles from knn neighborhoods (FULLY DIFFERENTIABLE)
             areas = self._sample_local_triangles(V_b, n_valid)
+            
             if areas.numel() == 0:
                 areas_batch.append(torch.tensor(0.0, device=device))
             else:
@@ -2809,76 +2828,61 @@ class TriangleAreaLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Sample triangles within local knn neighborhoods.
+        FULLY DIFFERENTIABLE - no .item() calls, all tensor operations.
         
         Args:
             V: (n, D) coordinates
             n: number of valid points
             
         Returns:
-            areas_squared: (T,) squared areas of sampled triangles
+            areas_normalized: (T,) normalized areas of sampled triangles
         """
         device = V.device
         k = min(self.knn_k, n - 1)
         
         if k < 2 or n < 3:
-            return torch.tensor([], device=device, dtype=torch.float32)
+            return torch.zeros(0, device=device, dtype=torch.float32)
         
-        # Compute pairwise distances
+        # Compute pairwise distances (DIFFERENTIABLE)
         D_dist = torch.cdist(V, V)  # (n, n)
         
-        # Get knn for each point
-        knn_dist, knn_idx = torch.topk(D_dist, k=k+1, dim=-1, largest=False, sorted=True)
-        knn_idx = knn_idx[:, 1:]  # exclude self
+        # Get knn for each point (DIFFERENTIABLE - indices don't need gradients)
+        _, knn_idx = torch.topk(D_dist, k=k+1, dim=-1, largest=False, sorted=True)
+        knn_idx = knn_idx[:, 1:]  # exclude self, shape (n, k)
         
         # Sample triangles
         num_to_sample = min(self.num_triangles_per_sample, n * (k * (k-1)) // 2)
-        areas_squared = []
         
-        for _ in range(num_to_sample):
-            # Pick random anchor point
-            i = torch.randint(0, n, (1,), device=device).item()
-            neighbors = knn_idx[i]  # (k,)
-            
-            if neighbors.numel() < 2:
-                continue
-            
-            # Pick two neighbors randomly
-            idx = torch.randperm(neighbors.numel(), device=device)[:2]
-            j, k_pt = neighbors[idx[0]].item(), neighbors[idx[1]].item()
-            
-            # Compute triangle area from edge lengths
-            a = D_dist[i, j].item()  # dist(i, j)
-            b = D_dist[i, k_pt].item()  # dist(i, k)
-            c = D_dist[j, k_pt].item()  # dist(j, k)
-            
-            A2 = self._cayley_menger_area_squared(a, b, c)
-            areas_squared.append(A2)
+        if num_to_sample == 0:
+            return torch.zeros(0, device=device, dtype=torch.float32)
         
-        if len(areas_squared) == 0:
-            return torch.tensor([], device=device, dtype=torch.float32)
+        # Sample anchor points (i) - shape (T,)
+        i_idx = torch.randint(0, n, (num_to_sample,), device=device)
         
-        return torch.tensor(areas_squared, device=device, dtype=torch.float32)
-    
-    @staticmethod
-    def _cayley_menger_area_squared(a: float, b: float, c: float) -> float:
-        """
-        Compute squared area of triangle from edge lengths using Cayley-Menger determinant.
+        # Sample 2 neighbors per anchor - shape (T, 2)
+        nbr_perm = torch.randint(0, k, (num_to_sample, 2), device=device)
         
-        For triangle with edges a, b, c:
-        A^2 = -1/16 * det(M)
-        where M is 4x4 Cayley-Menger matrix.
+        # Get neighbor indices j and k_pt - shape (T,)
+        j_idx = knn_idx[i_idx, nbr_perm[:, 0]]
+        k_idx = knn_idx[i_idx, nbr_perm[:, 1]]
         
-        Simplified formula: A^2 = 1/16 * (4a^2 b^2 - (a^2 + b^2 - c^2)^2)
-        """
-        # Heron's formula equivalent (more numerically stable)
-        s = (a + b + c) / 2.0  # semi-perimeter
-        temp = s * (s - a) * (s - b) * (s - c)
+        # CRITICAL: Compute edge lengths as TENSORS (not .item())
+        a = D_dist[i_idx, j_idx]  # (T,) - distance i to j
+        b = D_dist[i_idx, k_idx]  # (T,) - distance i to k
+        c = D_dist[j_idx, k_idx]  # (T,) - distance j to k
         
-        if temp <= 0:
-            return 0.0
+        # Heron's formula in TENSOR FORM (DIFFERENTIABLE)
+        s = 0.5 * (a + b + c)  # semi-perimeter (T,)
+        area_sq = s * (s - a) * (s - b) * (s - c)  # (T,)
+        area_sq = area_sq.clamp(min=0.0)  # prevent negative from numerical errors
+        A = torch.sqrt(area_sq + 1e-12)  # (T,)
         
-        A_squared = temp
-        return A_squared
+        # Normalize by scale to make dimensionless (DIFFERENTIABLE)
+        avg_edge = (a + b + c) / 3.0  # (T,)
+        scale = (avg_edge ** 2).clamp(min=1e-8)  # (T,)
+        A_normalized = A / scale  # (T,)
+        
+        return A_normalized  # (T,) - TENSOR with gradient graph intact
 
 
 class RadialHistogramLoss(nn.Module):
