@@ -915,15 +915,26 @@ def main(args=None):
             losses = history_st['epoch_avg']
             
             # ST-specific losses
-            st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align']
-            st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime']
+            # st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align']
+            # st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime']
+
+            st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial']
+            st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime', 'brown', 'pink', 'gray']
+
             
-            fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+            # fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+            fig, axes = plt.subplots(4, 3, figsize=(20, 20))
+
             fig.suptitle('Phase 1: ST-Only Training Losses', fontsize=18, fontweight='bold', y=0.995)
             
+            # for idx, (name, color) in enumerate(zip(st_loss_names, st_colors)):
+            #     if name in losses and len(losses[name]) > 0:
+            #         ax = axes[idx // 3, idx % 3]
+
+            axes = axes.flatten()
             for idx, (name, color) in enumerate(zip(st_loss_names, st_colors)):
                 if name in losses and len(losses[name]) > 0:
-                    ax = axes[idx // 3, idx % 3]
+                    ax = axes[idx]
                     ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
                     ax.set_xlabel('Epoch', fontsize=12)
                     ax.set_ylabel('Loss', fontsize=12)
@@ -936,6 +947,10 @@ def main(args=None):
                         ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
                         ax.legend(fontsize=10)
             
+            # Hide unused subplots
+            for idx in range(len(st_loss_names), 12):
+                axes[idx].axis('off')
+
             plt.tight_layout()
             st_plot_filename = f"stageC_phase1_ST_losses_{timestamp}.png"
             st_plot_path = os.path.join(outdir, st_plot_filename)
@@ -998,9 +1013,14 @@ def main(args=None):
             if 'total' in st_losses and len(st_losses['total']) > 0:
                 print(f"Final total loss: {st_losses['total'][-1]:.4f}")
                 print(f"Final ST geometry losses:")
-                for name in ['gram', 'heat', 'edm_tail', 'gen_align']:
+                for name in ['gram', 'heat', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial']:
                     if name in st_losses and len(st_losses[name]) > 0:
                         print(f"  {name}: {st_losses[name][-1]:.4f}")
+
+                # print(f"Final ST geometry losses:")
+                # for name in ['gram', 'heat', 'edm_tail', 'gen_align']:
+                #     if name in st_losses and len(st_losses[name]) > 0:
+                #         print(f"  {name}: {st_losses[name][-1]:.4f}")
         
         if args.num_sc_samples > 0 and training_history is not None:
             print("\n--- Phase 2: SC Fine-tuning ---")

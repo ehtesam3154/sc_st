@@ -757,6 +757,11 @@ def train_stageC_diffusion_generator(
     )
     loss_sw = uet.SlicedWassersteinLoss1D()
     loss_triplet = uet.OrdinalTripletLoss()
+
+    loss_dim = uet.IntrinsicDimensionLoss(k_neighbors=20, target_dim=2.0)
+    loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
+    loss_radial = uet.RadialHistogramLoss(num_bins=20)
+
     
     # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
@@ -909,19 +914,37 @@ def train_stageC_diffusion_generator(
     #     'st_dist': 0.3
     # }
 
+    # WEIGHTS = {
+    #     'score': 1.0,
+    #     'gram': 4.0,
+    #     'gram_scale': 0.25,
+    #     'heat': 0.5,          # START AT ZERO - warmup later
+    #     'sw_st': 0.05,        # REDUCED from 0.5 (scale-free, weakens tail)
+    #     'sw_sc': 0.6,
+    #     'overlap': 0.2,
+    #     'ordinal_sc': 0.5,
+    #     'st_dist': 0.3,
+    #     'edm_tail': 1.0,      # NEW: EDM tail loss (prioritize far distances)
+    #     'gen_align': 1.0      # NEW: Generator alignment to factor_from_gram
+    # }
+
     WEIGHTS = {
         'score': 1.0,
-        'gram': 4.0,
-        'gram_scale': 0.25,
-        'heat': 0.5,          # START AT ZERO - warmup later
-        'sw_st': 0.05,        # REDUCED from 0.5 (scale-free, weakens tail)
-        'sw_sc': 0.6,
-        'overlap': 0.2,
+        'gram': 0.5,
+        'gram_scale': 0.3,
+        'heat': 0.25,
+        'sw_st': 0.5,
+        'sw_sc': 0.3,
+        'overlap': 0.25,
         'ordinal_sc': 0.5,
-        'st_dist': 0.3,
-        'edm_tail': 1.0,      # NEW: EDM tail loss (prioritize far distances)
-        'gen_align': 1.0      # NEW: Generator alignment to factor_from_gram
+        'st_dist': 0.0,
+        'edm_tail': 0.5,
+        'gen_align': 0.3,
+        'dim': 0.1,
+        'triangle': 0.1,
+        'radial': 0.2
     }
+
     
     # Heat warmup schedule
     HEAT_WARMUP_EPOCHS = 10
@@ -946,16 +969,26 @@ def train_stageC_diffusion_generator(
     # CFG config
     p_uncond = 0.25
     
+    # history = {
+    #     'epoch': [],
+    #     'batch_losses': [],
+    #     'epoch_avg': {
+    #         'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
+    #         'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
+    #         'edm_tail': [], 'gen_align': []
+    #     }
+    # }
+
     history = {
         'epoch': [],
         'batch_losses': [],
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': []
+            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': []
         }
-
     }
+
     
     # Compute sigma_data once at start
     print("Computing sigma_data from data statistics...")
@@ -1256,6 +1289,10 @@ def train_stageC_diffusion_generator(
             L_st_dist = torch.tensor(0.0, device=device)
             L_edm_tail = torch.tensor(0.0, device=device)
             L_gen_align = torch.tensor(0.0, device=device)
+            L_dim = torch.zeros((), device=device)
+            L_triangle = torch.zeros((), device=device)
+            L_radial = torch.zeros((), device=device)
+
             
             # Denoise to get V_hat
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -1648,6 +1685,35 @@ def train_stageC_diffusion_generator(
                                 mask=mask
                             )
 
+                        # ==================== NEW MANIFOLD-AWARE REGULARIZERS ====================
+                        # B1: Intrinsic dimension regularizer
+                        with torch.autocast(device_type='cuda', enabled=False):
+                            L_dim = loss_dim(
+                                V_pred=V_geom,
+                                V_target=V_target_batch,
+                                mask=mask,
+                                use_target=True
+                            )
+                        
+                        # B2: Triangle area regularizer
+                        with torch.autocast(device_type='cuda', enabled=False):
+                            L_triangle = loss_triangle(
+                                V_pred=V_geom,
+                                V_target=V_target_batch,
+                                mask=mask,
+                                use_target=True,
+                                hinge_mode=False
+                            )
+                        
+                        # B3: Radial histogram loss
+                        with torch.autocast(device_type='cuda', enabled=False):
+                            L_radial = loss_radial(
+                                V_pred=V_geom,
+                                V_target=V_target_batch,
+                                mask=mask
+                            )
+
+
                         if DEBUG and (global_step % LOG_EVERY == 0):
                             print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
 
@@ -1910,6 +1976,19 @@ def train_stageC_diffusion_generator(
             #     if 'geo_gate' in locals() and geo_gate.float().mean() > 0.5:
             #         score_multiplier = 0.25
 
+            # L_total = (WEIGHTS['score'] * score_multiplier * L_score +
+            #                     # WEIGHTS['cone'] * L_cone +
+            #                     WEIGHTS['gram'] * L_gram +
+            #                     WEIGHTS['gram_scale'] * L_gram_scale +
+            #                     WEIGHTS['heat'] * L_heat +
+            #                     WEIGHTS['sw_st'] * L_sw_st +
+            #                     WEIGHTS['sw_sc'] * L_sw_sc +
+            #                     WEIGHTS['overlap'] * L_overlap +
+            #                     WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
+            #                     WEIGHTS['st_dist'] * L_st_dist +
+            #                     WEIGHTS['edm_tail'] * L_edm_tail +      
+            #                     WEIGHTS['gen_align'] * L_gen_align) 
+
             L_total = (WEIGHTS['score'] * score_multiplier * L_score +
                                 # WEIGHTS['cone'] * L_cone +
                                 WEIGHTS['gram'] * L_gram +
@@ -1921,7 +2000,11 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
                                 WEIGHTS['st_dist'] * L_st_dist +
                                 WEIGHTS['edm_tail'] * L_edm_tail +      
-                                WEIGHTS['gen_align'] * L_gen_align)     
+                                WEIGHTS['gen_align'] * L_gen_align +
+                                WEIGHTS['dim'] * L_dim +
+                                WEIGHTS['triangle'] * L_triangle +
+                                WEIGHTS['radial'] * L_radial)
+    
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
             # if DEBUG and (global_step % LOG_EVERY == 0):
@@ -2145,6 +2228,10 @@ def train_stageC_diffusion_generator(
             epoch_losses['ordinal_sc'] += L_ordinal_sc.item()
             epoch_losses['edm_tail'] += L_edm_tail.item()
             epoch_losses['gen_align'] += L_gen_align.item()
+            epoch_losses['dim'] += L_dim.item()
+            epoch_losses['triangle'] += L_triangle.item()
+            epoch_losses['radial'] += L_radial.item()
+
 
 
             def _is_rank0():
@@ -2203,12 +2290,17 @@ def train_stageC_diffusion_generator(
                 avg_st_dist = epoch_losses['st_dist'] / max(n_batches, 1)
                 avg_edm_tail = epoch_losses['edm_tail'] / max(n_batches, 1)
                 avg_gen_align = epoch_losses['gen_align'] / max(n_batches, 1)
+                avg_dim = epoch_losses['dim'] / max(n_batches, 1)
+                avg_triangle = epoch_losses['triangle'] / max(n_batches, 1)
+                avg_radial = epoch_losses['radial'] / max(n_batches, 1)
                 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
                 print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f}")
                 print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
+                print(f"  dim={avg_dim:.4f} | triangle={avg_triangle:.4f} | radial={avg_radial:.4f}")
+
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
@@ -2356,14 +2448,25 @@ def train_stageC_diffusion_generator(
             dist.all_reduce(sum_overlap_batches, op=dist.ReduceOp.SUM)
 
         # Determine denominator per loss type
+        # def _denom_for(key):
+        #     if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone'):
+        #         return cnt_st
+        #     if key in ('sw_sc', 'ordinal_sc'):
+        #         return cnt_sc
+        #     if key == 'overlap':
+        #         return sum_overlap_batches
+        #     return sum_batches  # 'total' and 'score'
+        
+        # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
             if key == 'overlap':
                 return sum_overlap_batches
             return sum_batches  # 'total' and 'score'
+
 
         # compute true epoch means
         epoch_means = {}
@@ -2378,17 +2481,6 @@ def train_stageC_diffusion_generator(
         history['epoch'].append(epoch + 1)
 
         # Recompute weighted total from means (don't use the raw 'total' sum)
-        # epoch_losses['total'] = (
-        #     WEIGHTS['score'] * epoch_losses['score'] +
-        #     WEIGHTS['gram'] * epoch_losses['gram'] +
-        #     WEIGHTS['gram_scale'] * epoch_losses['gram_scale'] +
-        #     WEIGHTS['heat'] * epoch_losses['heat'] +
-        #     WEIGHTS['sw_st'] * epoch_losses['sw_st'] +
-        #     WEIGHTS['sw_sc'] * epoch_losses['sw_sc'] +
-        #     WEIGHTS['overlap'] * epoch_losses['overlap'] +
-        #     WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc']
-        # )
-
         epoch_losses['total'] = (
             WEIGHTS['score'] * epoch_losses['score'] +
             WEIGHTS['gram'] * epoch_losses['gram'] +
@@ -2399,8 +2491,12 @@ def train_stageC_diffusion_generator(
             WEIGHTS['overlap'] * epoch_losses['overlap'] +
             WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc'] +
             WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
-            WEIGHTS['gen_align'] * epoch_losses['gen_align']
+            WEIGHTS['gen_align'] * epoch_losses['gen_align'] +
+            WEIGHTS['dim'] * epoch_losses['dim'] +
+            WEIGHTS['triangle'] * epoch_losses['triangle'] +
+            WEIGHTS['radial'] * epoch_losses['radial']
         )
+
 
         # Override the history['epoch_avg']['total'] with correct value
         history['epoch_avg']['total'][-1] = epoch_losses['total']

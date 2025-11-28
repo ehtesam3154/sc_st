@@ -2575,3 +2575,491 @@ def build_laplacian_from_edges(
         L = torch.diag(deg) - adj
     
     return L
+
+
+class IntrinsicDimensionLoss(nn.Module):
+    """
+    Levina-Bickel MLE intrinsic dimension regularizer.
+    
+    Estimates local intrinsic dimension from pairwise distances (EDM)
+    and matches it to ground truth.
+    
+    Args:
+        k_neighbors: number of nearest neighbors for local estimation (default: 20)
+        target_dim: target intrinsic dimension for SC (default: 2.0)
+    """
+    
+    def __init__(self, k_neighbors: int = 20, target_dim: float = 2.0):
+        super().__init__()
+        self.k_neighbors = k_neighbors
+        self.target_dim = target_dim
+    
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        use_target: bool = True
+    ) -> torch.Tensor:
+        """
+        Compute intrinsic dimension loss.
+        
+        Args:
+            V_pred: (B, N, D) predicted coordinates
+            V_target: (B, N, D) target coordinates (for ST) or None (for SC)
+            mask: (B, N) boolean mask
+            use_target: if True, match to V_target's dimension; else use self.target_dim
+            
+        Returns:
+            loss: scalar dimension mismatch loss
+        """
+        B, N, D = V_pred.shape
+        device = V_pred.device
+        
+        # Ensure float32 for numerical stability
+        V_pred = V_pred.float()
+        if V_target is not None:
+            V_target = V_target.float()
+        
+        # Compute intrinsic dimension for predictions
+        m_pred = self._estimate_dimension_batch(V_pred, mask)
+        
+        if use_target and V_target is not None:
+            # Match to ground truth dimension
+            m_true = self._estimate_dimension_batch(V_target, mask)
+            loss = (m_pred - m_true).pow(2).mean()
+        else:
+            # Match to target dimension (for SC)
+            m_target = torch.tensor(self.target_dim, device=device, dtype=torch.float32)
+            loss = (m_pred - m_target).pow(2).mean()
+        
+        return loss
+    
+    def _estimate_dimension_batch(
+        self,
+        V: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Estimate intrinsic dimension for each sample in batch.
+        
+        Args:
+            V: (B, N, D) coordinates
+            mask: (B, N) boolean mask
+            
+        Returns:
+            m: (B,) estimated intrinsic dimensions
+        """
+        B, N, D = V.shape
+        device = V.device
+        k = min(self.k_neighbors, N - 1)
+        
+        if k < 2:
+            # Not enough neighbors, return default
+            return torch.full((B,), 2.0, device=device, dtype=torch.float32)
+        
+        # Compute pairwise distances
+        D_dist = torch.cdist(V, V)  # (B, N, N)
+        
+        # For each point, get k nearest neighbors
+        # topk excludes self (distance=0) by taking k+1 and slicing [1:]
+        distances, indices = torch.topk(D_dist, k=k+1, dim=-1, largest=False, sorted=True)
+        r_k = distances[:, :, 1:]  # (B, N, k) - exclude self
+        
+        # Apply mask if provided
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1).expand(-1, -1, k)
+            r_k = r_k.where(mask_expanded, torch.full_like(r_k, float('inf')))
+        
+        # Levina-Bickel MLE estimator: m_i = [1/(k-1) * sum_{j=1}^{k-1} log(r_k / r_j)]^{-1}
+        r_k_outer = r_k[:, :, -1:]  # (B, N, 1) - largest distance
+        r_j = r_k[:, :, :-1]  # (B, N, k-1) - all but largest
+        
+        # Avoid log(0) and division by zero
+        ratio = (r_k_outer + 1e-8) / (r_j + 1e-8)
+        log_ratio = torch.log(ratio + 1e-8)
+        
+        # Average log ratios per point
+        mean_log_ratio = log_ratio.mean(dim=-1)  # (B, N)
+        
+        # Inverse gives dimension estimate per point
+        m_i = 1.0 / (mean_log_ratio + 1e-8)
+        
+        # Clamp to reasonable range [0.5, 10] to avoid numerical issues
+        m_i = m_i.clamp(min=0.5, max=10.0)
+        
+        # Apply mask and average over points
+        if mask is not None:
+            m_patch = (m_i * mask.float()).sum(dim=1) / mask.float().sum(dim=1).clamp(min=1.0)
+        else:
+            m_patch = m_i.mean(dim=1)
+        
+        return m_patch  # (B,)
+
+class TriangleAreaLoss(nn.Module):
+    """
+    Local triangle area regularizer using Cayley-Menger determinant.
+    
+    Penalizes degenerate (1-D) manifolds by enforcing non-zero triangle areas.
+    
+    Args:
+        num_triangles_per_sample: number of triangles to sample per point cloud
+        knn_k: use neighbors within knn_k for triangle sampling
+    """
+    
+    def __init__(self, num_triangles_per_sample: int = 500, knn_k: int = 12):
+        super().__init__()
+        self.num_triangles_per_sample = num_triangles_per_sample
+        self.knn_k = knn_k
+    
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        use_target: bool = True,
+        hinge_mode: bool = False,
+        epsilon: float = 1e-4
+    ) -> torch.Tensor:
+        """
+        Compute triangle area loss.
+        
+        Args:
+            V_pred: (B, N, D) predicted coordinates
+            V_target: (B, N, D) target coordinates (for ST) or None
+            mask: (B, N) boolean mask
+            use_target: if True, match to V_target areas; else use hinge
+            hinge_mode: if True, enforce A^2 >= epsilon; else match to target
+            epsilon: minimum triangle area for hinge mode
+            
+        Returns:
+            loss: scalar area loss
+        """
+        B, N, D = V_pred.shape
+        device = V_pred.device
+        
+        V_pred = V_pred.float()
+        if V_target is not None:
+            V_target = V_target.float()
+        
+        # Compute average triangle area for predictions
+        A2_pred = self._compute_avg_triangle_area(V_pred, mask)
+        
+        if use_target and V_target is not None:
+            # Match to ground truth areas
+            A2_true = self._compute_avg_triangle_area(V_target, mask)
+            loss = (A2_pred - A2_true).pow(2).mean()
+        elif hinge_mode:
+            # Hinge: enforce A^2_pred >= epsilon
+            violation = torch.clamp(epsilon - A2_pred, min=0.0)
+            loss = violation.pow(2).mean()
+        else:
+            # Default: match to a reasonable target area
+            A2_target = torch.tensor(0.1, device=device, dtype=torch.float32)
+            loss = (A2_pred - A2_target).pow(2).mean()
+        
+        return loss
+    
+    def _compute_avg_triangle_area(
+        self,
+        V: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute average squared triangle area for each sample.
+        
+        Args:
+            V: (B, N, D) coordinates
+            mask: (B, N) boolean mask
+            
+        Returns:
+            A2_avg: (B,) average squared area per sample
+        """
+        B, N, D = V.shape
+        device = V.device
+        
+        # For each sample, sample triangles from knn neighborhoods
+        areas_batch = []
+        
+        for b in range(B):
+            V_b = V[b]  # (N, D)
+            if mask is not None:
+                valid_mask = mask[b]
+                n_valid = valid_mask.sum().item()
+                if n_valid < 3:
+                    areas_batch.append(torch.tensor(0.0, device=device))
+                    continue
+                V_b = V_b[valid_mask]  # (n_valid, D)
+            else:
+                n_valid = N
+            
+            # Sample triangles from knn neighborhoods
+            areas = self._sample_local_triangles(V_b, n_valid)
+            if areas.numel() == 0:
+                areas_batch.append(torch.tensor(0.0, device=device))
+            else:
+                areas_batch.append(areas.mean())
+        
+        return torch.stack(areas_batch)  # (B,)
+    
+    def _sample_local_triangles(
+        self,
+        V: torch.Tensor,
+        n: int
+    ) -> torch.Tensor:
+        """
+        Sample triangles within local knn neighborhoods.
+        
+        Args:
+            V: (n, D) coordinates
+            n: number of valid points
+            
+        Returns:
+            areas_squared: (T,) squared areas of sampled triangles
+        """
+        device = V.device
+        k = min(self.knn_k, n - 1)
+        
+        if k < 2 or n < 3:
+            return torch.tensor([], device=device, dtype=torch.float32)
+        
+        # Compute pairwise distances
+        D_dist = torch.cdist(V, V)  # (n, n)
+        
+        # Get knn for each point
+        knn_dist, knn_idx = torch.topk(D_dist, k=k+1, dim=-1, largest=False, sorted=True)
+        knn_idx = knn_idx[:, 1:]  # exclude self
+        
+        # Sample triangles
+        num_to_sample = min(self.num_triangles_per_sample, n * (k * (k-1)) // 2)
+        areas_squared = []
+        
+        for _ in range(num_to_sample):
+            # Pick random anchor point
+            i = torch.randint(0, n, (1,), device=device).item()
+            neighbors = knn_idx[i]  # (k,)
+            
+            if neighbors.numel() < 2:
+                continue
+            
+            # Pick two neighbors randomly
+            idx = torch.randperm(neighbors.numel(), device=device)[:2]
+            j, k_pt = neighbors[idx[0]].item(), neighbors[idx[1]].item()
+            
+            # Compute triangle area from edge lengths
+            a = D_dist[i, j].item()  # dist(i, j)
+            b = D_dist[i, k_pt].item()  # dist(i, k)
+            c = D_dist[j, k_pt].item()  # dist(j, k)
+            
+            A2 = self._cayley_menger_area_squared(a, b, c)
+            areas_squared.append(A2)
+        
+        if len(areas_squared) == 0:
+            return torch.tensor([], device=device, dtype=torch.float32)
+        
+        return torch.tensor(areas_squared, device=device, dtype=torch.float32)
+    
+    @staticmethod
+    def _cayley_menger_area_squared(a: float, b: float, c: float) -> float:
+        """
+        Compute squared area of triangle from edge lengths using Cayley-Menger determinant.
+        
+        For triangle with edges a, b, c:
+        A^2 = -1/16 * det(M)
+        where M is 4x4 Cayley-Menger matrix.
+        
+        Simplified formula: A^2 = 1/16 * (4a^2 b^2 - (a^2 + b^2 - c^2)^2)
+        """
+        # Heron's formula equivalent (more numerically stable)
+        s = (a + b + c) / 2.0  # semi-perimeter
+        temp = s * (s - a) * (s - b) * (s - c)
+        
+        if temp <= 0:
+            return 0.0
+        
+        A_squared = temp
+        return A_squared
+
+
+class RadialHistogramLoss(nn.Module):
+    """
+    Occupancy / radial histogram loss for ST patches.
+    
+    Canonicalizes coordinates (center, PCA, scale) and matches radial distribution.
+    Directly attacks hollow centers by comparing radial occupancy.
+    Uses DIFFERENTIABLE soft binning instead of torch.histogram.
+    
+    Args:
+        num_bins: number of radial bins (default: 20)
+        temperature: softmax temperature for soft binning (default: 0.1)
+    """
+    
+    def __init__(self, num_bins: int = 20, temperature: float = 0.1):
+        super().__init__()
+        self.num_bins = num_bins
+        self.temperature = temperature
+    
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute radial histogram loss.
+        
+        Args:
+            V_pred: (B, N, D) predicted coordinates
+            V_target: (B, N, D) target coordinates
+            mask: (B, N) boolean mask
+            
+        Returns:
+            loss: scalar histogram matching loss
+        """
+        B, N, D = V_pred.shape
+        device = V_pred.device
+        
+        V_pred = V_pred.float()
+        V_target = V_target.float()
+        
+        # Canonicalize both pred and target, compute histograms
+        hist_pred = self._compute_radial_histogram_batch(V_pred, mask)
+        hist_target = self._compute_radial_histogram_batch(V_target, mask)
+        
+        # L2 loss between histograms
+        loss = (hist_pred - hist_target).pow(2).sum(dim=-1).mean()
+        
+        return loss
+    
+    def _compute_radial_histogram_batch(
+        self,
+        V: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Canonicalize coordinates and compute radial histogram using soft binning.
+        
+        Args:
+            V: (B, N, D) coordinates
+            mask: (B, N) boolean mask
+            
+        Returns:
+            hist: (B, num_bins) normalized radial histograms
+        """
+        B, N, D = V.shape
+        device = V.device
+        
+        hists = []
+        
+        for b in range(B):
+            V_b = V[b]  # (N, D)
+            
+            if mask is not None:
+                valid_mask = mask[b]
+                n_valid = valid_mask.sum().item()
+                if n_valid < 3:
+                    # Not enough points, return uniform
+                    hists.append(torch.ones(self.num_bins, device=device) / self.num_bins)
+                    continue
+                V_b = V_b[valid_mask]  # (n_valid, D)
+            else:
+                n_valid = N
+            
+            # Canonicalize
+            V_canon = self._canonicalize(V_b)
+            
+            # Compute radii
+            radii = torch.norm(V_canon, dim=-1)  # (n_valid,)
+            
+            # Normalize radii to [0, 1]
+            max_r = radii.max()
+            if max_r > 1e-8:
+                radii_norm = radii / max_r
+            else:
+                radii_norm = radii
+            
+            # DIFFERENTIABLE soft binning
+            hist = self._soft_histogram(radii_norm, self.num_bins, self.temperature)
+            
+            # Normalize histogram
+            hist = hist / (hist.sum() + 1e-8)
+            hists.append(hist)
+        
+        return torch.stack(hists)  # (B, num_bins)
+    
+    @staticmethod
+    def _soft_histogram(
+        values: torch.Tensor,
+        num_bins: int,
+        temperature: float = 0.1
+    ) -> torch.Tensor:
+        """
+        Differentiable soft histogram using Gaussian kernels.
+        
+        Args:
+            values: (N,) values in range [0, 1]
+            num_bins: number of bins
+            temperature: kernel width (smaller = sharper bins)
+            
+        Returns:
+            hist: (num_bins,) soft histogram counts
+        """
+        device = values.device
+        n = values.shape[0]
+        
+        # Bin centers uniformly spaced in [0, 1]
+        bin_centers = torch.linspace(0.0, 1.0, num_bins, device=device)
+        
+        # Compute distance from each value to each bin center
+        # values: (N,) -> (N, 1)
+        # bin_centers: (num_bins,) -> (1, num_bins)
+        dist = (values.unsqueeze(1) - bin_centers.unsqueeze(0)).abs()  # (N, num_bins)
+        
+        # Soft assignment using Gaussian kernel
+        # weight[i,j] = how much value i contributes to bin j
+        weights = torch.exp(-dist.pow(2) / (2 * temperature**2))  # (N, num_bins)
+        
+        # Sum weights across values to get histogram
+        hist = weights.sum(dim=0)  # (num_bins,)
+        
+        return hist
+    
+    @staticmethod
+    def _canonicalize(V: torch.Tensor) -> torch.Tensor:
+        """
+        Canonicalize coordinates: center, PCA rotate, scale to unit max radius.
+        
+        Args:
+            V: (n, D) coordinates
+            
+        Returns:
+            V_canon: (n, D) canonicalized coordinates
+        """
+        n, D = V.shape
+        device = V.device
+        
+        # Center
+        V_centered = V - V.mean(dim=0, keepdim=True)
+        
+        # PCA rotation (optional - can skip if causing issues)
+        if D > 1 and n > D:
+            try:
+                # Use SVD for differentiable PCA
+                U, S, Vh = torch.svd(V_centered)
+                V_rotated = V_centered @ Vh
+            except:
+                # Fallback if SVD fails
+                V_rotated = V_centered
+        else:
+            V_rotated = V_centered
+        
+        # Scale to unit max radius
+        radii = torch.norm(V_rotated, dim=-1)
+        max_r = radii.max()
+        if max_r > 1e-8:
+            V_canon = V_rotated / max_r
+        else:
+            V_canon = V_rotated
+        
+        return V_canon
+
