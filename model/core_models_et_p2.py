@@ -762,37 +762,6 @@ def train_stageC_diffusion_generator(
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
     loss_radial = uet.RadialHistogramLoss(num_bins=20)
 
-    # ========== COMPUTE TRIANGLE EPSILON FOR ST ONLY ==========
-    print("\n[Triangle Loss] Computing ST-specific threshold (ST batches only)...")
-    
-    triangle_refs = []
-    with torch.no_grad():
-        for _ in range(20):
-            try:
-                batch = next(iter(st_loader))
-            except:
-                st_loader_temp = DataLoader(
-                    st_dataset, batch_size=4, shuffle=True,
-                    collate_fn=collate_minisets, num_workers=0
-                )
-                batch = next(iter(st_loader_temp))
-            
-            V_target = batch['V_target'].to(device)
-            mask = batch['mask'].to(device)
-            A_ref = loss_triangle._compute_avg_triangle_area(V_target, mask)
-            triangle_refs.extend(A_ref.cpu().tolist())
-    
-    triangle_epsilon_st = 0.6 * float(torch.tensor(triangle_refs).median())
-    
-    # SC uses FIXED small epsilon (ST-independent)
-    triangle_epsilon_sc = 0.01  # Just "don't collapse to line", no ST bias
-    
-    print(f"[Triangle Loss] ST epsilon (60% of median): {triangle_epsilon_st:.4f}")
-    print(f"[Triangle Loss] SC epsilon (fixed, ST-independent): {triangle_epsilon_sc:.4f}")
-    print(f"[Triangle Loss] → ST: Hinge mode with ST-derived threshold")
-    print(f"[Triangle Loss] → SC: Weak guardrail, no ST influence\n")
-    # =============================================================
-
     
     # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
@@ -865,7 +834,36 @@ def train_stageC_diffusion_generator(
 
     LOG_EVERY = steps_per_epoch  # Print once per epoch
 
-
+    # ========== COMPUTE TRIANGLE EPSILON FOR ST ONLY ==========
+    print("\n[Triangle Loss] Computing ST-specific threshold (ST batches only)...")
+    
+    triangle_refs = []
+    with torch.no_grad():
+        for _ in range(20):
+            try:
+                batch = next(iter(st_loader))
+            except:
+                st_loader_temp = DataLoader(
+                    st_dataset, batch_size=4, shuffle=True,
+                    collate_fn=collate_minisets, num_workers=0
+                )
+                batch = next(iter(st_loader_temp))
+            
+            V_target = batch['V_target'].to(device)
+            mask = batch['mask'].to(device)
+            A_ref = loss_triangle._compute_avg_triangle_area(V_target, mask)
+            triangle_refs.extend(A_ref.cpu().tolist())
+    
+    triangle_epsilon_st = 0.6 * float(torch.tensor(triangle_refs).median())
+    
+    # SC uses FIXED small epsilon (ST-independent)
+    triangle_epsilon_sc = 0.01  # Just "don't collapse to line", no ST bias
+    
+    print(f"[Triangle Loss] ST epsilon (60% of median): {triangle_epsilon_st:.4f}")
+    print(f"[Triangle Loss] SC epsilon (fixed, ST-independent): {triangle_epsilon_sc:.4f}")
+    print(f"[Triangle Loss] → ST: Hinge mode with ST-derived threshold")
+    print(f"[Triangle Loss] → SC: Weak guardrail, no ST influence\n")
+    # =============================================================
 
     # ============================================================================
     # DEBUG: MINISETS SANITY CHECK
