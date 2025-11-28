@@ -2771,6 +2771,15 @@ class TriangleAreaLoss(nn.Module):
             # Hinge: enforce A_pred >= epsilon
             violation = torch.clamp(epsilon - A_pred, min=0.0)
             loss = violation.pow(2).mean()
+
+            # DEBUG: Log actual values to diagnose zero loss
+            if torch.rand(1).item() < 0.01:  # Log 1% of the time
+                print(f"[TriangleLoss DEBUG] epsilon={epsilon:.6f}, "
+                      f"A_pred mean={A_pred.mean().item():.6f}, "
+                      f"A_pred min={A_pred.min().item():.6f}, "
+                      f"A_pred max={A_pred.max().item():.6f}, "
+                      f"violation mean={violation.mean().item():.6f}, "
+                      f"loss={loss.item():.6f}")
         else:
             # Default: match to a reasonable target area
             A_target = torch.tensor(0.1, device=device, dtype=torch.float32)
@@ -2876,12 +2885,18 @@ class TriangleAreaLoss(nn.Module):
         area_sq = s * (s - a) * (s - b) * (s - c)  # (T,)
         area_sq = area_sq.clamp(min=0.0)  # prevent negative from numerical errors
         A = torch.sqrt(area_sq + 1e-12)  # (T,)
-        
+
         # Normalize by scale to make dimensionless (DIFFERENTIABLE)
         avg_edge = (a + b + c) / 3.0  # (T,)
         scale = (avg_edge ** 2).clamp(min=1e-8)  # (T,)
         A_normalized = A / scale  # (T,)
-        
+
+        # DEBUG: Occasionally log raw vs normalized areas
+        if torch.rand(1).item() < 0.005:  # 0.5% of calls
+            print(f"[Triangle DEBUG] Raw area: mean={A.mean().item():.6f}, "
+                  f"Normalized: mean={A_normalized.mean().item():.6f}, "
+                  f"avg_edge mean={avg_edge.mean().item():.4f}")
+
         return A_normalized  # (T,) - TENSOR with gradient graph intact
 
 
