@@ -1064,11 +1064,36 @@ def train_stageC_diffusion_generator(
     global_step = 0
 
     # EMA-based autobalance (stable)
+    # ema_grads = {
+    #     'score': 1.0,
+    #     'gram': 0.1,
+    #     'heat': 0.1,
+    #     'sw_st': 0.1
+    # }
+    # ema_sc = {
+    #     'score': 1.0,
+    #     'sw_sc': 0.1,
+    #     'overlap': 0.1,
+    #     'ordinal_sc': 0.1
+    # }
+    # EMA_BETA = 0.98  # CHANGED from 0.95
+    
+    # TARGET = {'gram': 0.05, 'heat': 0.15, 'sw_st': 0.10}
+    # TARGET_SC = {'sw_sc': 0.08, 'overlap': 0.01, 'ordinal_sc': 0.06}
+
+
+
     ema_grads = {
         'score': 1.0,
         'gram': 0.1,
+        'gram_scale': 0.1,
         'heat': 0.1,
-        'sw_st': 0.1
+        'sw_st': 0.1,
+        'st_dist': 0.1,
+        'edm_tail': 0.1,
+        'gen_align': 0.1,
+        'radial': 0.1,
+        # dim and triangle are regularizers - keep manual for now
     }
     ema_sc = {
         'score': 1.0,
@@ -1077,9 +1102,19 @@ def train_stageC_diffusion_generator(
         'ordinal_sc': 0.1
     }
     EMA_BETA = 0.98  # CHANGED from 0.95
-    
-    TARGET = {'gram': 0.05, 'heat': 0.15, 'sw_st': 0.10}
-    TARGET_SC = {'sw_sc': 0.08, 'overlap': 0.01, 'ordinal_sc': 0.06}
+ 
+    # Target gradient ratios relative to score loss
+    # These control how much each loss contributes to the gradient
+    TARGET = {
+        'gram': 0.05,           # Keep Gram gradients at ~5% of score
+        'gram_scale': 0.03,     # Scale regularizer weaker
+        'heat': 0.15,           # Heat kernel at ~15% of score
+        'sw_st': 0.10,          # Sliced-Wasserstein at ~10%
+        'st_dist': 0.08,        # ST distance classification at ~8%
+        'edm_tail': 0.12,       # EDM tail loss at ~12%
+        'gen_align': 0.06,      # Procrustes alignment at ~6%
+        'radial': 0.04,         # Radial histogram at ~4%
+    }
     AUTOBALANCE_EVERY = 100
     AUTOBALANCE_START = 200
 
@@ -2032,30 +2067,50 @@ def train_stageC_diffusion_generator(
                     g_vhat_equiv = g_eps * inv_sigma  # ||∂L/∂V_hat|| = ||∂L/∂eps|| / σ
                     return float(g_vhat_equiv.norm().item())
 
-                vgn_score = vhat_gn_from_eps(L_score, eps_pred, sigma_t)
+                vgn_score = vhat_gn_from_eps(L_score, eps_pred, sigma_t)                
+                # ST-side gradient norms
                 vgn_gram = vhat_gn(L_gram) if not is_sc else 0.0
+                vgn_gram_scale = vhat_gn(L_gram_scale) if not is_sc else 0.0
                 vgn_heat = vhat_gn(L_heat) if not is_sc else 0.0
                 vgn_swst = vhat_gn(L_sw_st) if not is_sc else 0.0
-                vgn_cone = vhat_gn(L_cone) if not is_sc else 0.0
+                vgn_stdist = vhat_gn(L_st_dist) if not is_sc else 0.0
+                vgn_edm = vhat_gn(L_edm_tail) if not is_sc else 0.0
+                vgn_align = vhat_gn(L_gen_align) if not is_sc else 0.0
+                vgn_radial = vhat_gn(L_radial) if not is_sc else 0.0
+ 
+                # SC-side gradient norms
                 vgn_swsc = vhat_gn(L_sw_sc) if is_sc else 0.0
                 vgn_ord = vhat_gn(L_ordinal_sc) if is_sc else 0.0
                 vgn_overlap = vhat_gn(L_overlap) if is_sc else 0.0
-                
+ 
                 # Add batch type label
                 batch_type = 'SC' if is_sc else 'ST'
-                
-                print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} gram={vgn_gram:.3e} heat={vgn_heat:.3e} "
-                    f"sw_st={vgn_swst:.3e} sw_sc={vgn_swsc:.3e} overlap={vgn_overlap:.3e} ord={vgn_ord:.3e}")
+ 
+                if not is_sc:
+                    print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} gram={vgn_gram:.3e} gram_scale={vgn_gram_scale:.3e} "
+                        f"heat={vgn_heat:.3e} sw_st={vgn_swst:.3e} st_dist={vgn_stdist:.3e} "
+                        f"edm={vgn_edm:.3e} align={vgn_align:.3e} radial={vgn_radial:.3e}")
+                else:
+                    print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} sw_sc={vgn_swsc:.3e} "
+                        f"overlap={vgn_overlap:.3e} ord={vgn_ord:.3e}")
                 
                 # Seed EMAs from first ST batch (prevents wrong-direction updates)
                 if (global_step == 0) and (not is_sc):
                     ema_grads['score'] = max(vgn_score, 1e-12)
                     ema_grads['gram']  = max(vgn_gram,  1e-12)
+                    ema_grads['gram_scale'] = max(vgn_gram_scale, 1e-12)
                     ema_grads['heat']  = max(vgn_heat,  1e-12)
                     ema_grads['sw_st'] = max(vgn_swst,  1e-12)
+                    ema_grads['st_dist'] = max(vgn_stdist, 1e-12)
+                    ema_grads['edm_tail'] = max(vgn_edm, 1e-12)
+                    ema_grads['gen_align'] = max(vgn_align, 1e-12)
+                    ema_grads['radial'] = max(vgn_radial, 1e-12)
                     if DEBUG:
                         print(f"[ema_init] score={ema_grads['score']:.3e} gram={ema_grads['gram']:.3e} "
-                            f"heat={ema_grads['heat']:.3e} sw_st={ema_grads['sw_st']:.3e}")
+                            f"gram_scale={ema_grads['gram_scale']:.3e} heat={ema_grads['heat']:.3e} "
+                            f"sw_st={ema_grads['sw_st']:.3e} st_dist={ema_grads['st_dist']:.3e} "
+                            f"edm={ema_grads['edm_tail']:.3e} align={ema_grads['gen_align']:.3e} "
+                            f"radial={ema_grads['radial']:.3e}")
 
                 # Seed SC EMAs from first SC batch
                 if (global_step <= 10) and is_sc and (vgn_score > 0):
@@ -2112,11 +2167,18 @@ def train_stageC_diffusion_generator(
 
                 # Update EMAs (separate for ST vs SC)
                 if not is_sc:
+                    # ST-side EMA updates for all geometric losses
                     ema_grads['score'] = EMA_BETA * ema_grads['score'] + (1 - EMA_BETA) * (vgn_score + 1e-12)
                     ema_grads['gram']  = EMA_BETA * ema_grads['gram']  + (1 - EMA_BETA) * (vgn_gram  + 1e-12)
+                    ema_grads['gram_scale'] = EMA_BETA * ema_grads['gram_scale'] + (1 - EMA_BETA) * (vgn_gram_scale + 1e-12)
                     ema_grads['heat']  = EMA_BETA * ema_grads['heat']  + (1 - EMA_BETA) * (vgn_heat  + 1e-12)
                     ema_grads['sw_st'] = EMA_BETA * ema_grads['sw_st'] + (1 - EMA_BETA) * (vgn_swst + 1e-12)
+                    ema_grads['st_dist'] = EMA_BETA * ema_grads['st_dist'] + (1 - EMA_BETA) * (vgn_stdist + 1e-12)
+                    ema_grads['edm_tail'] = EMA_BETA * ema_grads['edm_tail'] + (1 - EMA_BETA) * (vgn_edm + 1e-12)
+                    ema_grads['gen_align'] = EMA_BETA * ema_grads['gen_align'] + (1 - EMA_BETA) * (vgn_align + 1e-12)
+                    ema_grads['radial'] = EMA_BETA * ema_grads['radial'] + (1 - EMA_BETA) * (vgn_radial + 1e-12)
                 else:
+                    # SC-side EMA updates
                     ema_sc['score']      = EMA_BETA * ema_sc['score']      + (1 - EMA_BETA) * (vgn_score   + 1e-12)
                     ema_sc['sw_sc']      = EMA_BETA * ema_sc['sw_sc']      + (1 - EMA_BETA) * (vgn_swsc    + 1e-12)
                     ema_sc['overlap']    = EMA_BETA * ema_sc['overlap']    + (1 - EMA_BETA) * (vgn_overlap + 1e-12)
@@ -2124,8 +2186,19 @@ def train_stageC_diffusion_generator(
 
                 # Adjust weights (ST batches only, after warmup, at intervals)
                 if (not is_sc) and (global_step >= AUTOBALANCE_START) and (global_step % AUTOBALANCE_EVERY == 0):
-                    bounds = {'gram': (6.0, 20.0), 'heat': (0.6, 3.0), 'sw_st': (0.8, 3.0)}
-
+                    # Define bounds for each loss (min_weight, max_weight)
+                    # Conservative bounds prevent any single loss from dominating
+                    bounds = {
+                        'gram': (6.0, 20.0),          # Original range
+                        'gram_scale': (0.05, 0.8),    # Scale regularizer - keep modest
+                        'heat': (0.6, 3.0),           # Original range
+                        'sw_st': (0.8, 3.0),          # Original range
+                        'st_dist': (0.01, 0.5),       # Distance classification - moderate
+                        'edm_tail': (0.05, 0.8),      # EDM tail - moderate
+                        'gen_align': (0.05, 0.6),     # Procrustes alignment - moderate
+                        'radial': (0.2, 2.0),         # Radial histogram - moderate
+                    }
+ 
                     def _update(key):
                         ratio = ema_grads[key] / (ema_grads['score'] + 1e-12)
                         target = TARGET[key]
@@ -2133,32 +2206,41 @@ def train_stageC_diffusion_generator(
                         new_w = WEIGHTS[key] * math.exp(delta)
                         lo, hi = bounds[key]
                         WEIGHTS[key] = float(min(max(new_w, lo), hi))
-
+ 
                     rank = 0
                     try:
                         if dist.is_available() and dist.is_initialized():
                             rank = dist.get_rank()
                     except Exception:
                         pass
-
+ 
                     if rank == 0:
-                        for key in ['gram', 'heat', 'sw_st']:
+                        # Update all ST-side autobalanced losses
+                        for key in ['gram', 'gram_scale', 'heat', 'sw_st', 'st_dist',
+                                    'edm_tail', 'gen_align', 'radial']:
                             _update(key)
-
+ 
                     try:
                         if dist.is_available() and dist.is_initialized():
-                            w = torch.tensor(
-                                [WEIGHTS['gram'], WEIGHTS['heat'], WEIGHTS['sw_st']],
-                                device=device, dtype=torch.float32
-                            )
+                            # Broadcast all updated weights to other ranks
+                            w = torch.tensor([
+                                WEIGHTS['gram'], WEIGHTS['gram_scale'], WEIGHTS['heat'],
+                                WEIGHTS['sw_st'], WEIGHTS['st_dist'], WEIGHTS['edm_tail'],
+                                WEIGHTS['gen_align'], WEIGHTS['radial']
+                            ], device=device, dtype=torch.float32)
                             dist.broadcast(w, src=0)
-                            WEIGHTS['gram'], WEIGHTS['heat'], WEIGHTS['sw_st'] = map(float, w.tolist())
+                            (WEIGHTS['gram'], WEIGHTS['gram_scale'], WEIGHTS['heat'],
+                             WEIGHTS['sw_st'], WEIGHTS['st_dist'], WEIGHTS['edm_tail'],
+                             WEIGHTS['gen_align'], WEIGHTS['radial']) = map(float, w.tolist())
                     except Exception:
                         pass
-
+ 
                     if DEBUG and (rank == 0):
                         print(f"[autobalance @ step {global_step}] "
-                            f"gram={WEIGHTS['gram']:.3g} heat={WEIGHTS['heat']:.3g} sw_st={WEIGHTS['sw_st']:.3g}")
+                            f"gram={WEIGHTS['gram']:.3g} gram_scale={WEIGHTS['gram_scale']:.3g} "
+                            f"heat={WEIGHTS['heat']:.3g} sw_st={WEIGHTS['sw_st']:.3g} "
+                            f"st_dist={WEIGHTS['st_dist']:.3g} edm={WEIGHTS['edm_tail']:.3g} "
+                            f"align={WEIGHTS['gen_align']:.3g} radial={WEIGHTS['radial']:.3g}")
 
                 # SC-side autobalance (separate from ST)
                 if is_sc and (global_step >= AUTOBALANCE_START) and (global_step % AUTOBALANCE_EVERY == 0):
