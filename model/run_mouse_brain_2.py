@@ -287,28 +287,6 @@ def main(args=None):
 
     st_gene_expr_dict = {0: st_expr}
 
-    # training_history = model.train_stageC(
-    #     st_gene_expr_dict=st_gene_expr_dict,
-    #     sc_gene_expr=sc_expr,
-    #     n_min=64, n_max=384,
-    #     num_st_samples=args.num_st_samples,
-    #     num_sc_samples=args.num_sc_samples,
-    #     n_epochs=stageC_epochs,
-    #     batch_size=stageC_batch,   # per-GPU batch; global batch = this * #GPUs
-    #     lr=lr,
-    #     n_timesteps=500,
-    #     sigma_min=0.01,
-    #     sigma_max=7.0,
-    #     outf=outdir,
-    #     fabric=fabric,
-    #     precision=precision,
-    #     # Early stopping
-    #     enable_early_stop=args.enable_early_stop,
-    #     early_stop_min_epochs=args.early_stop_min_epochs,
-    #     early_stop_patience=args.early_stop_patience,
-    #     early_stop_threshold=args.early_stop_threshold,
-    # )
-
     # ========== PHASE 1: ST-ONLY TRAINING ==========
     print("\n" + "="*70)
     print("PHASE 1: Training with ST data ONLY (fix geometry)")
@@ -317,7 +295,7 @@ def main(args=None):
     history_st = model.train_stageC(
         st_gene_expr_dict=st_gene_expr_dict,
         sc_gene_expr=sc_expr,
-        n_min=64, n_max=384,
+        n_min=96, n_max=384,
         num_st_samples=args.num_st_samples,
         num_sc_samples=0,  # DISABLE SC in phase 1
         n_epochs=stageC_epochs,
@@ -325,7 +303,7 @@ def main(args=None):
         lr=lr,
         n_timesteps=500,
         sigma_min=0.01,
-        sigma_max=7.0,
+        sigma_max=3.0,
         outf=outdir,
         fabric=fabric,
         precision=precision,
@@ -426,7 +404,7 @@ def main(args=None):
         training_history = model.train_stageC(
             st_gene_expr_dict=st_gene_expr_dict,
             sc_gene_expr=sc_expr,
-            n_min=64, n_max=384,
+            n_min=96, n_max=384,
             num_st_samples=num_st_finetune,  # ← CHANGED from 0
             num_sc_samples=args.num_sc_samples,
             n_epochs=epochs_finetune,
@@ -434,7 +412,7 @@ def main(args=None):
             lr=lr_finetune,
             n_timesteps=500,
             sigma_min=0.01,
-            sigma_max=7.0,
+            sigma_max=3.0,
             outf=outdir,
             fabric=fabric,
             precision=precision,
@@ -534,32 +512,20 @@ def main(args=None):
                 # Set different seed for each sample
                 torch.manual_seed(42 + k)
 
-                # sample_results = model.infer_sc_anchored(
-                #     sc_gene_expr=sc_expr,
-                #     n_timesteps_sample=300,
-                #     return_coords=True,
-                #     anchor_size=640,
-                #     batch_size=512,      # ← REDUCED from 512 to avoid OOM
-                #     eta=0.0,
-                #     guidance_scale=7.0,
-                #     sigma_min=0.01,      # ← ADD THIS
-                #     sigma_max=5.0,      # ← MATCH TRAINING (was 5.0, should be 53.0)
-                # )
-
                 n_cells = sc_expr.shape[0]
 
                 sample_results = model.infer_sc_patchwise(
                     sc_gene_expr=sc_expr,
-                    n_timesteps_sample=300,
+                    n_timesteps_sample=500,
                     return_coords=True,
                     # patch_size=512,          # was batch_size; also your Stage D batch size
-                    patch_size=n_cells,
-                    coverage_per_cell=5.0,   # you can tune 3–6
-                    n_align_iters=10,        # can tune 5–15
+                    patch_size=256,
+                    coverage_per_cell=6.0,   # you can tune 3–6
+                    n_align_iters=12,        # can tune 5–15
                     eta=0.0,
                     guidance_scale=2.0,
                     sigma_min=0.01,
-                    sigma_max=7.0,
+                    sigma_max=3.0,
                 )
                 
                 # Compute EDM cone penalty as quality score (lower is better)
@@ -877,27 +843,6 @@ def main(args=None):
         
         print(f"✓ Saved summary: {summary_path}")
         print("[DEBUG Rank-0] Inference complete!")
-
-    # # === CLEAN SYNC POINT ===
-    # # === FINAL SYNC POINT ===
-    # # Rank-1 has been waiting here while rank-0 did inference
-    # print(f"[DEBUG Rank-{fabric.global_rank}] Reaching final sync point", flush=True)
-    # torch.cuda.synchronize()
-    # if fabric.world_size > 1:
-    #     fabric.barrier()
-    # print(f"[DEBUG Rank-{fabric.global_rank}] Passed final sync point", flush=True)
-
-    # Add this right after the inference block
-    # if not fabric.is_global_zero:
-    #     print(f"[DEBUG Rank-{fabric.global_rank}] Inference skipped, ready for sync", flush=True)
-    #     print(f"[DEBUG Rank-{fabric.global_rank}] Reached post-inference point")
-
-
-    #     # ============================================================================
-    #     # PLOT STAGE C TRAINING LOSSES
-    #     # ============================================================================
-        
-    #     print("\n=== Loading and plotting Stage C training losses ===")
         
     #     # ============================================================================
     #     # PLOT STAGE C TRAINING LOSSES (NO CHECKPOINT NEEDED)
@@ -915,9 +860,6 @@ def main(args=None):
             losses = history_st['epoch_avg']
             
             # ST-specific losses
-            # st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align']
-            # st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime']
-
             st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial']
             st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime', 'brown', 'pink', 'gray']
 
@@ -927,10 +869,6 @@ def main(args=None):
 
             fig.suptitle('Phase 1: ST-Only Training Losses', fontsize=18, fontweight='bold', y=0.995)
             
-            # for idx, (name, color) in enumerate(zip(st_loss_names, st_colors)):
-            #     if name in losses and len(losses[name]) > 0:
-            #         ax = axes[idx // 3, idx % 3]
-
             axes = axes.flatten()
             for idx, (name, color) in enumerate(zip(st_loss_names, st_colors)):
                 if name in losses and len(losses[name]) > 0:
@@ -1016,11 +954,6 @@ def main(args=None):
                 for name in ['gram', 'heat', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial']:
                     if name in st_losses and len(st_losses[name]) > 0:
                         print(f"  {name}: {st_losses[name][-1]:.4f}")
-
-                # print(f"Final ST geometry losses:")
-                # for name in ['gram', 'heat', 'edm_tail', 'gen_align']:
-                #     if name in st_losses and len(st_losses[name]) > 0:
-                #         print(f"  {name}: {st_losses[name][-1]:.4f}")
         
         if args.num_sc_samples > 0 and training_history is not None:
             print("\n--- Phase 2: SC Fine-tuning ---")

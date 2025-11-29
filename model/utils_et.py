@@ -2015,6 +2015,23 @@ def build_triplets_from_cache_for_set(
     return triplets
 
 
+def canonicalize_center_only(V, mask, eps=1e-8):
+    """
+    Center V per set over valid points, but DO NOT rescale to unit RMS.
+    This keeps absolute scale for geometry-sensitive losses.
+    """
+    B, N, D = V.shape
+    mask_expanded = mask.unsqueeze(-1)          # (B,N,1)
+    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1)
+
+    mean = (V * mask_expanded).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+    V_centered = (V - mean) * mask_expanded
+
+    # Keep a dummy scale tensor for API symmetry if needed
+    scale = torch.ones(B, 1, 1, device=V.device, dtype=V.dtype)
+    return V_centered, mean, scale
+
+
 def sliced_wasserstein_sc(
     V: torch.Tensor,             # (B2, N, D) batched embeddings (A and B interleaved)
     mask: torch.Tensor,          # (B2, N) boolean mask
@@ -2048,7 +2065,8 @@ def sliced_wasserstein_sc(
     # optional: canonicalize each set (center + unit RMS) to remove scale
     if use_canon:
         # canonicalize per set using the same function you use elsewhere
-        from utils_et import canonicalize_unit_rms as _canon
+        # from utils_et import canonicalize_unit_rms as _canon
+        from utils_et import canonicalize_center_only as _canon
         Vc, _, _ = _canon(V.float(), mask)  # do math in fp32
     else:
         Vc = V.float()
@@ -2771,6 +2789,15 @@ class TriangleAreaLoss(nn.Module):
             # Hinge: enforce A_pred >= epsilon
             violation = torch.clamp(epsilon - A_pred, min=0.0)
             loss = violation.pow(2).mean()
+
+            # DEBUG: Log actual values to diagnose zero loss
+            if torch.rand(1).item() < 0.01:  # Log 1% of the time
+                print(f"[TriangleLoss DEBUG] epsilon={epsilon:.6f}, "
+                      f"A_pred mean={A_pred.mean().item():.6f}, "
+                      f"A_pred min={A_pred.min().item():.6f}, "
+                      f"A_pred max={A_pred.max().item():.6f}, "
+                      f"violation mean={violation.mean().item():.6f}, "
+                      f"loss={loss.item():.6f}")
         else:
             # Default: match to a reasonable target area
             A_target = torch.tensor(0.1, device=device, dtype=torch.float32)
@@ -2878,9 +2905,21 @@ class TriangleAreaLoss(nn.Module):
         A = torch.sqrt(area_sq + 1e-12)  # (T,)
         
         # Normalize by scale to make dimensionless (DIFFERENTIABLE)
+        # avg_edge = (a + b + c) / 3.0  # (T,)
+        # scale = (avg_edge ** 2).clamp(min=1e-8)  # (T,)
+        # A_normalized = A / scale  # (T,)
+
+
+        # Normalize by scale to make dimensionless (DIFFERENTIABLE)
         avg_edge = (a + b + c) / 3.0  # (T,)
         scale = (avg_edge ** 2).clamp(min=1e-8)  # (T,)
         A_normalized = A / scale  # (T,)
+ 
+        # DEBUG: Occasionally log raw vs normalized areas
+        # if torch.rand(1).item() < 0.005:  # 0.5% of calls
+        #     print(f"[Triangle DEBUG] Raw area: mean={A.mean().item():.6f}, "
+        #           f"Normalized: mean={A_normalized.mean().item():.6f}, "
+        #           f"avg_edge mean={avg_edge.mean().item():.4f}")
         
         return A_normalized  # (T,) - TENSOR with gradient graph intact
 

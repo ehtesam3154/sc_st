@@ -854,7 +854,9 @@ def train_stageC_diffusion_generator(
             A_ref = loss_triangle._compute_avg_triangle_area(V_target, mask)
             triangle_refs.extend(A_ref.cpu().tolist())
     
-    triangle_epsilon_st = 0.6 * float(torch.tensor(triangle_refs).median())
+    # triangle_epsilon_st = 1.0 * float(torch.tensor(triangle_refs).median())
+    areas = np.array(triangle_refs)
+    triangle_epsilon_st = float(np.quantile(areas, 0.10))
     
     # SC uses FIXED small epsilon (ST-independent)
     triangle_epsilon_sc = 0.01  # Just "don't collapse to line", no ST bias
@@ -962,11 +964,11 @@ def train_stageC_diffusion_generator(
         'gram': 0.5,
         'gram_scale': 0.3,
         'heat': 0.25,
-        'sw_st': 0.5,
-        'sw_sc': 0.3,
+        'sw_st': 0.0,
+        'sw_sc': 0.0,
         'overlap': 0.25,
         'ordinal_sc': 0.5,
-        'st_dist': 0.0,
+        'st_dist': 0.03,
         'edm_tail': 0.3,
         'gen_align': 0.3,
         'dim': 0.1,
@@ -1511,12 +1513,6 @@ def train_stageC_diffusion_generator(
 
                         # Use the same weighted approach to avoid divergence
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
-
-                        # if geo_gate.any():
-                        #     # Only use low-noise, conditional samples (same gate as L_gram)
-                        #     L_gram_scale = (log_ratio[geo_gate] ** 2).mean()
-                        # else:
-                        #     L_gram_scale = V_hat.new_tensor(0.0)
                 
                 # Heat kernel loss (batched)
                 if (global_step % heat_every_k) == 0:
@@ -1559,53 +1555,6 @@ def train_stageC_diffusion_generator(
 
                             L_heat = loss_heat(L_pred_batch, L_targ_batch, mask=mask, t_list=t_list)
 
-                            # Heat loss with FIXED adjacency
-                            # L_heat = torch.tensor(0.0, device=device)
-                            
-                            # if 'miniset_graphs' in batch and WEIGHTS['heat'] > 0:
-                            #     # Build Laplacians with fixed adjacency
-                            #     B_actual = V_hat.shape[0]
-                            #     n_max = V_hat.shape[1]
-                                
-                            #     L_pred_batch = torch.zeros(B_actual, n_max, n_max, device=device)
-                            #     L_gt_batch = torch.zeros(B_actual, n_max, n_max, device=device)
-                                
-                            #     for b in range(B_actual):
-                            #         m = mask[b]
-                            #         n_valid = int(m.sum())
-                            #         if n_valid < 2:
-                            #             continue
-                                    
-                            #         miniset_graph = batch['miniset_graphs'][b]
-                            #         edges_local = miniset_graph['edges_local'].to(device)
-                            #         w_gt = miniset_graph['w_gt'].to(device)
-                            #         sigma = miniset_graph['sigma']
-                                    
-                            #         # Get predicted coordinates for this sample
-                            #         Vb = V_hat[b, m]  # (n_valid, D)
-                                    
-                            #         # Compute predicted weights on FIXED edges
-                            #         li = edges_local[0]
-                            #         lj = edges_local[1]
-                            #         d_ij = (Vb[li] - Vb[lj]).norm(dim=-1)  # (E_sub,)
-                            #         w_pred = torch.exp(-(d_ij**2) / (2 * sigma**2 + 1e-8))
-                                    
-                            #         # Build Laplacians from fixed edges
-                            #         L_gt = uet.build_laplacian_from_edges(n_valid, edges_local, w_gt, laplacian_type='sym')
-                            #         L_pred = uet.build_laplacian_from_edges(n_valid, edges_local, w_pred, laplacian_type='sym')
-                                    
-                            #         # Place in padded batch tensors
-                            #         L_gt_batch[b, :n_valid, :n_valid] = L_gt
-                            #         L_pred_batch[b, :n_valid, :n_valid] = L_pred
-                                
-                            #     # Use existing HeatKernelLoss class
-                            #     L_heat = loss_heat(L_pred_batch, L_gt_batch, mask=mask)
-
-                            # # Gate heat loss to low-noise, conditional samples
-                            # if geo_gate.sum() > 0:
-                            #     L_heat = L_heat_raw
-                            # else:
-                            #     L_heat = V_hat.new_tensor(0.0)
 
                 L_sw_st = torch.zeros((), device=device)
                 if (global_step % sw_every_k) == 0:
@@ -1651,7 +1600,7 @@ def train_stageC_diffusion_generator(
                             pair_idxB=pairB,
                             K_proj=64,
                             N_cap=512,
-                            use_canon=True,   # center + unit-RMS per set
+                            use_canon=True,   # center per set
                         )
 
                         # ==================== NEW: EDM TAIL LOSS ====================
@@ -1677,25 +1626,6 @@ def train_stageC_diffusion_generator(
                                 tail_quantile=0.85,       # top 20% distances
                                 weight_tail=2.0
                             )
-
-                            # L_edm_tail = uet.compute_edm_tail_loss(
-                            #     V_geom,           # centered V_hat
-                            #     V_target_batch,   # from factor_from_gram
-                            #     mask,
-                            #     tail_quantile=0.80,
-                            #     weight_tail=1.0,      # Reduced from 2.0
-                            #     clip_quantile=0.995   # New: clip extreme outliers
-                            # )
-
-                            # L_edm_tail = uet.compute_edm_tail_loss(
-                            #     V_pred=V_geom,           # centered V_hat
-                            #     V_target=V_target_batch,  # from factor_from_gram
-                            #     mask=mask,
-                            #     tail_quantile=0.80,       # top 20% = far tail, bottom 20% = near tail
-                            #     weight_tail=3.0,          # INCREASED: weight both tails heavily
-                            #     mid_weight=1.0,           # NEW: weight for mid-range pairs
-                            #     margin_frac=0.05          # NEW: 5% tolerance band before hinge activates
-                            # )
                         
                         # ==================== NEW: GENERATOR ALIGNMENT LOSS ====================
                         # Align generator output V_0 to target geometry via Procrustes
@@ -1725,15 +1655,27 @@ def train_stageC_diffusion_generator(
                             )
                         
                         # B2: Triangle area regularizer (ST: hinge with ST-derived epsilon)
+                        # with torch.autocast(device_type='cuda', enabled=False):
+                        #     L_triangle = loss_triangle(
+                        #         V_pred=V_geom,
+                        #         V_target=None,
+                        #         mask=mask,
+                        #         use_target=False,
+                        #         hinge_mode=True,
+                        #         epsilon=triangle_epsilon_st  # ST-specific threshold
+                        #     )
+
+                        # B2: Triangle area regularizer (ST: match normalized area to ST median)
                         with torch.autocast(device_type='cuda', enabled=False):
-                            L_triangle = loss_triangle(
-                                V_pred=V_geom,
-                                V_target=None,
-                                mask=mask,
-                                use_target=False,
-                                hinge_mode=True,
-                                epsilon=triangle_epsilon_st  # ST-specific threshold
-                            )
+                            # Compute average normalized triangle area per sample (B,)
+                            A_pred = loss_triangle._compute_avg_triangle_area(V_geom, mask)
+                            
+                            # Target
+                            target = torch.full_like(A_pred, triangle_epsilon_st)
+                            
+                            # MSE loss to pull areas toward ST-style geometry
+                            L_triangle = (A_pred - target).pow(2).mean()
+
 
                         
                         # B3: Radial histogram loss
@@ -2523,15 +2465,6 @@ def train_stageC_diffusion_generator(
         if dist.is_initialized():
             dist.all_reduce(sum_overlap_batches, op=dist.ReduceOp.SUM)
 
-        # Determine denominator per loss type
-        # def _denom_for(key):
-        #     if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone'):
-        #         return cnt_st
-        #     if key in ('sw_sc', 'ordinal_sc'):
-        #         return cnt_sc
-        #     if key == 'overlap':
-        #         return sum_overlap_batches
-        #     return sum_batches  # 'total' and 'score'
         
         # Determine denominator per loss type
         def _denom_for(key):
@@ -2996,33 +2929,40 @@ def sample_sc_edm_patchwise(
 
     # 5.1 Initialize X by averaging patch coords per cell
     X_global = torch.zeros(n_sc, D_latent, dtype=torch.float32, device=device)
-    counts = torch.zeros(n_sc, dtype=torch.int32, device=device) 
-
-    for k in range(K):
-        S_k = patch_indices[k]
-        V_k = patch_coords[k].to(device) # Ensure patch coords move to GPU
-        
-        # Vectorized addition is faster and cleaner on GPU
-        # (Or keep your loop, but ensure V_k[local_idx] matches device)
-        for local_idx, i_global in enumerate(S_k.tolist()):
-            X_global[i_global] += V_k[local_idx]
-            counts[i_global] += 1
-
-    mask_seen = counts > 0
-    X_global[mask_seen] /= counts[mask_seen].unsqueeze(-1).float()
-
-    X_global = X_global - X_global.mean(dim=0, keepdim=True)
-    rms = X_global.pow(2).mean().sqrt().item()
+    W_global = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
 
     if DEBUG_FLAG:
-        rms = X_global.pow(2).mean().sqrt().item()
-        print(f"[ALIGN] Init X_global: coords_rms={rms:.3f} (not normalized)")
-    
-    # if rms > 0:
-    #     X_global = X_global / rms
+        print("\n[ALIGN] Stitching with centrality weighting...")
 
-    # if DEBUG_FLAG:
-    #     print(f"[ALIGN] Init X_global: coords_rms={rms:.3f}")
+    for k in range(K):
+        # Global indices for this patch
+        S_k = patch_indices[k].to(device)              # (m_k,)
+        V_k = patch_coords[k].to(device)               # (m_k, D)
+
+        # --- centrality weights in patch coordinates ---
+        # center of patch in its local frame
+        center_k = V_k.mean(dim=0, keepdim=True)       # (1, D)
+        # distance of each point from center
+        dists = torch.norm(V_k - center_k, dim=1, keepdim=True)   # (m_k, 1)
+        max_d = dists.max().clamp_min(1e-6)
+        # linear taper: 1.0 at center, ~0.2 at edge, clamped at 0.01
+        weights_k = 1.0 - (dists / (max_d * 1.2))
+        weights_k = weights_k.clamp(min=0.01)          # (m_k, 1)
+        # -----------------------------------------------
+
+        # accumulate weighted coords and total weight
+        X_global.index_add_(0, S_k, V_k * weights_k)   # (N,D) += (m_k,D)
+        W_global.index_add_(0, S_k, weights_k)         # (N,1) += (m_k,1)
+
+    # normalize by total weight where seen
+    mask_seen = W_global.squeeze(-1) > 0
+    X_global[mask_seen] /= W_global[mask_seen]
+
+    # global recentering (keep learned scale)
+    X_global = X_global - X_global.mean(dim=0, keepdim=True)
+    rms = X_global.pow(2).mean().sqrt().item()
+    if DEBUG_FLAG:
+        print(f"[ALIGN] Init X_global: coords_rms={rms:.3f} (centrality-weighted)")
 
     # 5.2 Alternating Procrustes alignment
     for it in range(n_align_iters):
@@ -3098,52 +3038,48 @@ def sample_sc_edm_patchwise(
         # ------------------------------------------------------------------
         # Step B: update X from all patch transforms (Vectorized)
         # ------------------------------------------------------------------
-        device_X = X_global.device  # Detect where X_global is (CPU or GPU)
+        # ------------------------------------------------------------------
+        # Step B: update X from all patch transforms (centrality-weighted)
+        # ------------------------------------------------------------------
+        device_X = X_global.device
 
-        new_X = torch.zeros_like(X_global) 
-        counts_X = torch.zeros(n_sc, dtype=torch.int32, device=device_X)
+        new_X = torch.zeros_like(X_global)
+        W_X = torch.zeros(n_sc, 1, dtype=torch.float32, device=device_X)
 
         for k in range(K):
-            # Ensure everything for this patch is on the same device as X_global
+            # indices and patch coords on same device
             S_k = patch_indices[k].to(device_X)          # (m_k,)
             V_k = patch_coords[k].to(device_X)           # (m_k, D)
             R_k = R_list[k].to(device_X)                 # (D, D)
             s_k = s_list[k]
             t_k = t_list[k].to(device_X)                 # (D,)
 
-            # Calculate predicted global coords for this patch
+            # centrality weights in local patch coordinates
+            center_k = V_k.mean(dim=0, keepdim=True)     # (1, D)
+            dists = torch.norm(V_k - center_k, dim=1, keepdim=True)   # (m_k, 1)
+            max_d = dists.max().clamp_min(1e-6)
+            weights_k = 1.0 - (dists / (max_d * 1.2))
+            weights_k = weights_k.clamp(min=0.01)        # (m_k, 1)
+
+            # transformed patch in global frame
             X_hat_k = s_k * (V_k @ R_k.T) + t_k          # (m_k, D)
 
-            # 1) Accumulate coordinates (Vectorized add)
-            new_X.index_add_(0, S_k, X_hat_k)
+            # weighted accumulation
+            new_X.index_add_(0, S_k, X_hat_k * weights_k)
+            W_X.index_add_(0, S_k, weights_k)
 
-            # 2) Accumulate counts (Vectorized add)
-            ones = torch.ones(S_k.shape[0], dtype=torch.int32, device=device_X)
-            counts_X.index_add_(0, S_k, ones)
-
-        # Finish Step B: average and canonicalize
-        mask_seen2 = counts_X > 0
-        # Avoid division by zero
-        new_X[mask_seen2] /= counts_X[mask_seen2].unsqueeze(-1).float()
+        # Finish Step B: normalize and recenter
+        mask_seen2 = W_X.squeeze(-1) > 0
+        new_X[mask_seen2] /= W_X[mask_seen2]
+        # cells never hit by any patch: keep previous
         new_X[~mask_seen2] = X_global[~mask_seen2]
 
         new_X = new_X - new_X.mean(dim=0, keepdim=True)
-        # RMS normalization removed - preserve learned scale
-        
         X_global = new_X
 
         if DEBUG_FLAG:
             rms_new = new_X.pow(2).mean().sqrt().item()
-            print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (not normalized)")
-
-        # rms_new = new_X.pow(2).mean().sqrt().item()
-        # if rms_new > 0:
-        #     new_X = new_X / rms_new
-
-        # X_global = new_X
-
-        # if DEBUG_FLAG:
-        #     print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f}")
+            print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (centrality-weighted)")
 
     # ------------------------------------------------------------------
     # 6) Compute EDM and optional ST-scale alignment
