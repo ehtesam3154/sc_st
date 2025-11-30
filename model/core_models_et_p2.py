@@ -1081,8 +1081,6 @@ def train_stageC_diffusion_generator(
     # TARGET = {'gram': 0.05, 'heat': 0.15, 'sw_st': 0.10}
     # TARGET_SC = {'sw_sc': 0.08, 'overlap': 0.01, 'ordinal_sc': 0.06}
 
-
-
     ema_grads = {
         'score': 1.0,
         'gram': 0.1,
@@ -1115,6 +1113,12 @@ def train_stageC_diffusion_generator(
         'gen_align': 0.06,      # Procrustes alignment at ~6%
         'radial': 0.04,         # Radial histogram at ~4%
     }
+
+    TARGET_SC = {
+        'sw_sc': 0.10,        # Match sw_st (was 0.08) - distribution matching is important
+        'overlap': 0.05,      # Increase from 0.01 - too weak at 1%
+        'ordinal_sc': 0.08,   # Increase from 0.06 - ordinal structure is important
+        }
     AUTOBALANCE_EVERY = 100
     AUTOBALANCE_START = 200
 
@@ -2975,11 +2979,6 @@ def sample_sc_edm_patchwise(
                 else:
                     V_t = V_t - sigma_t * eps
 
-            # # Canonicalize patch
-            # V_final = V_t  # (1, m_k, D)
-            # V_canon, _, _ = uet.canonicalize_unit_rms(V_final, mask_k)
-            # V_canon = V_canon.squeeze(0).detach().cpu()   # (m_k, D)
-            # patch_coords.append(V_canon)
 
             # if DEBUG_FLAG and (k % max(1, K // 5) == 0):
             #     rms = V_canon.pow(2).mean().sqrt().item()
@@ -3052,108 +3051,133 @@ def sample_sc_edm_patchwise(
             print(f"\n[ALIGN] Iteration {it + 1}/{n_align_iters}")
 
         R_list: List[torch.Tensor] = []
-        s_list: List[float] = []
         t_list: List[torch.Tensor] = []
-
+        
+        # For GLOBAL scale computation
+        numerators = []
+        denominators = []
+        
         # For global alignment loss tracking
-        total_sqerr = 0.0
-        total_points = 0
         per_patch_mse = []
 
+        # ======================================================================
+        # Step A: Compute rotations and accumulate global scale components
+        # ======================================================================
         for k in range(K):
             S_k = patch_indices[k]
             V_k = patch_coords[k].to(X_global.device)   # (m_k, D)
             X_k = X_global[S_k]                         # (m_k, D)
             m_k = V_k.shape[0]
 
-            mu_X = X_k.mean(dim=0, keepdim=True)
-            mu_V = V_k.mean(dim=0, keepdim=True)
+            # Centrality weights (same as Step B initialization)
+            center_k = V_k.mean(dim=0, keepdim=True)       # (1, D)
+            dists = torch.norm(V_k - center_k, dim=1, keepdim=True)   # (m_k, 1)
+            max_d = dists.max().clamp_min(1e-6)
+            weights_k = 1.0 - (dists / (max_d * 1.2))
+            weights_k = weights_k.clamp(min=0.01)          # (m_k, 1)
+
+            # Weighted centroids
+            w_sum = weights_k.sum()
+            mu_X = (weights_k * X_k).sum(dim=0, keepdim=True) / w_sum
+            mu_V = (weights_k * V_k).sum(dim=0, keepdim=True) / w_sum
+            
+            # Center
             Xc = X_k - mu_X
             Vc = V_k - mu_V
 
-            C = Xc.T @ Vc    # (D, D)
+            # Weighted cross-covariance
+            C = (Xc.T * weights_k.squeeze(-1)) @ Vc    # (D, D)
+            
+            # SVD for rotation
             U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
             R_k = U @ Vh
             if torch.det(R_k) < 0:
                 U[:, -1] *= -1
                 R_k = U @ Vh
 
-            denom = (Vc.pow(2).sum() + 1e-8)
-            s_k = (S_vals.sum() / denom).item()
-            t_k = (mu_X - s_k * (V_k @ R_k.T).mean(dim=0, keepdim=True)).squeeze(0)
+            # Accumulate for GLOBAL scale (don't compute s_k yet!)
+            numerators.append(S_vals.sum())
+            denominators.append((weights_k * (Vc ** 2)).sum())
+
+            R_list.append(R_k)
+
+        # ======================================================================
+        # Compute GLOBAL scale (shared across all patches)
+        # ======================================================================
+        s_global = float(sum(numerators) / (sum(denominators) + 1e-8))
+
+        if DEBUG_FLAG:
+            print(f"[ALIGN] global_scale={s_global:.4f}")
+
+        # ======================================================================
+        # Step A (cont.): Compute translations and track alignment error
+        # ======================================================================
+        for k in range(K):
+            S_k = patch_indices[k]
+            V_k = patch_coords[k].to(X_global.device)
+            X_k = X_global[S_k]
+            R_k = R_list[k]
+
+            # Recompute centrality weights (or cache from above)
+            center_k = V_k.mean(dim=0, keepdim=True)
+            dists = torch.norm(V_k - center_k, dim=1, keepdim=True)
+            max_d = dists.max().clamp_min(1e-6)
+            weights_k = 1.0 - (dists / (max_d * 1.2))
+            weights_k = weights_k.clamp(min=0.01)
+
+            w_sum = weights_k.sum()
+            mu_X = (weights_k * X_k).sum(dim=0, keepdim=True) / w_sum
+            mu_V = (weights_k * V_k).sum(dim=0, keepdim=True) / w_sum
+
+            # Translation using GLOBAL scale
+            t_k = (mu_X - s_global * (mu_V @ R_k.T)).squeeze(0)
+            t_list.append(t_k)
 
             # Track patch alignment error with current X_global
-            X_hat_k = s_k * (V_k @ R_k.T) + t_k  # (m_k, D)
+            X_hat_k = s_global * (V_k @ R_k.T) + t_k  # (m_k, D)
             sqerr = (X_hat_k - X_k).pow(2).sum(dim=1)  # (m_k,)
             patch_mse = sqerr.mean().item()
             per_patch_mse.append(patch_mse)
-            total_sqerr += sqerr.sum().item()
-            total_points += m_k
-
-            R_list.append(R_k)
-            s_list.append(s_k)
-            t_list.append(t_k)
 
         if DEBUG_FLAG:
-            global_mse = total_sqerr / max(total_points, 1)
             per_patch_mse_t = torch.tensor(per_patch_mse)
-            s_t = torch.tensor(s_list)
-            print(f"[ALIGN] pre-update global_mse={global_mse:.4e}")
             print(f"[ALIGN] per-patch mse: "
-                  f"p10={per_patch_mse_t.quantile(0.10).item():.4e} "
-                  f"p50={per_patch_mse_t.quantile(0.50).item():.4e} "
-                  f"p90={per_patch_mse_t.quantile(0.90).item():.4e}")
-            print(f"[ALIGN] scales s_k: "
-                  f"min={s_t.min().item():.3f} "
-                  f"p25={s_t.quantile(0.25).item():.3f} "
-                  f"p50={s_t.quantile(0.50).item():.3f} "
-                  f"p75={s_t.quantile(0.75).item():.3f} "
-                  f"max={s_t.max().item():.3f}")
+                f"p10={per_patch_mse_t.quantile(0.10).item():.4e} "
+                f"p50={per_patch_mse_t.quantile(0.50).item():.4e} "
+                f"p90={per_patch_mse_t.quantile(0.90).item():.4e}")
 
-            # Check orthogonality of first few rotations
-            K_check = min(3, K)
-            for kk in range(K_check):
-                RtR = R_list[kk].T @ R_list[kk]
-                ortho_err = (RtR - torch.eye(D_latent, device=RtR.device)).norm().item()
-                print(f"[ALIGN] patch {kk} R^T R - I Fro norm={ortho_err:.3e}")
-
-        # ------------------------------------------------------------------
-        # Step B: update X from all patch transforms (Vectorized)
-        # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
+        # ======================================================================
         # Step B: update X from all patch transforms (centrality-weighted)
-        # ------------------------------------------------------------------
+        # ======================================================================
         device_X = X_global.device
 
         new_X = torch.zeros_like(X_global)
         W_X = torch.zeros(n_sc, 1, dtype=torch.float32, device=device_X)
 
         for k in range(K):
-            # indices and patch coords on same device
             S_k = patch_indices[k].to(device_X)          # (m_k,)
             V_k = patch_coords[k].to(device_X)           # (m_k, D)
             R_k = R_list[k].to(device_X)                 # (D, D)
-            s_k = s_list[k]
             t_k = t_list[k].to(device_X)                 # (D,)
 
-            # centrality weights in local patch coordinates
+            # Centrality weights in local patch coordinates
             center_k = V_k.mean(dim=0, keepdim=True)     # (1, D)
             dists = torch.norm(V_k - center_k, dim=1, keepdim=True)   # (m_k, 1)
             max_d = dists.max().clamp_min(1e-6)
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)        # (m_k, 1)
 
-            # transformed patch in global frame
-            X_hat_k = s_k * (V_k @ R_k.T) + t_k          # (m_k, D)
+            # Transformed patch in global frame using GLOBAL scale
+            X_hat_k = s_global * (V_k @ R_k.T) + t_k     # (m_k, D)
 
-            # weighted accumulation
+            # Weighted accumulation
             new_X.index_add_(0, S_k, X_hat_k * weights_k)
             W_X.index_add_(0, S_k, weights_k)
 
         # Finish Step B: normalize and recenter
         mask_seen2 = W_X.squeeze(-1) > 0
         new_X[mask_seen2] /= W_X[mask_seen2]
-        # cells never hit by any patch: keep previous
+        # Cells never hit by any patch: keep previous
         new_X[~mask_seen2] = X_global[~mask_seen2]
 
         new_X = new_X - new_X.mean(dim=0, keepdim=True)
@@ -3161,7 +3185,7 @@ def sample_sc_edm_patchwise(
 
         if DEBUG_FLAG:
             rms_new = new_X.pow(2).mean().sqrt().item()
-            print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (centrality-weighted)")
+            print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (global scale)")
 
     # ------------------------------------------------------------------
     # 6) Compute EDM and optional ST-scale alignment
@@ -3242,7 +3266,7 @@ def sample_sc_edm_patchwise(
     # Cleanup GPU tensors to allow process exit
     del Xd, D, X_full
     del Z_all, patch_indices, memberships, patch_coords
-    del X_global, R_list, s_list, t_list
+    del X_global, R_list, t_list
     
     if "cuda" in device:
         torch.cuda.synchronize()

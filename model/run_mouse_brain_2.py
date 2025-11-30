@@ -183,6 +183,45 @@ def main(args=None):
         st_coords, st_mu, st_scale = uet.canonicalize_st_coords_per_slide(
             st_coords_raw, slide_ids
         )
+
+        # ========== DEBUG CODE START ==========
+        print("\n" + "="*60)
+        print("COORDINATE NORMALIZATION DEBUG")
+        print("="*60)
+        print(f"Raw coords shape: {st_coords_raw.shape}")
+        print(f"Raw coords stats:")
+        print(f"  mean: {st_coords_raw.mean(dim=0).cpu().numpy()}")
+        print(f"  std:  {st_coords_raw.std(dim=0).cpu().numpy()}")
+        print(f"  min:  {st_coords_raw.min(dim=0)[0].cpu().numpy()}")
+        print(f"  max:  {st_coords_raw.max(dim=0)[0].cpu().numpy()}")
+
+        centered_raw = st_coords_raw - st_coords_raw.mean(dim=0)
+        rms_raw = centered_raw.pow(2).sum(dim=1).mean().sqrt().item()
+        print(f"  RMS radius: {rms_raw:.4f}")
+
+        print(f"\nAfter canonicalize_st_coords_per_slide:")
+        print(f"  st_mu: {st_mu.cpu().numpy()}")
+        print(f"  st_scale: {st_scale.cpu().numpy()}")
+        print(f"\nCanonical coords stats:")
+        print(f"  mean: {st_coords.mean(dim=0).cpu().numpy()}")
+        print(f"  std:  {st_coords.std(dim=0).cpu().numpy()}")
+        print(f"  min:  {st_coords.min(dim=0)[0].cpu().numpy()}")
+        print(f"  max:  {st_coords.max(dim=0)[0].cpu().numpy()}")
+
+        rms_canon = st_coords.pow(2).sum(dim=1).mean().sqrt().item()
+        print(f"  RMS radius: {rms_canon:.4f} (should be ~1.0 if unit RMS)")
+
+        # Check pairwise distances
+        D = torch.cdist(st_coords, st_coords)
+        triu_mask = torch.triu(torch.ones_like(D, dtype=torch.bool), diagonal=1)
+        D_upper = D[triu_mask]
+        print(f"\nPairwise distances after canonicalization:")
+        print(f"  p50: {D_upper.quantile(0.50).item():.6f}")
+        print(f"  p90: {D_upper.quantile(0.90).item():.6f}")
+        print(f"  p95: {D_upper.quantile(0.95).item():.6f}")
+        print(f"  max: {D_upper.max().item():.6f}")
+        print("="*60 + "\n")
+        # ========== DEBUG CODE END ==========
         
         # Save canonicalization stats for later denormalization
         os.makedirs(outdir, exist_ok=True)
