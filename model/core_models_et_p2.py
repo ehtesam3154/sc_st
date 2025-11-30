@@ -2829,7 +2829,9 @@ def sample_sc_edm_patchwise(
     import utils_et as uet
     from typing import List, Dict
 
-    print(f"[PATCHWISE] Running on device={device}, starting inference...", flush=True)
+
+
+    print(f"[PATCHWISE] THIS IS THE NEW LOGIC BROTHER Running on device={device}, starting inference...", flush=True)
 
     encoder.eval()
     context_encoder.eval()
@@ -3107,7 +3109,7 @@ def sample_sc_edm_patchwise(
         s_global = float(sum(numerators) / (sum(denominators) + 1e-8))
 
         if DEBUG_FLAG:
-            print(f"[ALIGN] global_scale={s_global:.4f}")
+            print(f"[new ALIGN] global_scale={s_global:.4f}")
 
         # ======================================================================
         # Step A (cont.): Compute translations and track alignment error
@@ -3185,7 +3187,7 @@ def sample_sc_edm_patchwise(
 
         if DEBUG_FLAG:
             rms_new = new_X.pow(2).mean().sqrt().item()
-            print(f"[ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (global scale)")
+            print(f"[new ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (global scale)")
 
     # ------------------------------------------------------------------
     # 6) Compute EDM and optional ST-scale alignment
