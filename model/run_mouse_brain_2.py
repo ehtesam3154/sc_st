@@ -555,14 +555,14 @@ def main(args=None):
 
                 sample_results = model.infer_sc_patchwise(
                     sc_gene_expr=sc_expr,
-                    n_timesteps_sample=500,
+                    n_timesteps_sample=400,
                     return_coords=True,
                     # patch_size=512,          # was batch_size; also your Stage D batch size
                     patch_size=256,
                     coverage_per_cell=6.0,   # you can tune 3–6
-                    n_align_iters=12,        # can tune 5–15
+                    n_align_iters=1,        # can tune 5–15
                     eta=0.0,
-                    guidance_scale=2.0,
+                    guidance_scale=3.0,
                     sigma_min=0.01,
                     sigma_max=3.0,
                 )
@@ -601,6 +601,233 @@ def main(args=None):
             print(f"\nInference complete!")
             print(f"  D_edm shape: {D_edm.shape}")
             print(f"  Coordinates shape: {coords_canon.shape}")
+
+        # ============================================================================
+        # SINGLE-PATCH INFERENCE (for comparison with patchwise)
+        # ============================================================================
+        print("\n" + "="*70)
+        print("SINGLE-PATCH SC INFERENCE (NO STITCHING)")
+        print("="*70)
+        
+        torch.manual_seed(42)  # Same seed as patchwise for fair comparison
+        
+        # Compute ST p95 target (same as patchwise)
+        st_coords = stadata.obsm['spatial']
+        D_st = torch.cdist(
+            torch.tensor(st_coords, dtype=torch.float32),
+            torch.tensor(st_coords, dtype=torch.float32)
+        )
+        target_st_p95 = D_st[torch.triu(torch.ones_like(D_st, dtype=torch.bool), diagonal=1)].quantile(0.95).item()
+        
+        results_single = model.infer_sc_single_patch(
+            sc_gene_expr=sc_expr,
+            n_timesteps_sample=500,
+            sigma_min=0.01,
+            sigma_max=3.0,
+            guidance_scale=2.0,
+            eta=0.0,
+            target_st_p95=target_st_p95,
+            return_coords=True,
+            DEBUG_FLAG=True,
+        )
+        
+        # Extract results
+        D_edm_single = results_single['D_edm'].cpu().numpy()
+        coords_single = results_single['coords'].cpu().numpy()
+        coords_canon_single = results_single['coords_canon'].cpu().numpy()
+        
+        print(f"\n✓ Single-patch inference complete!")
+        print(f"  D_edm shape: {D_edm_single.shape}")
+        print(f"  Coordinates shape: {coords_canon_single.shape}")
+        
+        # ============================================================================
+        # SAVE SINGLE-PATCH RESULTS
+        # ============================================================================
+        results_single_filename = f"sc_inference_SINGLE_PATCH_{timestamp}.pt"
+        results_single_path = os.path.join(outdir, results_single_filename)
+        torch.save(results_single, results_single_path)
+        print(f"✓ Saved single-patch results: {results_single_path}")
+        
+        # Save processed results
+        results_single_processed = {
+            'D_edm': D_edm_single,
+            'coords': coords_single,
+            'coords_canon': coords_canon_single,
+            'n_cells': coords_canon_single.shape[0],
+            'timestamp': timestamp,
+            'method': 'single_patch',
+            'model_config': {
+                'n_genes': model.n_genes,
+                'D_latent': model.D_latent,
+                'c_dim': model.c_dim,
+            }
+        }
+        processed_single_filename = f"sc_inference_SINGLE_PATCH_processed_{timestamp}.pt"
+        processed_single_path = os.path.join(outdir, processed_single_filename)
+        torch.save(results_single_processed, processed_single_path)
+        print(f"✓ Saved processed single-patch results: {processed_single_path}")
+        
+        # ============================================================================
+        # VISUALIZE SINGLE-PATCH RESULTS
+        # ============================================================================
+        print("\n=== Creating single-patch visualizations ===")
+        
+        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+        
+        # Plot 1: Single-patch coordinates colored by cell type
+        if 'celltype' in scadata.obs.columns:
+            cell_types = scadata.obs['celltype']
+            unique_types = cell_types.unique()
+            colors = sns.color_palette("husl", len(unique_types))
+            color_map = dict(zip(unique_types, colors))
+            
+            for ct in unique_types:
+                mask = (cell_types == ct).values
+                axes[0].scatter(
+                    coords_canon_single[mask, 0], 
+                    coords_canon_single[mask, 1],
+                    s=3, 
+                    alpha=0.7, 
+                    label=ct,
+                    c=[color_map[ct]]
+                )
+            
+            axes[0].set_title('Single-Patch Coordinates (by cell type)', fontsize=16, fontweight='bold')
+            axes[0].set_xlabel('Dim 1', fontsize=12)
+            axes[0].set_ylabel('Dim 2', fontsize=12)
+            axes[0].legend(markerscale=3, fontsize=10, loc='best', framealpha=0.9)
+            axes[0].grid(True, alpha=0.3)
+        else:
+            axes[0].scatter(coords_canon_single[:, 0], coords_canon_single[:, 1], s=3, alpha=0.7, c='steelblue')
+            axes[0].set_title('Single-Patch Coordinates', fontsize=16, fontweight='bold')
+            axes[0].set_xlabel('Dim 1', fontsize=12)
+            axes[0].set_ylabel('Dim 2', fontsize=12)
+            axes[0].grid(True, alpha=0.3)
+        
+        axes[0].axis('equal')
+        
+        # Plot 2: Distance distribution
+        upper_tri_idx = np.triu_indices_from(D_edm_single, k=1)
+        distances_single = D_edm_single[upper_tri_idx]
+        
+        axes[1].hist(distances_single, bins=100, alpha=0.7, edgecolor='black', color='green')
+        axes[1].set_title('Pairwise Distance Distribution (Single-Patch)', fontsize=16, fontweight='bold')
+        axes[1].set_xlabel('Distance', fontsize=12)
+        axes[1].set_ylabel('Count', fontsize=12)
+        axes[1].axvline(distances_single.mean(), color='r', linestyle='--', linewidth=2, 
+                       label=f'Mean: {distances_single.mean():.2f}')
+        axes[1].axvline(np.median(distances_single), color='b', linestyle='--', linewidth=2, 
+                       label=f'Median: {np.median(distances_single):.2f}')
+        axes[1].legend(fontsize=10)
+        axes[1].grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        
+        plot_single_filename = f"gems_inference_SINGLE_PATCH_{timestamp}.png"
+        plot_single_path = os.path.join(outdir, plot_single_filename)
+        plt.savefig(plot_single_path, dpi=300, bbox_inches='tight')
+        print(f"✓ Saved single-patch plot: {plot_single_path}")
+        plt.close()
+        
+        # ============================================================================
+        # COMPARISON PLOT: Patchwise vs Single-Patch
+        # ============================================================================
+        print("\n=== Creating comparison plot ===")
+        
+        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+        
+        # Patchwise (left)
+        if 'celltype' in scadata.obs.columns:
+            for ct in unique_types:
+                mask = (cell_types == ct).values
+                axes[0].scatter(
+                    coords_canon[mask, 0], 
+                    coords_canon[mask, 1],
+                    s=3, alpha=0.7, label=ct, c=[color_map[ct]]
+                )
+            axes[0].legend(markerscale=3, fontsize=8, loc='best', framealpha=0.9)
+        else:
+            axes[0].scatter(coords_canon[:, 0], coords_canon[:, 1], s=3, alpha=0.7, c='steelblue')
+        
+        axes[0].set_title('PATCHWISE (with alignment)', fontsize=16, fontweight='bold')
+        axes[0].set_xlabel('Dim 1', fontsize=12)
+        axes[0].set_ylabel('Dim 2', fontsize=12)
+        axes[0].grid(True, alpha=0.3)
+        axes[0].axis('equal')
+        
+        # Single-patch (right)
+        if 'celltype' in scadata.obs.columns:
+            for ct in unique_types:
+                mask = (cell_types == ct).values
+                axes[1].scatter(
+                    coords_canon_single[mask, 0], 
+                    coords_canon_single[mask, 1],
+                    s=3, alpha=0.7, label=ct, c=[color_map[ct]]
+                )
+            axes[1].legend(markerscale=3, fontsize=8, loc='best', framealpha=0.9)
+        else:
+            axes[1].scatter(coords_canon_single[:, 0], coords_canon_single[:, 1], s=3, alpha=0.7, c='green')
+        
+        axes[1].set_title('SINGLE-PATCH (no alignment)', fontsize=16, fontweight='bold')
+        axes[1].set_xlabel('Dim 1', fontsize=12)
+        axes[1].set_ylabel('Dim 2', fontsize=12)
+        axes[1].grid(True, alpha=0.3)
+        axes[1].axis('equal')
+        
+        plt.tight_layout()
+        
+        comparison_filename = f"gems_COMPARISON_patchwise_vs_single_{timestamp}.png"
+        comparison_path = os.path.join(outdir, comparison_filename)
+        plt.savefig(comparison_path, dpi=300, bbox_inches='tight')
+        print(f"✓ Saved comparison plot: {comparison_path}")
+        plt.close()
+        
+        # ============================================================================
+        # COMPARISON STATISTICS
+        # ============================================================================
+        print("\n" + "="*70)
+        print("COMPARISON: PATCHWISE vs SINGLE-PATCH")
+        print("="*70)
+
+        # Compute distances from D_edm (upper triangle)
+        upper_tri_idx = np.triu_indices_from(D_edm, k=1)
+        distances = D_edm[upper_tri_idx]
+        
+        print(f"\nPATCHWISE:")
+        print(f"  Coordinate range: [{coords_canon.min():.2f}, {coords_canon.max():.2f}]")
+        print(f"  Distance stats: mean={distances.mean():.4f}, median={np.median(distances):.4f}, std={distances.std():.4f}")
+        
+        print(f"\nSINGLE-PATCH:")
+        print(f"  Coordinate range: [{coords_canon_single.min():.2f}, {coords_canon_single.max():.2f}]")
+        print(f"  Distance stats: mean={distances_single.mean():.4f}, median={np.median(distances_single):.4f}, std={distances_single.std():.4f}")
+        
+        # Compute geometry metrics
+        def compute_geometry_metrics(coords):
+            """Compute dimensionality and anisotropy metrics."""
+            coords_centered = coords - coords.mean(axis=0)
+            cov = np.cov(coords_centered.T)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = np.sort(eigvals)[::-1]  # Descending order
+            
+            # Effective dimensionality (participation ratio)
+            dim_eff = (eigvals.sum() ** 2) / (eigvals ** 2).sum()
+            
+            # Anisotropy ratio (top 2 eigenvalues)
+            if len(eigvals) >= 2:
+                aniso = eigvals[0] / (eigvals[1] + 1e-8)
+            else:
+                aniso = 1.0
+            
+            return dim_eff, aniso, eigvals
+        
+        dim_pw, aniso_pw, eig_pw = compute_geometry_metrics(coords_canon)
+        dim_sp, aniso_sp, eig_sp = compute_geometry_metrics(coords_canon_single)
+        
+        print(f"\nGEOMETRY METRICS:")
+        print(f"  Patchwise:    eff_dim={dim_pw:.2f}, anisotropy={aniso_pw:.2f}, top_eigs={eig_pw[:3]}")
+        print(f"  Single-patch: eff_dim={dim_sp:.2f}, anisotropy={aniso_sp:.2f}, top_eigs={eig_sp[:3]}")
+        print("="*70 + "\n")
+
 
         if False:
             print("\n=== Inference (rank-0) with Multi-Sample Ranking [RANDOM MODE] ===")
@@ -899,12 +1126,14 @@ def main(args=None):
             losses = history_st['epoch_avg']
             
             # ST-specific losses
-            st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial']
-            st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime', 'brown', 'pink', 'gray']
+            # ST-specific losses (including new shape constraints)
+            st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'repel', 'shape']
+            st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime', 'brown', 'pink', 'gray', 'darkred', 'darkblue']
 
             
-            # fig, axes = plt.subplots(3, 3, figsize=(20, 15))
-            fig, axes = plt.subplots(4, 3, figsize=(20, 20))
+            # Increased grid to fit new losses
+            fig, axes = plt.subplots(5, 3, figsize=(20, 25))
+
 
             fig.suptitle('Phase 1: ST-Only Training Losses', fontsize=18, fontweight='bold', y=0.995)
             
@@ -924,9 +1153,13 @@ def main(args=None):
                         ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
                         ax.legend(fontsize=10)
             
-            # Hide unused subplots
-            for idx in range(len(st_loss_names), 12):
-                axes[idx].axis('off')
+            # # Hide unused subplots
+            # for idx in range(len(st_loss_names), 12):
+            #     axes[idx].axis('off')
+
+            # Hide unused subplot (now we have 14 losses, 15 total subplots)
+            axes[14].axis('off')
+
 
             plt.tight_layout()
             st_plot_filename = f"stageC_phase1_ST_losses_{timestamp}.png"
@@ -990,9 +1223,10 @@ def main(args=None):
             if 'total' in st_losses and len(st_losses['total']) > 0:
                 print(f"Final total loss: {st_losses['total'][-1]:.4f}")
                 print(f"Final ST geometry losses:")
-                for name in ['gram', 'heat', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial']:
+                for name in ['gram', 'heat', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'repel', 'shape']:
                     if name in st_losses and len(st_losses[name]) > 0:
                         print(f"  {name}: {st_losses[name][-1]:.4f}")
+
         
         if args.num_sc_samples > 0 and training_history is not None:
             print("\n--- Phase 2: SC Fine-tuning ---")

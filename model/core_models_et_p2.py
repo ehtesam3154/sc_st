@@ -867,6 +867,55 @@ def train_stageC_diffusion_generator(
     print(f"[Triangle Loss] → SC: Weak guardrail, no ST influence\n")
     # =============================================================
 
+
+    # ========== COMPUTE REPEL EPSILON FOR ST (NEAREST-NEIGHBOR DISTANCE) ==========
+    print("\n[Repel Loss] Computing ST nearest-neighbor distance threshold (ST batches only)...")
+    
+    nn_dists = []
+    with torch.no_grad():
+        st_iter_repel = iter(st_loader)  # CREATE ITERATOR ONCE
+        for _ in range(20):
+            try:
+                batch = next(st_iter_repel)  # ADVANCE ITERATOR
+            except StopIteration:
+                st_iter_repel = iter(st_loader)  # RESET IF EXHAUSTED
+                batch = next(st_iter_repel)
+            
+            V_target = batch['V_target'].to(device)
+            mask = batch['mask'].to(device)
+            
+            # Compute nearest-neighbor distances for each valid point in each sample
+            B, N, D = V_target.shape
+            for b in range(B):
+                m_b = mask[b]
+                n_valid = m_b.sum().item()
+                if n_valid < 2:
+                    continue
+                
+                V_b = V_target[b, m_b]  # (n_valid, D)
+                D_mat = torch.cdist(V_b, V_b)  # (n_valid, n_valid)
+                
+                # Mask out diagonal
+                D_mat = D_mat + torch.eye(n_valid, device=device) * 1e6
+                
+                # Get nearest neighbor distance for each point
+                nn_dist_b = D_mat.min(dim=1)[0]  # (n_valid,)
+                nn_dists.extend(nn_dist_b.cpu().tolist())
+    
+    # Use 15% quantile as repel epsilon
+    nn_dists_arr = np.array(nn_dists)  
+    # ADD THIS CHECK:
+    if len(nn_dists_arr) == 0:
+        raise RuntimeError("[Repel Loss] No ST NN distances collected! Check ST loader.")
+    
+    repel_epsilon_st = float(np.quantile(nn_dists_arr, 0.15))
+
+    
+    print(f"[Repel Loss] ST epsilon (15% quantile of NN dists): {repel_epsilon_st:.6f}")
+    print(f"[Repel Loss] → Penalizes predicted distances < {repel_epsilon_st:.6f}\n")
+    # =============================================================================
+
+
     # ============================================================================
     # DEBUG: MINISETS SANITY CHECK
     # ============================================================================
@@ -973,8 +1022,11 @@ def train_stageC_diffusion_generator(
         'gen_align': 0.3,
         'dim': 0.1,
         'triangle': 0.5,
-        'radial': 1.0
+        'radial': 1.0,
+        'repel': 0.05,      # NEW: ST repulsion loss
+        'shape': 0.05       # NEW: ST anisotropy/shape loss
     }
+
 
     
     # Heat warmup schedule
@@ -1016,11 +1068,11 @@ def train_stageC_diffusion_generator(
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': []
+            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [],
+            'repel': [], 'shape': []  # NEW: ST shape constraints
         }
     }
 
-    
     # Compute sigma_data once at start
     print("Computing sigma_data from data statistics...")
 
@@ -1362,8 +1414,9 @@ def train_stageC_diffusion_generator(
             L_dim = torch.zeros((), device=device)
             L_triangle = torch.zeros((), device=device)
             L_radial = torch.zeros((), device=device)
-
-            
+            L_repel = torch.tensor(0.0, device=device)   # NEW: ST repulsion
+            L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
+      
             # Denoise to get V_hat
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
                 V_hat = V_t - sigma_t * eps_pred
@@ -1729,6 +1782,109 @@ def train_stageC_diffusion_generator(
                         if DEBUG and (global_step % LOG_EVERY == 0):
                             print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
 
+
+                # ==================== NEW: REPULSION LOSS (ST ONLY) ====================
+                # Penalize very small predicted pairwise distances (avoid local overlaps)
+                if DEBUG and (global_step % LOG_EVERY == 0):
+                    print(f"\n[REPEL] Computing repulsion loss for ST batch...")
+                
+                B_rep, N_rep, D_rep = V_geom.shape
+                L_repel_batch = []
+                
+                for b in range(B_rep):
+                    m_b = mask[b]
+                    n_valid = m_b.sum().item()
+                    if n_valid < 2:
+                        continue
+                    
+                    V_b = V_geom[b, m_b]  # (n_valid, D)
+                    D_pred_b = torch.cdist(V_b, V_b)  # (n_valid, n_valid)
+                    
+                    # Mask out diagonal
+                    eye_b = torch.eye(n_valid, device=device, dtype=torch.bool)
+                    D_pred_b_nodiag = D_pred_b.masked_fill(eye_b, 1e6)
+                    
+                    # Find pairs with distance < repel_epsilon_st
+                    violating_mask = (D_pred_b_nodiag < repel_epsilon_st) & (~eye_b)
+                    
+                    if violating_mask.any():
+                        # Penalty: (epsilon - D_ij)^2 for violating pairs
+                        violations = D_pred_b_nodiag[violating_mask]
+                        penalty = (repel_epsilon_st - violations).pow(2).mean()
+                        L_repel_batch.append(penalty)
+                    else:
+                        L_repel_batch.append(torch.tensor(0.0, device=device))
+                
+                # Average over batch
+                if len(L_repel_batch) > 0:
+                    L_repel = torch.stack(L_repel_batch).mean()
+                else:
+                    L_repel = torch.tensor(0.0, device=device)
+                
+                if DEBUG and (global_step % LOG_EVERY == 0):
+                    print(f"[REPEL] L_repel={L_repel.item():.6f} | epsilon={repel_epsilon_st:.6f}")
+                
+                # ==================== NEW: SHAPE/ANISOTROPY LOSS (ST ONLY) ====================
+                # Match eigenvalue ratio of predicted Gram to target Gram
+                if DEBUG and (global_step % LOG_EVERY == 0):
+                    print(f"\n[SHAPE] Computing anisotropy/shape loss for ST batch...")
+                
+                L_shape_batch = []
+                
+                for b in range(B_rep):
+                    m_b = mask[b].bool()
+                    n_valid = m_b.sum().item()
+                    if n_valid < 3:  # Need at least 3 points for meaningful eigenvalues
+                        continue
+                    
+                    # Predicted Gram (already computed above as Gp_raw)
+                    Gp_b = Gp_raw[b][m_b][:, m_b]  # (n_valid, n_valid)
+                    Gt_b = Gt[b][m_b][:, m_b]     
+
+                    
+                    # Compute eigenvalues (symmetric, so use eigvalsh)
+                    try:
+                        eig_pred = torch.linalg.eigvalsh(Gp_b)  # (n_valid,), ascending order
+                        eig_targ = torch.linalg.eigvalsh(Gt_b)  # (n_valid,), ascending order
+                        
+                        # Clamp from below to avoid log(0)
+                        eig_pred = eig_pred.clamp_min(1e-8)
+                        eig_targ = eig_targ.clamp_min(1e-8)
+                        
+                        # Take top 2 eigenvalues (largest)
+                        lambda1_pred = eig_pred[-1]
+                        lambda2_pred = eig_pred[-2]
+                        lambda1_targ = eig_targ[-1]
+                        lambda2_targ = eig_targ[-2]
+                        
+                        # Anisotropy ratio (how elongated vs round)
+                        r_pred = lambda1_pred / lambda2_pred.clamp_min(1e-8)
+                        r_targ = lambda1_targ / lambda2_targ.clamp_min(1e-8)
+                        
+                        # Log-ratio penalty (scale-invariant)
+                        log_ratio_loss = (torch.log(r_pred) - torch.log(r_targ)).pow(2)
+                        L_shape_batch.append(log_ratio_loss)
+                        
+                    except Exception as e:
+                        # If eigendecomposition fails (numerical issues), skip this sample
+                        if DEBUG and (global_step % LOG_EVERY == 0):
+                            print(f"[SHAPE] Warning: eigendecomp failed for sample {b}: {e}")
+                        continue
+                
+                # Average over batch
+                if len(L_shape_batch) > 0:
+                    L_shape = torch.stack(L_shape_batch).mean()
+                else:
+                    L_shape = torch.tensor(0.0, device=device)
+                
+                if DEBUG and (global_step % LOG_EVERY == 0):
+                    print(f"[SHAPE] L_shape={L_shape.item():.6f}")
+                    if len(L_shape_batch) > 0:
+                        print(f"[SHAPE] per-sample: min={min([x.item() for x in L_shape_batch]):.6f} "
+                              f"max={max([x.item() for x in L_shape_batch]):.6f}")
+                # ==============================================================================
+
+
                 # ============================================================================
                 # DEBUG: RIGID TRANSFORM INVARIANCE TEST (ST batch only)
                 # ============================================================================
@@ -2031,7 +2187,6 @@ def train_stageC_diffusion_generator(
             #                     WEIGHTS['gen_align'] * L_gen_align) 
 
             L_total = (WEIGHTS['score'] * score_multiplier * L_score +
-                                # WEIGHTS['cone'] * L_cone +
                                 WEIGHTS['gram'] * L_gram +
                                 WEIGHTS['gram_scale'] * L_gram_scale +
                                 WEIGHTS['heat'] * L_heat +
@@ -2044,7 +2199,10 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['gen_align'] * L_gen_align +
                                 WEIGHTS['dim'] * L_dim +
                                 WEIGHTS['triangle'] * L_triangle +
-                                WEIGHTS['radial'] * L_radial)
+                                WEIGHTS['radial'] * L_radial +
+                                WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
+                                WEIGHTS['shape'] * L_shape)       # NEW: ST shape/anisotropy
+
             
             # Add SC dimension prior if this is an SC batch
             if is_sc:
@@ -2354,6 +2512,9 @@ def train_stageC_diffusion_generator(
                     f"sw_st={L_sw_st.item():.4f} sw_sc={L_sw_sc.item():.4f} "
                     f"overlap={L_overlap.item():.4f}")
                 
+                print(f"[NEW LOSSES] L_repel={L_repel.item():.3e} L_shape={L_shape.item():.3e}")
+
+                
         #============ END OF EPOCH SUMMARY ============
         if use_sc:
             print(f"\n[Epoch {epoch+1}] ST batches: {st_batches}, SC batches: {sc_batches}")
@@ -2593,6 +2754,7 @@ def train_stageC_diffusion_generator(
         )
 
 
+
         # Override the history['epoch_avg']['total'] with correct value
         history['epoch_avg']['total'][-1] = epoch_losses['total']
 
@@ -2782,6 +2944,151 @@ def train_stageC_diffusion_generator(
 
 
     return history if _is_rank0() else None
+
+
+# ==============================================================================
+# STAGE D: SC INFERENCE (SINGLE-PATCH MODE - NO STITCHING)
+# ==============================================================================
+
+def sample_sc_edm_single_patch(
+    sc_gene_expr: torch.Tensor,
+    encoder: "SharedEncoder",
+    context_encoder: "SetEncoderContext",
+    score_net: "DiffusionScoreNet",
+    target_st_p95: Optional[float] = None,
+    n_timesteps_sample: int = 500,
+    sigma_min: float = 0.01,
+    sigma_max: float = 3.0,
+    guidance_scale: float = 2.0,
+    eta: float = 0.0,
+    device: str = "cuda",
+    DEBUG_FLAG: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """
+    Stage D: Single-patch SC inference (NO patchwise stitching).
+    
+    This is a reference implementation that treats all SC cells as one patch.
+    Useful for:
+    1. Debugging Stage C without patchwise alignment artifacts
+    2. Small datasets where patchwise isn't needed
+    3. Comparing patchwise vs single-patch geometry
+    
+    Returns:
+        Dictionary with:
+        - 'D_edm': (n_sc, n_sc) Euclidean distance matrix
+        - 'coords': (n_sc, D_latent) raw coordinates
+        - 'coords_canon': (n_sc, D_latent) canonicalized coordinates
+    """
+    import torch.nn.functional as F
+    import utils_et as uet
+    
+    print(f"\n{'='*72}")
+    print("STAGE D — SINGLE-PATCH SC INFERENCE (NO PATCHWISE STITCHING)")
+    print(f"{'='*72}")
+    
+    encoder.eval()
+    context_encoder.eval()
+    score_net.eval()
+    
+    n_sc = sc_gene_expr.shape[0]
+    D_latent = score_net.D_latent
+    
+    if DEBUG_FLAG:
+        print(f"[cfg] n_sc={n_sc}  D_latent={D_latent}")
+        print(f"[cfg] timesteps={n_timesteps_sample}  guidance_scale={guidance_scale}")
+        print(f"[cfg] sigma_min={sigma_min}  sigma_max={sigma_max}")
+    
+    # 1) Encode all SC cells
+    encode_bs = 1024
+    Z_chunks = []
+    for i in range(0, n_sc, encode_bs):
+        z = encoder(sc_gene_expr[i:i + encode_bs].to(device)).detach()
+        Z_chunks.append(z)
+    Z_all = torch.cat(Z_chunks, dim=0).to(device)  # (n_sc, h)
+    
+    if DEBUG_FLAG:
+        print(f"[ENC] Z_all shape={tuple(Z_all.shape)}")
+    
+    # 2) Build single-patch context
+    Z_set = Z_all.unsqueeze(0)  # (1, n_sc, h)
+    mask = torch.ones(1, n_sc, dtype=torch.bool, device=device)
+    H = context_encoder(Z_set, mask)  # (1, n_sc, c_dim)
+    
+    # 3) Diffusion sampling
+    sigmas = torch.exp(torch.linspace(
+        torch.log(torch.tensor(sigma_max, device=device)),
+        torch.log(torch.tensor(sigma_min, device=device)),
+        n_timesteps_sample,
+        device=device,
+    ))
+    
+    V_t = torch.randn(1, n_sc, D_latent, device=device) * sigmas[0]
+    
+    if DEBUG_FLAG:
+        print(f"\n[SAMPLE] Starting diffusion with {n_timesteps_sample} steps...")
+    
+    with torch.no_grad():
+        for t_idx in range(n_timesteps_sample):
+            sigma_t = sigmas[t_idx]
+            t_norm = torch.tensor([[t_idx / float(n_timesteps_sample - 1)]], device=device)
+            
+            # Classifier-free guidance
+            H_null = torch.zeros_like(H)
+            eps_uncond = score_net(V_t, t_norm, H_null, mask)
+            eps_cond = score_net(V_t, t_norm, H, mask)
+            eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+            
+            if DEBUG_FLAG and t_idx % 100 == 0:
+                print(f"  [STEP] t={t_idx:3d}/{n_timesteps_sample} sigma={float(sigma_t):.4f}")
+            
+            # DDIM/EDM step
+            if t_idx < n_timesteps_sample - 1:
+                sigma_next = sigmas[t_idx + 1]
+                V_0_pred = V_t - sigma_t * eps
+                V_t = V_0_pred + (sigma_next / sigma_t) * (V_t - V_0_pred)
+                if eta > 0:
+                    noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_t**2, min=0))
+                    V_t = V_t + noise_scale * torch.randn_like(V_t)
+            else:
+                V_t = V_t - sigma_t * eps
+    
+    # 4) Canonicalize: center only, no RMS scaling (match training)
+    V_final = V_t.squeeze(0)  # (n_sc, D_latent)
+    V_canon = V_final - V_final.mean(dim=0, keepdim=True)
+    
+    # 5) Compute EDM
+    D_edm = torch.cdist(V_canon, V_canon)  # (n_sc, n_sc)
+
+    triu_mask = torch.triu(torch.ones_like(D_edm, dtype=torch.bool), diagonal=1)
+
+    
+    # 6) Optional: rescale to ST p95
+    if target_st_p95 is not None:
+        current_p95 = D_edm[triu_mask].quantile(0.95).item()
+        scale_factor = target_st_p95 / (current_p95 + 1e-8)
+        D_edm = D_edm * scale_factor
+        V_canon = V_canon * scale_factor
+        
+        if DEBUG_FLAG:
+            print(f"\n[SCALE] Rescaled to match ST p95={target_st_p95:.4f} (factor={scale_factor:.4f})")
+    
+    # 7) Stats
+    if DEBUG_FLAG:
+        print(f"\n[RESULT] EDM shape: {tuple(D_edm.shape)}")
+        print(f"[RESULT] Coords RMS: {V_canon.pow(2).mean().sqrt().item():.4f}")
+        D_upper = D_edm[triu_mask]
+        print(f"[RESULT] Distance stats: "
+              f"p50={D_upper.quantile(0.50).item():.4f} "
+              f"p95={D_upper.quantile(0.95).item():.4f} "
+              f"max={D_upper.max().item():.4f}")
+        print(f"{'='*72}\n")
+    
+    return {
+        'D_edm': D_edm,
+        'coords': V_final,
+        'coords_canon': V_canon,
+    }
+
 
 # ==============================================================================
 # STAGE D: SC INFERENCE (PATCH-BASED GLOBAL ALIGNMENT)
@@ -3047,7 +3354,12 @@ def sample_sc_edm_patchwise(
     if DEBUG_FLAG:
         print(f"[ALIGN] Init X_global: coords_rms={rms:.3f} (centrality-weighted)")
 
-    # 5.2 Alternating Procrustes alignment
+    # 5.2 Alternating Procrustes alignment (SIMPLIFIED: fixed scale, single iteration)
+    s_global = 1.0
+    
+    print(f"\n[ALIGN] Using FIXED global scale s_global={s_global} (no dynamic scaling)")
+    print(f"[ALIGN] Running simplified alignment with {n_align_iters} iteration(s)...")
+    
     for it in range(n_align_iters):
         if DEBUG_FLAG:
             print(f"\n[ALIGN] Iteration {it + 1}/{n_align_iters}")
@@ -3055,15 +3367,11 @@ def sample_sc_edm_patchwise(
         R_list: List[torch.Tensor] = []
         t_list: List[torch.Tensor] = []
         
-        # For GLOBAL scale computation
-        numerators = []
-        denominators = []
-        
         # For global alignment loss tracking
         per_patch_mse = []
 
         # ======================================================================
-        # Step A: Compute rotations and accumulate global scale components
+        # Step A: Compute rotations (NO scale accumulation)
         # ======================================================================
         for k in range(K):
             S_k = patch_indices[k]
@@ -3097,19 +3405,14 @@ def sample_sc_edm_patchwise(
                 U[:, -1] *= -1
                 R_k = U @ Vh
 
-            # Accumulate for GLOBAL scale (don't compute s_k yet!)
-            numerators.append(S_vals.sum())
-            denominators.append((weights_k * (Vc ** 2)).sum())
-
+            # NO numerator/denominator accumulation - scale is fixed!
             R_list.append(R_k)
 
         # ======================================================================
-        # Compute GLOBAL scale (shared across all patches)
+        # NO GLOBAL SCALE RECOMPUTATION - use fixed s_global = 1.0
         # ======================================================================
-        s_global = float(sum(numerators) / (sum(denominators) + 1e-8))
-
-        if DEBUG_FLAG:
-            print(f"[new ALIGN] global_scale={s_global:.4f}")
+        if DEBUG_FLAG and it == 0:
+            print(f"[ALIGN] Using FIXED s_global={s_global} (not recomputed from patches)")
 
         # ======================================================================
         # Step A (cont.): Compute translations and track alignment error
@@ -3131,7 +3434,7 @@ def sample_sc_edm_patchwise(
             mu_X = (weights_k * X_k).sum(dim=0, keepdim=True) / w_sum
             mu_V = (weights_k * V_k).sum(dim=0, keepdim=True) / w_sum
 
-            # Translation using GLOBAL scale
+            # Translation using FIXED s_global = 1.0
             t_k = (mu_X - s_global * (mu_V @ R_k.T)).squeeze(0)
             t_list.append(t_k)
 
@@ -3169,7 +3472,7 @@ def sample_sc_edm_patchwise(
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)        # (m_k, 1)
 
-            # Transformed patch in global frame using GLOBAL scale
+            # Transformed patch in global frame using FIXED s_global = 1.0
             X_hat_k = s_global * (V_k @ R_k.T) + t_k     # (m_k, D)
 
             # Weighted accumulation
@@ -3181,6 +3484,7 @@ def sample_sc_edm_patchwise(
         new_X[mask_seen2] /= W_X[mask_seen2]
         # Cells never hit by any patch: keep previous
         new_X[~mask_seen2] = X_global[~mask_seen2]
+
 
         new_X = new_X - new_X.mean(dim=0, keepdim=True)
         X_global = new_X
@@ -3268,7 +3572,7 @@ def sample_sc_edm_patchwise(
     # Cleanup GPU tensors to allow process exit
     del Xd, D, X_full
     del Z_all, patch_indices, memberships, patch_coords
-    del X_global, R_list, t_list
+    # del X_global, R_list, t_list
     
     if "cuda" in device:
         torch.cuda.synchronize()

@@ -538,6 +538,43 @@ class GEMSModel:
         )
 
         return res
+    
+
+    def infer_sc_single_patch(
+        self,
+        sc_gene_expr: torch.Tensor,
+        n_timesteps_sample: int = 500,
+        sigma_min: float = 0.01,
+        sigma_max: float = 3.0,
+        guidance_scale: float = 2.0,
+        eta: float = 0.0,
+        target_st_p95: Optional[float] = None,
+        return_coords: bool = True,
+        DEBUG_FLAG: bool = True,
+    ):
+        """
+        Single-patch SC inference (no patchwise stitching).
+        Treats all SC cells as one batch - useful for small datasets and debugging.
+        """
+        from core_models_et_p2 import sample_sc_edm_single_patch
+        
+        result = sample_sc_edm_single_patch(
+            sc_gene_expr=sc_gene_expr,
+            encoder=self.encoder,
+            context_encoder=self.context_encoder,
+            score_net=self.score_net,
+            target_st_p95=target_st_p95,
+            n_timesteps_sample=n_timesteps_sample,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            guidance_scale=guidance_scale,
+            eta=eta,
+            device=self.device,
+            DEBUG_FLAG=DEBUG_FLAG,
+        )
+        
+        return result
+
 
 
 
