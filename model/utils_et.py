@@ -3199,3 +3199,151 @@ def z_neighbor_preservation_loss(
     loss = diff_sq.sum() / valid_mask.float().sum().clamp(min=1.0)
     
     return loss
+
+
+# ==============================================================================
+# ST SPATIAL k-NN RANKING LOSS (GPU-EFFICIENT, DATA-DRIVEN MARGIN)
+# ==============================================================================
+
+@torch.no_grad()
+def build_st_knn_triplets_batched(
+    D_true: torch.Tensor,      # (n_valid, n_valid) ground-truth distance matrix
+    k_pos: int = 10,           # number of positive neighbors per anchor
+    k_neg: int = 30,           # number of negative (far) neighbors per anchor  
+    n_neg_sample: int = 3,     # negatives to sample per positive
+    triplet_cap: int = 20000,  # max triplets to return
+) -> tuple:
+    """
+    Build triplets from ground-truth ST distances. Fully vectorized, GPU-friendly.
+    
+    For each anchor i:
+      - positives = k_pos nearest spatial neighbors
+      - negatives = k_neg farthest spatial neighbors
+    
+    Returns: 
+        triplets: (T, 3) LongTensor of [anchor, positive, negative] indices
+        d_pos_med_sq: median squared distance for positive pairs
+        d_neg_med_sq: median squared distance for negative pairs
+    """
+    device = D_true.device
+    n = D_true.shape[0]
+    
+    if n <= k_pos + 2:
+        return (torch.zeros((0, 3), dtype=torch.long, device=device),
+                torch.tensor(0.0, device=device),
+                torch.tensor(1.0, device=device))
+    
+    # Sort distances per anchor (ascending)
+    dist_sorted, sorted_idx = torch.sort(D_true, dim=1)
+    dist_sorted = dist_sorted[:, 1:]  # drop self
+    sorted_idx = sorted_idx[:, 1:]    # drop self
+    
+    # Positives: first k_pos neighbors (closest)
+    k_pos_actual = min(k_pos, sorted_idx.shape[1])
+    pos_idx = sorted_idx[:, :k_pos_actual]       # (n, k_pos)
+    pos_dists = dist_sorted[:, :k_pos_actual]    # (n, k_pos)
+    
+    # Negatives: last k_neg neighbors (farthest)
+    k_neg_actual = min(k_neg, sorted_idx.shape[1] - k_pos_actual)
+    if k_neg_actual <= 0:
+        return (torch.zeros((0, 3), dtype=torch.long, device=device),
+                torch.tensor(0.0, device=device),
+                torch.tensor(1.0, device=device))
+    neg_idx = sorted_idx[:, -k_neg_actual:]      # (n, k_neg)
+    neg_dists = dist_sorted[:, -k_neg_actual:]   # (n, k_neg)
+    
+    # Compute median squared distances for margin calculation
+    d_pos_med_sq = pos_dists.pow(2).median()
+    d_neg_med_sq = neg_dists.pow(2).median()
+    
+    # Build triplets vectorized
+    n_anchors = n
+    n_pos = k_pos_actual
+    n_neg = k_neg_actual
+    
+    triplets_per_anchor = n_pos * n_neg_sample
+    
+    # Generate anchor indices
+    anchors = torch.arange(n_anchors, device=device).unsqueeze(1).expand(-1, triplets_per_anchor).reshape(-1)
+    
+    # Generate positive indices
+    pos_expanded = pos_idx.unsqueeze(2).expand(-1, -1, n_neg_sample).reshape(n_anchors, -1)
+    positives = pos_expanded.reshape(-1)
+    
+    # Generate negative indices (random sample)
+    neg_samples = torch.randint(0, n_neg, (n_anchors, n_pos, n_neg_sample), device=device)
+    neg_gathered = torch.gather(neg_idx.unsqueeze(1).expand(-1, n_pos, -1), 2, neg_samples)
+    negatives = neg_gathered.reshape(-1)
+    
+    triplets = torch.stack([anchors, positives, negatives], dim=1)
+    
+    # Cap if too many
+    if triplets.shape[0] > triplet_cap:
+        sel = torch.randperm(triplets.shape[0], device=device)[:triplet_cap]
+        triplets = triplets[sel]
+    
+    return triplets, d_pos_med_sq, d_neg_med_sq
+
+
+def st_knn_ranking_loss(
+    V_pred: torch.Tensor,       # (n_valid, D) predicted coordinates
+    D_true: torch.Tensor,       # (n_valid, n_valid) ground-truth distances
+    k_pos: int = 10,
+    k_neg: int = 30,
+    n_neg_sample: int = 3,
+    margin_frac: float = 0.25,  # fraction of gap to use as margin
+    triplet_cap: int = 20000,
+    return_stats: bool = False, # return active fraction for debugging
+) -> torch.Tensor:
+    """
+    Ranking loss: true spatial neighbors should remain closer than true far points
+    in the predicted coordinate space.
+    
+    Data-driven margin: margin = margin_frac * (d_neg_med² - d_pos_med²)
+    This adapts to the actual distance scale in each mini-set.
+    """
+    device = V_pred.device
+    n = V_pred.shape[0]
+    
+    if n <= k_pos + 2:
+        if return_stats:
+            return V_pred.new_tensor(0.0), 0.0, 0.0
+        return V_pred.new_tensor(0.0)
+    
+    # Build triplets and get distance statistics
+    triplets, d_pos_med_sq, d_neg_med_sq = build_st_knn_triplets_batched(
+        D_true=D_true,
+        k_pos=k_pos,
+        k_neg=k_neg,
+        n_neg_sample=n_neg_sample,
+        triplet_cap=triplet_cap
+    )
+    
+    if triplets.shape[0] == 0:
+        if return_stats:
+            return V_pred.new_tensor(0.0), 0.0, 0.0
+        return V_pred.new_tensor(0.0)
+    
+    # Compute data-driven margin
+    gap_sq = (d_neg_med_sq - d_pos_med_sq).clamp(min=1e-6)
+    margin = margin_frac * gap_sq
+    
+    # Compute predicted distances for triplets
+    a_idx, p_idx, n_idx = triplets[:, 0], triplets[:, 1], triplets[:, 2]
+    
+    Va = V_pred[a_idx]
+    Vp = V_pred[p_idx]
+    Vn = V_pred[n_idx]
+    
+    d_ap_sq = (Va - Vp).pow(2).sum(dim=1)
+    d_an_sq = (Va - Vn).pow(2).sum(dim=1)
+    
+    # Margin ranking loss
+    delta = d_ap_sq - d_an_sq + margin
+    loss = torch.relu(delta).mean()
+    
+    if return_stats:
+        active_frac = (delta > 0).float().mean().item()
+        return loss, active_frac, margin.item()
+    
+    return loss
