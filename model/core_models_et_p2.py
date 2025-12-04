@@ -1186,6 +1186,47 @@ def train_stageC_diffusion_generator(
             f"patience={early_stop_patience}, threshold={early_stop_threshold:.1%}")
     
     for epoch in range(n_epochs):
+
+        # ========== DEBUG: Print ST sampling stats every 10 epochs ==========
+        # if use_st and st_dataset is not None and (epoch == 0 or epoch % 10 == 0):
+        #     print(f"\n{'='*100}")
+        #     print(f"🔍 EPOCH {epoch}: ST MINI-SUBSET SAMPLING VERIFICATION")
+        #     print(f"{'='*100}")
+            
+        #     if hasattr(st_dataset, '_debug_slide_counts'):
+        #         counts = st_dataset._debug_slide_counts
+        #         total = sum(counts.values())
+        #         print(f"📊 Total ST mini-subsets created so far: {total}")
+        #         for slide_id in sorted(counts.keys()):
+        #             count = counts[slide_id]
+        #             pct = (count / total * 100) if total > 0 else 0
+        #             print(f"   Slide {slide_id}: {count} subsets ({pct:.1f}%)")
+                
+        #         if hasattr(st_dataset, '_debug_samples') and len(st_dataset._debug_samples) > 0:
+        #             print(f"\n🔬 First 10 mini-subsets (detailed inspection):")
+        #             for s in st_dataset._debug_samples[:10]:
+        #                 print(f"\n   Sample #{s['sample_idx']}:")
+        #                 print(f"      Chosen slide: {s['slide']}")
+        #                 print(f"      Slide has {s['n_spots_in_slide']} spots (valid indices: 0-{s['n_spots_in_slide']-1})")
+        #                 print(f"      Center point: {s['center_idx']}")
+        #                 print(f"      Total sampled: {s['total_sampled']}")
+        #                 print(f"      First 20 indices: {s['sampled_indices']}")
+                        
+        #                 # Verify purity
+        #                 all_valid = all(0 <= idx < s['n_spots_in_slide'] for idx in s['sampled_indices'])
+                        
+        #                 if all_valid:
+        #                     print(f"      ✅ PURE: All indices valid for slide {s['slide']}")
+        #                 else:
+        #                     invalid = [idx for idx in s['sampled_indices'] if idx < 0 or idx >= s['n_spots_in_slide']]
+        #                     print(f"      ❌ CONTAMINATED: Invalid indices: {invalid}")
+        #     else:
+        #         print("⚠️  Debug tracking not initialized in st_dataset")
+            
+        #     print(f"{'='*100}\n")
+        # ========== END DEBUG ==========
+
+
         st_iter = iter(st_loader) if use_st else None
         sc_iter = iter(sc_loader) if use_sc else None
         
@@ -2577,10 +2618,10 @@ def train_stageC_diffusion_generator(
 
         avg_shape = epoch_losses['shape'] / max(n_batches, 1)
         avg_repel = epoch_losses['repel'] / max(n_batches, 1)
-        print(f"[EPOCH {epoch+1} LOSS DEBUG]")
-        print(f"  L_shape avg: {avg_shape:.6f} (weight={WEIGHTS['shape']:.3f})")
-        print(f"  L_repel avg: {avg_repel:.6f} (weight={WEIGHTS['repel']:.3f})")
-        print(f"  L_shape contribution to total: {WEIGHTS['shape'] * avg_shape:.6f}")
+        # print(f"[EPOCH {epoch+1} LOSS DEBUG]")
+        # print(f"  L_shape avg: {avg_shape:.6f} (weight={WEIGHTS['shape']:.3f})")
+        # print(f"  L_repel avg: {avg_repel:.6f} (weight={WEIGHTS['repel']:.3f})")
+        # print(f"  L_shape contribution to total: {WEIGHTS['shape'] * avg_shape:.6f}")
 
         should_stop = False 
 
@@ -2594,13 +2635,15 @@ def train_stageC_diffusion_generator(
             # print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
             # Print detailed losses every 5 epochs, simple summary otherwise
-            if (epoch + 1) % 5 == 0:
+            # Print detailed losses every 5 epochs, simple summary otherwise
+            if (epoch + 1) % 10 == 0:
                 avg_gram_scale = epoch_losses['gram_scale'] / max(n_batches, 1)
                 avg_heat = epoch_losses['heat'] / max(n_batches, 1)
                 avg_sw_st = epoch_losses['sw_st'] / max(n_batches, 1)
                 avg_sw_sc = epoch_losses['sw_sc'] / max(n_batches, 1)
                 avg_overlap = epoch_losses['overlap'] / max(n_batches, 1)
                 avg_ordinal_sc = epoch_losses['ordinal_sc'] / max(n_batches, 1)
+                avg_z_nbr = epoch_losses['z_nbr'] / max(n_batches, 1)  # ← ADD THIS
                 avg_st_dist = epoch_losses['st_dist'] / max(n_batches, 1)
                 avg_edm_tail = epoch_losses['edm_tail'] / max(n_batches, 1)
                 avg_gen_align = epoch_losses['gen_align'] / max(n_batches, 1)
@@ -2611,7 +2654,7 @@ def train_stageC_diffusion_generator(
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
                 print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f}")
-                print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
+                print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | z_nbr={avg_z_nbr:.4f} | st_dist={avg_st_dist:.4f}")  # ← UPDATED LINE
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
                 print(f"  dim={avg_dim:.4f} | triangle={avg_triangle:.4f} | radial={avg_radial:.4f}")
 

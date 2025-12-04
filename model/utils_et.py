@@ -12,6 +12,15 @@ from scipy import sparse
 from scipy.spatial.distance import pdist, squareform
 from sklearn.neighbors import NearestNeighbors
 import warnings
+import scipy.sparse as sp
+from scipy.sparse.csgraph import shortest_path
+from scipy.spatial.distance import pdist, squareform
+from functools import lru_cache
+import torch.distributed as dist
+import math 
+from sklearn.neighbors import kneighbors_graph
+from typing import Dict
+
 
 # ==============================================================================
 # PART 1: POSE NORMALIZATION (reuse existing for continuity)
@@ -574,10 +583,7 @@ def safe_eigh(A, cpu=False, return_vecs=True, regularize=1e-6):
         return eigvals, None
 
 
-# utils_et.py
-import torch
-import torch.nn.functional as F
-from functools import lru_cache
+
 
 # def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
 #     """
@@ -604,7 +610,6 @@ from functools import lru_cache
 #         counts = torch.bincount(flat, minlength=B * nb).view(B, nb).float()
 #         return counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
 
-import torch
 
 @torch.no_grad()
 def compute_distance_hist(
@@ -699,9 +704,6 @@ def compute_distance_hist(
         raise ValueError(f"compute_distance_hist: expected D dim 2 or 3, got {D.dim()}")
 
 
-import torch
-import torch.nn.functional as F
-
 def _get_device_for_build(x: torch.Tensor) -> torch.device:
     if x.is_cuda:
         return x.device
@@ -722,7 +724,6 @@ def build_topk_index(
     - If torch.distributed is initialized, rank 0 computes once and broadcasts to all ranks.
     - Returns a CPU pinned (N, K) LongTensor for fast DataLoader use.
     """
-    import torch.distributed as dist
 
     device = _get_device_for_build(Z_all)
     Z = Z_all.to(device, non_blocking=True).contiguous()
@@ -1545,9 +1546,7 @@ def build_knn_graph(
     else:
         return edge_index.long(), None
 
-import math 
-import torch
-import torch.nn as nn
+
 
 #fast heat trace via strochastic lanczos quadratur (dense L)
 @torch.no_grad()
@@ -1626,8 +1625,7 @@ def heat_trace_slq_dense(L, t_list, num_probe=4, m=12):
     return traces  # per-node trace, roughly in [e^{-2t}, 1] for normalized L
 
 
-import torch
-import torch.nn.functional as F
+
 
 @torch.no_grad()
 def _upper_tri_vec(D):
@@ -1682,7 +1680,6 @@ def wasserstein_1d_quantile_loss(
 
     return diff.mean()
 
-import torch
 
 def farthest_point_sampling(Z: torch.Tensor, k: int, device='cpu') -> torch.Tensor:
     """
@@ -1741,11 +1738,6 @@ def mds_from_latent(X: torch.Tensor, d_out: int = 2) -> torch.Tensor:
     
     return coords
 
-# Add these imports at the top if not already present
-import scipy.sparse as sp
-from scipy.sparse.csgraph import shortest_path
-from scipy.spatial.distance import pdist, squareform
-
 def affine_whitening(coords: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, float]:
     """
     Affine whitening with eigendecomp. Returns whitened coords and scale factor.
@@ -1781,7 +1773,6 @@ def compute_geodesic_distances(coords: torch.Tensor, k: int = 15, device: str = 
     coords_np = coords.cpu().numpy()
     
     # Build kNN graph with Euclidean edge weights
-    from sklearn.neighbors import kneighbors_graph
     knn_graph = kneighbors_graph(coords_np, n_neighbors=k, mode='distance', metric='euclidean', include_self=False)
     
     # Symmetrize
@@ -1904,9 +1895,7 @@ def create_sc_miniset_pair(
     return indices_A, indices_B, shared_in_A, shared_in_B
 
 
-import torch
-import torch.nn.functional as F
-from typing import Dict
+
 
 @torch.no_grad()
 def build_sc_knn_cache(
@@ -2151,7 +2140,6 @@ def init_st_dist_bins_from_data(
     Build distance bin edges automatically from ST coordinates.
     Returns: torch.tensor of shape (n_bins+1,) = bin edges (increasing).
     """
-    from scipy.spatial.distance import pdist
     
     # coords: use a random subset if huge
     if coords.shape[0] > 2000:
@@ -2468,7 +2456,6 @@ def precompute_st_graph_fixed(
         - sigma: bandwidth used
         - N_total: total number of nodes
     """
-    from sklearn.neighbors import NearestNeighbors
     
     N_total = y_hat.shape[0]
     device = y_hat.device
@@ -3106,3 +3093,109 @@ class RadialHistogramLoss(nn.Module):
         
         return V_canon
 
+# ==============================================================================
+# Z-SPACE NEIGHBORHOOD PRESERVATION LOSS
+# ==============================================================================
+
+@torch.no_grad()
+def _gather_z_neighbors_in_set(
+    set_global_idx: torch.Tensor,    # (n_valid,) global indices of cells in this set
+    pos_idx_cpu: torch.Tensor,       # (N_total, k_pos) precomputed global k-NN
+    k_use: int = 15                  # how many neighbors to use
+) -> torch.Tensor:
+    """
+    For each cell in set, find which of its Z-space k-NN are also in the set.
+    Returns: (n_valid, k_use) local indices, padded with -1 where neighbor not in set.
+    """
+    n_valid = set_global_idx.numel()
+    device = set_global_idx.device
+    
+    # Build reverse map: global_idx -> local position in set
+    # Use a tensor for O(1) lookup (max global index bounded)
+    max_global = int(set_global_idx.max().item()) + 1
+    global_to_local = torch.full((max_global,), -1, dtype=torch.long, device=device)
+    local_positions = torch.arange(n_valid, device=device)
+    global_to_local[set_global_idx] = local_positions
+    
+    # For each cell, get its global k-NN and map to local
+    # pos_idx_cpu is (N_total, k_pos), we need rows for our set's global indices
+    k_pos_avail = pos_idx_cpu.shape[1]
+    k_actual = min(k_use, k_pos_avail)
+    
+    # Gather global neighbor indices for cells in this set
+    set_global_np = set_global_idx.cpu()
+    nbr_global = pos_idx_cpu[set_global_np, :k_actual].to(device)  # (n_valid, k_actual)
+    
+    # Map to local indices (-1 if neighbor not in set)
+    nbr_global_clamped = nbr_global.clamp(0, max_global - 1)
+    nbr_local = global_to_local[nbr_global_clamped]  # (n_valid, k_actual)
+    
+    # Mark out-of-range neighbors as -1
+    out_of_range = (nbr_global < 0) | (nbr_global >= max_global)
+    nbr_local[out_of_range] = -1
+    
+    return nbr_local
+
+def z_neighbor_preservation_loss(
+    V_pred: torch.Tensor,           # (n_valid, D) predicted coordinates
+    Z_embed: torch.Tensor,          # (n_valid, h) Z-space embeddings
+    nbr_local: torch.Tensor,        # (n_valid, k) local indices of Z-neighbors, -1 = invalid
+    normalize: bool = True,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Penalize when Z-space neighbors are far apart in predicted V-space.
+    
+    Loss = mean over anchors of mean over valid neighbors of:
+        (d_V(i,j) / mean_d_V - d_Z(i,j) / mean_d_Z)^2
+    
+    This is a local, sampled Gromov-Wasserstein style constraint.
+    """
+    n_valid, k = nbr_local.shape
+    device = V_pred.device
+    
+    if n_valid < 2 or k == 0:
+        return V_pred.new_tensor(0.0)
+    
+    # Compute all pairwise distances in V and Z (only for this mini-set, so cheap)
+    D_V = torch.cdist(V_pred, V_pred)  # (n_valid, n_valid)
+    D_Z = torch.cdist(Z_embed, Z_embed)  # (n_valid, n_valid)
+    
+    # Gather neighbor distances
+    # nbr_local: (n_valid, k), values in [0, n_valid-1] or -1
+    valid_mask = nbr_local >= 0  # (n_valid, k)
+    
+    if not valid_mask.any():
+        return V_pred.new_tensor(0.0)
+    
+    # Safe gather with clamped indices
+    nbr_clamped = nbr_local.clamp(0, n_valid - 1)
+    
+    # For each anchor i, gather distances to its neighbors
+    anchor_idx = torch.arange(n_valid, device=device).unsqueeze(1).expand(-1, k)  # (n_valid, k)
+    
+    d_V_nbr = D_V[anchor_idx, nbr_clamped]  # (n_valid, k)
+    d_Z_nbr = D_Z[anchor_idx, nbr_clamped]  # (n_valid, k)
+    
+    # Mask invalid entries
+    d_V_nbr = d_V_nbr * valid_mask.float()
+    d_Z_nbr = d_Z_nbr * valid_mask.float()
+    
+    if normalize:
+        # Normalize by mean distance (allows global scale difference)
+        d_V_mean = d_V_nbr[valid_mask].mean().clamp(min=eps)
+        d_Z_mean = d_Z_nbr[valid_mask].mean().clamp(min=eps)
+        
+        d_V_norm = d_V_nbr / d_V_mean
+        d_Z_norm = d_Z_nbr / d_Z_mean
+    else:
+        d_V_norm = d_V_nbr
+        d_Z_norm = d_Z_nbr
+    
+    # Squared difference, only for valid neighbors
+    diff_sq = (d_V_norm - d_Z_norm).pow(2) * valid_mask.float()
+    
+    # Mean over valid entries
+    loss = diff_sq.sum() / valid_mask.float().sum().clamp(min=1.0)
+    
+    return loss
