@@ -477,6 +477,9 @@ class STSetDataset(Dataset):
         m = targets.y_hat.shape[0]
         n = min(n, m)  # don't exceed slide size
 
+        # DEBUG: Only print for first 3 minisets per epoch
+        debug_this_sample = (idx < 3)
+
         # ------------------------------------------------------------------
         # New sampling: center-based near / mid / far using true distances
         # ------------------------------------------------------------------
@@ -599,8 +602,8 @@ class STSetDataset(Dataset):
         # In STSetDataset.__getitem__(), after line "G_subset = y_hat_centered @ y_hat_centered.t()"
 
         # # ===== DEBUG: Check Gram scale =====
-        # G_diag = torch.diag(G_subset)
-        # D_subset_check = targets.D[indices][:, indices]
+        G_diag = torch.diag(G_subset)
+        D_subset_check = targets.D[indices][:, indices]
 
         # print(f"\n[DEBUG STSetDataset] n={len(indices)}")
         # print(f"  y_hat_subset RMS: {torch.sqrt((y_hat_subset**2).mean()):.6f}")
@@ -608,7 +611,7 @@ class STSetDataset(Dataset):
         # print(f"  G_subset diagonal: min={G_diag.min():.6f}, max={G_diag.max():.6f}, mean={G_diag.mean():.6f}")
         # print(f"  D_subset from targets: p50={D_subset_check.quantile(0.5):.6f}, p95={D_subset_check.quantile(0.95):.6f}")
 
-        # # Reconstruct distances from G_subset
+        # Reconstruct distances from G_subset
         # D_recon = torch.zeros_like(G_subset)
         # for i in range(len(indices)):
         #     for j in range(len(indices)):
@@ -623,6 +626,31 @@ class STSetDataset(Dataset):
         D_subset = targets.D[indices][:, indices]
 
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
+
+        if debug_this_sample:
+            # ===== DEBUG: Full diagnostics =====
+            G_diag = torch.diag(G_subset)
+            D_subset_check = targets.D[indices][:, indices]
+            
+            V_target_rms = V_target.pow(2).mean().sqrt()
+            D_vtarget = torch.cdist(V_target, V_target)
+            D_vtarget_nodiag = D_vtarget + torch.eye(len(V_target), device=V_target.device) * 1e10
+            nn_dists_vt = D_vtarget_nodiag.min(dim=1)[0]
+            triu_mask_vt = torch.triu(torch.ones_like(D_vtarget, dtype=torch.bool), diagonal=1)
+            D_recon = torch.cdist(y_hat_centered, y_hat_centered)
+            
+            print(f"\n[DEBUG STSetDataset #{idx}] n={len(indices)}")
+            print(f"  y_hat_subset RMS: {torch.sqrt((y_hat_subset**2).mean()):.6f}")
+            print(f"  y_hat_centered RMS: {torch.sqrt((y_hat_centered**2).mean()):.6f}")
+            print(f"  G_subset diagonal: min={G_diag.min():.6f}, max={G_diag.max():.6f}, mean={G_diag.mean():.6f}")
+            print(f"  D_subset from targets: p50={D_subset_check[triu_mask_vt].quantile(0.5):.6f}, p95={D_subset_check[triu_mask_vt].quantile(0.95):.6f}")
+            print(f"  V_target shape: {V_target.shape}, RMS: {V_target_rms:.6f}")
+            print(f"  V_target distances - p15: {D_vtarget[triu_mask_vt].quantile(0.15):.6f}, p50: {D_vtarget[triu_mask_vt].quantile(0.50):.6f}, p95: {D_vtarget[triu_mask_vt].quantile(0.95):.6f}")
+            print(f"  V_target NN dist - min: {nn_dists_vt.min():.6f}, p15: {nn_dists_vt.quantile(0.15):.6f}, median: {nn_dists_vt.median():.6f}")
+            print(f"  y_hat_centered distances - p50: {D_recon[triu_mask_vt].quantile(0.50):.6f}, p95: {D_recon[triu_mask_vt].quantile(0.95):.6f}")
+            print(f"  Distance preservation error: {(D_vtarget[triu_mask_vt] - D_recon[triu_mask_vt]).abs().mean():.6f}")
+            print("="*60)
+
         edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n_nodes=len(indices))
 

@@ -870,48 +870,79 @@ def train_stageC_diffusion_generator(
 
     # ========== COMPUTE REPEL EPSILON FOR ST (NEAREST-NEIGHBOR DISTANCE) ==========
     print("\n[Repel Loss] Computing ST nearest-neighbor distance threshold (ST batches only)...")
-    
+
     nn_dists = []
+    debug_batches_processed = 0
+    debug_samples_processed = 0
+
     with torch.no_grad():
-        st_iter_repel = iter(st_loader)  # CREATE ITERATOR ONCE
-        for _ in range(20):
+        st_iter_repel = iter(st_loader)
+        for batch_idx in range(20):
             try:
-                batch = next(st_iter_repel)  # ADVANCE ITERATOR
+                batch = next(st_iter_repel)
             except StopIteration:
-                st_iter_repel = iter(st_loader)  # RESET IF EXHAUSTED
+                st_iter_repel = iter(st_loader)
                 batch = next(st_iter_repel)
             
-            V_target = batch['V_target'].to(device)
+            D_target = batch['D_target'].to(device)
             mask = batch['mask'].to(device)
             
-            # Compute nearest-neighbor distances for each valid point in each sample
-            B, N, D = V_target.shape
+            B, N, _ = D_target.shape
+            debug_batches_processed += 1
+            
             for b in range(B):
                 m_b = mask[b]
                 n_valid = m_b.sum().item()
+                
                 if n_valid < 2:
                     continue
                 
-                V_b = V_target[b, m_b]  # (n_valid, D)
-                D_mat = torch.cdist(V_b, V_b)  # (n_valid, n_valid)
+                debug_samples_processed += 1
+                
+                D_b = D_target[b][m_b][:, m_b]  # (n_valid, n_valid)
                 
                 # Mask out diagonal
-                D_mat = D_mat + torch.eye(n_valid, device=device) * 1e6
+                D_b_nodiag = D_b + torch.eye(n_valid, device=device) * 1e6
                 
                 # Get nearest neighbor distance for each point
-                nn_dist_b = D_mat.min(dim=1)[0]  # (n_valid,)
+                nn_dist_b = D_b_nodiag.min(dim=1)[0]  # (n_valid,)
+                
+                # DEBUG: Print first batch's statistics
+                if batch_idx == 0 and b == 0:
+                    print(f"\n[REPEL DEBUG] First sample (batch {batch_idx}, sample {b}):")
+                    print(f"  n_valid: {n_valid}")
+                    print(f"  D_b stats: min={D_b.min():.6f}, max={D_b.max():.6f}, mean={D_b.mean():.6f}")
+                    print(f"  NN distances for this sample: min={nn_dist_b.min():.6f}, max={nn_dist_b.max():.6f}, mean={nn_dist_b.mean():.6f}")
+                    print(f"  First 10 NN distances: {nn_dist_b[:10].cpu().tolist()}")
+                
                 nn_dists.extend(nn_dist_b.cpu().tolist())
-    
-    # Use 15% quantile as repel epsilon
-    nn_dists_arr = np.array(nn_dists)  
-    # ADD THIS CHECK:
-    if len(nn_dists_arr) == 0:
-        raise RuntimeError("[Repel Loss] No ST NN distances collected! Check ST loader.")
-    
-    repel_epsilon_st = float(np.quantile(nn_dists_arr, 0.15))
 
-    
-    print(f"[Repel Loss] ST epsilon (15% quantile of NN dists): {repel_epsilon_st:.6f}")
+    print(f"\n[REPEL DEBUG SUMMARY]")
+    print(f"  Batches processed: {debug_batches_processed}")
+    print(f"  Samples processed: {debug_samples_processed}")
+    print(f"  Total NN distances collected: {len(nn_dists)}")
+
+    nn_dists_arr = np.array(nn_dists)
+
+    if len(nn_dists_arr) == 0:
+        raise RuntimeError("[Repel Loss] No ST NN distances collected!")
+
+    print(f"  NN distances array stats:")
+    print(f"    min: {nn_dists_arr.min():.6f}")
+    print(f"    max: {nn_dists_arr.max():.6f}")
+    print(f"    mean: {nn_dists_arr.mean():.6f}")
+    print(f"    median: {np.median(nn_dists_arr):.6f}")
+    print(f"    p05: {np.quantile(nn_dists_arr, 0.05):.6f}")
+    print(f"    p10: {np.quantile(nn_dists_arr, 0.10):.6f}")
+    print(f"    p15: {np.quantile(nn_dists_arr, 0.15):.6f}")
+    print(f"    p25: {np.quantile(nn_dists_arr, 0.25):.6f}")
+    print(f"  Number of zeros: {(nn_dists_arr == 0.0).sum()}")
+    print(f"  Number < 0.001: {(nn_dists_arr < 0.001).sum()}")
+    print(f"  First 20 values: {nn_dists_arr[:20].tolist()}")
+
+    repel_epsilon_st = float(np.quantile(nn_dists_arr, 0.01))
+
+    print(f"\n[Repel Loss] ST epsilon (15% quantile of NN dists): {repel_epsilon_st:.6f}")
     print(f"[Repel Loss] → Penalizes predicted distances < {repel_epsilon_st:.6f}\n")
     # =============================================================================
 
@@ -984,49 +1015,42 @@ def train_stageC_diffusion_generator(
 
     # WEIGHTS = {
     #     'score': 1.0,
-    #     'gram': 4.0,
-    #     'gram_scale': 0.25,
-    #     'heat': 0.5,
-    #     'sw_st': 0.5,
-    #     'sw_sc': 0.6,
-    #     'overlap': 0.1,
+    #     'gram': 0.5,
+    #     'gram_scale': 0.3,
+    #     'heat': 0.25,
+    #     'sw_st': 0.3,
+    #     'sw_sc': 0.3,
+    #     'overlap': 0.25,
     #     'ordinal_sc': 0.5,
-    #     'st_dist': 0.3
+    #     'st_dist': 0.03,
+    #     'edm_tail': 0.3,
+    #     'gen_align': 0.3,
+    #     'dim': 0.1,
+    #     'triangle': 0.5,
+    #     'radial': 1.0,
+    #     'repel': 0.0,      # NEW: ST repulsion loss
+    #     'shape': 0.0,       # NEW: ST anisotropy/shape loss
+    #     'z_nbr': 0.4
     # }
-
-    # WEIGHTS = {
-    #     'score': 1.0,
-    #     'gram': 4.0,
-    #     'gram_scale': 0.25,
-    #     'heat': 0.5,          # START AT ZERO - warmup later
-    #     'sw_st': 0.05,        # REDUCED from 0.5 (scale-free, weakens tail)
-    #     'sw_sc': 0.6,
-    #     'overlap': 0.2,
-    #     'ordinal_sc': 0.5,
-    #     'st_dist': 0.3,
-    #     'edm_tail': 1.0,      # NEW: EDM tail loss (prioritize far distances)
-    #     'gen_align': 1.0      # NEW: Generator alignment to factor_from_gram
-    # }
-
     WEIGHTS = {
         'score': 1.0,
         'gram': 0.5,
         'gram_scale': 0.3,
         'heat': 0.25,
-        'sw_st': 0.3,
-        'sw_sc': 0.3,
+        'sw_st': 0.2,
+        'sw_sc': 0.2,
         'overlap': 0.25,
-        'ordinal_sc': 0.5,
-        'st_dist': 0.03,
+        'ordinal_sc': 0.3,
+        'st_dist': 0.3,
         'edm_tail': 0.3,
         'gen_align': 0.3,
         'dim': 0.1,
-        'triangle': 0.5,
+        'triangle': 0.25,
         'radial': 1.0,
-        'repel': 0.05,      # NEW: ST repulsion loss
-        'shape': 0.05       # NEW: ST anisotropy/shape loss
+        'repel': 0.0,      # NEW: ST repulsion loss
+        'shape': 0.0,       # NEW: ST anisotropy/shape loss
+        'z_nbr': 0.5
     }
-
 
     
     # Heat warmup schedule
@@ -1052,15 +1076,6 @@ def train_stageC_diffusion_generator(
     # CFG config
     p_uncond = 0.25
     
-    # history = {
-    #     'epoch': [],
-    #     'batch_losses': [],
-    #     'epoch_avg': {
-    #         'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
-    #         'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-    #         'edm_tail': [], 'gen_align': []
-    #     }
-    # }
 
     history = {
         'epoch': [],
@@ -1069,7 +1084,8 @@ def train_stageC_diffusion_generator(
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
             'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [],
-            'repel': [], 'shape': []  # NEW: ST shape constraints
+            'repel': [], 'shape': [],
+            'z_nbr': [],  
         }
     }
 
@@ -1099,11 +1115,6 @@ def train_stageC_diffusion_generator(
         else:
             sigma_data = 0.0
 
-    # print(f"[synced] sigma_data = {sigma_data:.4f}")
-
-    # For now, force sigma_data to match canonicalized V_0 scale.
-    # sigma_data = 1.0
-    # print("[StageC] Overriding sigma_data → 1.0 (V_0 is unit-RMS)")
 
     sigma_data = sync_scalar(sigma_data, device)
     print(f"[StageC] sigma_data (from ST Gram factors) = {sigma_data:.4f}")
@@ -1114,24 +1125,6 @@ def train_stageC_diffusion_generator(
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
     
     global_step = 0
-
-    # EMA-based autobalance (stable)
-    # ema_grads = {
-    #     'score': 1.0,
-    #     'gram': 0.1,
-    #     'heat': 0.1,
-    #     'sw_st': 0.1
-    # }
-    # ema_sc = {
-    #     'score': 1.0,
-    #     'sw_sc': 0.1,
-    #     'overlap': 0.1,
-    #     'ordinal_sc': 0.1
-    # }
-    # EMA_BETA = 0.98  # CHANGED from 0.95
-    
-    # TARGET = {'gram': 0.05, 'heat': 0.15, 'sw_st': 0.10}
-    # TARGET_SC = {'sw_sc': 0.08, 'overlap': 0.01, 'ordinal_sc': 0.06}
 
     ema_grads = {
         'score': 1.0,
@@ -1149,7 +1142,8 @@ def train_stageC_diffusion_generator(
         'score': 1.0,
         'sw_sc': 0.1,
         'overlap': 0.1,
-        'ordinal_sc': 0.1
+        'ordinal_sc': 0.1,
+        'z_nbr': 0.1
     }
     EMA_BETA = 0.98  # CHANGED from 0.95
  
@@ -1167,10 +1161,12 @@ def train_stageC_diffusion_generator(
     }
 
     TARGET_SC = {
-        'sw_sc': 0.10,        # Match sw_st (was 0.08) - distribution matching is important
-        'overlap': 0.05,      # Increase from 0.01 - too weak at 1%
-        'ordinal_sc': 0.08,   # Increase from 0.06 - ordinal structure is important
+            'sw_sc': 0.10,
+            'overlap': 0.05,
+            'ordinal_sc': 0.08,
+            'z_nbr': 0.12,      # NEW: give it meaningful gradient share
         }
+    
     AUTOBALANCE_EVERY = 100
     AUTOBALANCE_START = 200
 
@@ -1416,6 +1412,7 @@ def train_stageC_diffusion_generator(
             L_radial = torch.zeros((), device=device)
             L_repel = torch.tensor(0.0, device=device)   # NEW: ST repulsion
             L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
+            L_z_nbr = torch.tensor(0.0, device=device)
       
             # Denoise to get V_hat
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -1746,17 +1743,6 @@ def train_stageC_diffusion_generator(
                                 use_target=True
                             )
                         
-                        # B2: Triangle area regularizer (ST: hinge with ST-derived epsilon)
-                        # with torch.autocast(device_type='cuda', enabled=False):
-                        #     L_triangle = loss_triangle(
-                        #         V_pred=V_geom,
-                        #         V_target=None,
-                        #         mask=mask,
-                        #         use_target=False,
-                        #         hinge_mode=True,
-                        #         epsilon=triangle_epsilon_st  # ST-specific threshold
-                        #     )
-
                         # B2: Triangle area regularizer (ST: match normalized area to ST median)
                         with torch.autocast(device_type='cuda', enabled=False):
                             # Compute average normalized triangle area per sample (B,)
@@ -1787,10 +1773,11 @@ def train_stageC_diffusion_generator(
                 # Penalize very small predicted pairwise distances (avoid local overlaps)
                 if DEBUG and (global_step % LOG_EVERY == 0):
                     print(f"\n[REPEL] Computing repulsion loss for ST batch...")
-                
+
                 B_rep, N_rep, D_rep = V_geom.shape
-                L_repel_batch = []
-                
+                repel_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
+                repel_debug = {"total_pairs": 0, "violating_pairs": 0, "min_dist": float('inf'), "samples_checked": 0}
+
                 for b in range(B_rep):
                     m_b = mask[b]
                     n_valid = m_b.sum().item()
@@ -1798,50 +1785,76 @@ def train_stageC_diffusion_generator(
                         continue
                     
                     V_b = V_geom[b, m_b]  # (n_valid, D)
-                    D_pred_b = torch.cdist(V_b, V_b)  # (n_valid, n_valid)
+                    
+                    # ROTATION-INVARIANT 2D PROJECTION (PCA)
+                    V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
+                    Cov_b = V_b_c.T @ V_b_c / n_valid  # (D, D) covariance
+                    eigvals, eigvecs = torch.linalg.eigh(Cov_b)  # ascending order
+                    U2 = eigvecs[:, -2:]  # top-2 eigenvectors (last 2 columns)
+                    V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
+                    
+                    D_pred_b = torch.cdist(V_b_2d, V_b_2d)  # (n_valid, n_valid)
                     
                     # Mask out diagonal
                     eye_b = torch.eye(n_valid, device=device, dtype=torch.bool)
                     D_pred_b_nodiag = D_pred_b.masked_fill(eye_b, 1e6)
                     
+                    # DEBUG: Track statistics
+                    repel_debug["samples_checked"] += 1
+                    min_dist_sample = D_pred_b_nodiag.min().item()
+                    repel_debug["min_dist"] = min(repel_debug["min_dist"], min_dist_sample)
+                    repel_debug["total_pairs"] += (n_valid * (n_valid - 1)) // 2
+                    
                     # Find pairs with distance < repel_epsilon_st
                     violating_mask = (D_pred_b_nodiag < repel_epsilon_st) & (~eye_b)
+                    n_violations = violating_mask.sum().item() // 2  # Divide by 2 (symmetric)
+                    repel_debug["violating_pairs"] += n_violations
                     
                     if violating_mask.any():
                         # Penalty: (epsilon - D_ij)^2 for violating pairs
                         violations = D_pred_b_nodiag[violating_mask]
                         penalty = (repel_epsilon_st - violations).pow(2).mean()
-                        L_repel_batch.append(penalty)
-                    else:
-                        L_repel_batch.append(torch.tensor(0.0, device=device))
-                
-                # Average over batch
-                if len(L_repel_batch) > 0:
-                    L_repel = torch.stack(L_repel_batch).mean()
-                else:
-                    L_repel = torch.tensor(0.0, device=device)
-                
-                if DEBUG and (global_step % LOG_EVERY == 0):
+                        repel_per_set[b] = penalty  # ← STORE IN TENSOR
+                    # else: repel_per_set[b] stays 0.0 (already initialized)
+
+                # Gate by low-noise + conditional (same as Gram)
+                # geo_gate is already computed above in Gram loss section
+                gate_sum = geo_gate.sum().clamp_min(1.0)
+                L_repel = (repel_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
+
+                # if DEBUG and (global_step % LOG_EVERY == 0):
+                if False:
                     print(f"[REPEL] L_repel={L_repel.item():.6f} | epsilon={repel_epsilon_st:.6f}")
+                    print(f"[REPEL] Samples checked: {repel_debug['samples_checked']}, Total pairs: {repel_debug['total_pairs']}, Violating: {repel_debug['violating_pairs']}")
+                    print(f"[REPEL] Min predicted distance across all samples: {repel_debug['min_dist']:.6f}")
                 
                 # ==================== NEW: SHAPE/ANISOTROPY LOSS (ST ONLY) ====================
                 # Match eigenvalue ratio of predicted Gram to target Gram
                 if DEBUG and (global_step % LOG_EVERY == 0):
                     print(f"\n[SHAPE] Computing anisotropy/shape loss for ST batch...")
-                
-                L_shape_batch = []
-                
+
+                shape_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
+                shape_debug = {"skipped_too_few": 0, "skipped_exception": 0, "computed": 0}
+
                 for b in range(B_rep):
                     m_b = mask[b].bool()
                     n_valid = m_b.sum().item()
                     if n_valid < 3:  # Need at least 3 points for meaningful eigenvalues
+                        shape_debug["skipped_too_few"] += 1
                         continue
                     
-                    # Predicted Gram (already computed above as Gp_raw)
-                    Gp_b = Gp_raw[b][m_b][:, m_b]  # (n_valid, n_valid)
-                    Gt_b = Gt[b][m_b][:, m_b]     
-
+                    # ROTATION-INVARIANT 2D PROJECTION (PCA)
+                    V_b = V_geom[b, m_b]  # (n_valid, 32)
+                    V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
+                    Cov_b = V_b_c.T @ V_b_c / n_valid  # (32, 32) covariance
+                    eigvals_cov, eigvecs_cov = torch.linalg.eigh(Cov_b)  # ascending order
+                    U2 = eigvecs_cov[:, -2:]  # top-2 eigenvectors
+                    V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
                     
+                    Gp_b = V_b_2d @ V_b_2d.T  # Recompute Gram in 2D space
+                    
+                    Gt_b = Gt[b][m_b][:, m_b]   
+
                     # Compute eigenvalues (symmetric, so use eigvalsh)
                     try:
                         eig_pred = torch.linalg.eigvalsh(Gp_b)  # (n_valid,), ascending order
@@ -1863,25 +1876,28 @@ def train_stageC_diffusion_generator(
                         
                         # Log-ratio penalty (scale-invariant)
                         log_ratio_loss = (torch.log(r_pred) - torch.log(r_targ)).pow(2)
-                        L_shape_batch.append(log_ratio_loss)
+                        shape_per_set[b] = log_ratio_loss  # ← STORE IN TENSOR
+                        shape_debug["computed"] += 1
+                        
+                        # DEBUG: Print first few samples
+                        if DEBUG and (global_step % LOG_EVERY == 0) and shape_debug["computed"] <= 3:
+                            print(f"  [SHAPE sample {b}] n_valid={n_valid}")
+                            print(f"    λ_pred: {lambda1_pred:.4f}, {lambda2_pred:.4f} → ratio: {r_pred:.4f}")
+                            print(f"    λ_targ: {lambda1_targ:.4f}, {lambda2_targ:.4f} → ratio: {r_targ:.4f}")
+                            print(f"    log_ratio_loss: {log_ratio_loss:.6f}")
                         
                     except Exception as e:
-                        # If eigendecomposition fails (numerical issues), skip this sample
+                        shape_debug["skipped_exception"] += 1
                         if DEBUG and (global_step % LOG_EVERY == 0):
                             print(f"[SHAPE] Warning: eigendecomp failed for sample {b}: {e}")
                         continue
-                
-                # Average over batch
-                if len(L_shape_batch) > 0:
-                    L_shape = torch.stack(L_shape_batch).mean()
-                else:
-                    L_shape = torch.tensor(0.0, device=device)
-                
+
+                # Gate by low-noise + conditional (same as Gram)
+                gate_sum = geo_gate.sum().clamp_min(1.0)
+                L_shape = (shape_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
+
                 if DEBUG and (global_step % LOG_EVERY == 0):
-                    print(f"[SHAPE] L_shape={L_shape.item():.6f}")
-                    if len(L_shape_batch) > 0:
-                        print(f"[SHAPE] per-sample: min={min([x.item() for x in L_shape_batch]):.6f} "
-                              f"max={max([x.item() for x in L_shape_batch]):.6f}")
+                    print(f"[SHAPE] L_shape={L_shape.item():.6f} | computed={shape_debug['computed']}, skipped_few={shape_debug['skipped_too_few']}, skipped_exc={shape_debug['skipped_exception']}")
                 # ==============================================================================
 
 
@@ -2010,6 +2026,50 @@ def train_stageC_diffusion_generator(
                         
                         if batch_size_real > 0:
                             L_ordinal_sc = L_ordinal_sc / batch_size_real
+
+                # ---- (1b) Z-Neighbor Preservation Loss (NEW) ----
+                z_nbr_count = 0
+                K_Z_NBR = 30  # number of Z-neighbors to use
+                
+                with torch.autocast(device_type='cuda', enabled=False):
+                    for i in range(batch_size_real):
+                        n_valid = int(n_list[i].item())
+                        if n_valid <= K_Z_NBR + 1:
+                            continue
+                        
+                        V_i = V_hat[i, :n_valid].float()
+                        Z_i = Z_set[i, :n_valid].float()
+                        set_global_idx = sc_global_indices[i, :n_valid]
+                        
+                        # Filter valid indices
+                        mask_valid = set_global_idx >= 0
+                        if mask_valid.sum() <= K_Z_NBR + 1:
+                            continue
+                        
+                        set_global_idx = set_global_idx[mask_valid]
+                        V_i = V_i[mask_valid]
+                        Z_i = Z_i[mask_valid]
+                        
+                        # Get local indices of Z-neighbors that are in this set
+                        nbr_local = uet._gather_z_neighbors_in_set(
+                            set_global_idx=set_global_idx,
+                            pos_idx_cpu=POS_IDX,
+                            k_use=K_Z_NBR
+                        )
+                        
+                        # Compute loss
+                        L_i = uet.z_neighbor_preservation_loss(
+                            V_pred=V_i,
+                            Z_embed=Z_i,
+                            nbr_local=nbr_local,
+                            normalize=True
+                        )
+                        
+                        L_z_nbr = L_z_nbr + L_i
+                        z_nbr_count += 1
+                    
+                    if z_nbr_count > 0:
+                        L_z_nbr = L_z_nbr / z_nbr_count
 
                 # ---- (2) Sliced Wasserstein between paired SC sets (A,B) ----
                 L_sw_sc = torch.zeros((), device=device)
@@ -2169,44 +2229,35 @@ def train_stageC_diffusion_generator(
             
             # Total loss with optional score deprioritization on geometry-heavy batches
             score_multiplier = 1.0
-            # if not is_sc:
-            #     if 'geo_gate' in locals() and geo_gate.float().mean() > 0.5:
-            #         score_multiplier = 0.25
 
-            # L_total = (WEIGHTS['score'] * score_multiplier * L_score +
-            #                     # WEIGHTS['cone'] * L_cone +
-            #                     WEIGHTS['gram'] * L_gram +
-            #                     WEIGHTS['gram_scale'] * L_gram_scale +
-            #                     WEIGHTS['heat'] * L_heat +
-            #                     WEIGHTS['sw_st'] * L_sw_st +
-            #                     WEIGHTS['sw_sc'] * L_sw_sc +
-            #                     WEIGHTS['overlap'] * L_overlap +
-            #                     WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
-            #                     WEIGHTS['st_dist'] * L_st_dist +
-            #                     WEIGHTS['edm_tail'] * L_edm_tail +      
-            #                     WEIGHTS['gen_align'] * L_gen_align) 
 
-            L_total = (WEIGHTS['score'] * score_multiplier * L_score +
-                                WEIGHTS['gram'] * L_gram +
-                                WEIGHTS['gram_scale'] * L_gram_scale +
-                                WEIGHTS['heat'] * L_heat +
-                                WEIGHTS['sw_st'] * L_sw_st +
-                                WEIGHTS['sw_sc'] * L_sw_sc +
-                                WEIGHTS['overlap'] * L_overlap +
-                                WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
-                                WEIGHTS['st_dist'] * L_st_dist +
-                                WEIGHTS['edm_tail'] * L_edm_tail +      
-                                WEIGHTS['gen_align'] * L_gen_align +
-                                WEIGHTS['dim'] * L_dim +
-                                WEIGHTS['triangle'] * L_triangle +
-                                WEIGHTS['radial'] * L_radial +
-                                WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
-                                WEIGHTS['shape'] * L_shape)       # NEW: ST shape/anisotropy
-
+            # Base loss (always computed)
+            L_total = WEIGHTS['score'] * score_multiplier * L_score
             
-            # Add SC dimension prior if this is an SC batch
-            if is_sc:
-                L_total = L_total + WEIGHTS['dim'] * L_dim_sc + WEIGHTS['triangle'] * L_triangle_sc
+            if not is_sc:  # ST batch
+                L_total = L_total + (
+                    WEIGHTS['gram'] * L_gram +
+                    WEIGHTS['gram_scale'] * L_gram_scale +
+                    WEIGHTS['heat'] * L_heat +
+                    WEIGHTS['sw_st'] * L_sw_st +
+                    WEIGHTS['st_dist'] * L_st_dist +
+                    WEIGHTS['edm_tail'] * L_edm_tail +
+                    WEIGHTS['gen_align'] * L_gen_align +
+                    WEIGHTS['dim'] * L_dim +
+                    WEIGHTS['triangle'] * L_triangle +
+                    WEIGHTS['radial'] * L_radial +
+                    WEIGHTS['repel'] * L_repel +
+                    WEIGHTS['shape'] * L_shape
+                )
+            else:  # SC batch
+                L_total = L_total + (
+                    WEIGHTS['sw_sc'] * L_sw_sc +
+                    WEIGHTS['overlap'] * L_overlap +
+                    WEIGHTS['ordinal_sc'] * L_ordinal_sc +
+                    WEIGHTS['z_nbr'] * L_z_nbr +
+                    WEIGHTS['dim'] * L_dim_sc +
+                    WEIGHTS['triangle'] * L_triangle_sc
+                )
     
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
@@ -2481,6 +2532,9 @@ def train_stageC_diffusion_generator(
             epoch_losses['dim'] += L_dim.item()
             epoch_losses['triangle'] += L_triangle.item()
             epoch_losses['radial'] += L_radial.item()
+            epoch_losses['repel'] += L_repel.item()
+            epoch_losses['shape'] += L_shape.item()
+            epoch_losses['z_nbr'] += L_z_nbr.item()
 
 
 
@@ -2521,6 +2575,13 @@ def train_stageC_diffusion_generator(
         else:
             print(f"\n[Epoch {epoch+1}] ST batches: {st_batches} (SC disabled)")
 
+        avg_shape = epoch_losses['shape'] / max(n_batches, 1)
+        avg_repel = epoch_losses['repel'] / max(n_batches, 1)
+        print(f"[EPOCH {epoch+1} LOSS DEBUG]")
+        print(f"  L_shape avg: {avg_shape:.6f} (weight={WEIGHTS['shape']:.3f})")
+        print(f"  L_repel avg: {avg_repel:.6f} (weight={WEIGHTS['repel']:.3f})")
+        print(f"  L_shape contribution to total: {WEIGHTS['shape'] * avg_shape:.6f}")
+
         should_stop = False 
 
         # Print loss summary
@@ -2557,24 +2618,6 @@ def train_stageC_diffusion_generator(
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
-            # ============ EARLY STOPPING CHECK ============
-            # if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
-            #     # Compute validation metric (use score + gram as proxy)
-            #     # Use mid-sigma score if available from debug_state
-            #     if 'score_bin_sum' in debug_state and debug_state.get('score_bin_cnt') is not None:
-            #         bins_sum = debug_state['score_bin_sum']
-            #         bins_cnt = debug_state['score_bin_cnt']
-            #         if bins_cnt.sum() > 0:
-            #             score_bins = bins_sum / bins_cnt.clamp(min=1)
-            #             score_mid = score_bins[2].item()  # Middle bin (index 2 out of 0-4)
-            #         else:
-            #             score_mid = avg_score
-            #     else:
-            #         score_mid = avg_score
-                
-            #     w_gram = 1.0
-            #     val_metric = score_mid + w_gram * avg_gram
-
             if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
                 # Use total weighted loss as validation metric
                 # This includes all geometry regularizers (dim, triangle, radial)
@@ -2611,15 +2654,6 @@ def train_stageC_diffusion_generator(
                     print(f"[Early Stop] Best val_metric: {early_stop_best:.4f}")
                     print(f"[Early Stop] No improvement for {early_stop_patience} epochs")
                     print(f"{'='*80}\n")
-            
-            # elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
-            #     # Just track best, don't stop yet
-            #     score_mid = avg_score
-            #     w_gram = 1.0
-            #     val_metric = score_mid + w_gram * avg_gram
-            #     if val_metric < early_stop_best:
-            #         early_stop_best = val_metric
-            #         print(f"[Early Stop] Warmup: best={early_stop_best:.4f} (min_epochs not reached)")
 
             elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
                 # Just track best, don't stop yet
@@ -2717,7 +2751,7 @@ def train_stageC_diffusion_generator(
         def _denom_for(key):
             if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist'):
                 return cnt_st
-            if key in ('sw_sc', 'ordinal_sc'):
+            if key in ('sw_sc', 'ordinal_sc', 'z_nbr'):
                 return cnt_sc
             if key == 'overlap':
                 return sum_overlap_batches
@@ -2738,22 +2772,24 @@ def train_stageC_diffusion_generator(
 
         # Recompute weighted total from means (don't use the raw 'total' sum)
         epoch_losses['total'] = (
-            WEIGHTS['score'] * epoch_losses['score'] +
-            WEIGHTS['gram'] * epoch_losses['gram'] +
+            WEIGHTS['score']    * epoch_losses['score']    +
+            WEIGHTS['gram']     * epoch_losses['gram']     +
             WEIGHTS['gram_scale'] * epoch_losses['gram_scale'] +
-            WEIGHTS['heat'] * epoch_losses['heat'] +
-            WEIGHTS['sw_st'] * epoch_losses['sw_st'] +
-            WEIGHTS['sw_sc'] * epoch_losses['sw_sc'] +
-            WEIGHTS['overlap'] * epoch_losses['overlap'] +
+            WEIGHTS['heat']     * epoch_losses['heat']     +
+            WEIGHTS['sw_st']    * epoch_losses['sw_st']    +
+            WEIGHTS['sw_sc']    * epoch_losses['sw_sc']    +
+            WEIGHTS['overlap']  * epoch_losses['overlap']  +
             WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc'] +
+            WEIGHTS['z_nbr'] * epoch_losses['z_nbr'] +
+            WEIGHTS['st_dist']  * epoch_losses['st_dist']  +   
             WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
-            WEIGHTS['gen_align'] * epoch_losses['gen_align'] +
-            WEIGHTS['dim'] * epoch_losses['dim'] +
+            WEIGHTS['gen_align']* epoch_losses['gen_align']+
+            WEIGHTS['dim']      * epoch_losses['dim']      +
             WEIGHTS['triangle'] * epoch_losses['triangle'] +
-            WEIGHTS['radial'] * epoch_losses['radial']
+            WEIGHTS['radial']   * epoch_losses['radial']   +
+            WEIGHTS['repel']    * epoch_losses['repel']    +   
+            WEIGHTS['shape']    * epoch_losses['shape']        
         )
-
-
 
         # Override the history['epoch_avg']['total'] with correct value
         history['epoch_avg']['total'][-1] = epoch_losses['total']
@@ -2808,31 +2844,7 @@ def train_stageC_diffusion_generator(
             ovl_share = epoch_losses['overlap'] / max(epoch_losses['total'], 1e-12)
             ord_pct = 100.0 * ord_share
             ovl_pct = 100.0 * ovl_share
-            
-            # Print health metrics
-            # print(f"\n{'='*70}")
-            # print(f"HEALTH METRICS (Epoch {epoch+1})")
-            # print(f"{'='*70}")
-            # print(f"1. Heat Share:           {heat_pct:.1f}%  (healthy: 25-50%)")
-            # print(f"2. Hi-Noise Inflation:   {r_hi:.2f}   (healthy: ≤1.3)")
-            # print(f"3. Gram Trace Ratio:     {gram_trace_ratio:.1f}%  (healthy: 85-92%)")
-            # print(f"4. Ordinal_SC Share:     {ord_pct:.1f}%  (healthy: ~5-15%)")
-            # print(f"5. Overlap Share:        {ovl_pct:.1f}%  (healthy: ~2-10%)")
-            
-            # Warning triggers
-            # warnings = []
-            # if heat_pct > 50:
-            #     warnings.append("⚠️  HEAT SHARE >50% - Consider reducing heat weight or increasing heat_every_k")
-            # if r_hi > 1.5:
-            #     warnings.append("⚠️  HI-NOISE INFLATION >1.5 - Consider capping sigma_max or reweighting timesteps")
-            # if gram_trace_ratio < 83 or gram_trace_ratio > 95:
-            #     warnings.append("⚠️  GRAM TRACE RATIO outside 85-92% - Check canonicalization or adjust gram weight")
-            # if ord_pct < 2.0:
-            #     warnings.append("⚠️  ORDINAL_SC SHARE <2% - Check SC kNN cache or triplet construction")
-            # if ovl_pct < 1e-2:
-            #     warnings.append("⚠️  OVERLAP SHARE ≈0 - Overlap keys or shared indices may be broken")
-            
-            
+                    
             print(f"{'='*70}\n")
             
             # Store in history for plotting later
@@ -3585,809 +3597,3 @@ def sample_sc_edm_patchwise(
         print("=" * 72 + "\n")
 
     return result
-
-
-
-# ==============================================================================
-# STAGE D: SC INFERENCE
-# ==============================================================================
-
-def sample_sc_edm_anchored(
-    sc_gene_expr: torch.Tensor,
-    encoder: 'SharedEncoder',
-    context_encoder: SetEncoderContext,
-    score_net: DiffusionScoreNet,
-    target_st_p95: Optional[float] = None,  # Add this line
-    n_timesteps_sample: int = 160,
-    sigma_min: float = 0.01,
-    sigma_max: float = 5.0,
-    return_coords: bool = True,
-    anchor_size: int = 384,
-    batch_size: int = 512,
-    eta: float = 0.0,
-    device: str = 'cuda',
-    guidance_scale: float = 8.0,
-    # stitching knobs
-    K_ANCH: int = 64,            # anchors used per cell for triangulation (>= D + 8)
-    L2_REG: float = 1e-4,        # Tikhonov regularization
-    CARRY_K: int = 256,          # carry-over frozen cells per batch (sampling only)
-    RES_CAP: int = 2000,         # reservoir cap (sampling only)
-    DEBUG_FLAG: bool = True,     # NEW: made it an argument
-    DEBUG_EVERY: int = 10,       # NEW: how often to print per-batch debug
-) -> Dict[str, torch.Tensor]:
-    """
-    Stage D (Inference) -- Structure-first stitching
-    ------------------------------------------------
-    1) Choose anchors in Z space.
-    2) Sample anchors ONCE via diffusion to estimate anchor-anchor distances.
-    3) Build a single global anchor frame via MDS on those distances.
-    4) Process remaining cells in batches:
-       - Sample with anchors+carry frozen (for local quality),
-       - Extract only distances to anchors,
-       - Triangulate each new cell into the global frame from those distances.
-    5) Return global EDM and (optional) global 2D coords.
-    """
-
-    import numpy as np
-    import torch.nn.functional as F
-    import utils_et as uet
-    from tqdm import tqdm
-
-    # -------- Init & encode Z --------
-    encoder.eval(); 
-    context_encoder.eval();
-    score_net.eval()
-    n_sc = sc_gene_expr.shape[0]
-    D_latent = score_net.D_latent
-
-    if DEBUG_FLAG:
-        print("\n" + "="*72)
-        print("STAGE D — STRUCTURE-FIRST ANCHORED INFERENCE")
-        print("="*72)
-        print(f"[cfg] n_sc={n_sc}  anchor_size={anchor_size}  batch_size={batch_size}  "
-              f"timesteps={n_timesteps_sample}  D_latent={D_latent}")
-        print(f"[cfg] sigma_min={sigma_min}  sigma_max={sigma_max}  guidance_scale={guidance_scale}")
-        print(f"[stitch] K_ANCH={K_ANCH}  L2_REG={L2_REG:.1e}  CARRY_K={CARRY_K}  RES_CAP={RES_CAP}")
-
-    # Encode all SC cells to Z (on CPU to save VRAM)
-    Z_chunks, encode_bs = [], 1024
-    for i in range(0, n_sc, encode_bs):
-        z = encoder(sc_gene_expr[i:i+encode_bs].to(device)).cpu()
-        Z_chunks.append(z)
-    Z_all = torch.cat(Z_chunks, dim=0)                    # (n_sc, h)
-    Z_all_unit = Z_all / (Z_all.norm(dim=1, keepdim=True) + 1e-8)
-
-    # -------- Choose anchors (FPS in Z) --------
-    anchor_size = min(anchor_size, n_sc)
-    anchor_idx = uet.farthest_point_sampling(Z_all_unit, anchor_size, device='cpu')
-    mask_non_anchor = torch.ones(n_sc, dtype=torch.bool)
-    mask_non_anchor[anchor_idx] = False
-    non_anchor_idx = mask_non_anchor.nonzero(as_tuple=False).squeeze(1)
-
-    if DEBUG_FLAG:
-        print(f"\n[anchors] chosen={len(anchor_idx)}  non_anchors={len(non_anchor_idx)}")
-
-    # Prepare context encoder input for anchors
-    Z_A = Z_all[anchor_idx].to(device).unsqueeze(0)       # (1, a, h)
-    mask_A = torch.ones(1, Z_A.shape[1], dtype=torch.bool, device=device)
-
-    # -------- Sigma schedule --------
-    sigmas = torch.exp(torch.linspace(
-        torch.log(torch.tensor(sigma_max, device=device)),
-        torch.log(torch.tensor(sigma_min, device=device)),
-        n_timesteps_sample, device=device
-    ))  # (T,)
-
-    # -------- Step 1/2: Sample anchors ONCE to estimate D_AA --------
-    if DEBUG_FLAG:
-        print("\n[Step A] Sampling anchors once to estimate anchor-anchor distances...")
-
-    H_A = context_encoder(Z_A, mask_A)
-
-    # NO GRADIENT NEEDED DURING INFERENCE
-    with torch.no_grad():
-        V_t = torch.randn(1, Z_A.shape[1], D_latent, device=device) * sigmas[0]
-        
-        for t_idx in range(n_timesteps_sample):
-            sigma_t = sigmas[t_idx]
-            t_norm = torch.tensor([[t_idx / float(n_timesteps_sample - 1)]], device=device)
-            H_null = torch.zeros_like(H_A)
-
-            eps_uncond = score_net(V_t, t_norm, H_null, mask_A)
-            eps_cond   = score_net(V_t, t_norm, H_A,    mask_A)
-            eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
-            # DEBUG: Score magnitudes at first few steps
-            if DEBUG_FLAG and t_idx < 3:
-                du = eps_uncond.norm(dim=[1,2]).mean().item()
-                dc = eps_cond.norm(dim=[1,2]).mean().item()
-                diff = (eps_cond - eps_uncond).norm(dim=[1,2]).mean().item()
-                ratio = diff / (du + 1e-8)
-                print(f"  [anchors] t={t_idx:3d} sigma={float(sigma_t):.4f} "
-                      f"||eps_u||={du:.3f} ||eps_c||={dc:.3f} ||diff||={diff:.3f} CFG_ratio={ratio:.3f}")
-
-            if t_idx < n_timesteps_sample - 1:
-                sigma_next = sigmas[t_idx + 1]
-                V_0_pred = V_t - sigma_t * eps
-                V_t = V_0_pred + (sigma_next / sigma_t) * (V_t - V_0_pred)
-                if eta > 0:
-                    noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_t**2, min=0))
-                    V_t = V_t + noise_scale * torch.randn_like(V_t)
-            else:
-                V_t = V_t - sigma_t * eps
-
-    # Structure only: take distances, not coords
-    V_A_sample = V_t.squeeze(0).detach()                  # throwaway coords after building D_AA
-    D_AA = torch.cdist(V_A_sample, V_A_sample)            # (a, a)
-    
-    # DEBUG: Anchor diffusion geometry
-    if DEBUG_FLAG:
-        iu_aa, ju_aa = torch.triu_indices(D_AA.shape[0], D_AA.shape[0], 1, device=device)
-        D_AA_flat = D_AA[iu_aa, ju_aa].float()
-        print(f"[SD_ANCHOR] D_AA dist: "
-              f"p50={D_AA_flat.quantile(0.50):.3f} "
-              f"p90={D_AA_flat.quantile(0.90):.3f} "
-              f"p99={D_AA_flat.quantile(0.99):.3f} "
-              f"max={D_AA_flat.max():.3f}")
-    
-    # Build one global anchor frame from structure (MDS)
-    a = D_AA.shape[0]
-    J = torch.eye(a, device=device) - (1.0 / a) * torch.ones(a, a, device=device)
-    B_A = -0.5 * (J @ (D_AA**2) @ J)
-    
-    # DEBUG: Gram matrix eigenvalues
-    if DEBUG_FLAG:
-        try:
-            evals = torch.linalg.eigvalsh(B_A.float())
-            print(f"[SD_ANCHOR] Gram eigs: "
-                  f"min={evals.min():.3e} "
-                  f"p10={evals.quantile(0.10):.3e} "
-                  f"p90={evals.quantile(0.90):.3e} "
-                  f"max={evals.max():.3e}")
-        except RuntimeError as e:
-            print(f"[SD_ANCHOR] eigvalsh failed: {e}")
-    
-    # X_A = uet.classical_mds(B_A, d_out=D_latent)          # (a, D)
-    
-    # # FIX 1: Only center, do NOT rescale (no canonicalize_coords)
-    # X_A = X_A - X_A.mean(dim=0, keepdim=True)
-
-    X_A = uet.classical_mds(B_A, d_out=D_latent)          # (a, D)
-
-    # Apply unit RMS canonicalization to match training
-    X_A_temp = X_A.unsqueeze(0)  # (1, a, D)
-    mask_A_temp = torch.ones(1, a, dtype=torch.bool, device=device)
-    X_A_canon, _, _ = uet.canonicalize_unit_rms(X_A_temp, mask_A_temp)
-    X_A = X_A_canon.squeeze(0)
-    
-    # DEBUG: Anchor coordinates after centering
-    if DEBUG_FLAG:
-        coords_rms = X_A.pow(2).mean().sqrt().item()
-        print(f"[SD_ANCHOR] X_A coords_rms={coords_rms:.3f}")
-    
-    # Precompute norms for triangulation
-    XA = X_A.to(device)
-    XA_norm2 = (XA**2).sum(dim=1)                         # (a,)
-
-    # FIX 2: Compute anchor_scale_p95 from X_A distances (consistent scale)
-    D_XA = torch.cdist(XA, XA)
-    iu, ju = torch.triu_indices(a, a, 1, device=device)
-    D_XA_flat = D_XA[iu, ju].float()
-    anchor_scale_p95 = torch.quantile(D_XA_flat, 0.95).detach()
-    
-    if DEBUG_FLAG:
-        print(f"[SD_ANCHOR] X_A dist: "
-              f"p50={D_XA_flat.quantile(0.50):.3f} "
-              f"p90={D_XA_flat.quantile(0.90):.3f} "
-              f"p99={D_XA_flat.quantile(0.99):.3f}")
-        print(f"[SD_ANCHOR] anchor_scale_p95={float(anchor_scale_p95):.4f}")
-        
-        # Z-space coverage check
-        Z_all_dev = Z_all.to(device)
-        ZA_dev = Z_all[anchor_idx].to(device)
-        sim = F.normalize(Z_all_dev, dim=1) @ F.normalize(ZA_dev, dim=1).T
-        max_sim, _ = sim.max(dim=1)
-        print(f"[SD_ANCHOR] Z-coverage max_sim to anchors: "
-              f"p10={max_sim.quantile(0.10):.3f} "
-              f"p50={max_sim.quantile(0.50):.3f} "
-              f"p90={max_sim.quantile(0.90):.3f} "
-              f"min={max_sim.min():.3f}")
-        del Z_all_dev, ZA_dev, sim, max_sim
-
-    # -------- Reservoir for carry (sampling-only) --------
-    reservoir_idx = anchor_idx.clone().cpu().tolist()
-    reservoir_V   = [X_A.detach().cpu()]                  # use stitched anchor coords for carry
-    if DEBUG_FLAG:
-        print(f"[reservoir] init size={len(reservoir_idx)}  carry_k={CARRY_K}")
-
-    # -------- Step 3/4: Process non-anchors in batches --------
-    all_X = [X_A.detach().cpu()]
-    order = [anchor_idx.tolist()]
-    n_batches = (non_anchor_idx.numel() + batch_size - 1) // batch_size
-
-    ZA = Z_all[anchor_idx].to(device)                     # (a, h) for anchor–Z matching
-
-    for batch_idx in tqdm(range(n_batches), desc="Batches"):
-        s = batch_idx * batch_size
-        e = min(s + batch_size, non_anchor_idx.numel())
-        idx_B = non_anchor_idx[s:e]                       # LongTensor
-        Z_B = Z_all[idx_B].to(device)                     # (|B|, h)
-
-        # --- Build set for sampling: anchors + optional carry + new cells ---
-        carry_idx = []
-        carry_coords = None
-        kcarry = 0
-        if len(reservoir_idx) > 0 and CARRY_K > 0:
-            sel = np.random.choice(len(reservoir_idx),
-                                   size=min(CARRY_K, len(reservoir_idx)),
-                                   replace=False)
-            carry_idx = [reservoir_idx[s] for s in sel]
-            carry_coords = torch.cat(reservoir_V, dim=0)[sel]  # (kcarry, D) CPU
-            kcarry = len(carry_idx)
-
-            Z_carry = Z_all[carry_idx].to(device).unsqueeze(0) # (1, kcarry, h)
-            Z_C = torch.cat([Z_A, Z_carry, Z_B.unsqueeze(0)], dim=1)
-        else:
-            Z_C = torch.cat([Z_A, Z_B.unsqueeze(0)], dim=1)
-
-        mask_C = torch.ones(1, Z_C.shape[1], dtype=torch.bool, device=device)
-        
-        # NO GRADIENT NEEDED DURING INFERENCE
-        with torch.no_grad():
-            H_C = context_encoder(Z_C, mask_C)
-
-            # --- Reverse diffusion: anchors+carry frozen, new noisy ---
-            V_t = torch.empty(1, Z_C.shape[1], D_latent, device=device)
-            V_t[:, :X_A.shape[0], :] = X_A                    # use stitched anchors in global frame
-            if kcarry > 0:
-                V_t[:, X_A.shape[0]:X_A.shape[0]+kcarry, :] = carry_coords.to(device)
-            V_t[:, X_A.shape[0]+kcarry:, :] = (
-                torch.randn(1, Z_C.shape[1] - X_A.shape[0] - kcarry, D_latent, device=device) * sigmas[0]
-            )
-
-            upd_mask = torch.ones_like(V_t)                   # 1 = update; 0 = freeze
-            upd_mask[:, :X_A.shape[0]+kcarry, :] = 0.0
-
-            for t_idx in range(n_timesteps_sample):
-                sigma_t = sigmas[t_idx]
-                t_norm = torch.tensor([[t_idx / float(n_timesteps_sample - 1)]], device=device)
-
-                H_null_C = torch.zeros_like(H_C)
-                eps_uncond = score_net(V_t, t_norm, H_null_C, mask_C)
-                eps_cond   = score_net(V_t, t_norm, H_C,        mask_C)
-                eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
-                # masked EDM step (do not move anchors+carry)
-                if t_idx < n_timesteps_sample - 1:
-                    sigma_next = sigmas[t_idx + 1]
-                    update = (sigma_t - sigma_next) * eps * upd_mask
-                else:
-                    update = sigma_t * eps * upd_mask
-                V_t = V_t - update
-
-        # --- Structure harvesting: distances only ---
-        V_all = V_t.squeeze(0)                            # (a + kcarry + |B|, D) throwaway coords
-        V_new = V_all[X_A.shape[0] + kcarry:]             # (|B|, D)
-
-        # FIX 3: Re-enable per-batch scale alignment properly
-        D_AA_batch = torch.cdist(V_all[:X_A.shape[0]], V_all[:X_A.shape[0]])
-        p95_batch = torch.quantile(D_AA_batch[iu, ju], 0.95)
-        scale = (anchor_scale_p95 / (p95_batch + 1e-8)).clamp(0.5, 2.0)
-
-        # distances to anchors (scaled)
-        D_newA = torch.cdist(V_new, V_all[:X_A.shape[0]]) * scale  # (|B|, a)
-
-        # DEBUG: Per-batch distances and scale
-        if DEBUG_FLAG and (batch_idx % DEBUG_EVERY == 0 or batch_idx < 3):
-            D_AA_b_flat = D_AA_batch[iu, ju].float()
-            print(f"\n[SD_BATCH] batch={batch_idx}/{n_batches} |B|={len(idx_B)} kcarry={kcarry}")
-            print(f"[SD_BATCH] D_AA_batch: "
-                  f"p50={D_AA_b_flat.quantile(0.50):.3f} "
-                  f"p90={D_AA_b_flat.quantile(0.90):.3f} "
-                  f"p99={D_AA_b_flat.quantile(0.99):.3f} "
-                  f"| scale={scale:.3f}")
-            
-            D_newA_flat = D_newA.flatten().float()
-            print(f"[SD_BATCH] D_newA (after scale): "
-                  f"p10={D_newA_flat.quantile(0.10):.3f} "
-                  f"p50={D_newA_flat.quantile(0.50):.3f} "
-                  f"p90={D_newA_flat.quantile(0.90):.3f} "
-                  f"max={D_newA_flat.max():.3f}")
-            
-            # Row spread check
-            row_means = D_newA.mean(dim=1)
-            row_stds  = D_newA.std(dim=1)
-            row_cv    = (row_stds / (row_means + 1e-8))
-            print(f"[SD_BATCH] row CV of D_newA: "
-                  f"p10={row_cv.quantile(0.10):.3f} "
-                  f"p50={row_cv.quantile(0.50):.3f} "
-                  f"p90={row_cv.quantile(0.90):.3f}")
-
-        # --- Triangulation in the global anchor frame (per cell) ---
-        # Use Z-similarity to pick K_ANCH nearest anchors (robust)
-        sim = F.normalize(Z_B, dim=1) @ F.normalize(ZA, dim=1).T  # (|B|, a)
-        topk = torch.topk(sim, k=min(K_ANCH, ZA.shape[0]), dim=1).indices  # (|B|, k)
-
-        X_B_list = []
-        tri_abs_list = []
-        tri_rel_list = []
-        cond_list = []
-        
-        for j in range(D_newA.shape[0]):
-            Sj = topk[j]                                     # (k,)
-            # reference anchor: closest by predicted distance
-            r_local = torch.argmin(D_newA[j, Sj]).item()
-            r_idx = Sj[r_local].item()
-
-            Xj = XA[Sj]                                      # (k, D)
-            xr = XA[r_idx]                                   # (D,)
-            Aj = 2.0 * (Xj - xr)                             # (k, D)
-
-            dj  = D_newA[j, Sj]                              # (k,)
-            djr = D_newA[j, r_idx]                           # scalar
-            bj = (djr**2 - dj**2 + (XA_norm2[Sj] - XA_norm2[r_idx]))  # (k,)
-
-            # Solve (A^T A + λ I) x = A^T b  (regularized least-squares)
-            AtA = Aj.T @ Aj                                  # (D,D)
-            rhs = Aj.T @ bj                                  # (D,)
-            xj = torch.linalg.solve(AtA + L2_REG*torch.eye(D_latent, device=device), rhs)  # (D,)
-            X_B_list.append(xj)
-            
-            # DEBUG: Triangulation residuals
-            if DEBUG_FLAG and (batch_idx % DEBUG_EVERY == 0 or batch_idx < 3):
-                D_recon = torch.cdist(xj[None, :], XA[Sj])[0]  # (k,)
-                abs_res = (D_recon - dj).abs()
-                mean_abs_res = abs_res.mean().item()
-                rel_res = mean_abs_res / (dj.mean().abs().item() + 1e-8)
-                
-                tri_abs_list.append(mean_abs_res)
-                tri_rel_list.append(rel_res)
-                
-                # Conditioning
-                try:
-                    eigs = torch.linalg.eigvalsh(AtA.float())
-                    cond = float(eigs.max() / (eigs.min().clamp(min=1e-8)))
-                except RuntimeError:
-                    cond = float("inf")
-                cond_list.append(cond)
-
-        X_B = torch.stack(X_B_list, dim=0).detach().cpu()    # (|B|, D)
-        
-        # DEBUG: Triangulation summary
-        if DEBUG_FLAG and (batch_idx % DEBUG_EVERY == 0 or batch_idx < 3) and tri_abs_list:
-            tri_abs = torch.tensor(tri_abs_list, device=device)
-            tri_rel = torch.tensor(tri_rel_list, device=device)
-            conds   = torch.tensor(cond_list,    device=device)
-            
-            print(f"[SD_TRIANG] batch={batch_idx} "
-                  f"| abs_res mean={tri_abs.mean():.3f} "
-                  f"p90={tri_abs.quantile(0.90):.3f} "
-                  f"| rel_res mean={tri_rel.mean():.3f} "
-                  f"p90={tri_rel.quantile(0.90):.3f}")
-            print(f"[SD_TRIANG] batch={batch_idx} "
-                  f"| cond median={conds.median():.1f} "
-                  f"p90={conds.quantile(0.90):.1f} "
-                  f"max={conds.max():.1f}")
-
-        # --- Keep stitched coords; throw away sampled coords ---
-        all_X.append(X_B)
-        order.append(idx_B.tolist())
-
-        # Update reservoir with STITCHED coords (global frame)
-        reservoir_idx.extend(idx_B.cpu().tolist())
-        reservoir_V.append(X_B)
-        if len(reservoir_idx) > RES_CAP:
-            keep = np.random.choice(len(reservoir_idx), size=RES_CAP, replace=False)
-            bigV = torch.cat(reservoir_V, dim=0)
-            reservoir_idx = [reservoir_idx[i] for i in keep]
-            reservoir_V   = [bigV[keep]]
-
-        # housekeeping
-        del Z_B, Z_C, H_C, V_t, eps_uncond, eps_cond, eps, V_all, V_new, D_AA_batch, D_newA, sim, topk
-        if 'cuda' in device:
-            torch.cuda.empty_cache()
-
-    # -------- Step 5: Reassemble global coordinates, compute EDM --------
-    if DEBUG_FLAG:
-        print("\n[Step Z] Reassembling global structure...")
-    X_full = torch.empty(n_sc, D_latent)
-    X_full[anchor_idx] = all_X[0]
-    for idxs, Xs in zip(order[1:], all_X[1:]):
-        X_full[torch.tensor(idxs, dtype=torch.long)] = Xs
-    X_full = X_full - X_full.mean(dim=0, keepdim=True)
-
-    # Global distances and EDM projection
-    Xd = X_full.to(device)
-    D = torch.cdist(Xd, Xd)
-    D_edm = uet.edm_project(D).detach().cpu()
-
-    # Global scale alignment to ST (if target provided)
-    if target_st_p95 is not None:
-        N = D_edm.shape[0]
-        iu_s, ju_s = torch.triu_indices(N, N, 1, device=D_edm.device)
-        D_vec = D_edm[iu_s, ju_s]
-        current_p95 = torch.quantile(D_vec, 0.95).clamp_min(1e-6)
-        scale_factor = target_st_p95 / current_p95
-        scale_factor = scale_factor.clamp(0.5, 4.0)
-        D_edm = D_edm * scale_factor
-        if DEBUG_FLAG:
-            print(f"[SD_RESCALE] current_p95={current_p95:.3f} target_p95={target_st_p95:.3f} scale={scale_factor:.3f}")
-
-    result = {'D_edm': D_edm}
-
-    # DEBUG: Global statistics
-    if DEBUG_FLAG:
-        N = D_edm.shape[0]
-        total_pairs = N * (N - 1) // 2
-        
-        print(f"\n[SD_GLOBAL] N={N} (total_pairs={total_pairs})")
-        
-        # Sample distances to avoid quantile() memory issues
-        MAX_SAMPLES = 1000000
-        if total_pairs <= MAX_SAMPLES:
-            # Small enough to compute directly
-            iu_all, ju_all = torch.triu_indices(N, N, 1, device=D_edm.device)
-            D_sample = D_edm[iu_all, ju_all].float()
-        else:
-            # Sample random pairs
-            k = MAX_SAMPLES
-            i = torch.randint(0, N, (int(k * 1.3),), device=D_edm.device)
-            j = torch.randint(0, N, (int(k * 1.3),), device=D_edm.device)
-            keep = i < j
-            i = i[keep][:k]
-            j = j[keep][:k]
-            D_sample = D_edm[i, j].float()
-            print(f"[SD_GLOBAL] (sampled {len(D_sample)} pairs for stats)")
-        
-        print(f"[SD_GLOBAL] dist: "
-            f"p50={D_sample.quantile(0.50):.3f} "
-            f"p90={D_sample.quantile(0.90):.3f} "
-            f"p99={D_sample.quantile(0.99):.3f} "
-            f"max={D_sample.max():.3f}")
-        
-        coords_rms = X_full.pow(2).mean().sqrt().item()
-        print(f"[SD_GLOBAL] coords_rms={coords_rms:.3f}")
-        
-        # Anisotropy check
-        cov = torch.cov(X_full.float().T)
-        eigs = torch.linalg.eigvalsh(cov)
-        ratio = float(eigs.max() / (eigs.min().clamp(min=1e-8)))
-        print(f"[SD_GLOBAL] coord_cov eigs: "
-            f"min={eigs.min():.3e} max={eigs.max():.3e} ratio={ratio:.1f}")
-
-    if return_coords:
-        # For visualization, compute 2D MDS from the final EDM
-        n = D_edm.shape[0]
-        Jn = torch.eye(n) - torch.ones(n, n) / n
-        B = -0.5 * (Jn @ (D_edm**2) @ Jn)
-        coords = uet.classical_mds(B.to(device), d_out=2).detach().cpu()
-        # NOW you can canonicalize for visualization only
-        coords_canon = uet.canonicalize_coords(coords).detach().cpu()
-        result['coords'] = coords
-        result['coords_canon'] = coords_canon
-
-    if DEBUG_FLAG:
-        print("="*72)
-        print("STAGE D COMPLETE")
-        print("="*72 + "\n")
-
-    return result
-
-
-# def sample_sc_edm_anchored(
-#     sc_gene_expr: torch.Tensor,
-#     encoder: 'SharedEncoder',
-#     context_encoder: SetEncoderContext,
-#     score_net: DiffusionScoreNet,
-#     n_timesteps_sample: int = 160,
-#     sigma_min: float = 0.01,
-#     sigma_max: float = 5.0,
-#     return_coords: bool = True,
-#     anchor_size: int = 384,
-#     batch_size: int = 512,
-#     eta: float = 0.0,
-#     device: str = 'cuda',
-#     guidance_scale: float = 8.0,
-#     # stitching knobs
-#     K_ANCH: int = 64,            # anchors used per cell for triangulation (>= D + 8)
-#     L2_REG: float = 1e-4,        # Tikhonov regularization
-#     CARRY_K: int = 256,          # carry-over frozen cells per batch (sampling only)
-#     RES_CAP: int = 2000          # reservoir cap (sampling only)
-# ) -> Dict[str, torch.Tensor]:
-#     """
-#     Stage D (Inference) -- Structure-first stitching
-#     ------------------------------------------------
-#     1) Choose anchors in Z space.
-#     2) Sample anchors ONCE via diffusion to estimate anchor-anchor distances.
-#     3) Build a single global anchor frame via MDS on those distances.
-#     4) Process remaining cells in batches:
-#        - Sample with anchors+carry frozen (for local quality),
-#        - Extract only distances to anchors,
-#        - Triangulate each new cell into the global frame from those distances.
-#     5) Return global EDM and (optional) global 2D coords.
-#     """
-
-#     #debug flag for inference
-#     DEBUG_FLAG = True
-
-#     import numpy as np
-#     import torch.nn.functional as F
-#     import utils_et as uet
-#     from tqdm import tqdm
-
-#     # -------- Init & encode Z --------
-#     encoder.eval(); context_encoder.eval(); score_net.eval()
-#     n_sc = sc_gene_expr.shape[0]
-#     D_latent = score_net.D_latent
-
-#     if DEBUG_FLAG:
-#         print("\n" + "="*72)
-#         print("STAGE D — STRUCTURE-FIRST ANCHORED INFERENCE")
-#         print("="*72)
-#         print(f"[cfg] n_sc={n_sc}  anchor_size={anchor_size}  batch_size={batch_size}  "
-#               f"timesteps={n_timesteps_sample}  D_latent={D_latent}")
-#         print(f"[stitch] K_ANCH={K_ANCH}  L2_REG={L2_REG:.1e}  CARRY_K={CARRY_K}  RES_CAP={RES_CAP}")
-
-#     # Encode all SC cells to Z (on CPU to save VRAM)
-#     Z_chunks, encode_bs = [], 1024
-#     for i in range(0, n_sc, encode_bs):
-#         z = encoder(sc_gene_expr[i:i+encode_bs].to(device)).cpu()
-#         Z_chunks.append(z)
-#     Z_all = torch.cat(Z_chunks, dim=0)                    # (n_sc, h)
-#     Z_all_unit = Z_all / (Z_all.norm(dim=1, keepdim=True) + 1e-8)
-
-#     # -------- Choose anchors (FPS in Z) --------
-#     anchor_size = min(anchor_size, n_sc)
-#     anchor_idx = uet.farthest_point_sampling(Z_all_unit, anchor_size, device='cpu')
-#     mask_non_anchor = torch.ones(n_sc, dtype=torch.bool)
-#     mask_non_anchor[anchor_idx] = False
-#     non_anchor_idx = mask_non_anchor.nonzero(as_tuple=False).squeeze(1)
-
-#     if DEBUG_FLAG:
-#         print(f"[anchors] chosen={len(anchor_idx)}  non_anchors={len(non_anchor_idx)}")
-
-#     # Prepare context encoder input for anchors
-#     Z_A = Z_all[anchor_idx].to(device).unsqueeze(0)       # (1, a, h)
-#     mask_A = torch.ones(1, Z_A.shape[1], dtype=torch.bool, device=device)
-
-#     # -------- Sigma schedule --------
-#     sigmas = torch.exp(torch.linspace(
-#         torch.log(torch.tensor(sigma_max, device=device)),
-#         torch.log(torch.tensor(sigma_min, device=device)),
-#         n_timesteps_sample, device=device
-#     ))  # (T,)
-
-#     # -------- Step 1/2: Sample anchors ONCE to estimate D_AA --------
-#     if DEBUG_FLAG:
-#         print("\n[Step A] Sampling anchors once to estimate anchor-anchor distances...")
-
-#     H_A = context_encoder(Z_A, mask_A)
-
-#     V_t = torch.randn(1, Z_A.shape[1], D_latent, device=device) * sigmas[0]
-#     for t_idx in range(n_timesteps_sample):
-#         sigma_t = sigmas[t_idx]
-#         t_norm = torch.tensor([[t_idx / float(n_timesteps_sample)]], device=device)
-#         H_null = torch.zeros_like(H_A)
-
-#         eps_uncond = score_net(V_t, t_norm, H_null, mask_A)
-#         eps_cond   = score_net(V_t, t_norm, H_A,    mask_A)
-#         eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
-#         if DEBUG_FLAG and t_idx < 5:
-#             ratio = (eps_cond - eps_uncond).norm() / (eps_uncond.norm() + 1e-8)
-#             print(f"  [anchors] t={t_idx:3d} sigma={float(sigma_t):.4f} CFG_ratio={float(ratio):.4f}")
-
-#         if t_idx < n_timesteps_sample - 1:
-#             sigma_next = sigmas[t_idx + 1]
-#             V_0_pred = V_t - sigma_t * eps
-#             V_t = V_0_pred + (sigma_next / sigma_t) * (V_t - V_0_pred)
-#             if eta > 0:
-#                 noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_t**2, min=0))
-#                 V_t = V_t + noise_scale * torch.randn_like(V_t)
-#         else:
-#             V_t = V_t - sigma_t * eps
-
-#     # Structure only: take distances, not coords
-#     V_A_sample = V_t.squeeze(0).detach()                  # throwaway coords after building D_AA
-#     D_AA = torch.cdist(V_A_sample, V_A_sample)            # (a, a)
-#     # Build one global anchor frame from structure (MDS)
-#     a = D_AA.shape[0]
-#     J = torch.eye(a, device=device) - (1.0 / a) * torch.ones(a, a, device=device)
-#     B_A = -0.5 * (J @ (D_AA**2) @ J)
-#     X_A = uet.classical_mds(B_A, d_out=D_latent)          # (a, D)
-#     X_A = uet.canonicalize_coords(X_A)
-#     # Precompute norms for triangulation
-#     XA = X_A.to(device)
-#     XA_norm2 = (XA**2).sum(dim=1)                         # (a,)
-
-#     # Global anchor scale (p95 of upper-tri distances)
-#     iu, ju = torch.triu_indices(a, a, 1, device=device)
-#     anchor_scale_p95 = torch.quantile(D_AA[iu, ju], 0.95).detach()
-#     if DEBUG_FLAG:
-#         print(f"[anchors] a={a}  p95={float(anchor_scale_p95):.4f}")
-
-#     # -------- Reservoir for carry (sampling-only) --------
-#     reservoir_idx = anchor_idx.clone().cpu().tolist()
-#     reservoir_V   = [X_A.detach().cpu()]                  # use stitched anchor coords for carry
-#     if DEBUG_FLAG:
-#         print(f"[reservoir] init size={len(reservoir_idx)}  carry_k={CARRY_K}")
-
-#     # -------- Step 3/4: Process non-anchors in batches --------
-#     all_X = [X_A.detach().cpu()]
-#     order = [anchor_idx.tolist()]
-#     n_batches = (non_anchor_idx.numel() + batch_size - 1) // batch_size
-
-#     ZA = Z_all[anchor_idx].to(device)                     # (a, h) for anchor–Z matching
-
-#     for batch_idx in tqdm(range(n_batches), desc="Batches"):
-#         s = batch_idx * batch_size
-#         e = min(s + batch_size, non_anchor_idx.numel())
-#         idx_B = non_anchor_idx[s:e]                       # LongTensor
-#         Z_B = Z_all[idx_B].to(device)                     # (|B|, h)
-
-#         # --- Build set for sampling: anchors + optional carry + new cells ---
-#         carry_idx = []
-#         carry_coords = None
-#         kcarry = 0
-#         if len(reservoir_idx) > 0 and CARRY_K > 0:
-#             sel = np.random.choice(len(reservoir_idx),
-#                                    size=min(CARRY_K, len(reservoir_idx)),
-#                                    replace=False)
-#             carry_idx = [reservoir_idx[s] for s in sel]
-#             carry_coords = torch.cat(reservoir_V, dim=0)[sel]  # (kcarry, D) CPU
-#             kcarry = len(carry_idx)
-
-#             Z_carry = Z_all[carry_idx].to(device).unsqueeze(0) # (1, kcarry, h)
-#             Z_C = torch.cat([Z_A, Z_carry, Z_B.unsqueeze(0)], dim=1)
-#         else:
-#             Z_C = torch.cat([Z_A, Z_B.unsqueeze(0)], dim=1)
-
-#         mask_C = torch.ones(1, Z_C.shape[1], dtype=torch.bool, device=device)
-#         H_C = context_encoder(Z_C, mask_C)
-
-#         # --- Reverse diffusion: anchors+carry frozen, new noisy ---
-#         V_t = torch.empty(1, Z_C.shape[1], D_latent, device=device)
-#         V_t[:, :X_A.shape[0], :] = X_A                    # use stitched anchors in global frame
-#         if kcarry > 0:
-#             V_t[:, X_A.shape[0]:X_A.shape[0]+kcarry, :] = carry_coords.to(device)
-#         V_t[:, X_A.shape[0]+kcarry:, :] = (
-#             torch.randn(1, Z_C.shape[1] - X_A.shape[0] - kcarry, D_latent, device=device) * sigmas[0]
-#         )
-
-#         upd_mask = torch.ones_like(V_t)                   # 1 = update; 0 = freeze
-#         upd_mask[:, :X_A.shape[0]+kcarry, :] = 0.0
-
-#         for t_idx in range(n_timesteps_sample):
-#             sigma_t = sigmas[t_idx]
-#             t_norm = torch.tensor([[t_idx / float(n_timesteps_sample)]], device=device)
-
-#             H_null_C = torch.zeros_like(H_C)
-#             eps_uncond = score_net(V_t, t_norm, H_null_C, mask_C)
-#             eps_cond   = score_net(V_t, t_norm, H_C,        mask_C)
-#             eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
-#             # masked EDM step (do not move anchors+carry)
-#             if t_idx < n_timesteps_sample - 1:
-#                 sigma_next = sigmas[t_idx + 1]
-#                 update = (sigma_t - sigma_next) * eps * upd_mask
-#             else:
-#                 update = sigma_t * eps * upd_mask
-#             V_t = V_t - update
-
-#         # --- Structure harvesting: distances only ---
-#         V_all = V_t.squeeze(0)                            # (a + kcarry + |B|, D) throwaway coords
-#         V_new = V_all[X_A.shape[0] + kcarry:]             # (|B|, D)
-
-#         # Safety: per-batch scale alignment using anchor–anchor p95
-#         D_AA_batch = torch.cdist(V_all[:X_A.shape[0]], V_all[:X_A.shape[0]])
-#         # scale = (anchor_scale_p95 / (torch.quantile(D_AA_batch[iu, ju], 0.95) + 1e-8)).clamp(0.5, 2.0)
-#         scale = 1.0
-
-#         # distances to anchors (scaled)
-#         D_newA = torch.cdist(V_new, V_all[:X_A.shape[0]]) * scale  # (|B|, a)
-
-#         if DEBUG_FLAG and (batch_idx % 10 == 0):
-#             print(f"[batch {batch_idx+1}/{n_batches}] |B|={len(idx_B)} kcarry={kcarry} scale={float(scale):.3f}")
-
-#         # --- Triangulation in the global anchor frame (per cell) ---
-#         # Use Z-similarity to pick K_ANCH nearest anchors (robust)
-#         sim = F.normalize(Z_B, dim=1) @ F.normalize(ZA, dim=1).T  # (|B|, a)
-#         topk = torch.topk(sim, k=min(K_ANCH, ZA.shape[0]), dim=1).indices  # (|B|, k)
-
-#         X_B_list = []
-#         for j in range(D_newA.shape[0]):
-#             Sj = topk[j]                                     # (k,)
-#             # reference anchor: closest by predicted distance
-#             r_local = torch.argmin(D_newA[j, Sj]).item()
-#             r_idx = Sj[r_local].item()
-
-#             Xj = XA[Sj]                                      # (k, D)
-#             xr = XA[r_idx]                                   # (D,)
-#             Aj = 2.0 * (Xj - xr)                             # (k, D)
-
-#             dj  = D_newA[j, Sj]                              # (k,)
-#             djr = D_newA[j, r_idx]                           # scalar
-#             bj = (djr**2 - dj**2 + (XA_norm2[Sj] - XA_norm2[r_idx]))  # (k,)
-
-#             # Solve (A^T A + λ I) x = A^T b  (regularized least-squares)
-#             AtA = Aj.T @ Aj                                  # (D,D)
-#             rhs = Aj.T @ bj                                  # (D,)
-#             xj = torch.linalg.solve(AtA + L2_REG*torch.eye(D_latent, device=device), rhs)  # (D,)
-#             X_B_list.append(xj)
-
-#         X_B = torch.stack(X_B_list, dim=0).detach().cpu()    # (|B|, D)
-
-#         # --- Keep stitched coords; throw away sampled coords ---
-#         all_X.append(X_B)
-#         order.append(idx_B.tolist())
-
-#         # Update reservoir with STITCHED coords (global frame)
-#         reservoir_idx.extend(idx_B.cpu().tolist())
-#         reservoir_V.append(X_B)
-#         if len(reservoir_idx) > RES_CAP:
-#             keep = np.random.choice(len(reservoir_idx), size=RES_CAP, replace=False)
-#             bigV = torch.cat(reservoir_V, dim=0)
-#             reservoir_idx = [reservoir_idx[i] for i in keep]
-#             reservoir_V   = [bigV[keep]]
-
-#         # housekeeping
-#         del Z_B, Z_C, H_C, V_t, eps_uncond, eps_cond, eps, V_all, V_new, D_AA_batch, D_newA, sim, topk
-#         if device == 'cuda':
-#             torch.cuda.empty_cache()
-
-#     # -------- Step 5: Reassemble global coordinates, compute EDM --------
-#     if DEBUG_FLAG:
-#         print("\n[Step Z] Reassembling global structure...")
-#     X_full = torch.empty(n_sc, D_latent)
-#     X_full[anchor_idx] = all_X[0]
-#     for idxs, Xs in zip(order[1:], all_X[1:]):
-#         X_full[torch.tensor(idxs, dtype=torch.long)] = Xs
-#     X_full = X_full - X_full.mean(dim=0, keepdim=True)
-
-#     # Global distances and EDM projection
-#     Xd = X_full.to(device)
-#     D = torch.cdist(Xd, Xd)
-#     D_edm = uet.edm_project(D).detach().cpu()
-
-#     result = {'D_edm': D_edm}
-
-#     if return_coords:
-#         # For visualization, compute 2D MDS from the final EDM
-#         n = D_edm.shape[0]
-#         Jn = torch.eye(n) - torch.ones(n, n) / n
-#         B = -0.5 * (Jn @ (D_edm**2) @ Jn)
-#         coords = uet.classical_mds(B.to(device), d_out=2).detach().cpu()
-#         coords_canon = uet.canonicalize_coords(coords).detach().cpu()
-#         result['coords'] = coords
-#         result['coords_canon'] = coords_canon
-
-#     def _approx_upper_quantile(D_cpu: torch.Tensor, q: float = 0.95, max_pairs: int = 1_000_000) -> float:
-#         """
-#         Robust quantile on the upper triangle using <= max_pairs random pairs.
-#         Avoids materializing the full 50M-element vector.
-#         """
-#         n = D_cpu.shape[0]
-#         total_pairs = n * (n - 1) // 2
-#         k = min(max_pairs, max(1, total_pairs))
-
-#         # Sample random (i,j) with i<j
-#         # Generate a bit more than k and filter to i<j to avoid bias
-#         m = int(k * 1.3)
-#         i = torch.randint(0, n, (m,), device=D_cpu.device)
-#         j = torch.randint(0, n, (m,), device=D_cpu.device)
-#         keep = i < j
-#         i = i[keep][:k]
-#         j = j[keep][:k]
-
-#         vals = D_cpu[i, j]  # length <= k
-#         return torch.quantile(vals, q).item()
-
-#     if DEBUG_FLAG:
-#         try:
-#             p95 = _approx_upper_quantile(D_edm, q=0.95, max_pairs=1_000_000)
-#             print(f"[done] ||X||_std={float(X_full.std()):.3f}  D_p95≈{p95:.3f}  (structure-first stitching complete)")
-#         except Exception as e:
-#             print(f"[done] ||X||_std={float(X_full.std()):.3f}  (p95 skipped: {e})  (structure-first stitching complete)")
-
-
-#     return result
