@@ -42,7 +42,7 @@ import time
 from contextlib import contextmanager
 
 #debug tools
-DEBUG = True #master switch for debug logging
+DEBUG = False #master switch for debug logging
 
 # LOG_EVERY = 500 #per-batch prints
 # SAVE_EVERY_EPOCH = 5 #extra plots/dumps
@@ -2689,8 +2689,7 @@ def train_stageC_diffusion_generator(
             
             # print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
-            # Print detailed losses every 5 epochs, simple summary otherwise
-            # Print detailed losses every 5 epochs, simple summary otherwise
+            # Print detailed losses every 5 epochs
             if (epoch + 1) % 10 == 0:
                 avg_gram_scale = epoch_losses['gram_scale'] / max(n_batches, 1)
                 avg_heat = epoch_losses['heat'] / max(n_batches, 1)
@@ -2698,7 +2697,8 @@ def train_stageC_diffusion_generator(
                 avg_sw_sc = epoch_losses['sw_sc'] / max(n_batches, 1)
                 avg_overlap = epoch_losses['overlap'] / max(n_batches, 1)
                 avg_ordinal_sc = epoch_losses['ordinal_sc'] / max(n_batches, 1)
-                avg_z_nbr = epoch_losses['z_nbr'] / max(n_batches, 1)  # ← ADD THIS
+                avg_z_nbr = epoch_losses['z_nbr'] / max(n_batches, 1) 
+                avg_knn_st = epoch_losses['knn_st'] / max(n_batches, 1) 
                 avg_st_dist = epoch_losses['st_dist'] / max(n_batches, 1)
                 avg_edm_tail = epoch_losses['edm_tail'] / max(n_batches, 1)
                 avg_gen_align = epoch_losses['gen_align'] / max(n_batches, 1)
@@ -2708,6 +2708,7 @@ def train_stageC_diffusion_generator(
                 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
+                print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f} | knn_st={avg_knn_st:.4f}")
                 print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f}")
                 print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | z_nbr={avg_z_nbr:.4f} | st_dist={avg_st_dist:.4f}")  # ← UPDATED LINE
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")

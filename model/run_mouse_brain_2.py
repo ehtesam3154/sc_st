@@ -4,11 +4,23 @@ import torch
 from lightning.fabric import Fabric
 import scanpy as sc
 from core_models_et_p3 import GEMSModel
-# from mouse_brain import train_gems_mousebrain  # optional, if you want its helpers
+from scipy.ndimage import gaussian_filter1d
+import torch.distributed as dist
+import pandas as pd
+import anndata as ad
+import numpy as np
+import utils_et as uet
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scanpy as sc
+import utils_et as uet
+
+
+
+
 import sys
-
 import argparse
-
 import shutil
 from pathlib import Path
 
@@ -53,7 +65,7 @@ def parse_args():
     parser.add_argument('--knn_k', type=int, default=12)
     parser.add_argument('--self_conditioning', action='store_true', default=True)
     parser.add_argument('--sc_feat_mode', type=str, default='concat', choices=['concat', 'mlp'])
-    parser.add_argument('--landmarks_L', type=int, default=0)
+    parser.add_argument('--landmarks_L', type=int, default=16)
 
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
@@ -81,9 +93,6 @@ def load_mouse_data():
     sc_counts = '/home/ehtesamul/sc_st/data/mousedata_2020/E1z2/simu_st2_counts_et.csv'
     sc_meta   = '/home/ehtesamul/sc_st/data/mousedata_2020/E1z2/simu_st2_metadata_et.csv'
     sc_ct     = '/home/ehtesamul/sc_st/data/mousedata_2020/E1z2/simu_st2_celltype_et.csv'
-
-    import pandas as pd
-    import anndata as ad
     
     # Load ST1 data (training)
     print("Loading ST1 (training ST data)...")
@@ -164,10 +173,7 @@ def main(args=None):
 
     # ---------- Stage A & B on rank-0 only ----------
     if fabric.is_global_zero:
-        # Extract tensors like mouse_brain.py does
-        import numpy as np
-        import utils_et as uet
-        
+        # Extract tensors like mouse_brain.py does        
         common = sorted(list(set(scadata.var_names) & set(stadata.var_names)))
         X_sc = scadata[:, common].X
         X_st = stadata[:, common].X
@@ -179,7 +185,8 @@ def main(args=None):
         # NEW: Per-slide canonicalization BEFORE Stage A/B
         st_coords_raw = torch.tensor(stadata.obsm["spatial"], dtype=torch.float32, device=fabric.device)
         slide_ids = torch.zeros(st_expr.shape[0], dtype=torch.long, device=fabric.device)
-        
+
+        import utils_et as uet
         st_coords, st_mu, st_scale = uet.canonicalize_st_coords_per_slide(
             st_coords_raw, slide_ids
         )
@@ -400,7 +407,6 @@ def main(args=None):
  
         # CRITICAL FIX: Broadcast E_ST_best to all ranks to ensure sync
         E_ST_best_tensor = torch.tensor([E_ST_best], dtype=torch.long, device=fabric.device)
-        import torch.distributed as dist
         if dist.is_initialized():
             dist.broadcast(E_ST_best_tensor, src=0)
         E_ST_best = int(E_ST_best_tensor.item())
@@ -524,10 +530,6 @@ def main(args=None):
         except Exception as e:
             print(f"[DEBUG Rank-0] Unwrap failed (maybe not wrapped?): {e}")
 
-        from datetime import datetime
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        import numpy as np
         
         # Create timestamp for all outputs
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -555,14 +557,14 @@ def main(args=None):
 
                 sample_results = model.infer_sc_patchwise(
                     sc_gene_expr=sc_expr,
-                    n_timesteps_sample=400,
+                    n_timesteps_sample=500,
                     return_coords=True,
                     # patch_size=512,          # was batch_size; also your Stage D batch size
                     patch_size=256,
-                    coverage_per_cell=6.0,   # you can tune 3–6
-                    n_align_iters=1,        # can tune 5–15
+                    coverage_per_cell=5.0,   # you can tune 3–6
+                    n_align_iters=10,        # can tune 5–15
                     eta=0.0,
-                    guidance_scale=3.0,
+                    guidance_scale=2.0,
                     sigma_min=0.01,
                     sigma_max=3.0,
                 )
@@ -1011,7 +1013,6 @@ def main(args=None):
             # Create scanpy-style embedding plot
             fig, ax = plt.subplots(figsize=(10, 8))
             
-            import scanpy as sc
             sc.settings.set_figure_params(dpi=150, frameon=False)
             
             # Use scanpy's embedding plot
@@ -1110,104 +1111,175 @@ def main(args=None):
         print(f"✓ Saved summary: {summary_path}")
         print("[DEBUG Rank-0] Inference complete!")
         
-    #     # ============================================================================
-    #     # PLOT STAGE C TRAINING LOSSES (NO CHECKPOINT NEEDED)
-    #     # ============================================================================
+        # ============================================================================
+        # PLOT STAGE C TRAINING LOSSES (NO CHECKPOINT NEEDED)
+        # ============================================================================
 
-    if fabric.is_global_zero:
-        print("\n=== Plotting Stage C training losses ===")
+        # ============================================================================
+        # AUTOMATED LOSS PLOTTING FUNCTION
+        # ============================================================================
         
-        # ============================================================================
-        # PLOT PHASE 1 (ST-ONLY) LOSSES
-        # ============================================================================
-        if history_st is not None and len(history_st['epoch']) > 0:
-            print("\n--- Plotting Phase 1 (ST-only) Losses ---")
-            epochs = history_st['epoch']
-            losses = history_st['epoch_avg']
+        def plot_training_losses(history: dict, phase_name: str, output_dir: str, timestamp: str, exclude_keys: list = None):
+            """
+            Automatically plot all losses from history dictionary.
             
-            # ST-specific losses
-            # ST-specific losses (including new shape constraints)
-            st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'repel', 'shape']
-            st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime', 'brown', 'pink', 'gray', 'darkred', 'darkblue']
-
+            Args:
+                history: dict with 'epoch' and 'epoch_avg' keys
+                phase_name: e.g. "Phase 1: ST-Only" or "Phase 2: SC Fine-tune"
+                output_dir: directory to save plots
+                timestamp: timestamp string for filename
+                exclude_keys: list of keys to exclude from plotting (e.g. ['total'] if you want separate)
+            """
+            if history is None or len(history.get('epoch', [])) == 0:
+                print(f"No data to plot for {phase_name}")
+                return
             
-            # Increased grid to fit new losses
-            fig, axes = plt.subplots(5, 3, figsize=(20, 25))
-
-
-            fig.suptitle('Phase 1: ST-Only Training Losses', fontsize=18, fontweight='bold', y=0.995)
+            epochs = history['epoch']
+            losses = history['epoch_avg']
             
-            axes = axes.flatten()
-            for idx, (name, color) in enumerate(zip(st_loss_names, st_colors)):
-                if name in losses and len(losses[name]) > 0:
-                    ax = axes[idx]
-                    ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
-                    ax.set_xlabel('Epoch', fontsize=12)
-                    ax.set_ylabel('Loss', fontsize=12)
-                    ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
-                    ax.grid(True, alpha=0.3)
-                    
-                    if len(epochs) > 10:
-                        from scipy.ndimage import gaussian_filter1d
-                        smoothed = gaussian_filter1d(losses[name], sigma=2)
-                        ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
-                        ax.legend(fontsize=10)
+            # Get all loss names that have data
+            exclude_keys = exclude_keys or []
+            loss_names = [k for k in losses.keys() if len(losses.get(k, [])) > 0 and k not in exclude_keys]
             
-            # # Hide unused subplots
-            # for idx in range(len(st_loss_names), 12):
-            #     axes[idx].axis('off')
-
-            # Hide unused subplot (now we have 14 losses, 15 total subplots)
-            axes[14].axis('off')
-
-
-            plt.tight_layout()
-            st_plot_filename = f"stageC_phase1_ST_losses_{timestamp}.png"
-            st_plot_path = os.path.join(outdir, st_plot_filename)
-            plt.savefig(st_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved Phase 1 (ST) loss plot: {st_plot_path}")
-            plt.close()
-        
-        # ============================================================================
-        # PLOT PHASE 2 (SC FINE-TUNE) LOSSES (if it ran)
-        # ============================================================================
-        if args.num_sc_samples > 0 and training_history is not None and len(training_history['epoch']) > 0:
-            print("\n--- Plotting Phase 2 (SC Fine-tune) Losses ---")
-            epochs = training_history['epoch']
-            losses = training_history['epoch_avg']
+            if not loss_names:
+                print(f"No losses to plot for {phase_name}")
+                return
             
-            # SC-specific losses (no gram/heat/edm_tail/gen_align)
-            sc_loss_names = ['total', 'score', 'sw_sc', 'overlap', 'ordinal_sc']
-            sc_colors = ['black', 'blue', 'purple', 'brown', 'pink']
+            # Sort: put 'total' first if present, then alphabetically
+            if 'total' in loss_names:
+                loss_names.remove('total')
+                loss_names = ['total'] + sorted(loss_names)
+            else:
+                loss_names = sorted(loss_names)
             
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-            fig.suptitle('Phase 2: SC Fine-tuning Losses', fontsize=18, fontweight='bold', y=0.995)
-            axes = axes.flatten()
+            # Auto color palette (enough for many losses)
+            base_colors = [
+                'black', 'blue', 'red', 'green', 'orange', 'purple', 
+                'brown', 'pink', 'cyan', 'magenta', 'lime', 'olive',
+                'navy', 'teal', 'maroon', 'gold', 'indigo', 'coral',
+                'darkgreen', 'darkred', 'darkblue', 'darkorange', 'darkviolet', 'deepskyblue'
+            ]
+            colors = (base_colors * ((len(loss_names) // len(base_colors)) + 1))[:len(loss_names)]
             
-            for idx, (name, color) in enumerate(zip(sc_loss_names, sc_colors)):
-                if name in losses and len(losses[name]) > 0:
-                    ax = axes[idx]
-                    ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
-                    ax.set_xlabel('Epoch', fontsize=12)
-                    ax.set_ylabel('Loss', fontsize=12)
-                    ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
-                    ax.grid(True, alpha=0.3)
-                    
-                    if len(epochs) > 10:
-                        from scipy.ndimage import gaussian_filter1d
-                        smoothed = gaussian_filter1d(losses[name], sigma=2)
-                        ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
-                        ax.legend(fontsize=10)
+            # Grid layout: 3 columns, variable rows
+            n_plots = len(loss_names)
+            n_cols = 3
+            n_rows = (n_plots + n_cols - 1) // n_cols  # ceiling division
             
-            # Hide empty subplot
-            axes[5].axis('off')
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+            fig.suptitle(f'{phase_name} Training Losses', fontsize=18, fontweight='bold', y=0.995)
+            
+            # Flatten axes for easy indexing
+            if n_rows == 1 and n_cols == 1:
+                axes = [axes]
+            elif n_rows == 1 or n_cols == 1:
+                axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+            else:
+                axes = axes.flatten()
+            
+            for idx, (name, color) in enumerate(zip(loss_names, colors)):
+                ax = axes[idx]
+                data = losses[name]
+                
+                ax.plot(epochs, data, color=color, linewidth=2, alpha=0.7, marker='o', markersize=3)
+                ax.set_xlabel('Epoch', fontsize=11)
+                ax.set_ylabel('Loss', fontsize=11)
+                ax.set_title(f'{name.upper()}', fontsize=13, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                
+                # Add smoothed trend line if enough data
+                if len(epochs) > 10:
+                    smoothed = gaussian_filter1d(data, sigma=2)
+                    ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
+                    ax.legend(fontsize=9)
+            
+            # Hide unused subplots
+            for idx in range(n_plots, len(axes)):
+                axes[idx].axis('off')
             
             plt.tight_layout()
-            sc_plot_filename = f"stageC_phase2_SC_losses_{timestamp}.png"
-            sc_plot_path = os.path.join(outdir, sc_plot_filename)
-            plt.savefig(sc_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved Phase 2 (SC) loss plot: {sc_plot_path}")
+            
+            # Generate filename
+            phase_tag = phase_name.lower().replace(' ', '_').replace(':', '').replace('-', '')
+            plot_filename = f"stageC_{phase_tag}_losses_{timestamp}.png"
+            plot_path = os.path.join(output_dir, plot_filename)
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved {phase_name} loss plot: {plot_path}")
             plt.close()
+            
+            # Also create a combined log-scale plot
+            fig, ax = plt.subplots(1, 1, figsize=(14, 7))
+            for name, color in zip(loss_names, colors):
+                if name == 'total':
+                    continue  # skip total in combined plot
+                data = losses[name]
+                if len(data) > 0 and max(data) > 0:
+                    ax.plot(epochs, data, color=color, linewidth=2, label=name.upper(), 
+                        marker='o', markersize=2, markevery=max(1, len(epochs)//20))
+            
+            ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Loss', fontsize=14, fontweight='bold')
+            ax.set_title(f'{phase_name} - All Losses (Log Scale)', fontsize=16, fontweight='bold')
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3, which='both')
+            ax.legend(fontsize=10, ncol=min(4, len(loss_names)//2 + 1), loc='upper right')
+            
+            plt.tight_layout()
+            combined_filename = f"stageC_{phase_tag}_combined_{timestamp}.png"
+            combined_path = os.path.join(output_dir, combined_filename)
+            plt.savefig(combined_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved {phase_name} combined plot: {combined_path}")
+            plt.close()
+
+        # ============================================================================
+        # PLOT STAGE C TRAINING LOSSES
+        # ============================================================================
+
+        if fabric.is_global_zero:
+            print("\n=== Plotting Stage C training losses ===")
+            
+            # Plot Phase 1 (ST-only) losses
+            if history_st is not None:
+                plot_training_losses(
+                    history=history_st,
+                    phase_name="Phase 1 ST-Only",
+                    output_dir=outdir,
+                    timestamp=timestamp
+                )
+            
+           # Plot Phase 2 (SC fine-tune) losses
+            if args.num_sc_samples > 0 and training_history is not None:
+                plot_training_losses(
+                    history=training_history,
+                    phase_name="Phase 2 SC Fine-tune",
+                    output_dir=outdir,
+                    timestamp=timestamp
+                )
+            
+            # ============================================================================
+            # SUMMARY STATISTICS
+            # ============================================================================
+            print("\n" + "="*70)
+            print("TRAINING SUMMARY")
+            print("="*70)
+            
+            def print_loss_summary(history: dict, phase_name: str):
+                if history is None or len(history.get('epoch', [])) == 0:
+                    return
+                print(f"\n--- {phase_name} ---")
+                losses = history['epoch_avg']
+                print(f"Total epochs: {len(history['epoch'])}")
+                
+                # Print final values for all non-empty losses
+                for name in sorted(losses.keys()):
+                    if len(losses[name]) > 0:
+                        print(f"  {name}: {losses[name][-1]:.6f}")
+            
+            print_loss_summary(history_st, "Phase 1: ST-Only Training")
+            if args.num_sc_samples > 0:
+                print_loss_summary(training_history, "Phase 2: SC Fine-tuning")
+            
+            print("="*70)
         
         # ============================================================================
         # SUMMARY STATISTICS

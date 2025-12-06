@@ -575,6 +575,147 @@ class GEMSModel:
         
         return result
 
+    # ==========================================================================
+    # STAGE C v2: ST-ONLY TRAINING WITH GRAPH-AWARE LOSSES
+    # ==========================================================================
+    
+    def train_stageC_v2(
+        self,
+        st_gene_expr_dict: Dict[int, torch.Tensor],
+        n_min: int = 96,
+        n_max: int = 384,
+        num_st_samples: int = 4000,
+        n_epochs: int = 100,
+        batch_size: int = 8,
+        lr: float = 1e-4,
+        n_timesteps: int = 500,
+        sigma_min: float = 0.01,
+        sigma_max: float = 3.0,
+        outf: str = 'output',
+        fabric: Optional['Fabric'] = None,
+        precision: str = '16-mixed',
+        w_score: float = 1.0,
+        w_edge: float = 1.0,
+        w_repel: float = 0.1,
+        enable_early_stop: bool = False,
+        early_stop_patience: int = 10,
+        early_stop_min_epochs: int = 20,
+    ):
+        """
+        Stage C v2: ST-only training with graph-aware losses.
+        
+        Losses:
+            1. Score loss (EDM-weighted denoising)
+            2. kNN edge distance loss (index-aware geometry)
+            3. Repulsion loss (prevent collapse)
+        """
+        from core_models_et_p2_v2 import train_stageC_st_only
+        from core_models_et_p1 import STSetDataset
+        
+        # Create ST dataset
+        st_dataset = STSetDataset(
+            targets_dict=self.targets_dict,
+            encoder=self.encoder,
+            st_gene_expr_dict=st_gene_expr_dict,
+            n_min=n_min,
+            n_max=n_max,
+            D_latent=self.D_latent,
+            num_samples=num_st_samples,
+            knn_k=self.cfg.get('knn_k', 12),
+            device=self.device,
+            landmarks_L=self.cfg.get('landmarks_L', 0),
+        )
+        
+        history = train_stageC_st_only(
+            context_encoder=self.context_encoder,
+            generator=self.generator,
+            score_net=self.score_net,
+            st_dataset=st_dataset,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            n_timesteps=n_timesteps,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            device=self.device,
+            outf=outf,
+            fabric=fabric,
+            precision=precision,
+            w_score=w_score,
+            w_edge=w_edge,
+            w_repel=w_repel,
+            enable_early_stop=enable_early_stop,
+            early_stop_patience=early_stop_patience,
+            early_stop_min_epochs=early_stop_min_epochs,
+        )
+        
+        return history
+    
+    # ==========================================================================
+    # SC ENCODER FINE-TUNING v2
+    # ==========================================================================
+    
+    def finetune_encoder_on_sc_v2(
+        self,
+        sc_gene_expr: torch.Tensor,
+        D_st_reference: torch.Tensor,
+        n_min: int = 96,
+        n_max: int = 384,
+        num_sc_samples: int = 5000,
+        n_epochs: int = 50,
+        batch_size: int = 8,
+        lr: float = 3e-5,
+        outf: str = 'output',
+        fabric: Optional['Fabric'] = None,
+        precision: str = '16-mixed',
+        w_overlap: float = 1.0,
+        w_geom: float = 1.0,
+        w_dim: float = 0.1,
+    ):
+        """
+        SC Encoder Fine-tuning with Frozen Geometry Prior.
+        
+        Generator and score_net weights are FROZEN but used as differentiable 
+        functions so gradients flow through them into encoder/context_encoder.
+        """
+        from core_models_et_p2_v2 import finetune_encoder_on_sc
+        from core_models_et_p1 import SCSetDataset
+        
+        # Create SC dataset
+        sc_dataset = SCSetDataset(
+            sc_gene_expr=sc_gene_expr.cpu(),
+            encoder=self.encoder,
+            n_min=n_min,
+            n_max=n_max,
+            overlap_min=20,
+            overlap_max=128,
+            num_samples=num_sc_samples,
+            K_nbrs=2048,
+            device=self.device,
+            landmarks_L=0,
+        )
+        
+        history = finetune_encoder_on_sc(
+            encoder=self.encoder,
+            context_encoder=self.context_encoder,
+            generator=self.generator,
+            score_net=self.score_net,
+            sc_gene_expr=sc_gene_expr,
+            sc_dataset=sc_dataset,
+            D_st_reference=D_st_reference,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            device=self.device,
+            outf=outf,
+            fabric=fabric,
+            precision=precision,
+            w_overlap=w_overlap,
+            w_geom=w_geom,
+            w_dim=w_dim,
+        )
+        
+        return history
 
 
 
