@@ -757,6 +757,7 @@ def train_stageC_diffusion_generator(
     )
     loss_sw = uet.SlicedWassersteinLoss1D()
     loss_triplet = uet.OrdinalTripletLoss()
+    loss_knn_nca = uet.KNNSoftmaxLoss(tau=1.0, k=15)
 
     loss_dim = uet.IntrinsicDimensionLoss(k_neighbors=20, target_dim=2.0)
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
@@ -1013,47 +1014,26 @@ def train_stageC_diffusion_generator(
     if fabric is None or fabric.is_global_zero:
         os.makedirs(plot_dir, exist_ok=True)
 
-    # WEIGHTS = {
-    #     'score': 1.0,
-    #     'gram': 0.5,
-    #     'gram_scale': 0.3,
-    #     'heat': 0.25,
-    #     'sw_st': 0.3,
-    #     'sw_sc': 0.3,
-    #     'overlap': 0.25,
-    #     'ordinal_sc': 0.5,
-    #     'st_dist': 0.03,
-    #     'edm_tail': 0.3,
-    #     'gen_align': 0.3,
-    #     'dim': 0.1,
-    #     'triangle': 0.5,
-    #     'radial': 1.0,
-    #     'repel': 0.0,      # NEW: ST repulsion loss
-    #     'shape': 0.0,       # NEW: ST anisotropy/shape loss
-    #     'z_nbr': 0.4
-    # }
     WEIGHTS = {
         'score': 1.0,
         'gram': 0.5,
         'gram_scale': 0.3,
         'heat': 0.25,
-        'sw_st': 0.2,
-        'sw_sc': 0.2,
+        'sw_st': 0.3,
+        'sw_sc': 0.3,
         'overlap': 0.25,
-        'ordinal_sc': 0.3,
-        'st_dist': 0.3,
+        'ordinal_sc': 0.5,
+        'st_dist': 0.03,
         'edm_tail': 0.3,
         'gen_align': 0.3,
         'dim': 0.1,
-        'triangle': 0.25,
+        'triangle': 0.5,
         'radial': 1.0,
+        'knn_nca': 0.3,
         'repel': 0.0,      # NEW: ST repulsion loss
-        'shape': 0.0,       # NEW: ST anisotropy/shape loss
-        'z_nbr': 0.5,
-        'knn_st': 0.5,      # NEW: ST k-NN ranking loss
+        'shape': 0.0       # NEW: ST anisotropy/shape loss
     }
 
-    
     # Heat warmup schedule
     HEAT_WARMUP_EPOCHS = 10
     HEAT_TARGET_WEIGHT = 0.05
@@ -1084,9 +1064,8 @@ def train_stageC_diffusion_generator(
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [],
-            'repel': [], 'shape': [],
-            'z_nbr': [],  'knn_st': [],   # NEW
+            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [], 'knn_nca': [], 
+            'repel': [], 'shape': []  # NEW: ST shape constraints
         }
     }
 
@@ -1137,15 +1116,13 @@ def train_stageC_diffusion_generator(
         'edm_tail': 0.1,
         'gen_align': 0.1,
         'radial': 0.1,
-        'knn_st': 0.2,      # NEW
         # dim and triangle are regularizers - keep manual for now
     }
     ema_sc = {
         'score': 1.0,
         'sw_sc': 0.1,
         'overlap': 0.1,
-        'ordinal_sc': 0.1,
-        'z_nbr': 0.2
+        'ordinal_sc': 0.1
     }
     EMA_BETA = 0.98  # CHANGED from 0.95
  
@@ -1153,7 +1130,6 @@ def train_stageC_diffusion_generator(
     # These control how much each loss contributes to the gradient
     TARGET = {
         'gram': 0.05,           # Keep Gram gradients at ~5% of score
-        'knn_st': 0.15,     # NEW: give meaningful gradient share
         'gram_scale': 0.03,     # Scale regularizer weaker
         'heat': 0.15,           # Heat kernel at ~15% of score
         'sw_st': 0.10,          # Sliced-Wasserstein at ~10%
@@ -1164,12 +1140,10 @@ def train_stageC_diffusion_generator(
     }
 
     TARGET_SC = {
-            'sw_sc': 0.10,
-            'overlap': 0.1,
-            'ordinal_sc': 0.1,
-            'z_nbr': 0.15,      # NEW: give it meaningful gradient share
+        'sw_sc': 0.10,        # Match sw_st (was 0.08) - distribution matching is important
+        'overlap': 0.05,      # Increase from 0.01 - too weak at 1%
+        'ordinal_sc': 0.08,   # Increase from 0.06 - ordinal structure is important
         }
-    
     AUTOBALANCE_EVERY = 100
     AUTOBALANCE_START = 200
 
@@ -1189,47 +1163,6 @@ def train_stageC_diffusion_generator(
             f"patience={early_stop_patience}, threshold={early_stop_threshold:.1%}")
     
     for epoch in range(n_epochs):
-
-        # ========== DEBUG: Print ST sampling stats every 10 epochs ==========
-        # if use_st and st_dataset is not None and (epoch == 0 or epoch % 10 == 0):
-        #     print(f"\n{'='*100}")
-        #     print(f"🔍 EPOCH {epoch}: ST MINI-SUBSET SAMPLING VERIFICATION")
-        #     print(f"{'='*100}")
-            
-        #     if hasattr(st_dataset, '_debug_slide_counts'):
-        #         counts = st_dataset._debug_slide_counts
-        #         total = sum(counts.values())
-        #         print(f"📊 Total ST mini-subsets created so far: {total}")
-        #         for slide_id in sorted(counts.keys()):
-        #             count = counts[slide_id]
-        #             pct = (count / total * 100) if total > 0 else 0
-        #             print(f"   Slide {slide_id}: {count} subsets ({pct:.1f}%)")
-                
-        #         if hasattr(st_dataset, '_debug_samples') and len(st_dataset._debug_samples) > 0:
-        #             print(f"\n🔬 First 10 mini-subsets (detailed inspection):")
-        #             for s in st_dataset._debug_samples[:10]:
-        #                 print(f"\n   Sample #{s['sample_idx']}:")
-        #                 print(f"      Chosen slide: {s['slide']}")
-        #                 print(f"      Slide has {s['n_spots_in_slide']} spots (valid indices: 0-{s['n_spots_in_slide']-1})")
-        #                 print(f"      Center point: {s['center_idx']}")
-        #                 print(f"      Total sampled: {s['total_sampled']}")
-        #                 print(f"      First 20 indices: {s['sampled_indices']}")
-                        
-        #                 # Verify purity
-        #                 all_valid = all(0 <= idx < s['n_spots_in_slide'] for idx in s['sampled_indices'])
-                        
-        #                 if all_valid:
-        #                     print(f"      ✅ PURE: All indices valid for slide {s['slide']}")
-        #                 else:
-        #                     invalid = [idx for idx in s['sampled_indices'] if idx < 0 or idx >= s['n_spots_in_slide']]
-        #                     print(f"      ❌ CONTAMINATED: Invalid indices: {invalid}")
-        #     else:
-        #         print("⚠️  Debug tracking not initialized in st_dataset")
-            
-        #     print(f"{'='*100}\n")
-        # ========== END DEBUG ==========
-
-
         st_iter = iter(st_loader) if use_st else None
         sc_iter = iter(sc_loader) if use_sc else None
         
@@ -1313,10 +1246,8 @@ def train_stageC_diffusion_generator(
                 sigma_t = sigmas[t_idx].view(-1, 1, 1)
                 
                 # Generate V_0 using generator (works for both ST and SC)
-                # Generate V_0 using generator (works for both ST and SC)
                 V_0 = generator(H, mask)
                 # NEW: Only mask out padded entries, DO NOT normalize scale per mini-set
-                # V_0 = V_0 * mask.unsqueeze(-1).float()
                 
                 # Debug: Check V_0 scale variation (first 10 steps only)
                 if DEBUG and global_step < 10:
@@ -1388,10 +1319,6 @@ def train_stageC_diffusion_generator(
                 mask_fp32 = mask.float()
 
                 # ===== CORRECT EDM WEIGHTING FOR NOISE PREDICTION =====
-                # Convert EDM x_0 weight to noise weight: w_noise = λ(σ) * σ²
-                # λ(σ) = (σ² + σ_d²) / (σ·σ_d)²
-                # λ(σ) * σ² = (σ² + σ_d²) / σ_d²
-
                 sigma_t_squeezed = sigma_t_fp32.squeeze(-1)  # (B, N) or (B,)
                 if sigma_t_squeezed.dim() == 1:
                     sigma_t_squeezed = sigma_t_squeezed.unsqueeze(-1)  # (B, 1)
@@ -1443,6 +1370,7 @@ def train_stageC_diffusion_generator(
             # Initialize other losses
             L_gram = torch.tensor(0.0, device=device)
             L_gram_scale = torch.tensor(0.0, device=device)
+            L_knn_nca = torch.tensor(0.0, device=device)
             L_heat = torch.tensor(0.0, device=device)
             L_sw_st = torch.tensor(0.0, device=device)
             L_sw_sc = torch.tensor(0.0, device=device)
@@ -1456,8 +1384,6 @@ def train_stageC_diffusion_generator(
             L_radial = torch.zeros((), device=device)
             L_repel = torch.tensor(0.0, device=device)   # NEW: ST repulsion
             L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
-            L_z_nbr = torch.tensor(0.0, device=device)
-            L_knn_st = torch.tensor(0.0, device=device)
       
             # Denoise to get V_hat
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -1647,6 +1573,49 @@ def train_stageC_diffusion_generator(
 
                         # Use the same weighted approach to avoid divergence
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
+
+                # Add NCA loss computation
+                L_knn_nca = torch.tensor(0.0, device=device)
+                knn_nca_count = 0
+
+                with torch.autocast(device_type='cuda', enabled=False):
+                    knn_indices_batch = batch['knn_indices'].to(device)  # (B, N, k)
+                    
+                    for b in range(len(mask)):
+                        m = mask[b]
+                        n_valid = m.sum().item()
+                        
+                        if n_valid < 12:  # Skip very small minisets
+                            continue
+                        
+                        # Get predicted coordinates for this miniset
+                        V_pred_b = V_geom[b, m]  # (n_valid, 2)
+                        
+                        # Compute predicted distance matrix
+                        D_pred_b = torch.cdist(V_pred_b, V_pred_b)  # (n_valid, n_valid)
+                        
+                        # Get kNN indices (already in local indexing)
+                        knn_b = knn_indices_batch[b, m]  # (n_valid, k)
+                        
+                        # Filter out invalid kNN indices (-1)
+                        # Keep only neighbors that are in this miniset
+                        valid_knn_mask = knn_b >= 0
+                        
+                        # Compute NCA loss for this miniset
+                        L_nca_b = loss_knn_nca(
+                            D_pred=D_pred_b,
+                            knn_indices=knn_b,
+                            mask=None,  # Already filtered by m
+                            tau=1.0,
+                            k=15
+                        )
+                        
+                        L_knn_nca = L_knn_nca + L_nca_b
+                        knn_nca_count += 1
+                    
+                    if knn_nca_count > 0:
+                        L_knn_nca = L_knn_nca / knn_nca_count
+
                 
                 # Heat kernel loss (batched)
                 if (global_step % heat_every_k) == 0:
@@ -1812,55 +1781,6 @@ def train_stageC_diffusion_generator(
 
                         if DEBUG and (global_step % LOG_EVERY == 0):
                             print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
-
-                
-                # ===== ST k-NN RANKING LOSS (NEW) =====
-                # Directly optimizes neighbor identity preservation
-                L_knn_st = torch.tensor(0.0, device=device)
-                knn_st_count = 0
-                knn_st_active_sum = 0.0  # track active fraction for debugging
-                
-                KNN_ST_K_POS = 10       # true spatial neighbors
-                KNN_ST_K_NEG = 30       # far points to contrast against
-                KNN_ST_N_NEG = 3        # negatives per positive
-                KNN_ST_MARGIN_FRAC = 0.25  # fraction of (d_neg² - d_pos²) gap
-                KNN_ST_CAP = 15000      # triplet cap per mini-set
-                
-                with torch.autocast(device_type='cuda', enabled=False):
-                    D_true_batch = batch['D_target'].to(device).float()
-                    
-                    for b in range(batch_size_real):
-                        n_valid = int(n_list[b].item())
-                        if n_valid <= KNN_ST_K_POS + 2:
-                            continue
-                        
-                        V_b = V_geom[b, :n_valid].float()
-                        D_b = D_true_batch[b, :n_valid, :n_valid]
-                        
-                        L_b, active_frac, margin_used = uet.st_knn_ranking_loss(
-                            V_pred=V_b,
-                            D_true=D_b,
-                            k_pos=KNN_ST_K_POS,
-                            k_neg=KNN_ST_K_NEG,
-                            n_neg_sample=KNN_ST_N_NEG,
-                            margin_frac=KNN_ST_MARGIN_FRAC,
-                            triplet_cap=KNN_ST_CAP,
-                            return_stats=True
-                        )
-                        
-                        L_knn_st = L_knn_st + L_b
-                        knn_st_active_sum += active_frac
-                        knn_st_count += 1
-                    
-                    if knn_st_count > 0:
-                        L_knn_st = L_knn_st / knn_st_count
-                
-                # Debug logging: check if loss is active
-                if DEBUG and (global_step % LOG_EVERY == 0) and knn_st_count > 0:
-                    avg_active = knn_st_active_sum / knn_st_count
-                    print(f"[knn_st] step={global_step} loss={L_knn_st.item():.4f} "
-                          f"active_frac={avg_active:.3f} (target: 0.2-0.5)")
-
 
 
                 # ==================== NEW: REPULSION LOSS (ST ONLY) ====================
@@ -2121,50 +2041,6 @@ def train_stageC_diffusion_generator(
                         if batch_size_real > 0:
                             L_ordinal_sc = L_ordinal_sc / batch_size_real
 
-                # ---- (1b) Z-Neighbor Preservation Loss (NEW) ----
-                z_nbr_count = 0
-                K_Z_NBR = 30  # number of Z-neighbors to use
-                
-                with torch.autocast(device_type='cuda', enabled=False):
-                    for i in range(batch_size_real):
-                        n_valid = int(n_list[i].item())
-                        if n_valid <= K_Z_NBR + 1:
-                            continue
-                        
-                        V_i = V_hat[i, :n_valid].float()
-                        Z_i = Z_set[i, :n_valid].float()
-                        set_global_idx = sc_global_indices[i, :n_valid]
-                        
-                        # Filter valid indices
-                        mask_valid = set_global_idx >= 0
-                        if mask_valid.sum() <= K_Z_NBR + 1:
-                            continue
-                        
-                        set_global_idx = set_global_idx[mask_valid]
-                        V_i = V_i[mask_valid]
-                        Z_i = Z_i[mask_valid]
-                        
-                        # Get local indices of Z-neighbors that are in this set
-                        nbr_local = uet._gather_z_neighbors_in_set(
-                            set_global_idx=set_global_idx,
-                            pos_idx_cpu=POS_IDX,
-                            k_use=K_Z_NBR
-                        )
-                        
-                        # Compute loss
-                        L_i = uet.z_neighbor_preservation_loss(
-                            V_pred=V_i,
-                            Z_embed=Z_i,
-                            nbr_local=nbr_local,
-                            normalize=True
-                        )
-                        
-                        L_z_nbr = L_z_nbr + L_i
-                        z_nbr_count += 1
-                    
-                    if z_nbr_count > 0:
-                        L_z_nbr = L_z_nbr / z_nbr_count
-
                 # ---- (2) Sliced Wasserstein between paired SC sets (A,B) ----
                 L_sw_sc = torch.zeros((), device=device)
                 if (global_step % sw_every_k) == 0:
@@ -2325,34 +2201,28 @@ def train_stageC_diffusion_generator(
             score_multiplier = 1.0
 
 
-            # Base loss (always computed)
-            L_total = WEIGHTS['score'] * score_multiplier * L_score
+            L_total = (WEIGHTS['score'] * score_multiplier * L_score +
+                                WEIGHTS['gram'] * L_gram +
+                                WEIGHTS['gram_scale'] * L_gram_scale +
+                                WEIGHTS['heat'] * L_heat +
+                                WEIGHTS['sw_st'] * L_sw_st +
+                                WEIGHTS['sw_sc'] * L_sw_sc +
+                                WEIGHTS['overlap'] * L_overlap +
+                                WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
+                                WEIGHTS['st_dist'] * L_st_dist +
+                                WEIGHTS['edm_tail'] * L_edm_tail +      
+                                WEIGHTS['gen_align'] * L_gen_align +
+                                WEIGHTS['dim'] * L_dim +
+                                WEIGHTS['triangle'] * L_triangle +
+                                WEIGHTS['radial'] * L_radial +
+                                + WEIGHTS['knn_nca'] * L_knn_nca +
+                                WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
+                                WEIGHTS['shape'] * L_shape)       # NEW: ST shape/anisotropy
+
             
-            if not is_sc:  # ST batch
-                L_total = L_total + (
-                    WEIGHTS['gram'] * L_gram +
-                    WEIGHTS['gram_scale'] * L_gram_scale +
-                    WEIGHTS['heat'] * L_heat +
-                    WEIGHTS['sw_st'] * L_sw_st +
-                    WEIGHTS['st_dist'] * L_st_dist +
-                    WEIGHTS['edm_tail'] * L_edm_tail +
-                    WEIGHTS['gen_align'] * L_gen_align +
-                    WEIGHTS['dim'] * L_dim +
-                    WEIGHTS['triangle'] * L_triangle +
-                    WEIGHTS['radial'] * L_radial +
-                    WEIGHTS['repel'] * L_repel +
-                    WEIGHTS['shape'] * L_shape +
-                    WEIGHTS['knn_st'] * L_knn_st    # NEW
-                )
-            else:  # SC batch
-                L_total = L_total + (
-                    WEIGHTS['sw_sc'] * L_sw_sc +
-                    WEIGHTS['overlap'] * L_overlap +
-                    WEIGHTS['ordinal_sc'] * L_ordinal_sc +
-                    WEIGHTS['z_nbr'] * L_z_nbr +
-                    WEIGHTS['dim'] * L_dim_sc +
-                    WEIGHTS['triangle'] * L_triangle_sc
-                )
+            # Add SC dimension prior if this is an SC batch
+            if is_sc:
+                L_total = L_total + WEIGHTS['dim'] * L_dim_sc + WEIGHTS['triangle'] * L_triangle_sc
     
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
@@ -2617,6 +2487,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['st_dist'] += L_st_dist.item()
             epoch_losses['gram'] += L_gram.item()
             epoch_losses['gram_scale'] += L_gram_scale.item()
+            epoch_losses['knn_nca'] += L_knn_nca.item()
             epoch_losses['heat'] += L_heat.item()
             epoch_losses['sw_st'] += L_sw_st.item()
             epoch_losses['sw_sc'] += L_sw_sc.item()
@@ -2629,8 +2500,6 @@ def train_stageC_diffusion_generator(
             epoch_losses['radial'] += L_radial.item()
             epoch_losses['repel'] += L_repel.item()
             epoch_losses['shape'] += L_shape.item()
-            epoch_losses['z_nbr'] += L_z_nbr.item()
-            epoch_losses['knn_st'] += L_knn_st.item()
 
 
 
@@ -2689,28 +2558,26 @@ def train_stageC_diffusion_generator(
             
             # print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
-            # Print detailed losses every 5 epochs
-            if (epoch + 1) % 10 == 0:
+            # Print detailed losses every 5 epochs, simple summary otherwise
+            if (epoch + 1) % 5 == 0:
                 avg_gram_scale = epoch_losses['gram_scale'] / max(n_batches, 1)
                 avg_heat = epoch_losses['heat'] / max(n_batches, 1)
                 avg_sw_st = epoch_losses['sw_st'] / max(n_batches, 1)
                 avg_sw_sc = epoch_losses['sw_sc'] / max(n_batches, 1)
                 avg_overlap = epoch_losses['overlap'] / max(n_batches, 1)
                 avg_ordinal_sc = epoch_losses['ordinal_sc'] / max(n_batches, 1)
-                avg_z_nbr = epoch_losses['z_nbr'] / max(n_batches, 1) 
-                avg_knn_st = epoch_losses['knn_st'] / max(n_batches, 1) 
                 avg_st_dist = epoch_losses['st_dist'] / max(n_batches, 1)
                 avg_edm_tail = epoch_losses['edm_tail'] / max(n_batches, 1)
                 avg_gen_align = epoch_losses['gen_align'] / max(n_batches, 1)
                 avg_dim = epoch_losses['dim'] / max(n_batches, 1)
                 avg_triangle = epoch_losses['triangle'] / max(n_batches, 1)
                 avg_radial = epoch_losses['radial'] / max(n_batches, 1)
+                avg_knn_nca = epoch_losses['knn_nca'] / max(n_batches, 1)
                 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
-                print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f} | knn_st={avg_knn_st:.4f}")
-                print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f}")
-                print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | z_nbr={avg_z_nbr:.4f} | st_dist={avg_st_dist:.4f}")  # ← UPDATED LINE
+                print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f} | knn_nca={avg_knn_nca:.4f}")
+                print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
                 print(f"  dim={avg_dim:.4f} | triangle={avg_triangle:.4f} | radial={avg_radial:.4f}")
 
@@ -2783,6 +2650,14 @@ def train_stageC_diffusion_generator(
             should_stop_tensor = torch.tensor([1.0 if should_stop else 0.0], device=fabric.device)
             fabric.broadcast(should_stop_tensor, src=0)
             should_stop = should_stop_tensor.item() > 0.5
+
+        # ALL ranks break together
+        # if should_stop:
+        #     # CDelete iterator references to allow clean exit
+        #     del st_iter
+        #     if sc_iter is not None:
+        #         del sc_iter
+        #     break
         
         scheduler.step()
 
@@ -2792,8 +2667,8 @@ def train_stageC_diffusion_generator(
             WEIGHTS['heat'] = HEAT_TARGET_WEIGHT
 
         # Adjust weights after initial epochs
-        # if epoch == 5:
-        #     print("\n⚡ [Weight Adjustment] Reducing overlap weight from 0.25 → 0.15")
+        if epoch == 5:
+            print("\n⚡ [Weight Adjustment] Reducing overlap weight from 0.25 → 0.15")
             # WEIGHTS['overlap'] = 0.15
 
         # MLflow logging
@@ -2840,14 +2715,13 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial',\
-                        'st_dist', 'repel', 'shape', 'knn_st'):  # ADD knn_st
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'knn_nca'):
                 return cnt_st
-            if key in ('sw_sc', 'ordinal_sc', 'z_nbr'):
+            if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
             if key == 'overlap':
                 return sum_overlap_batches
-            return sum_batches
+            return sum_batches  # 'total' and 'score'
 
 
         # compute true epoch means
@@ -2867,13 +2741,12 @@ def train_stageC_diffusion_generator(
             WEIGHTS['score']    * epoch_losses['score']    +
             WEIGHTS['gram']     * epoch_losses['gram']     +
             WEIGHTS['gram_scale'] * epoch_losses['gram_scale'] +
+            WEIGHTS['knn_nca'] * epoch_losses['knn_nca'] +
             WEIGHTS['heat']     * epoch_losses['heat']     +
             WEIGHTS['sw_st']    * epoch_losses['sw_st']    +
             WEIGHTS['sw_sc']    * epoch_losses['sw_sc']    +
             WEIGHTS['overlap']  * epoch_losses['overlap']  +
             WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc'] +
-            WEIGHTS['z_nbr'] * epoch_losses['z_nbr'] +
-            WEIGHTS['knn_st'] * epoch_losses['knn_st'] +    # NEW
             WEIGHTS['st_dist']  * epoch_losses['st_dist']  +   
             WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
             WEIGHTS['gen_align']* epoch_losses['gen_align']+

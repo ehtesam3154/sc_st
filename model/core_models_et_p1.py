@@ -262,6 +262,7 @@ class STTargets:
     triplets: torch.Tensor   # (T, 3) ordinal triplets
     k: int                   # kNN parameter
     scale: float             # normalization scale factor
+    knn_indices: torch.Tensor  # (n, k) k-NN indices for each spot
 
 
 class STStageBPrecomputer:
@@ -324,6 +325,26 @@ class STStageBPrecomputer:
         # 2. Pairwise distances & Gram
         D = torch.cdist(y_hat, y_hat, p=2)
         G = uet.gram_from_coords(y_hat)
+
+
+        # Compute k-NN indices for each spot
+        # Shape: (n, k) where knn_indices[i, :] are the k nearest neighbors of spot i
+        knn_k = self.k  # Use the k parameter from __init__
+        n_spots = y_hat.shape[0]
+        knn_indices = torch.zeros(n_spots, knn_k, dtype=torch.long, device=device)
+
+        for i in range(n_spots):
+            # Get distances from spot i to all others
+            dists_from_i = D[i]  # (n,)
+            # Set self-distance to infinity to exclude
+            dists_from_i_copy = dists_from_i.clone()
+            dists_from_i_copy[i] = float('inf')
+            # Get indices of k smallest distances
+            _, indices = torch.topk(dists_from_i_copy, k=min(knn_k, n_spots-1), largest=False)
+            knn_indices[i, :len(indices)] = indices
+            # If we have fewer than k neighbors, pad with -1
+            if len(indices) < knn_k:
+                knn_indices[i, len(indices):] = -1
         
         # 3. Distance histogram
         d_95 = torch.quantile(D[torch.triu(torch.ones_like(D), diagonal=1).bool()], 0.95)
@@ -348,7 +369,8 @@ class STStageBPrecomputer:
             k=self.k,
             sigma_policy=self.sigma_policy,
             triplets=triplets,
-            Z_indices=Z_indices
+            Z_indices=Z_indices,
+            knn_indices=knn_indices
         )
         
         return targets
@@ -409,6 +431,24 @@ class STStageBPrecomputer:
             edge_index, edge_weight = uet.build_knn_graph(y_hat, k=self.k, device=self.device)
             L = uet.compute_graph_laplacian(edge_index, edge_weight, n)
 
+            # Compute k-NN indices for each spot
+            knn_k = self.k
+            n_spots = y_hat.shape[0]
+            knn_indices = torch.zeros(n_spots, knn_k, dtype=torch.long, device=self.device)
+
+            for i in range(n_spots):
+                # Get distances from spot i to all others
+                dists_from_i = D[i]  # (n,)
+                # Set self-distance to infinity to exclude
+                dists_from_i_copy = dists_from_i.clone()
+                dists_from_i_copy[i] = float('inf')
+                # Get indices of k smallest distances
+                _, indices = torch.topk(dists_from_i_copy, k=min(knn_k, n_spots-1), largest=False)
+                knn_indices[i, :len(indices)] = indices
+                # If we have fewer than k neighbors, pad with -1
+                if len(indices) < knn_k:
+                    knn_indices[i, len(indices):] = -1
+
             targets = STTargets(
                 y_hat=y_hat.cpu(),
                 G=G.cpu(),
@@ -419,7 +459,8 @@ class STStageBPrecomputer:
                 t_list=self.t_list,
                 triplets=triplets.cpu(),
                 k=self.k,
-                scale=scale
+                scale=scale,
+                knn_indices=knn_indices.cpu()
             )
             
             targets_dict[slide_id] = targets
@@ -456,7 +497,7 @@ class STSetDataset(Dataset):
         self.knn_k = knn_k  # Store knn_k
         self.device = device
         self.slide_ids = list(targets_dict.keys())
-        self.landmarks_L = landmarks_L
+        self.landmarks_L = 0
         
         # Precompute encoder embeddings for all slides
         self.Z_dict = {}
@@ -570,6 +611,21 @@ class STSetDataset(Dataset):
         # Store actual base size BEFORE adding landmarks
         base_n = indices.shape[0]
 
+        # Extract kNN indices for this miniset
+        # targets.knn_indices is (m, k_full) in global indexing
+        # We need to map to local indexing [0..n-1]
+
+        # Create mapping from global to local indices
+        global_to_local = torch.full((m,), -1, dtype=torch.long)
+        global_to_local[indices] = torch.arange(n, dtype=torch.long)
+
+        # Get kNN indices for selected spots (still in global indexing)
+        knn_global = targets.knn_indices[indices]  # (n, k)
+
+        # Map to local indexing
+        knn_local = global_to_local[knn_global]  # (n, k)
+        # Any neighbor not in this miniset will be -1 (invalid)
+
         # ------------------------------------------------------------------
         # Landmarks via FPS in embedding space (unchanged)
         # ------------------------------------------------------------------
@@ -627,29 +683,29 @@ class STSetDataset(Dataset):
 
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
 
-        if debug_this_sample:
-            # ===== DEBUG: Full diagnostics =====
-            G_diag = torch.diag(G_subset)
-            D_subset_check = targets.D[indices][:, indices]
+        # if debug_this_sample:
+        #     # ===== DEBUG: Full diagnostics =====
+        #     G_diag = torch.diag(G_subset)
+        #     D_subset_check = targets.D[indices][:, indices]
             
-            V_target_rms = V_target.pow(2).mean().sqrt()
-            D_vtarget = torch.cdist(V_target, V_target)
-            D_vtarget_nodiag = D_vtarget + torch.eye(len(V_target), device=V_target.device) * 1e10
-            nn_dists_vt = D_vtarget_nodiag.min(dim=1)[0]
-            triu_mask_vt = torch.triu(torch.ones_like(D_vtarget, dtype=torch.bool), diagonal=1)
-            D_recon = torch.cdist(y_hat_centered, y_hat_centered)
+        #     V_target_rms = V_target.pow(2).mean().sqrt()
+        #     D_vtarget = torch.cdist(V_target, V_target)
+        #     D_vtarget_nodiag = D_vtarget + torch.eye(len(V_target), device=V_target.device) * 1e10
+        #     nn_dists_vt = D_vtarget_nodiag.min(dim=1)[0]
+        #     triu_mask_vt = torch.triu(torch.ones_like(D_vtarget, dtype=torch.bool), diagonal=1)
+        #     D_recon = torch.cdist(y_hat_centered, y_hat_centered)
             
-            print(f"\n[DEBUG STSetDataset #{idx}] n={len(indices)}")
-            print(f"  y_hat_subset RMS: {torch.sqrt((y_hat_subset**2).mean()):.6f}")
-            print(f"  y_hat_centered RMS: {torch.sqrt((y_hat_centered**2).mean()):.6f}")
-            print(f"  G_subset diagonal: min={G_diag.min():.6f}, max={G_diag.max():.6f}, mean={G_diag.mean():.6f}")
-            print(f"  D_subset from targets: p50={D_subset_check[triu_mask_vt].quantile(0.5):.6f}, p95={D_subset_check[triu_mask_vt].quantile(0.95):.6f}")
-            print(f"  V_target shape: {V_target.shape}, RMS: {V_target_rms:.6f}")
-            print(f"  V_target distances - p15: {D_vtarget[triu_mask_vt].quantile(0.15):.6f}, p50: {D_vtarget[triu_mask_vt].quantile(0.50):.6f}, p95: {D_vtarget[triu_mask_vt].quantile(0.95):.6f}")
-            print(f"  V_target NN dist - min: {nn_dists_vt.min():.6f}, p15: {nn_dists_vt.quantile(0.15):.6f}, median: {nn_dists_vt.median():.6f}")
-            print(f"  y_hat_centered distances - p50: {D_recon[triu_mask_vt].quantile(0.50):.6f}, p95: {D_recon[triu_mask_vt].quantile(0.95):.6f}")
-            print(f"  Distance preservation error: {(D_vtarget[triu_mask_vt] - D_recon[triu_mask_vt]).abs().mean():.6f}")
-            print("="*60)
+        #     print(f"\n[DEBUG STSetDataset #{idx}] n={len(indices)}")
+        #     print(f"  y_hat_subset RMS: {torch.sqrt((y_hat_subset**2).mean()):.6f}")
+        #     print(f"  y_hat_centered RMS: {torch.sqrt((y_hat_centered**2).mean()):.6f}")
+        #     print(f"  G_subset diagonal: min={G_diag.min():.6f}, max={G_diag.max():.6f}, mean={G_diag.mean():.6f}")
+        #     print(f"  D_subset from targets: p50={D_subset_check[triu_mask_vt].quantile(0.5):.6f}, p95={D_subset_check[triu_mask_vt].quantile(0.95):.6f}")
+        #     print(f"  V_target shape: {V_target.shape}, RMS: {V_target_rms:.6f}")
+        #     print(f"  V_target distances - p15: {D_vtarget[triu_mask_vt].quantile(0.15):.6f}, p50: {D_vtarget[triu_mask_vt].quantile(0.50):.6f}, p95: {D_vtarget[triu_mask_vt].quantile(0.95):.6f}")
+        #     print(f"  V_target NN dist - min: {nn_dists_vt.min():.6f}, p15: {nn_dists_vt.quantile(0.15):.6f}, median: {nn_dists_vt.median():.6f}")
+        #     print(f"  y_hat_centered distances - p50: {D_recon[triu_mask_vt].quantile(0.50):.6f}, p95: {D_recon[triu_mask_vt].quantile(0.95):.6f}")
+        #     print(f"  Distance preservation error: {(D_vtarget[triu_mask_vt] - D_recon[triu_mask_vt]).abs().mean():.6f}")
+        #     print("="*60)
 
         edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n_nodes=len(indices))
@@ -678,7 +734,8 @@ class STSetDataset(Dataset):
             'L_info': L_info,
             'triplets': triplets_subset,
             'n': len(indices),
-            'overlap_info': overlap_info
+            'overlap_info': overlap_info,
+            'knn_indices': knn_local,
         }
 
 
@@ -714,6 +771,10 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     H_bins_batch = []
     overlap_info_batch = []
 
+    knn_k = batch[0]['knn_indices'].shape[1]  # Get k from first item
+    knn_batch = torch.full((batch_size, n_max, knn_k), -1, dtype=torch.long, device=device)
+
+
     
     for i, item in enumerate(batch):
         n = item['n']
@@ -729,6 +790,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         triplets_batch.append(item['triplets'])
         H_bins_batch.append(item['H_bins'])
         overlap_info_batch.append(item['overlap_info'])
+        knn_batch[i, :n] = item['knn_indices']
     
     return {
         'Z_set': Z_batch,
@@ -743,7 +805,8 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'n': n_batch,
         'overlap_info': overlap_info_batch,
         'is_landmark': is_landmark_batch,  # ADD THIS
-        'is_sc': False 
+        'is_sc': False,
+        'knn_indices': knn_batch,
     }
 
 class SCSetDataset(Dataset):

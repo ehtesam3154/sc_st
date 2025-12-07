@@ -12,15 +12,6 @@ from scipy import sparse
 from scipy.spatial.distance import pdist, squareform
 from sklearn.neighbors import NearestNeighbors
 import warnings
-import scipy.sparse as sp
-from scipy.sparse.csgraph import shortest_path
-from scipy.spatial.distance import pdist, squareform
-from functools import lru_cache
-import torch.distributed as dist
-import math 
-from sklearn.neighbors import kneighbors_graph
-from typing import Dict
-
 
 # ==============================================================================
 # PART 1: POSE NORMALIZATION (reuse existing for continuity)
@@ -583,7 +574,10 @@ def safe_eigh(A, cpu=False, return_vecs=True, regularize=1e-6):
         return eigvals, None
 
 
-
+# utils_et.py
+import torch
+import torch.nn.functional as F
+from functools import lru_cache
 
 # def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
 #     """
@@ -610,6 +604,7 @@ def safe_eigh(A, cpu=False, return_vecs=True, regularize=1e-6):
 #         counts = torch.bincount(flat, minlength=B * nb).view(B, nb).float()
 #         return counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
 
+import torch
 
 @torch.no_grad()
 def compute_distance_hist(
@@ -704,6 +699,9 @@ def compute_distance_hist(
         raise ValueError(f"compute_distance_hist: expected D dim 2 or 3, got {D.dim()}")
 
 
+import torch
+import torch.nn.functional as F
+
 def _get_device_for_build(x: torch.Tensor) -> torch.device:
     if x.is_cuda:
         return x.device
@@ -724,6 +722,7 @@ def build_topk_index(
     - If torch.distributed is initialized, rank 0 computes once and broadcasts to all ranks.
     - Returns a CPU pinned (N, K) LongTensor for fast DataLoader use.
     """
+    import torch.distributed as dist
 
     device = _get_device_for_build(Z_all)
     Z = Z_all.to(device, non_blocking=True).contiguous()
@@ -1546,7 +1545,9 @@ def build_knn_graph(
     else:
         return edge_index.long(), None
 
-
+import math 
+import torch
+import torch.nn as nn
 
 #fast heat trace via strochastic lanczos quadratur (dense L)
 @torch.no_grad()
@@ -1625,7 +1626,8 @@ def heat_trace_slq_dense(L, t_list, num_probe=4, m=12):
     return traces  # per-node trace, roughly in [e^{-2t}, 1] for normalized L
 
 
-
+import torch
+import torch.nn.functional as F
 
 @torch.no_grad()
 def _upper_tri_vec(D):
@@ -1680,6 +1682,7 @@ def wasserstein_1d_quantile_loss(
 
     return diff.mean()
 
+import torch
 
 def farthest_point_sampling(Z: torch.Tensor, k: int, device='cpu') -> torch.Tensor:
     """
@@ -1738,6 +1741,11 @@ def mds_from_latent(X: torch.Tensor, d_out: int = 2) -> torch.Tensor:
     
     return coords
 
+# Add these imports at the top if not already present
+import scipy.sparse as sp
+from scipy.sparse.csgraph import shortest_path
+from scipy.spatial.distance import pdist, squareform
+
 def affine_whitening(coords: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, float]:
     """
     Affine whitening with eigendecomp. Returns whitened coords and scale factor.
@@ -1773,6 +1781,7 @@ def compute_geodesic_distances(coords: torch.Tensor, k: int = 15, device: str = 
     coords_np = coords.cpu().numpy()
     
     # Build kNN graph with Euclidean edge weights
+    from sklearn.neighbors import kneighbors_graph
     knn_graph = kneighbors_graph(coords_np, n_neighbors=k, mode='distance', metric='euclidean', include_self=False)
     
     # Symmetrize
@@ -1895,7 +1904,9 @@ def create_sc_miniset_pair(
     return indices_A, indices_B, shared_in_A, shared_in_B
 
 
-
+import torch
+import torch.nn.functional as F
+from typing import Dict
 
 @torch.no_grad()
 def build_sc_knn_cache(
@@ -2140,6 +2151,7 @@ def init_st_dist_bins_from_data(
     Build distance bin edges automatically from ST coordinates.
     Returns: torch.tensor of shape (n_bins+1,) = bin edges (increasing).
     """
+    from scipy.spatial.distance import pdist
     
     # coords: use a random subset if huge
     if coords.shape[0] > 2000:
@@ -2456,6 +2468,7 @@ def precompute_st_graph_fixed(
         - sigma: bandwidth used
         - N_total: total number of nodes
     """
+    from sklearn.neighbors import NearestNeighbors
     
     N_total = y_hat.shape[0]
     device = y_hat.device
@@ -3093,257 +3106,128 @@ class RadialHistogramLoss(nn.Module):
         
         return V_canon
 
-# ==============================================================================
-# Z-SPACE NEIGHBORHOOD PRESERVATION LOSS
-# ==============================================================================
 
-@torch.no_grad()
-def _gather_z_neighbors_in_set(
-    set_global_idx: torch.Tensor,    # (n_valid,) global indices of cells in this set
-    pos_idx_cpu: torch.Tensor,       # (N_total, k_pos) precomputed global k-NN
-    k_use: int = 15                  # how many neighbors to use
-) -> torch.Tensor:
+class KNNSoftmaxLoss(nn.Module):
     """
-    For each cell in set, find which of its Z-space k-NN are also in the set.
-    Returns: (n_valid, k_use) local indices, padded with -1 where neighbor not in set.
+    NCA/SNE-style neighbor preservation loss.
+    
+    For each anchor point i, defines target distribution P_ij over neighbors
+    (uniform over k-NN, zero elsewhere), and predicted distribution Q_ij 
+    from softmax over predicted distances.
+    
+    Loss = sum_i sum_j P_ij * (-log Q_ij)  (cross-entropy)
+    
+    Args:
+        tau: Temperature for softmax (smaller = sharper)
+        k: Number of nearest neighbors to preserve
     """
-    n_valid = set_global_idx.numel()
-    device = set_global_idx.device
     
-    # Build reverse map: global_idx -> local position in set
-    # Use a tensor for O(1) lookup (max global index bounded)
-    max_global = int(set_global_idx.max().item()) + 1
-    global_to_local = torch.full((max_global,), -1, dtype=torch.long, device=device)
-    local_positions = torch.arange(n_valid, device=device)
-    global_to_local[set_global_idx] = local_positions
+    def __init__(self, tau: float = 1.0, k: int = 10):
+        super().__init__()
+        self.tau = tau
+        self.k = k
     
-    # For each cell, get its global k-NN and map to local
-    # pos_idx_cpu is (N_total, k_pos), we need rows for our set's global indices
-    k_pos_avail = pos_idx_cpu.shape[1]
-    k_actual = min(k_use, k_pos_avail)
-    
-    # Gather global neighbor indices for cells in this set
-    set_global_np = set_global_idx.cpu()
-    nbr_global = pos_idx_cpu[set_global_np, :k_actual].to(device)  # (n_valid, k_actual)
-    
-    # Map to local indices (-1 if neighbor not in set)
-    nbr_global_clamped = nbr_global.clamp(0, max_global - 1)
-    nbr_local = global_to_local[nbr_global_clamped]  # (n_valid, k_actual)
-    
-    # Mark out-of-range neighbors as -1
-    out_of_range = (nbr_global < 0) | (nbr_global >= max_global)
-    nbr_local[out_of_range] = -1
-    
-    return nbr_local
-
-def z_neighbor_preservation_loss(
-    V_pred: torch.Tensor,           # (n_valid, D) predicted coordinates
-    Z_embed: torch.Tensor,          # (n_valid, h) Z-space embeddings
-    nbr_local: torch.Tensor,        # (n_valid, k) local indices of Z-neighbors, -1 = invalid
-    normalize: bool = True,
-    eps: float = 1e-6
-) -> torch.Tensor:
-    """
-    Penalize when Z-space neighbors are far apart in predicted V-space.
-    
-    Loss = mean over anchors of mean over valid neighbors of:
-        (d_V(i,j) / mean_d_V - d_Z(i,j) / mean_d_Z)^2
-    
-    This is a local, sampled Gromov-Wasserstein style constraint.
-    """
-    n_valid, k = nbr_local.shape
-    device = V_pred.device
-    
-    if n_valid < 2 or k == 0:
-        return V_pred.new_tensor(0.0)
-    
-    # Compute all pairwise distances in V and Z (only for this mini-set, so cheap)
-    D_V = torch.cdist(V_pred, V_pred)  # (n_valid, n_valid)
-    D_Z = torch.cdist(Z_embed, Z_embed)  # (n_valid, n_valid)
-    
-    # Gather neighbor distances
-    # nbr_local: (n_valid, k), values in [0, n_valid-1] or -1
-    valid_mask = nbr_local >= 0  # (n_valid, k)
-    
-    if not valid_mask.any():
-        return V_pred.new_tensor(0.0)
-    
-    # Safe gather with clamped indices
-    nbr_clamped = nbr_local.clamp(0, n_valid - 1)
-    
-    # For each anchor i, gather distances to its neighbors
-    anchor_idx = torch.arange(n_valid, device=device).unsqueeze(1).expand(-1, k)  # (n_valid, k)
-    
-    d_V_nbr = D_V[anchor_idx, nbr_clamped]  # (n_valid, k)
-    d_Z_nbr = D_Z[anchor_idx, nbr_clamped]  # (n_valid, k)
-    
-    # Mask invalid entries
-    d_V_nbr = d_V_nbr * valid_mask.float()
-    d_Z_nbr = d_Z_nbr * valid_mask.float()
-    
-    if normalize:
-        # Normalize by mean distance (allows global scale difference)
-        d_V_mean = d_V_nbr[valid_mask].mean().clamp(min=eps)
-        d_Z_mean = d_Z_nbr[valid_mask].mean().clamp(min=eps)
+    def forward(
+        self,
+        D_pred: torch.Tensor,
+        knn_indices: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        tau: Optional[float] = None,
+        k: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Compute NCA-style neighbor softmax loss.
         
-        d_V_norm = d_V_nbr / d_V_mean
-        d_Z_norm = d_Z_nbr / d_Z_mean
-    else:
-        d_V_norm = d_V_nbr
-        d_Z_norm = d_Z_nbr
-    
-    # Squared difference, only for valid neighbors
-    diff_sq = (d_V_norm - d_Z_norm).pow(2) * valid_mask.float()
-    
-    # Mean over valid entries
-    loss = diff_sq.sum() / valid_mask.float().sum().clamp(min=1.0)
-    
-    return loss
+        Args:
+            D_pred: (B, N, N) or (N, N) predicted distance matrix
+            knn_indices: (B, N, k_precomputed) or (N, k_precomputed) ground truth k-NN indices
+            mask: (B, N) or (N,) optional validity mask
+            tau: Optional temperature override
+            k: Optional k override - will use first k neighbors from knn_indices
+            
+        Returns:
+            loss: Scalar cross-entropy loss
+        """
+        if tau is None:
+            tau = self.tau
+        if k is None:
+            k = self.k
+        
+        # ADD THIS BLOCK - Slice knn_indices to use only first k neighbors
+        if knn_indices.shape[-1] > k:
+            knn_indices = knn_indices[..., :k]  # Take first k neighbors only
+        elif knn_indices.shape[-1] < k:
+            # If precomputed k is smaller than requested k, use what we have
+            k = knn_indices.shape[-1]
+        # END OF NEW BLOCK
+        
+        is_batched = D_pred.dim() == 3
+        
+        if not is_batched:
+            # Add batch dimension
+            D_pred = D_pred.unsqueeze(0)          # (1, N, N)
+            knn_indices = knn_indices.unsqueeze(0)  # (1, N, k)
+            if mask is not None:
+                mask = mask.unsqueeze(0)  # (1, N)
+        
+        B, N, _ = D_pred.shape
+        device = D_pred.device
+        
+        # Create target distribution P_ij: uniform over k-NN, zero elsewhere
+        # Shape: (B, N, N)
+        P = torch.zeros(B, N, N, device=device, dtype=D_pred.dtype)
+        
+        # For each batch and each anchor i, set P[b,i,j]=1/k for j in knn_indices[b,i]
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, N, k)
+        anchor_idx = torch.arange(N, device=device).view(1, N, 1).expand(B, N, k)
+        
+        # Handle invalid kNN indices (padded with -1)
+        valid_knn = knn_indices >= 0  # (B, N, k)
 
+        # Set P values only for valid neighbors
+        for b in range(B):
+            for i in range(N):
+                valid_mask = valid_knn[b, i]  # (k,) boolean mask
+                valid_neighbors = knn_indices[b, i, valid_mask]  # Get only valid neighbor indices
+                if len(valid_neighbors) > 0:
+                    P[b, i, valid_neighbors] = 1.0 / len(valid_neighbors)
 
-# ==============================================================================
-# ST SPATIAL k-NN RANKING LOSS (GPU-EFFICIENT, DATA-DRIVEN MARGIN)
-# ==============================================================================
+        # if (P > 0).any():
+        #     print("NCA: has neighbors, mean P mass per anchor =",
+        #         (P.sum(dim=2) > 0).float().mean().item())
+        # else:
+        #     print("NCA: WARNING – P is all zeros")
 
-@torch.no_grad()
-def build_st_knn_triplets_batched(
-    D_true: torch.Tensor,      # (n_valid, n_valid) ground-truth distance matrix
-    k_pos: int = 10,           # number of positive neighbors per anchor
-    k_neg: int = 30,           # number of negative (far) neighbors per anchor  
-    n_neg_sample: int = 3,     # negatives to sample per positive
-    triplet_cap: int = 20000,  # max triplets to return
-) -> tuple:
-    """
-    Build triplets from ground-truth ST distances. Fully vectorized, GPU-friendly.
-    
-    For each anchor i:
-      - positives = k_pos nearest spatial neighbors
-      - negatives = k_neg farthest spatial neighbors
-    
-    Returns: 
-        triplets: (T, 3) LongTensor of [anchor, positive, negative] indices
-        d_pos_med_sq: median squared distance for positive pairs
-        d_neg_med_sq: median squared distance for negative pairs
-    """
-    device = D_true.device
-    n = D_true.shape[0]
-    
-    if n <= k_pos + 2:
-        return (torch.zeros((0, 3), dtype=torch.long, device=device),
-                torch.tensor(0.0, device=device),
-                torch.tensor(1.0, device=device))
-    
-    # Sort distances per anchor (ascending)
-    dist_sorted, sorted_idx = torch.sort(D_true, dim=1)
-    dist_sorted = dist_sorted[:, 1:]  # drop self
-    sorted_idx = sorted_idx[:, 1:]    # drop self
-    
-    # Positives: first k_pos neighbors (closest)
-    k_pos_actual = min(k_pos, sorted_idx.shape[1])
-    pos_idx = sorted_idx[:, :k_pos_actual]       # (n, k_pos)
-    pos_dists = dist_sorted[:, :k_pos_actual]    # (n, k_pos)
-    
-    # Negatives: last k_neg neighbors (farthest)
-    k_neg_actual = min(k_neg, sorted_idx.shape[1] - k_pos_actual)
-    if k_neg_actual <= 0:
-        return (torch.zeros((0, 3), dtype=torch.long, device=device),
-                torch.tensor(0.0, device=device),
-                torch.tensor(1.0, device=device))
-    neg_idx = sorted_idx[:, -k_neg_actual:]      # (n, k_neg)
-    neg_dists = dist_sorted[:, -k_neg_actual:]   # (n, k_neg)
-    
-    # Compute median squared distances for margin calculation
-    d_pos_med_sq = pos_dists.pow(2).median()
-    d_neg_med_sq = neg_dists.pow(2).median()
-    
-    # Build triplets vectorized
-    n_anchors = n
-    n_pos = k_pos_actual
-    n_neg = k_neg_actual
-    
-    triplets_per_anchor = n_pos * n_neg_sample
-    
-    # Generate anchor indices
-    anchors = torch.arange(n_anchors, device=device).unsqueeze(1).expand(-1, triplets_per_anchor).reshape(-1)
-    
-    # Generate positive indices
-    pos_expanded = pos_idx.unsqueeze(2).expand(-1, -1, n_neg_sample).reshape(n_anchors, -1)
-    positives = pos_expanded.reshape(-1)
-    
-    # Generate negative indices (random sample)
-    neg_samples = torch.randint(0, n_neg, (n_anchors, n_pos, n_neg_sample), device=device)
-    neg_gathered = torch.gather(neg_idx.unsqueeze(1).expand(-1, n_pos, -1), 2, neg_samples)
-    negatives = neg_gathered.reshape(-1)
-    
-    triplets = torch.stack([anchors, positives, negatives], dim=1)
-    
-    # Cap if too many
-    if triplets.shape[0] > triplet_cap:
-        sel = torch.randperm(triplets.shape[0], device=device)[:triplet_cap]
-        triplets = triplets[sel]
-    
-    return triplets, d_pos_med_sq, d_neg_med_sq
-
-
-def st_knn_ranking_loss(
-    V_pred: torch.Tensor,       # (n_valid, D) predicted coordinates
-    D_true: torch.Tensor,       # (n_valid, n_valid) ground-truth distances
-    k_pos: int = 10,
-    k_neg: int = 30,
-    n_neg_sample: int = 3,
-    margin_frac: float = 0.25,  # fraction of gap to use as margin
-    triplet_cap: int = 20000,
-    return_stats: bool = False, # return active fraction for debugging
-) -> torch.Tensor:
-    """
-    Ranking loss: true spatial neighbors should remain closer than true far points
-    in the predicted coordinate space.
-    
-    Data-driven margin: margin = margin_frac * (d_neg_med² - d_pos_med²)
-    This adapts to the actual distance scale in each mini-set.
-    """
-    device = V_pred.device
-    n = V_pred.shape[0]
-    
-    if n <= k_pos + 2:
-        if return_stats:
-            return V_pred.new_tensor(0.0), 0.0, 0.0
-        return V_pred.new_tensor(0.0)
-    
-    # Build triplets and get distance statistics
-    triplets, d_pos_med_sq, d_neg_med_sq = build_st_knn_triplets_batched(
-        D_true=D_true,
-        k_pos=k_pos,
-        k_neg=k_neg,
-        n_neg_sample=n_neg_sample,
-        triplet_cap=triplet_cap
-    )
-    
-    if triplets.shape[0] == 0:
-        if return_stats:
-            return V_pred.new_tensor(0.0), 0.0, 0.0
-        return V_pred.new_tensor(0.0)
-    
-    # Compute data-driven margin
-    gap_sq = (d_neg_med_sq - d_pos_med_sq).clamp(min=1e-6)
-    margin = margin_frac * gap_sq
-    
-    # Compute predicted distances for triplets
-    a_idx, p_idx, n_idx = triplets[:, 0], triplets[:, 1], triplets[:, 2]
-    
-    Va = V_pred[a_idx]
-    Vp = V_pred[p_idx]
-    Vn = V_pred[n_idx]
-    
-    d_ap_sq = (Va - Vp).pow(2).sum(dim=1)
-    d_an_sq = (Va - Vn).pow(2).sum(dim=1)
-    
-    # Margin ranking loss
-    delta = d_ap_sq - d_an_sq + margin
-    loss = torch.relu(delta).mean()
-    
-    if return_stats:
-        active_frac = (delta > 0).float().mean().item()
-        return loss, active_frac, margin.item()
-    
-    return loss
+            
+        # Compute predicted distribution Q_ij from softmax over distances
+        # Q_ij = exp(-d_ij^2 / tau) / sum_l exp(-d_il^2 / tau)
+        
+        # Negative squared distances (for numerical stability)
+        neg_sq_dist = -(D_pred ** 2) / tau  # (B, N, N)
+        
+        # Mask out self-connections (diagonal)
+        eye = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
+        neg_sq_dist = neg_sq_dist.masked_fill(eye, -float('inf'))
+        
+        # Apply validity mask if provided
+        if mask is not None:
+            # Mask both anchors and neighbors
+            anchor_mask = mask.unsqueeze(2)  # (B, N, 1)
+            neighbor_mask = mask.unsqueeze(1)  # (B, 1, N)
+            valid_pairs = anchor_mask & neighbor_mask  # (B, N, N)
+            neg_sq_dist = neg_sq_dist.masked_fill(~valid_pairs, -float('inf'))
+        
+        # Softmax to get Q
+        Q = F.softmax(neg_sq_dist, dim=2)  # (B, N, N)
+        
+        # Cross-entropy: -sum_j P_ij * log(Q_ij)
+        # Add epsilon to avoid log(0)
+        loss_per_anchor = -(P * torch.log(Q + 1e-12)).sum(dim=2)  # (B, N)
+        
+        # Average over valid anchors
+        if mask is not None:
+            loss = (loss_per_anchor * mask).sum() / mask.sum().clamp(min=1.0)
+        else:
+            loss = loss_per_anchor.mean()
+        
+        return loss

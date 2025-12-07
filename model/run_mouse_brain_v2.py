@@ -86,11 +86,12 @@ def parse_args():
     parser.add_argument('--enable_early_stop', action='store_true', default=False)
     parser.add_argument('--early_stop_patience', type=int, default=10)
     parser.add_argument('--early_stop_min_epochs', type=int, default=20)
+    parser.add_argument('--early_stop_threshold', type=float, default=0.01)
     
     # Inference
     parser.add_argument('--skip_inference', action='store_true', default=False)
     parser.add_argument('--n_timesteps_sample', type=int, default=500)
-    parser.add_argument('--guidance_scale', type=float, default=3.0)
+    parser.add_argument('--guidance_scale', type=float, default=2.0)
     
     # Output
     parser.add_argument('--outdir', type=str, default='gems_v2_output')
@@ -312,7 +313,7 @@ def run_inference_and_evaluate(model, sc_expr, scadata, outdir, timestamp, args)
         n_timesteps_sample=args.n_timesteps_sample,
         sigma_min=0.01,
         sigma_max=3.0,
-        patch_size=384,
+        patch_size=256,
         coverage_per_cell=4.0,
         n_align_iters=10,
         eta=0.0,
@@ -643,6 +644,7 @@ def main(args=None):
         enable_early_stop=args.enable_early_stop,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_epochs=args.early_stop_min_epochs,
+        early_stop_threshold=args.early_stop_threshold,
     )
     
     fabric.barrier()
@@ -696,11 +698,17 @@ def main(args=None):
         # ===== SAVE FINAL CHECKPOINT =====
         if fabric.is_global_zero:
             checkpoint_path = os.path.join(outdir, f"final_checkpoint_{timestamp}.pt")
+            # Unwrap all models if needed
+            encoder_state = model.encoder.module.state_dict() if hasattr(model.encoder, 'module') else model.encoder.state_dict()
+            context_state = model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict()
+            gen_state = model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict()
+            score_state = model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict()
+            
             checkpoint = {
-                'encoder': model.encoder.state_dict() if not hasattr(model.encoder, 'module') else model.encoder.module.state_dict(),
-                'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
-                'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
-                'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
+                'encoder': encoder_state,
+                'context_encoder': context_state,
+                'generator': gen_state,
+                'score_net': score_state,
                 'history_st': history_st,
                 'history_sc': history_sc,
                 'timestamp': timestamp,
@@ -711,13 +719,20 @@ def main(args=None):
             # Plot SC losses
             plot_training_history(history_sc, "StageD_SC", outdir, timestamp)
             plot_combined_losses(history_st, history_sc, outdir, timestamp)
+
     else:
         print("\n[INFO] Skipping SC fine-tuning")
     
+    # All ranks sync here at the very end of training
     fabric.barrier()
+
+    # IMPORTANT: let non-zero ranks exit before inference
+    if not fabric.is_global_zero:
+        print(f"[Rank {fabric.global_rank}] Training complete, exiting before inference.")
+        return
     
     # ========== INFERENCE (RANK-0 ONLY) ==========
-    if fabric.is_global_zero and not args.skip_inference:
+    if not args.skip_inference:
         print("\n[Rank-0] Unwrapping models for inference...")
         
         # Unwrap DDP modules
@@ -753,9 +768,9 @@ def main(args=None):
         print(f"  Patchwise:    Pearson={inference_results['patchwise']['pearson']:.4f}")
         print("="*70)
     
-    fabric.barrier()
+    # DO NOT call fabric.barrier() here; other ranks have already returned
 
-
+    
 if __name__ == "__main__":
     args = parse_args()
     main(args)

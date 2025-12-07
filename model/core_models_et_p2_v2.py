@@ -680,11 +680,13 @@ def train_stageC_st_only(
     w_edge: float = 1.0,
     w_repel: float = 0.1,
     # Repulsion config
-    r_min: float = 0.02,  # Will be auto-computed if None
+    # r_min: float = 0.02,  # Will be auto-computed if None
+    r_min: Optional[float] = None,
     # Early stopping
     enable_early_stop: bool = True,
     early_stop_patience: int = 10,
     early_stop_min_epochs: int = 20,
+    early_stop_threshold: float = 0.01,
 ):
     """
     Stage C 2.0: ST-only training with graph-aware losses.
@@ -753,8 +755,16 @@ def train_stageC_st_only(
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
 
     # Loss modules
-    loss_knn_edge = uet.KNNEdgeDistanceLoss(max_edges_per_sample=1024)
-    loss_repel = uet.RepulsionLoss(r_min=r_min, max_pairs=2000)
+    # loss_knn_edge = uet.KNNEdgeDistanceLoss(max_edges_per_sample=1024)
+    loss_knn_edge = uet.KNNEdgeDistanceLoss(
+        max_edges_per_sample=1024,
+        min_gt=0.02,
+        use_log=True,    # keep this True
+    )
+
+    # loss_repel = uet.RepulsionLoss(r_min=r_min, max_pairs=2000)
+    loss_repel = uet.RepulsionLoss(r_min=r_min)
+
 
     # Compute sigma_data from ST data
     print("Computing sigma_data from ST statistics...")
@@ -816,6 +826,8 @@ def train_stageC_st_only(
     
     best_loss = float('inf')
     patience_counter = 0
+    early_stopped = False
+    early_stop_epoch = -1
     D_latent = score_net.D_latent
 
     # ========== TRAINING LOOP ==========
@@ -903,6 +915,40 @@ def train_stageC_st_only(
             with torch.autocast(device_type='cuda', enabled=False):
                 V_hat_fp32 = V_hat.float()
                 
+                # ===== ONE-SHOT DEBUG ON FIRST BATCH OF FIRST EPOCH =====
+                if epoch == 0 and n_batches == 0:
+                    with torch.no_grad():
+                        b0 = 0  # just inspect first sample in batch
+                        m0 = mask[b0]
+                        Vt0 = V_target[b0, m0]
+                        Vh0 = V_hat_fp32[b0, m0]
+
+                        Dt0 = torch.cdist(Vt0, Vt0)
+                        Dh0 = torch.cdist(Vh0, Vh0)
+
+                        print("\n[DEBUG] Batch 0, sample 0")
+                        print("  V_target std:", Vt0.std().item())
+                        print("  V_hat   std:", Vh0.std().item())
+                        Dt_nonzero = Dt0[Dt0 > 0]
+                        Dh_nonzero = Dh0[Dh0 > 0]
+                        print("  Dtgt  >0 min/med/max:",
+                              Dt_nonzero.min().item(),
+                              Dt_nonzero.median().item(),
+                              Dt_nonzero.max().item())
+                        print("  Dhat  >0 min/med/max:",
+                              Dh_nonzero.min().item(),
+                              Dh_nonzero.median().item(),
+                              Dh_nonzero.max().item())
+
+                        ei0 = knn_edge_index[0].to(device)
+                        dgt0 = knn_edge_dists[0].to(device)
+                        print("  edge_dists (GT) min/med/max:",
+                              dgt0.min().item(),
+                              dgt0.median().item(),
+                              dgt0.max().item())
+                        print("  knn_edge_index[0].max():", ei0.max().item(),
+                              " n_valid:", m0.sum().item())
+
                 # kNN Edge Distance Loss (NEW - index-aware)
                 L_edge = loss_knn_edge(
                     V_pred=V_hat_fp32,
@@ -913,6 +959,7 @@ def train_stageC_st_only(
                 
                 # Repulsion Loss (NEW - prevent collapse)
                 L_repel = loss_repel(V_pred=V_hat_fp32, mask=mask)
+
 
             # ===== TOTAL LOSS =====
             L_total = w_score * L_score + w_edge * L_edge + w_repel * L_repel
@@ -945,33 +992,77 @@ def train_stageC_st_only(
         
         scheduler.step()
 
-        # ===== EPOCH SUMMARY =====
-        avg_total = epoch_losses['total'] / max(n_batches, 1)
-        avg_score = epoch_losses['score'] / max(n_batches, 1)
-        avg_edge = epoch_losses['edge'] / max(n_batches, 1)
-        avg_repel = epoch_losses['repel'] / max(n_batches, 1)
-        
-        history['epoch'].append(epoch + 1)
-        history['epoch_avg']['total'].append(avg_total)
-        history['epoch_avg']['score'].append(avg_score)
-        history['epoch_avg']['edge'].append(avg_edge)
-        history['epoch_avg']['repel'].append(avg_repel)
-        
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"[Epoch {epoch+1:3d}] total={avg_total:.4f} | "
-                  f"score={avg_score:.4f} | edge={avg_edge:.4f} | repel={avg_repel:.4f}")
-        
-        # ===== EARLY STOPPING =====
-        if enable_early_stop and epoch >= early_stop_min_epochs:
-            if avg_total < best_loss * 0.99:  # 1% improvement threshold
-                best_loss = avg_total
-                patience_counter = 0
-            else:
-                patience_counter += 1
+        # ===== EPOCH SUMMARY AND EARLY STOPPING =====
+        should_stop = False
+
+        # Print loss summary (rank-0 only)
+        if fabric is None or fabric.is_global_zero:
+            avg_total = epoch_losses['total'] / max(n_batches, 1)
+            avg_score = epoch_losses['score'] / max(n_batches, 1)
+            avg_edge = epoch_losses['edge'] / max(n_batches, 1)
+            avg_repel = epoch_losses['repel'] / max(n_batches, 1)
             
-            if patience_counter >= early_stop_patience:
-                print(f"\n[Early Stop] No improvement for {early_stop_patience} epochs. Stopping.")
-                break
+            history['epoch'].append(epoch + 1)
+            history['epoch_avg']['total'].append(avg_total)
+            history['epoch_avg']['score'].append(avg_score)
+            history['epoch_avg']['edge'].append(avg_edge)
+            history['epoch_avg']['repel'].append(avg_repel)
+            
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f"[Epoch {epoch+1:3d}] total={avg_total:.4f} | "
+                      f"score={avg_score:.4f} | edge={avg_edge:.4f} | repel={avg_repel:.4f}")
+            
+            # Early stopping logic (PROPER THRESHOLD VERSION)
+            if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
+                val_metric = avg_total
+                
+                # Check for improvement
+                if val_metric < best_loss:
+                    rel_improv = (best_loss - val_metric) / max(best_loss, 1e-8)
+                    
+                    if rel_improv > early_stop_threshold:
+                        # Significant improvement
+                        print(f"[Early Stop] Improvement: {rel_improv:.2%} (val_metric: {best_loss:.4f} → {val_metric:.4f})")
+                        best_loss = val_metric
+                        patience_counter = 0
+                    else:
+                        # Minor improvement, doesn't count
+                        patience_counter += 1
+                        print(f"[Early Stop] Minor improvement: {rel_improv:.2%} < {early_stop_threshold:.1%} "
+                              f"(no_improve: {patience_counter}/{early_stop_patience})")
+                else:
+                    # No improvement
+                    patience_counter += 1
+                    print(f"[Early Stop] No improvement: val_metric={val_metric:.4f} >= best={best_loss:.4f} "
+                          f"(no_improve: {patience_counter}/{early_stop_patience})")
+                
+                # Check if we should stop
+                if patience_counter >= early_stop_patience:
+                    should_stop = True
+                    early_stopped = True
+                    early_stop_epoch = epoch + 1
+                    print(f"\n{'='*80}")
+                    print(f"[Early Stop] PLATEAU DETECTED after {early_stop_epoch} epochs")
+                    print(f"[Early Stop] Best val_metric: {best_loss:.4f}")
+                    print(f"[Early Stop] No improvement for {early_stop_patience} epochs")
+                    print(f"{'='*80}\n")
+
+            elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
+                # Just track best, don't stop yet
+                val_metric = avg_total
+                if val_metric < best_loss:
+                    best_loss = val_metric
+                    print(f"[Early Stop] Warmup: best={best_loss:.4f} (min_epochs not reached)")
+        
+        # BROADCAST STOP DECISION TO ALL RANKS
+        if fabric is not None:
+            should_stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.long, device=fabric.device)
+            dist.broadcast(should_stop_tensor, src=0)
+            should_stop = bool(should_stop_tensor.item())
+        
+        # ALL RANKS BREAK TOGETHER
+        if should_stop:
+            break
     
     print("\n" + "="*70)
     print("STAGE C 2.0 TRAINING COMPLETE")
@@ -1032,21 +1123,47 @@ def finetune_encoder_on_sc(
     for p in score_net.parameters():
         p.requires_grad = False
     print("[Frozen weights] generator, score_net (still differentiable)")
-    
-    # ========== TRAINABLE COMPONENTS ==========
+
+    # ========== UNWRAP FROM DDP IF NEEDED ==========
+    if hasattr(encoder, 'module'):
+        print("[Unwrap] encoder from DDP")
+        encoder = encoder.module
+    if hasattr(context_encoder, 'module'):
+        print("[Unwrap] context_encoder from DDP")
+        context_encoder = context_encoder.module
+
+    # ========== UNFREEZE AND SET TRAINABLE ==========
     encoder = encoder.to(device).train()
     context_encoder = context_encoder.to(device).train()
-    
+
+    # CRITICAL: Unfreeze encoder (it was frozen in Stage A!)
+    for p in encoder.parameters():
+        p.requires_grad = True
+    for p in context_encoder.parameters():
+        p.requires_grad = True
+
+    print("[Unfrozen] encoder, context_encoder (now trainable)")
+
     trainable_params = (
         list(encoder.parameters()) +
         list(context_encoder.parameters())
     )
+
+    # Verify we have trainable params
+    n_trainable = sum(p.numel() for p in trainable_params if p.requires_grad)
+    print(f"[Trainable params] {n_trainable:,} parameters")
+
+    if n_trainable == 0:
+        raise RuntimeError("ERROR: No trainable parameters found in encoder/context_encoder!")
+
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-4)
-    
+
     if fabric is not None:
-        encoder, context_encoder, generator, optimizer = fabric.setup(
-            encoder, context_encoder, generator, optimizer
+        encoder, context_encoder, optimizer = fabric.setup(
+            encoder, context_encoder, optimizer
         )
+        # Don't wrap generator/score_net - they're frozen
+
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
     

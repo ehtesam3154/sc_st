@@ -13,10 +13,15 @@ from core_models_et_p1 import (
     STSetDataset, STTargets
 )
 
-from core_models_et_p2 import (
-    SetEncoderContext, MetricSetGenerator, DiffusionScoreNet,
-    train_stageC_diffusion_generator
+# from core_models_et_p2 import (
+#     SetEncoderContext, MetricSetGenerator, DiffusionScoreNet,
+#     train_stageC_diffusion_generator
+# )
+
+from core_models_et_p2_v2 import (
+    SetEncoderContext, MetricSetGenerator, DiffusionScoreNet
 )
+from core_models_et_p2 import train_stageC_diffusion_generator
 
 import utils_et as uet
 import numpy as np
@@ -600,6 +605,7 @@ class GEMSModel:
         enable_early_stop: bool = False,
         early_stop_patience: int = 10,
         early_stop_min_epochs: int = 20,
+        early_stop_threshold: float = 0.01,
     ):
         """
         Stage C v2: ST-only training with graph-aware losses.
@@ -621,7 +627,8 @@ class GEMSModel:
             n_max=n_max,
             D_latent=self.D_latent,
             num_samples=num_st_samples,
-            knn_k=self.cfg.get('knn_k', 12),
+            # knn_k=self.cfg.get('knn_k', 12),
+            knn_k=self.cfg['denoiser']['knn_k'],
             device=self.device,
             landmarks_L=self.cfg.get('landmarks_L', 0),
         )
@@ -647,6 +654,7 @@ class GEMSModel:
             enable_early_stop=enable_early_stop,
             early_stop_patience=early_stop_patience,
             early_stop_min_epochs=early_stop_min_epochs,
+            early_stop_threshold=early_stop_threshold,
         )
         
         return history
