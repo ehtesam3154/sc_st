@@ -3106,3 +3106,113 @@ class RadialHistogramLoss(nn.Module):
         
         return V_canon
 
+
+class KNNSoftmaxLoss(nn.Module):
+    """
+    NCA/SNE-style neighbor preservation loss.
+    
+    For each anchor point i, defines target distribution P_ij over neighbors
+    (uniform over k-NN, zero elsewhere), and predicted distribution Q_ij 
+    from softmax over predicted distances.
+    
+    Loss = sum_i sum_j P_ij * (-log Q_ij)  (cross-entropy)
+    
+    Args:
+        tau: Temperature for softmax (smaller = sharper)
+        k: Number of nearest neighbors to preserve
+    """
+    
+    def __init__(self, tau: float = 1.0, k: int = 10):
+        super().__init__()
+        self.tau = tau
+        self.k = k
+    
+    def forward(
+        self,
+        D_pred: torch.Tensor,
+        knn_indices: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        tau: Optional[float] = None,
+        k: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Compute NCA-style neighbor softmax loss.
+        
+        Args:
+            D_pred: (B, N, N) or (N, N) predicted distance matrix
+            knn_indices: (B, N, k) or (N, k) ground truth k-NN indices (local indexing)
+            mask: (B, N) or (N,) optional validity mask
+            tau: Optional temperature override
+            k: Optional k override
+            
+        Returns:
+            loss: Scalar cross-entropy loss
+        """
+        if tau is None:
+            tau = self.tau
+        if k is None:
+            k = self.k
+            
+        is_batched = D_pred.dim() == 3
+        
+        if not is_batched:
+            # Add batch dimension
+            D_pred = D_pred.unsqueeze(0)          # (1, N, N)
+            knn_indices = knn_indices.unsqueeze(0)  # (1, N, k)
+            if mask is not None:
+                mask = mask.unsqueeze(0)  # (1, N)
+        
+        B, N, _ = D_pred.shape
+        device = D_pred.device
+        
+        # Create target distribution P_ij: uniform over k-NN, zero elsewhere
+        # Shape: (B, N, N)
+        P = torch.zeros(B, N, N, device=device, dtype=D_pred.dtype)
+        
+        # For each batch and each anchor i, set P[b,i,j]=1/k for j in knn_indices[b,i]
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, N, k)
+        anchor_idx = torch.arange(N, device=device).view(1, N, 1).expand(B, N, k)
+        
+        # Handle invalid kNN indices (padded with -1)
+        valid_knn = knn_indices >= 0  # (B, N, k)
+        knn_indices_clamped = knn_indices.clamp(min=0)  # Replace -1 with 0 temporarily
+        
+        P[batch_idx, anchor_idx, knn_indices_clamped] = 1.0 / k
+        P = P * valid_knn.unsqueeze(1).float()  # Zero out invalid entries
+        
+        # Normalize rows to handle variable k (in case some points have <k neighbors)
+        row_sums = P.sum(dim=2, keepdim=True).clamp(min=1e-12)
+        P = P / row_sums
+        
+        # Compute predicted distribution Q_ij from softmax over distances
+        # Q_ij = exp(-d_ij^2 / tau) / sum_l exp(-d_il^2 / tau)
+        
+        # Negative squared distances (for numerical stability)
+        neg_sq_dist = -(D_pred ** 2) / tau  # (B, N, N)
+        
+        # Mask out self-connections (diagonal)
+        eye = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
+        neg_sq_dist = neg_sq_dist.masked_fill(eye, -float('inf'))
+        
+        # Apply validity mask if provided
+        if mask is not None:
+            # Mask both anchors and neighbors
+            anchor_mask = mask.unsqueeze(2)  # (B, N, 1)
+            neighbor_mask = mask.unsqueeze(1)  # (B, 1, N)
+            valid_pairs = anchor_mask & neighbor_mask  # (B, N, N)
+            neg_sq_dist = neg_sq_dist.masked_fill(~valid_pairs, -float('inf'))
+        
+        # Softmax to get Q
+        Q = F.softmax(neg_sq_dist, dim=2)  # (B, N, N)
+        
+        # Cross-entropy: -sum_j P_ij * log(Q_ij)
+        # Add epsilon to avoid log(0)
+        loss_per_anchor = -(P * torch.log(Q + 1e-12)).sum(dim=2)  # (B, N)
+        
+        # Average over valid anchors
+        if mask is not None:
+            loss = (loss_per_anchor * mask).sum() / mask.sum().clamp(min=1.0)
+        else:
+            loss = loss_per_anchor.mean()
+        
+        return loss

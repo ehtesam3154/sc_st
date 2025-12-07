@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument('--knn_k', type=int, default=12)
     parser.add_argument('--self_conditioning', action='store_true', default=True)
     parser.add_argument('--sc_feat_mode', type=str, default='concat', choices=['concat', 'mlp'])
-    parser.add_argument('--landmarks_L', type=int, default=16)
+    parser.add_argument('--landmarks_L', type=int, default=0)
 
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
@@ -792,7 +792,7 @@ def main(args=None):
         # Compute distances from D_edm (upper triangle)
         upper_tri_idx = np.triu_indices_from(D_edm, k=1)
         distances = D_edm[upper_tri_idx]
-        
+
         print(f"\nPATCHWISE:")
         print(f"  Coordinate range: [{coords_canon.min():.2f}, {coords_canon.max():.2f}]")
         print(f"  Distance stats: mean={distances.mean():.4f}, median={np.median(distances):.4f}, std={distances.std():.4f}")
