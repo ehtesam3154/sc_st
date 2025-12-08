@@ -1390,8 +1390,54 @@ def train_stageC_diffusion_generator(
                 V_hat = V_t - sigma_t * eps_pred
                 V_hat = V_hat * mask.unsqueeze(-1).float()
 
-            # ----------------- Cone Loss (PSD penalty) for ST -----------------
-            L_cone = torch.tensor(0.0, device=device)
+            # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
+            # 1. Canonicalize V_hat (Center per set) - NOW GLOBAL for ST and SC
+            with torch.autocast(device_type='cuda', enabled=False):
+                V_hat_f32 = V_hat.float()
+                m_bool = mask.bool()
+                m_float = mask.float().unsqueeze(-1)
+                
+                # center per set over valid nodes
+                valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+                mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+                V_geom = (V_hat_f32 - mean) * m_float  # (B,N,D), centered
+
+            # 2. Compute kNN NCA loss (BOTH ST and SC now)
+            L_knn_nca = torch.tensor(0.0, device=device)
+            knn_nca_count = 0
+
+            # Only run if batch actually has indices (SC loader must provide them)
+            if 'knn_indices' in batch:
+                with torch.autocast(device_type='cuda', enabled=False):
+                    knn_indices_batch = batch['knn_indices'].to(device)
+                    
+                    for b in range(len(mask)):
+                        m = mask[b]
+                        n_valid = m.sum().item()
+                        
+                        if n_valid < 12: 
+                            continue
+                        
+                        # Use the globally computed V_geom
+                        V_pred_b = V_geom[b, m]
+                        D_pred_b = torch.cdist(V_pred_b, V_pred_b)
+                        knn_b = knn_indices_batch[b, m]
+                        
+                        L_nca_b = loss_knn_nca(
+                            D_pred=D_pred_b,
+                            knn_indices=knn_b,
+                            mask=None,
+                            tau=1.0,
+                            k=15
+                        )
+                        
+                        L_knn_nca = L_knn_nca + L_nca_b
+                        knn_nca_count += 1
+                
+                if knn_nca_count > 0:
+                    L_knn_nca = L_knn_nca / knn_nca_count
+            # ===================================================================
+
 
             if not is_sc:
                 # ===== ST STEP: Score + Gram + Heat + SW_ST =====
@@ -1417,16 +1463,6 @@ def train_stageC_diffusion_generator(
                 else:
                     L_st_dist = torch.tensor(0.0, device=device)
 
-                # Canonicalize V_hat for geometry: center only, no RMS scaling
-                with torch.autocast(device_type='cuda', enabled=False):
-                    V_hat_f32 = V_hat.float()
-                    m_bool = mask.bool()
-                    m_float = mask.float().unsqueeze(-1)              # (B,N,1)
-
-                    # center per set over valid nodes
-                    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1)
-                    mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
-                    V_geom = (V_hat_f32 - mean) * m_float             # (B,N,D), centered, scale-preserving
 
                     Gt = G_target.float()
                     B, N, _ = V_geom.shape
@@ -2483,7 +2519,6 @@ def train_stageC_diffusion_generator(
             # Log
             epoch_losses['total'] += L_total.item()
             epoch_losses['score'] += L_score.item()
-            # epoch_losses['cone'] += L_cone.item()
             epoch_losses['st_dist'] += L_st_dist.item()
             epoch_losses['gram'] += L_gram.item()
             epoch_losses['gram_scale'] += L_gram_scale.item()
@@ -2539,13 +2574,6 @@ def train_stageC_diffusion_generator(
             print(f"\n[Epoch {epoch+1}] ST batches: {st_batches}, SC batches: {sc_batches}")
         else:
             print(f"\n[Epoch {epoch+1}] ST batches: {st_batches} (SC disabled)")
-
-        avg_shape = epoch_losses['shape'] / max(n_batches, 1)
-        avg_repel = epoch_losses['repel'] / max(n_batches, 1)
-        # print(f"[EPOCH {epoch+1} LOSS DEBUG]")
-        # print(f"  L_shape avg: {avg_shape:.6f} (weight={WEIGHTS['shape']:.3f})")
-        # print(f"  L_repel avg: {avg_repel:.6f} (weight={WEIGHTS['repel']:.3f})")
-        # print(f"  L_shape contribution to total: {WEIGHTS['shape'] * avg_shape:.6f}")
 
         should_stop = False 
 
@@ -2630,12 +2658,10 @@ def train_stageC_diffusion_generator(
           
         # Broadcast stop decision to ALL ranks
         if fabric is not None:
-            # print(f"[DEBUG train_stageC BROADCAST] Rank {fabric.global_rank} - BEFORE broadcast, local should_stop={should_stop}")
             # Use dist.broadcast directly - fabric.broadcast is buggy
             should_stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.long, device=fabric.device)
             dist.broadcast(should_stop_tensor, src=0)
             should_stop = bool(should_stop_tensor.item())
-            # print(f"[DEBUG train_stageC BROADCAST] Rank {fabric.global_rank} - AFTER broadcast, should_stop={should_stop}, tensor={should_stop_tensor.item()}")
 
         # ALL ranks break together
         if should_stop:
@@ -2651,13 +2677,6 @@ def train_stageC_diffusion_generator(
             fabric.broadcast(should_stop_tensor, src=0)
             should_stop = should_stop_tensor.item() > 0.5
 
-        # ALL ranks break together
-        # if should_stop:
-        #     # CDelete iterator references to allow clean exit
-        #     del st_iter
-        #     if sc_iter is not None:
-        #         del sc_iter
-        #     break
         
         scheduler.step()
 
@@ -2715,7 +2734,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'knn_nca'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
