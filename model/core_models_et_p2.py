@@ -1014,22 +1014,43 @@ def train_stageC_diffusion_generator(
     if fabric is None or fabric.is_global_zero:
         os.makedirs(plot_dir, exist_ok=True)
 
+    # WEIGHTS = {
+    #     'score': 1.0,
+    #     'gram': 0.5,
+    #     'gram_scale': 0.3,
+    #     'heat': 0.25,
+    #     'sw_st': 0.2,
+    #     'sw_sc': 0.2,
+    #     'overlap': 0.25,
+    #     'ordinal_sc': 0.5,
+    #     'st_dist': 0.3,
+    #     'edm_tail': 0.3,
+    #     'gen_align': 0.3,
+    #     'dim': 0.1,
+    #     'triangle': 0.5,
+    #     'radial': 1.0,
+    #     'knn_nca': 0.5,
+    #     'repel': 0.0,      # NEW: ST repulsion loss
+    #     'shape': 0.0       # NEW: ST anisotropy/shape loss
+    # }
+
+
     WEIGHTS = {
         'score': 1.0,
         'gram': 0.5,
-        'gram_scale': 0.3,
-        'heat': 0.25,
-        'sw_st': 0.3,
-        'sw_sc': 0.3,
+        'gram_scale': 0.5,
+        'heat': 0.0,
+        'sw_st': 0.0,
+        'sw_sc': 0.25,
         'overlap': 0.25,
         'ordinal_sc': 0.5,
-        'st_dist': 0.03,
-        'edm_tail': 0.3,
-        'gen_align': 0.3,
-        'dim': 0.1,
-        'triangle': 0.5,
-        'radial': 1.0,
-        'knn_nca': 0.3,
+        'st_dist': 0.0,
+        'edm_tail': 0.0,
+        'gen_align': 0.0,
+        'dim': 0.0,
+        'triangle': 0.0,
+        'radial': 0.0,
+        'knn_nca': 0.7,
         'repel': 0.0,      # NEW: ST repulsion loss
         'shape': 0.0       # NEW: ST anisotropy/shape loss
     }
@@ -1147,7 +1168,7 @@ def train_stageC_diffusion_generator(
     AUTOBALANCE_EVERY = 100
     AUTOBALANCE_START = 200
 
-    USE_AUTOBALANCE = True
+    USE_AUTOBALANCE = False
 
     #self conditioning probability
     p_sc = 0.5 #prob of using self-conditioning in training
@@ -1463,6 +1484,18 @@ def train_stageC_diffusion_generator(
                 else:
                     L_st_dist = torch.tensor(0.0, device=device)
 
+                with torch.autocast(device_type='cuda', enabled=False):
+                    V_hat_f32 = V_hat.float()
+                    m_bool = mask.bool()
+                    m_float = mask.float().unsqueeze(-1)              # (B,N,1)
+
+                    # center per set over valid nodes
+                    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1)
+                    mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+                    V_geom = (V_hat_f32 - mean) * m_float             # (B,N,D), centered, scale-preserving
+
+                    Gt = G_target.float()
+                    B, N, _ = V_geom.shape
 
                     Gt = G_target.float()
                     B, N, _ = V_geom.shape
@@ -1610,48 +1643,42 @@ def train_stageC_diffusion_generator(
                         # Use the same weighted approach to avoid divergence
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
 
-                # Add NCA loss computation
+
+                # 2. Compute kNN NCA loss
                 L_knn_nca = torch.tensor(0.0, device=device)
                 knn_nca_count = 0
 
-                with torch.autocast(device_type='cuda', enabled=False):
-                    knn_indices_batch = batch['knn_indices'].to(device)  # (B, N, k)
-                    
-                    for b in range(len(mask)):
-                        m = mask[b]
-                        n_valid = m.sum().item()
+                # Only run if batch actually has indices (SC loader must provide them)
+                if 'knn_indices' in batch:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        knn_indices_batch = batch['knn_indices'].to(device)
                         
-                        if n_valid < 12:  # Skip very small minisets
-                            continue
-                        
-                        # Get predicted coordinates for this miniset
-                        V_pred_b = V_geom[b, m]  # (n_valid, 2)
-                        
-                        # Compute predicted distance matrix
-                        D_pred_b = torch.cdist(V_pred_b, V_pred_b)  # (n_valid, n_valid)
-                        
-                        # Get kNN indices (already in local indexing)
-                        knn_b = knn_indices_batch[b, m]  # (n_valid, k)
-                        
-                        # Filter out invalid kNN indices (-1)
-                        # Keep only neighbors that are in this miniset
-                        valid_knn_mask = knn_b >= 0
-                        
-                        # Compute NCA loss for this miniset
-                        L_nca_b = loss_knn_nca(
-                            D_pred=D_pred_b,
-                            knn_indices=knn_b,
-                            mask=None,  # Already filtered by m
-                            tau=1.0,
-                            k=15
-                        )
-                        
-                        L_knn_nca = L_knn_nca + L_nca_b
-                        knn_nca_count += 1
+                        for b in range(len(mask)):
+                            m = mask[b]
+                            n_valid = m.sum().item()
+                            
+                            if n_valid < 5: 
+                                continue
+                            
+                            # Use the globally computed V_geom
+                            V_pred_b = V_geom[b, m]
+                            D_pred_b = torch.cdist(V_pred_b, V_pred_b)
+                            knn_b = knn_indices_batch[b, m]
+                            
+                            L_nca_b = loss_knn_nca(
+                                D_pred=D_pred_b,
+                                knn_indices=knn_b,
+                                mask=None,
+                                tau=1.0,
+                                k=15
+                            )
+                            
+                            L_knn_nca = L_knn_nca + L_nca_b
+                            knn_nca_count += 1
                     
                     if knn_nca_count > 0:
                         L_knn_nca = L_knn_nca / knn_nca_count
-
+                # ===================================================================
                 
                 # Heat kernel loss (batched)
                 if (global_step % heat_every_k) == 0:
