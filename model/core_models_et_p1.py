@@ -326,16 +326,19 @@ class STStageBPrecomputer:
         D = torch.cdist(y_hat, y_hat, p=2)
         G = uet.gram_from_coords(y_hat)
 
+        # Compute k-NN indices from EMBEDDINGS (not coordinates)
+        # This makes the loss biologically meaningful (expression similarity preservation)
+        print(f"[Stage B] Computing kNN from embeddings (not coordinates)")
+        Z = encoder(st_gene_expr.to(device))  # (n, 128) embeddings
+        D_Z = torch.cdist(Z, Z)  # Distance in embedding space
 
-        # Compute k-NN indices for each spot
-        # Shape: (n, k) where knn_indices[i, :] are the k nearest neighbors of spot i
-        knn_k = self.k  # Use the k parameter from __init__
+        knn_k = self.k
         n_spots = y_hat.shape[0]
         knn_indices = torch.zeros(n_spots, knn_k, dtype=torch.long, device=device)
 
         for i in range(n_spots):
-            # Get distances from spot i to all others
-            dists_from_i = D[i]  # (n,)
+            # Get distances from spot i to all others IN EMBEDDING SPACE
+            dists_from_i = D_Z[i]  # (n,)
             # Set self-distance to infinity to exclude
             dists_from_i_copy = dists_from_i.clone()
             dists_from_i_copy[i] = float('inf')
@@ -345,6 +348,8 @@ class STStageBPrecomputer:
             # If we have fewer than k neighbors, pad with -1
             if len(indices) < knn_k:
                 knn_indices[i, len(indices):] = -1
+
+        print(f"[Stage B] kNN computed from embeddings: {knn_indices.shape}")
         
         # 3. Distance histogram
         d_95 = torch.quantile(D[torch.triu(torch.ones_like(D), diagonal=1).bool()], 0.95)
@@ -431,6 +436,24 @@ class STStageBPrecomputer:
             edge_index, edge_weight = uet.build_knn_graph(y_hat, k=self.k, device=self.device)
             L = uet.compute_graph_laplacian(edge_index, edge_weight, n)
 
+            # Compute k-NN indices for each spot
+            knn_k = self.k
+            n_spots = y_hat.shape[0]
+            knn_indices = torch.zeros(n_spots, knn_k, dtype=torch.long, device=self.device)
+
+            for i in range(n_spots):
+                # Get distances from spot i to all others
+                dists_from_i = D[i]  # (n,)
+                # Set self-distance to infinity to exclude
+                dists_from_i_copy = dists_from_i.clone()
+                dists_from_i_copy[i] = float('inf')
+                # Get indices of k smallest distances
+                _, indices = torch.topk(dists_from_i_copy, k=min(knn_k, n_spots-1), largest=False)
+                knn_indices[i, :len(indices)] = indices
+                # If we have fewer than k neighbors, pad with -1
+                if len(indices) < knn_k:
+                    knn_indices[i, len(indices):] = -1
+
             targets = STTargets(
                 y_hat=y_hat.cpu(),
                 G=G.cpu(),
@@ -441,7 +464,8 @@ class STStageBPrecomputer:
                 t_list=self.t_list,
                 triplets=triplets.cpu(),
                 k=self.k,
-                scale=scale
+                scale=scale,
+                knn_indices=knn_indices.cpu()
             )
             
             targets_dict[slide_id] = targets
@@ -636,57 +660,9 @@ class STSetDataset(Dataset):
         y_hat_centered = y_hat_subset - y_hat_subset.mean(dim=0, keepdim=True)
         G_subset = y_hat_centered @ y_hat_centered.t()
 
-        # In STSetDataset.__getitem__(), after line "G_subset = y_hat_centered @ y_hat_centered.t()"
-
-        # # ===== DEBUG: Check Gram scale =====
-        G_diag = torch.diag(G_subset)
-        D_subset_check = targets.D[indices][:, indices]
-
-        # print(f"\n[DEBUG STSetDataset] n={len(indices)}")
-        # print(f"  y_hat_subset RMS: {torch.sqrt((y_hat_subset**2).mean()):.6f}")
-        # print(f"  y_hat_centered RMS: {torch.sqrt((y_hat_centered**2).mean()):.6f}")
-        # print(f"  G_subset diagonal: min={G_diag.min():.6f}, max={G_diag.max():.6f}, mean={G_diag.mean():.6f}")
-        # print(f"  D_subset from targets: p50={D_subset_check.quantile(0.5):.6f}, p95={D_subset_check.quantile(0.95):.6f}")
-
-        # Reconstruct distances from G_subset
-        # D_recon = torch.zeros_like(G_subset)
-        # for i in range(len(indices)):
-        #     for j in range(len(indices)):
-        #         D_recon[i,j] = torch.sqrt(torch.clamp(G_diag[i] + G_diag[j] - 2*G_subset[i,j], min=0))
-                
-        # triu_mask = torch.triu(torch.ones_like(D_recon, dtype=torch.bool), diagonal=1)
-        # D_recon_upper = D_recon[triu_mask]
-        # print(f"  D reconstructed from G_subset: p50={D_recon_upper.quantile(0.5):.6f}, p95={D_recon_upper.quantile(0.95):.6f}")
-        # print("="*60)
-        # # ===== END DEBUG =====
-
         D_subset = targets.D[indices][:, indices]
 
         V_target = uet.factor_from_gram(G_subset, self.D_latent)
-
-        if debug_this_sample:
-            # ===== DEBUG: Full diagnostics =====
-            G_diag = torch.diag(G_subset)
-            D_subset_check = targets.D[indices][:, indices]
-            
-            V_target_rms = V_target.pow(2).mean().sqrt()
-            D_vtarget = torch.cdist(V_target, V_target)
-            D_vtarget_nodiag = D_vtarget + torch.eye(len(V_target), device=V_target.device) * 1e10
-            nn_dists_vt = D_vtarget_nodiag.min(dim=1)[0]
-            triu_mask_vt = torch.triu(torch.ones_like(D_vtarget, dtype=torch.bool), diagonal=1)
-            D_recon = torch.cdist(y_hat_centered, y_hat_centered)
-            
-            print(f"\n[DEBUG STSetDataset #{idx}] n={len(indices)}")
-            print(f"  y_hat_subset RMS: {torch.sqrt((y_hat_subset**2).mean()):.6f}")
-            print(f"  y_hat_centered RMS: {torch.sqrt((y_hat_centered**2).mean()):.6f}")
-            print(f"  G_subset diagonal: min={G_diag.min():.6f}, max={G_diag.max():.6f}, mean={G_diag.mean():.6f}")
-            print(f"  D_subset from targets: p50={D_subset_check[triu_mask_vt].quantile(0.5):.6f}, p95={D_subset_check[triu_mask_vt].quantile(0.95):.6f}")
-            print(f"  V_target shape: {V_target.shape}, RMS: {V_target_rms:.6f}")
-            print(f"  V_target distances - p15: {D_vtarget[triu_mask_vt].quantile(0.15):.6f}, p50: {D_vtarget[triu_mask_vt].quantile(0.50):.6f}, p95: {D_vtarget[triu_mask_vt].quantile(0.95):.6f}")
-            print(f"  V_target NN dist - min: {nn_dists_vt.min():.6f}, p15: {nn_dists_vt.quantile(0.15):.6f}, median: {nn_dists_vt.median():.6f}")
-            print(f"  y_hat_centered distances - p50: {D_recon[triu_mask_vt].quantile(0.50):.6f}, p95: {D_recon[triu_mask_vt].quantile(0.95):.6f}")
-            print(f"  Distance preservation error: {(D_vtarget[triu_mask_vt] - D_recon[triu_mask_vt]).abs().mean():.6f}")
-            print("="*60)
 
         edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)
         L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n_nodes=len(indices))
@@ -839,6 +815,30 @@ class SCSetDataset(Dataset):
         # Build neighbor index once (CPU pinned)
         self.nbr_idx = uet.build_topk_index(Z_all, K=K_nbrs, block=min(4096, Z_all.shape[0]))
 
+        # Compute embedding-based kNN indices (for NCA loss)
+        print(f"[SC Dataset] Computing embedding-based kNN indices...")
+        n_sc = self.Z_cpu.shape[0]
+        knn_k = min(K_nbrs, 20)  # Use smaller k for NCA loss
+
+        # Compute distance matrix in chunks to save memory
+        self.knn_indices = torch.zeros(n_sc, knn_k, dtype=torch.long)
+
+        chunk_size = 2048
+        for i in range(0, n_sc, chunk_size):
+            end_i = min(i + chunk_size, n_sc)
+            D_chunk = torch.cdist(self.Z_cpu[i:end_i], self.Z_cpu)
+            
+            for local_i, global_i in enumerate(range(i, end_i)):
+                dists_from_i = D_chunk[local_i]
+                dists_from_i_copy = dists_from_i.clone()
+                dists_from_i_copy[global_i] = float('inf')  # Exclude self
+                _, indices = torch.topk(dists_from_i_copy, k=min(knn_k, n_sc-1), largest=False)
+                self.knn_indices[global_i, :len(indices)] = indices
+                if len(indices) < knn_k:
+                    self.knn_indices[global_i, len(indices):] = -1
+
+        print(f"[SC Dataset] kNN indices computed: {self.knn_indices.shape}")
+
     def __len__(self):
         return self.num_samples
 
@@ -948,6 +948,17 @@ class SCSetDataset(Dataset):
         assert A.numel() == A.unique().numel(), f"Set A has duplicates: {A.numel()} vs {A.unique().numel()}"
         assert B.numel() == B.unique().numel(), f"Set B has duplicates: {B.numel()} vs {B.unique().numel()}"
 
+        # Extract kNN indices for minisets A and B, map to local indexing
+        global_to_local_A = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
+        global_to_local_A[A] = torch.arange(len(A), dtype=torch.long)
+        knn_global_A = self.knn_indices[A]  # (n_A, k)
+        knn_local_A = global_to_local_A[knn_global_A]  # Map to local indices
+
+        global_to_local_B = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
+        global_to_local_B[B] = torch.arange(len(B), dtype=torch.long)
+        knn_global_B = self.knn_indices[B]  # (n_B, k)
+        knn_local_B = global_to_local_B[knn_global_B]  # Map to local indices
+
         return {
             "Z_A": Z_A, "Z_B": Z_B,
             "n_A": int(A.numel()), "n_B": int(B.numel()),
@@ -957,7 +968,9 @@ class SCSetDataset(Dataset):
             "is_landmark_A": is_landmark_A,  # ADD THIS
             "is_landmark_B": is_landmark_B,  # ADD THIS
             "global_indices_A": A,  # ADD THIS
-            "global_indices_B": B   # ADD THIS
+            "global_indices_B": B,   # ADD THIS
+            "knn_indices_A": knn_local_A,  # ADD THIS
+            "knn_indices_B": knn_local_B 
         }
 
 from typing import List, Dict
@@ -1036,24 +1049,28 @@ def collate_sc_minisets(batch: List[Dict]) -> Dict:
     else:
         is_landmark_batch = torch.zeros(B * 2, n_max, dtype=torch.bool, device=device)
 
+    # Collate kNN indices
+    knn_k = batch[0]['knn_indices_A'].shape[1]
+    knn_batch = torch.full((B * 2, n_max, knn_k), -1, dtype=torch.long, device=device)
+
+    for i, item in enumerate(batch):
+        nA, nB = item["n_A"], item["n_B"]
+        knn_batch[2*i, :nA] = item["knn_indices_A"].to(device, non_blocking=True)
+        knn_batch[2*i+1, :nB] = item["knn_indices_B"].to(device, non_blocking=True)
+
     return {
         "Z_set": Z_batch,                 # (2B, n_max, h)
         "mask": mask,                     # (2B, n_max)
         "n": n_vec,                       # (2B,)
-
-        # ✅ new-style keys (debug trainer expects these)
         "pair_idxA": pair_idxA,           # (P=B,)
         "pair_idxB": pair_idxB,           # (P=B,)
         "shared_A_idx": shared_A_idx,     # (B, Kmax) padded -1
         "shared_B_idx": shared_B_idx,     # (B, Kmax) padded -1
         "shared_len": shared_len,         # (B,)
-
-        # ✅ old-style key (non-debug trainer expects this)
         "shared_info": shared_info,
-
-        # extras you already had
         "sc_global_indices": global_indices,
         "is_sc": True,
+        'knn_indices': knn_batch,
         "is_landmark": is_landmark_batch,
     }
 
