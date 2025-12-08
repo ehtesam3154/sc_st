@@ -1423,42 +1423,6 @@ def train_stageC_diffusion_generator(
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                 V_geom = (V_hat_f32 - mean) * m_float  # (B,N,D), centered
 
-            # 2. Compute kNN NCA loss (BOTH ST and SC now)
-            L_knn_nca = torch.tensor(0.0, device=device)
-            knn_nca_count = 0
-
-            # Only run if batch actually has indices (SC loader must provide them)
-            if 'knn_indices' in batch:
-                with torch.autocast(device_type='cuda', enabled=False):
-                    knn_indices_batch = batch['knn_indices'].to(device)
-                    
-                    for b in range(len(mask)):
-                        m = mask[b]
-                        n_valid = m.sum().item()
-                        
-                        if n_valid < 12: 
-                            continue
-                        
-                        # Use the globally computed V_geom
-                        V_pred_b = V_geom[b, m]
-                        D_pred_b = torch.cdist(V_pred_b, V_pred_b)
-                        knn_b = knn_indices_batch[b, m]
-                        
-                        L_nca_b = loss_knn_nca(
-                            D_pred=D_pred_b,
-                            knn_indices=knn_b,
-                            mask=None,
-                            tau=1.0,
-                            k=15
-                        )
-                        
-                        L_knn_nca = L_knn_nca + L_nca_b
-                        knn_nca_count += 1
-                
-                if knn_nca_count > 0:
-                    L_knn_nca = L_knn_nca / knn_nca_count
-            # ===================================================================
-
 
             if not is_sc:
                 # ===== ST STEP: Score + Gram + Heat + SW_ST =====
@@ -1679,7 +1643,7 @@ def train_stageC_diffusion_generator(
                     if knn_nca_count > 0:
                         L_knn_nca = L_knn_nca / knn_nca_count
                 # ===================================================================
-                
+
                 # Heat kernel loss (batched)
                 if (global_step % heat_every_k) == 0:
                     L_info_batch = batch.get('L_info', [])
