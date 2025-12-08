@@ -695,6 +695,37 @@ def train_stageC_diffusion_generator(
         'overlap_count_this_epoch': 0
     }
 
+    # After you initialize loss_knn_nca but BEFORE training starts:
+    print("\n[Computing reference-based tau for KNN NCA]")
+
+    # Collect all ST reference coordinates
+    all_ref_coords = []
+    for slide_id in st_dataset.targets_dict:
+        y_hat = st_dataset.targets_dict[slide_id].y_hat  # True ST coordinates
+        all_ref_coords.append(y_hat)
+
+    all_ref_coords = torch.cat(all_ref_coords, dim=0).to(device)  # (N_total, 2)
+
+    # Compute k-NN distances in reference
+    with torch.no_grad():
+        N_ref = all_ref_coords.shape[0]
+        D_ref = torch.cdist(all_ref_coords, all_ref_coords)  # (N, N)
+        # D_ref = D_ref + torch.eye(N_ref, device=device) * 1e6  # Mask diagonal
+        D_ref[torch.arange(N_ref), torch.arange(N_ref)] = float('inf')
+
+        
+        # Get 15-th nearest neighbor distance for each point
+        knn_dists, _ = torch.topk(D_ref, k=15, dim=1, largest=False)  # (N, 15)
+        d_15th = knn_dists[:, -1]  # Distance to 15th neighbor for each point
+        
+        # Take median across all points
+        r_15_median = d_15th.median().item()
+        tau_reference = r_15_median ** 2  # Square it for d² scale
+        
+        print(f"  Reference 15-NN median distance: {r_15_median:.6f}")
+        print(f"  Setting tau = d²_median = {tau_reference:.6f}")
+        print(f"  (This tau is FIXED and based on true tissue structure)\n")
+
     """
     Train diffusion generator with mixed ST/SC regimen.
     OPTIMIZED with: AMP, loss alternation, CFG, reduced overlap computation.
@@ -758,6 +789,30 @@ def train_stageC_diffusion_generator(
     loss_sw = uet.SlicedWassersteinLoss1D()
     loss_triplet = uet.OrdinalTripletLoss()
     loss_knn_nca = uet.KNNSoftmaxLoss(tau=1.0, k=15)
+
+    # ADD THIS BLOCK:
+    # if use_st:
+    # print("\n[Computing adaptive tau for KNN NCA loss]")
+    # st_knn_sq_dists = []
+    # for slide_id in st_dataset.targets_dict:
+    #     y_hat = st_dataset.targets_dict[slide_id].y_hat
+    #     D_ref = torch.cdist(y_hat, y_hat)
+    #     # Get k=15 nearest neighbors per point
+    #     knn_dists, _ = torch.topk(D_ref, k=16, dim=1, largest=False)  # +1 for self
+    #     knn_dists = knn_dists[:, 1:]  # Remove self
+    #     st_knn_sq_dists.append(knn_dists[:, :15].flatten() ** 2)
+    
+    # st_knn_sq_dists = torch.cat(st_knn_sq_dists).cpu().numpy()
+    # tau_median = float(np.median(st_knn_sq_dists))
+    # tau_mean = float(np.mean(st_knn_sq_dists))
+    
+    # print(f"  Reference k-NN squared distances (k=15):")
+    # print(f"    Median: {tau_median:.6f}")
+    # print(f"    Mean: {tau_mean:.6f}")
+    # print(f"    Suggested tau range: [{tau_median*0.1:.6f}, {tau_median:.6f}]")
+    # print(f"  Currently using tau={loss_knn_nca.tau:.6f}")
+    # print(f"  Consider setting tau={tau_median*0.5:.6f} (0.5 * median)\n")
+    # END BLOCK
 
     loss_dim = uet.IntrinsicDimensionLoss(k_neighbors=20, target_dim=2.0)
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
@@ -908,20 +963,9 @@ def train_stageC_diffusion_generator(
                 # Get nearest neighbor distance for each point
                 nn_dist_b = D_b_nodiag.min(dim=1)[0]  # (n_valid,)
                 
-                # DEBUG: Print first batch's statistics
-                if batch_idx == 0 and b == 0:
-                    print(f"\n[REPEL DEBUG] First sample (batch {batch_idx}, sample {b}):")
-                    print(f"  n_valid: {n_valid}")
-                    print(f"  D_b stats: min={D_b.min():.6f}, max={D_b.max():.6f}, mean={D_b.mean():.6f}")
-                    print(f"  NN distances for this sample: min={nn_dist_b.min():.6f}, max={nn_dist_b.max():.6f}, mean={nn_dist_b.mean():.6f}")
-                    print(f"  First 10 NN distances: {nn_dist_b[:10].cpu().tolist()}")
                 
                 nn_dists.extend(nn_dist_b.cpu().tolist())
 
-    print(f"\n[REPEL DEBUG SUMMARY]")
-    print(f"  Batches processed: {debug_batches_processed}")
-    print(f"  Samples processed: {debug_samples_processed}")
-    print(f"  Total NN distances collected: {len(nn_dists)}")
 
     nn_dists_arr = np.array(nn_dists)
 
@@ -1184,6 +1228,13 @@ def train_stageC_diffusion_generator(
             f"patience={early_stop_patience}, threshold={early_stop_threshold:.1%}")
     
     for epoch in range(n_epochs):
+
+        epoch_cv_sum = 0.0
+        epoch_qent_sum = 0.0
+        epoch_nca_loss_sum = 0.0
+        epoch_nca_count = 0
+
+
         st_iter = iter(st_loader) if use_st else None
         sc_iter = iter(sc_loader) if use_sc else None
         
@@ -1218,7 +1269,7 @@ def train_stageC_diffusion_generator(
                 
         # Batch progress bar
         # batch_pbar = tqdm(schedule, desc=f"Epoch {epoch+1}/{n_epochs}", leave=True)
-        batch_pbar = tqdm(schedule, desc=f"Epoch {epoch+1}/{n_epochs} [{mode_str}]", leave=True)
+        batch_pbar = tqdm(schedule, desc=f"Epoch {epoch+1}/{n_epochs} [{mode_str}]", leave=False)
         
         for batch_type in batch_pbar:
             if batch_type == 'ST':
@@ -1458,6 +1509,36 @@ def train_stageC_diffusion_generator(
                     mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                     V_geom = (V_hat_f32 - mean) * m_float             # (B,N,D), centered, scale-preserving
 
+                    # After: V_geom = (V_hat_f32 - mean) * m_float
+                    # if global_step % LOG_EVERY == 0:
+                    # with torch.no_grad():
+                    #     V_geom_valid = V_geom[mask.bool()]
+                    #     radii = torch.norm(V_geom_valid, dim=-1)
+                    #     print(f"[DEBUG Radii]")
+                    #     print(f"  Mean radius: {radii.mean().item():.6f}")
+                    #     print(f"  Std radius: {radii.std().item():.6f}")
+                    #     print(f"  Radius CV: {radii.std().item() / radii.mean().item():.2%}")
+                        
+                    #     if radii.std() / radii.mean() < 0.2:
+                    #         print(f"  WARNING: Points clustered on sphere (low radius variation)")
+
+
+                    # ADD THIS:
+                    # if global_step % LOG_EVERY == 0:
+                    #     with torch.no_grad():
+                    #         # Check if V_geom has variation
+                    #         V_geom_valid = V_geom[mask.bool()]  # Only valid coordinates
+                    #         print(f"\n[DEBUG V_geom] step={global_step}")
+                    #         print(f"  Shape: {V_geom.shape}")
+                    #         print(f"  Mean: {V_geom_valid.mean().item():.6f} (should be ~0)")
+                    #         print(f"  Std: {V_geom_valid.std().item():.6f}")
+                    #         print(f"  Min: {V_geom_valid.min().item():.6f}")
+                    #         print(f"  Max: {V_geom_valid.max().item():.6f}")
+                            
+                    #         # Check if all coordinates are identical (collapse)
+                    #         if V_geom_valid.std() < 1e-4:
+                    #             print(f"  WARNING: V_geom has collapsed (std < 1e-4)!")
+
                     Gt = G_target.float()
                     B, N, _ = V_geom.shape
 
@@ -1613,9 +1694,13 @@ def train_stageC_diffusion_generator(
                 knn_nca_count = 0
 
                 # Only run if batch actually has indices (SC loader must provide them)
-                if 'knn_indices' in batch:
+                if not is_sc and 'knn_indices' in batch:
                     with torch.autocast(device_type='cuda', enabled=False):
                         knn_indices_batch = batch['knn_indices'].to(device)
+                        # print(f"\n[DEBUG] knn_indices check:")
+                        # print(f"  Shape: {knn_indices_batch.shape}")
+                        # print(f"  Valid neighbors (>=0): {(knn_indices_batch >= 0).float().mean().item():.2%}")
+                        # print(f"  Sample knn_indices[0,0]: {knn_indices_batch[0,0,:5]}")
                         
                         for b in range(len(mask)):
                             m = mask[b]
@@ -1628,12 +1713,21 @@ def train_stageC_diffusion_generator(
                             V_pred_b = V_geom[b, m]
                             D_pred_b = torch.cdist(V_pred_b, V_pred_b)
                             knn_b = knn_indices_batch[b, m]
+
+
+                            # Inside the training loop, before calling loss_knn_nca:
+                            with torch.no_grad():
+                                d_sq = D_pred_b ** 2
+                                d_sq_valid = d_sq[~torch.eye(d_sq.shape[0], device=device, dtype=torch.bool)]
+                                cv_batch = (d_sq_valid.std() / d_sq_valid.mean()).item()
+                                epoch_cv_sum += cv_batch
+                                epoch_nca_count += 1
                             
                             L_nca_b = loss_knn_nca(
                                 D_pred=D_pred_b,
                                 knn_indices=knn_b,
                                 mask=None,
-                                tau=1.0,
+                                tau=tau_reference,
                                 k=15
                             )
                             
@@ -1645,7 +1739,7 @@ def train_stageC_diffusion_generator(
                 # ===================================================================
 
                 # Heat kernel loss (batched)
-                if (global_step % heat_every_k) == 0:
+                if WEIGHTS['heat'] > 0 and (global_step % heat_every_k) == 0:
                     L_info_batch = batch.get('L_info', [])
                     if L_info_batch:
                         with torch.autocast(device_type='cuda', enabled=False):
@@ -1684,10 +1778,12 @@ def train_stageC_diffusion_generator(
                             t_list = L_info_batch[0].get('t_list', [0.5, 1.0])
 
                             L_heat = loss_heat(L_pred_batch, L_targ_batch, mask=mask, t_list=t_list)
+                else:
+                    L_heat = torch.tensor(0.0, device=device)    
 
 
                 L_sw_st = torch.zeros((), device=device)
-                if (global_step % sw_every_k) == 0:
+                if WEIGHTS['sw_st'] > 0 and (global_step % sw_every_k) == 0:
                     with torch.autocast(device_type='cuda', enabled=False):
                         # build a paired batch: (pred_i, tgt_i) for each i
                         B2, N, D = V_hat.shape  # B2 is your current batch_size_real
@@ -1776,34 +1872,41 @@ def train_stageC_diffusion_generator(
 
                         # ==================== NEW MANIFOLD-AWARE REGULARIZERS ====================
                         # B1: Intrinsic dimension regularizer
-                        with torch.autocast(device_type='cuda', enabled=False):
-                            L_dim = loss_dim(
-                                V_pred=V_geom,
-                                V_target=V_target_batch,
-                                mask=mask,
-                                use_target=True
-                            )
+                        if WEIGHTS['dim'] > 0:
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                L_dim = loss_dim(
+                                    V_pred=V_geom,
+                                    V_target=V_target_batch,
+                                    mask=mask,
+                                    use_target=True
+                                )
+                        else:
+                            L_dim = torch.tensor(0.0, device=device)
                         
                         # B2: Triangle area regularizer (ST: match normalized area to ST median)
-                        with torch.autocast(device_type='cuda', enabled=False):
-                            # Compute average normalized triangle area per sample (B,)
-                            A_pred = loss_triangle._compute_avg_triangle_area(V_geom, mask)
-                            
-                            # Target
-                            target = torch.full_like(A_pred, triangle_epsilon_st)
-                            
-                            # MSE loss to pull areas toward ST-style geometry
-                            L_triangle = (A_pred - target).pow(2).mean()
-
-
+                        if WEIGHTS['triangle'] > 0:
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                # Compute average normalized triangle area per sample (B,)
+                                A_pred = loss_triangle._compute_avg_triangle_area(V_geom, mask)
+                                
+                                # Target
+                                target = torch.full_like(A_pred, triangle_epsilon_st)
+                                
+                                # MSE loss to pull areas toward ST-style geometry
+                                L_triangle = (A_pred - target).pow(2).mean()
+                        else:
+                            L_triangle = torch.tensor(0.0, device=device)
                         
                         # B3: Radial histogram loss
-                        with torch.autocast(device_type='cuda', enabled=False):
-                            L_radial = loss_radial(
-                                V_pred=V_geom,
-                                V_target=V_target_batch,
-                                mask=mask
-                            )
+                        if WEIGHTS['radial'] > 0:
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                L_radial = loss_radial(
+                                    V_pred=V_geom,
+                                    V_target=V_target_batch,
+                                    mask=mask
+                                )
+                        else:
+                            L_radial = torch.tensor(0.0, device=device)
 
 
                         if DEBUG and (global_step % LOG_EVERY == 0):
@@ -1812,56 +1915,57 @@ def train_stageC_diffusion_generator(
 
                 # ==================== NEW: REPULSION LOSS (ST ONLY) ====================
                 # Penalize very small predicted pairwise distances (avoid local overlaps)
-                if DEBUG and (global_step % LOG_EVERY == 0):
-                    print(f"\n[REPEL] Computing repulsion loss for ST batch...")
+                if False:
+                    if DEBUG and (global_step % LOG_EVERY == 0):
+                        print(f"\n[REPEL] Computing repulsion loss for ST batch...")
 
-                B_rep, N_rep, D_rep = V_geom.shape
-                repel_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
-                repel_debug = {"total_pairs": 0, "violating_pairs": 0, "min_dist": float('inf'), "samples_checked": 0}
+                    B_rep, N_rep, D_rep = V_geom.shape
+                    repel_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
+                    repel_debug = {"total_pairs": 0, "violating_pairs": 0, "min_dist": float('inf'), "samples_checked": 0}
 
-                for b in range(B_rep):
-                    m_b = mask[b]
-                    n_valid = m_b.sum().item()
-                    if n_valid < 2:
-                        continue
-                    
-                    V_b = V_geom[b, m_b]  # (n_valid, D)
-                    
-                    # ROTATION-INVARIANT 2D PROJECTION (PCA)
-                    V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
-                    Cov_b = V_b_c.T @ V_b_c / n_valid  # (D, D) covariance
-                    eigvals, eigvecs = torch.linalg.eigh(Cov_b)  # ascending order
-                    U2 = eigvecs[:, -2:]  # top-2 eigenvectors (last 2 columns)
-                    V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
-                    
-                    D_pred_b = torch.cdist(V_b_2d, V_b_2d)  # (n_valid, n_valid)
-                    
-                    # Mask out diagonal
-                    eye_b = torch.eye(n_valid, device=device, dtype=torch.bool)
-                    D_pred_b_nodiag = D_pred_b.masked_fill(eye_b, 1e6)
-                    
-                    # DEBUG: Track statistics
-                    repel_debug["samples_checked"] += 1
-                    min_dist_sample = D_pred_b_nodiag.min().item()
-                    repel_debug["min_dist"] = min(repel_debug["min_dist"], min_dist_sample)
-                    repel_debug["total_pairs"] += (n_valid * (n_valid - 1)) // 2
-                    
-                    # Find pairs with distance < repel_epsilon_st
-                    violating_mask = (D_pred_b_nodiag < repel_epsilon_st) & (~eye_b)
-                    n_violations = violating_mask.sum().item() // 2  # Divide by 2 (symmetric)
-                    repel_debug["violating_pairs"] += n_violations
-                    
-                    if violating_mask.any():
-                        # Penalty: (epsilon - D_ij)^2 for violating pairs
-                        violations = D_pred_b_nodiag[violating_mask]
-                        penalty = (repel_epsilon_st - violations).pow(2).mean()
-                        repel_per_set[b] = penalty  # ← STORE IN TENSOR
-                    # else: repel_per_set[b] stays 0.0 (already initialized)
+                    for b in range(B_rep):
+                        m_b = mask[b]
+                        n_valid = m_b.sum().item()
+                        if n_valid < 2:
+                            continue
+                        
+                        V_b = V_geom[b, m_b]  # (n_valid, D)
+                        
+                        # ROTATION-INVARIANT 2D PROJECTION (PCA)
+                        V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
+                        Cov_b = V_b_c.T @ V_b_c / n_valid  # (D, D) covariance
+                        eigvals, eigvecs = torch.linalg.eigh(Cov_b)  # ascending order
+                        U2 = eigvecs[:, -2:]  # top-2 eigenvectors (last 2 columns)
+                        V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
+                        
+                        D_pred_b = torch.cdist(V_b_2d, V_b_2d)  # (n_valid, n_valid)
+                        
+                        # Mask out diagonal
+                        eye_b = torch.eye(n_valid, device=device, dtype=torch.bool)
+                        D_pred_b_nodiag = D_pred_b.masked_fill(eye_b, 1e6)
+                        
+                        # DEBUG: Track statistics
+                        repel_debug["samples_checked"] += 1
+                        min_dist_sample = D_pred_b_nodiag.min().item()
+                        repel_debug["min_dist"] = min(repel_debug["min_dist"], min_dist_sample)
+                        repel_debug["total_pairs"] += (n_valid * (n_valid - 1)) // 2
+                        
+                        # Find pairs with distance < repel_epsilon_st
+                        violating_mask = (D_pred_b_nodiag < repel_epsilon_st) & (~eye_b)
+                        n_violations = violating_mask.sum().item() // 2  # Divide by 2 (symmetric)
+                        repel_debug["violating_pairs"] += n_violations
+                        
+                        if violating_mask.any():
+                            # Penalty: (epsilon - D_ij)^2 for violating pairs
+                            violations = D_pred_b_nodiag[violating_mask]
+                            penalty = (repel_epsilon_st - violations).pow(2).mean()
+                            repel_per_set[b] = penalty  # ← STORE IN TENSOR
+                        # else: repel_per_set[b] stays 0.0 (already initialized)
 
-                # Gate by low-noise + conditional (same as Gram)
-                # geo_gate is already computed above in Gram loss section
-                gate_sum = geo_gate.sum().clamp_min(1.0)
-                L_repel = (repel_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
+                    # Gate by low-noise + conditional (same as Gram)
+                    # geo_gate is already computed above in Gram loss section
+                    gate_sum = geo_gate.sum().clamp_min(1.0)
+                    L_repel = (repel_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
 
                 # if DEBUG and (global_step % LOG_EVERY == 0):
                 if False:
@@ -1871,75 +1975,76 @@ def train_stageC_diffusion_generator(
                 
                 # ==================== NEW: SHAPE/ANISOTROPY LOSS (ST ONLY) ====================
                 # Match eigenvalue ratio of predicted Gram to target Gram
-                if DEBUG and (global_step % LOG_EVERY == 0):
-                    print(f"\n[SHAPE] Computing anisotropy/shape loss for ST batch...")
+                if False:
+                    if DEBUG and (global_step % LOG_EVERY == 0):
+                        print(f"\n[SHAPE] Computing anisotropy/shape loss for ST batch...")
 
-                shape_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
-                shape_debug = {"skipped_too_few": 0, "skipped_exception": 0, "computed": 0}
+                    shape_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
+                    shape_debug = {"skipped_too_few": 0, "skipped_exception": 0, "computed": 0}
 
-                for b in range(B_rep):
-                    m_b = mask[b].bool()
-                    n_valid = m_b.sum().item()
-                    if n_valid < 3:  # Need at least 3 points for meaningful eigenvalues
-                        shape_debug["skipped_too_few"] += 1
-                        continue
-                    
-                    # ROTATION-INVARIANT 2D PROJECTION (PCA)
-                    V_b = V_geom[b, m_b]  # (n_valid, 32)
-                    V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
-                    Cov_b = V_b_c.T @ V_b_c / n_valid  # (32, 32) covariance
-                    eigvals_cov, eigvecs_cov = torch.linalg.eigh(Cov_b)  # ascending order
-                    U2 = eigvecs_cov[:, -2:]  # top-2 eigenvectors
-                    V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
-                    
-                    Gp_b = V_b_2d @ V_b_2d.T  # Recompute Gram in 2D space
-                    
-                    Gt_b = Gt[b][m_b][:, m_b]   
+                    for b in range(B_rep):
+                        m_b = mask[b].bool()
+                        n_valid = m_b.sum().item()
+                        if n_valid < 3:  # Need at least 3 points for meaningful eigenvalues
+                            shape_debug["skipped_too_few"] += 1
+                            continue
+                        
+                        # ROTATION-INVARIANT 2D PROJECTION (PCA)
+                        V_b = V_geom[b, m_b]  # (n_valid, 32)
+                        V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
+                        Cov_b = V_b_c.T @ V_b_c / n_valid  # (32, 32) covariance
+                        eigvals_cov, eigvecs_cov = torch.linalg.eigh(Cov_b)  # ascending order
+                        U2 = eigvecs_cov[:, -2:]  # top-2 eigenvectors
+                        V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
+                        
+                        Gp_b = V_b_2d @ V_b_2d.T  # Recompute Gram in 2D space
+                        
+                        Gt_b = Gt[b][m_b][:, m_b]   
 
-                    # Compute eigenvalues (symmetric, so use eigvalsh)
-                    try:
-                        eig_pred = torch.linalg.eigvalsh(Gp_b)  # (n_valid,), ascending order
-                        eig_targ = torch.linalg.eigvalsh(Gt_b)  # (n_valid,), ascending order
-                        
-                        # Clamp from below to avoid log(0)
-                        eig_pred = eig_pred.clamp_min(1e-8)
-                        eig_targ = eig_targ.clamp_min(1e-8)
-                        
-                        # Take top 2 eigenvalues (largest)
-                        lambda1_pred = eig_pred[-1]
-                        lambda2_pred = eig_pred[-2]
-                        lambda1_targ = eig_targ[-1]
-                        lambda2_targ = eig_targ[-2]
-                        
-                        # Anisotropy ratio (how elongated vs round)
-                        r_pred = lambda1_pred / lambda2_pred.clamp_min(1e-8)
-                        r_targ = lambda1_targ / lambda2_targ.clamp_min(1e-8)
-                        
-                        # Log-ratio penalty (scale-invariant)
-                        log_ratio_loss = (torch.log(r_pred) - torch.log(r_targ)).pow(2)
-                        shape_per_set[b] = log_ratio_loss  # ← STORE IN TENSOR
-                        shape_debug["computed"] += 1
-                        
-                        # DEBUG: Print first few samples
-                        if DEBUG and (global_step % LOG_EVERY == 0) and shape_debug["computed"] <= 3:
-                            print(f"  [SHAPE sample {b}] n_valid={n_valid}")
-                            print(f"    λ_pred: {lambda1_pred:.4f}, {lambda2_pred:.4f} → ratio: {r_pred:.4f}")
-                            print(f"    λ_targ: {lambda1_targ:.4f}, {lambda2_targ:.4f} → ratio: {r_targ:.4f}")
-                            print(f"    log_ratio_loss: {log_ratio_loss:.6f}")
-                        
-                    except Exception as e:
-                        shape_debug["skipped_exception"] += 1
-                        if DEBUG and (global_step % LOG_EVERY == 0):
-                            print(f"[SHAPE] Warning: eigendecomp failed for sample {b}: {e}")
-                        continue
+                        # Compute eigenvalues (symmetric, so use eigvalsh)
+                        try:
+                            eig_pred = torch.linalg.eigvalsh(Gp_b)  # (n_valid,), ascending order
+                            eig_targ = torch.linalg.eigvalsh(Gt_b)  # (n_valid,), ascending order
+                            
+                            # Clamp from below to avoid log(0)
+                            eig_pred = eig_pred.clamp_min(1e-8)
+                            eig_targ = eig_targ.clamp_min(1e-8)
+                            
+                            # Take top 2 eigenvalues (largest)
+                            lambda1_pred = eig_pred[-1]
+                            lambda2_pred = eig_pred[-2]
+                            lambda1_targ = eig_targ[-1]
+                            lambda2_targ = eig_targ[-2]
+                            
+                            # Anisotropy ratio (how elongated vs round)
+                            r_pred = lambda1_pred / lambda2_pred.clamp_min(1e-8)
+                            r_targ = lambda1_targ / lambda2_targ.clamp_min(1e-8)
+                            
+                            # Log-ratio penalty (scale-invariant)
+                            log_ratio_loss = (torch.log(r_pred) - torch.log(r_targ)).pow(2)
+                            shape_per_set[b] = log_ratio_loss  # ← STORE IN TENSOR
+                            shape_debug["computed"] += 1
+                            
+                            # DEBUG: Print first few samples
+                            if DEBUG and (global_step % LOG_EVERY == 0) and shape_debug["computed"] <= 3:
+                                print(f"  [SHAPE sample {b}] n_valid={n_valid}")
+                                print(f"    λ_pred: {lambda1_pred:.4f}, {lambda2_pred:.4f} → ratio: {r_pred:.4f}")
+                                print(f"    λ_targ: {lambda1_targ:.4f}, {lambda2_targ:.4f} → ratio: {r_targ:.4f}")
+                                print(f"    log_ratio_loss: {log_ratio_loss:.6f}")
+                            
+                        except Exception as e:
+                            shape_debug["skipped_exception"] += 1
+                            if DEBUG and (global_step % LOG_EVERY == 0):
+                                print(f"[SHAPE] Warning: eigendecomp failed for sample {b}: {e}")
+                            continue
 
-                # Gate by low-noise + conditional (same as Gram)
-                gate_sum = geo_gate.sum().clamp_min(1.0)
-                L_shape = (shape_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
+                    # Gate by low-noise + conditional (same as Gram)
+                    gate_sum = geo_gate.sum().clamp_min(1.0)
+                    L_shape = (shape_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
 
-                if DEBUG and (global_step % LOG_EVERY == 0):
-                    print(f"[SHAPE] L_shape={L_shape.item():.6f} | computed={shape_debug['computed']}, skipped_few={shape_debug['skipped_too_few']}, skipped_exc={shape_debug['skipped_exception']}")
-                # ==============================================================================
+                    if DEBUG and (global_step % LOG_EVERY == 0):
+                        print(f"[SHAPE] L_shape={L_shape.item():.6f} | computed={shape_debug['computed']}, skipped_few={shape_debug['skipped_too_few']}, skipped_exc={shape_debug['skipped_exception']}")
+                    # ==============================================================================
 
 
                 # ============================================================================
@@ -2241,8 +2346,8 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['gen_align'] * L_gen_align +
                                 WEIGHTS['dim'] * L_dim +
                                 WEIGHTS['triangle'] * L_triangle +
+                                WEIGHTS['knn_nca'] * L_knn_nca +
                                 WEIGHTS['radial'] * L_radial +
-                                + WEIGHTS['knn_nca'] * L_knn_nca +
                                 WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
                                 WEIGHTS['shape'] * L_shape)       # NEW: ST shape/anisotropy
 
@@ -2602,6 +2707,30 @@ def train_stageC_diffusion_generator(
 
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
+
+            # Add this summary print every 10 epochs
+            if epoch % 2 == 0:
+                # Compute averages
+                cv_avg = (epoch_cv_sum / max(epoch_nca_count, 1)) * 100  # Convert to percentage
+                loss_nca = epoch_nca_loss_sum / max(epoch_nca_count, 1)
+                
+                # Get Q entropy average from global accumulator
+                from utils_et import _nca_qent_accum
+                if len(_nca_qent_accum) > 0:
+                    qent_avg = (sum(_nca_qent_accum) / len(_nca_qent_accum)) * 100  # Convert to %
+                    _nca_qent_accum.clear()  # Reset for next epoch
+                else:
+                    qent_avg = 100.0  # Default if no data
+                
+                print(f"\n{'='*60}")
+                print(f"EPOCH {epoch} PROGRESS CHECK")
+                print(f"{'='*60}")
+                print(f"Metric          | Current | Target  | Status")
+                print(f"----------------|---------|---------|--------")
+                print(f"d² CV          | {cv_avg:.1f}%   | >30%    | {'✓' if cv_avg > 30 else '⚠️'}")
+                print(f"Q entropy ratio| {qent_avg:.1f}% | <70%    | {'✓' if qent_avg < 70 else '⚠️'}")
+                print(f"NCA loss       | {loss_nca:.2f}  | <3.5    | {'✓' if loss_nca < 3.5 else '⚠️'}")
+                print(f"{'='*60}\n")
             
             if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
                 # Use total weighted loss as validation metric

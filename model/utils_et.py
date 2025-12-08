@@ -13,6 +13,8 @@ from scipy.spatial.distance import pdist, squareform
 from sklearn.neighbors import NearestNeighbors
 import warnings
 
+_nca_qent_accum = []
+
 # ==============================================================================
 # PART 1: POSE NORMALIZATION (reuse existing for continuity)
 # ==============================================================================
@@ -3106,7 +3108,6 @@ class RadialHistogramLoss(nn.Module):
         
         return V_canon
 
-
 class KNNSoftmaxLoss(nn.Module):
     """
     NCA/SNE-style neighbor preservation loss.
@@ -3192,15 +3193,16 @@ class KNNSoftmaxLoss(nn.Module):
                 if len(valid_neighbors) > 0:
                     P[b, i, valid_neighbors] = 1.0 / len(valid_neighbors)
 
-        # if (P > 0).any():
-        #     print("NCA: has neighbors, mean P mass per anchor =",
-        #         (P.sum(dim=2) > 0).float().mean().item())
-        # else:
-        #     print("NCA: WARNING – P is all zeros")
-
-            
-        # Compute predicted distribution Q_ij from softmax over distances
-        # Q_ij = exp(-d_ij^2 / tau) / sum_l exp(-d_il^2 / tau)
+        # ADD THIS DEBUG:
+        # if torch.cuda.current_device() == 0:  # Only rank 0
+        #     P_mass = P.sum(dim=2)  # (B, N) - probability mass per anchor
+        #     n_anchors_with_neighbors = (P_mass > 0).sum().item()
+        #     print(f"\n[DEBUG KNN NCA - P distribution]")
+        #     print(f"  Anchors with neighbors: {n_anchors_with_neighbors}/{B*N}")
+        #     print(f"  Mean P mass per anchor: {P_mass.mean().item():.6f} (should be 1.0)")
+        #     if n_anchors_with_neighbors == 0:
+        #         print(f"  ERROR: No valid k-NN neighbors found! Check knn_indices.")
+        # END DEBUG
         
         # Negative squared distances (for numerical stability)
         neg_sq_dist = -(D_pred ** 2) / tau  # (B, N, N)
@@ -3219,6 +3221,39 @@ class KNNSoftmaxLoss(nn.Module):
         
         # Softmax to get Q
         Q = F.softmax(neg_sq_dist, dim=2)  # (B, N, N)
+
+        # Accumulate Q entropy for epoch averaging
+        if torch.cuda.current_device() == 0:
+            with torch.no_grad():
+                Q_entropy = -(Q * torch.log(Q + 1e-12)).sum(dim=2).mean().item()
+                Q_max_entropy = torch.log(torch.tensor(N - 1.0)).item()
+                qent_ratio = Q_entropy / Q_max_entropy
+                
+                # Store for later averaging
+                global _nca_qent_accum
+                _nca_qent_accum.append(qent_ratio)
+
+        # ADD THIS:
+        # if torch.cuda.current_device() == 0:
+        #     Q_entropy = -(Q * torch.log(Q + 1e-12)).sum(dim=2).mean().item()
+        #     Q_max_entropy = torch.log(torch.tensor(N - 1.0)).item()
+        #     print(f"\n[DEBUG KNN NCA - Q distribution]")
+        #     print(f"  Q entropy: {Q_entropy:.4f} / {Q_max_entropy:.4f} (uniform)")
+        #     print(f"  Q entropy ratio: {Q_entropy/Q_max_entropy:.2%}")
+            
+        #     # Check if Q is nearly uniform
+        #     if Q_entropy / Q_max_entropy > 0.95:
+        #         print(f"  WARNING: Q is nearly uniform! Check tau and D_pred statistics.")
+                
+        #         # Diagnose tau
+        #         d_sq_valid = (D_pred ** 2)[~torch.eye(N, device=D_pred.device, dtype=torch.bool).unsqueeze(0)]
+        #         d_sq_mean = d_sq_valid.mean().item()
+        #         d_sq_median = d_sq_valid.median().item()
+        #         tau_current = tau if tau is not None else self.tau
+        #         print(f"  Mean d²: {d_sq_mean:.6f}, Median d²: {d_sq_median:.6f}")
+        #         print(f"  Current tau: {tau_current:.6f}")
+        #         print(f"  Ratio d²/tau: {d_sq_mean/tau_current:.2f} (should be ~1-10 for good separation)")
+        # END DEBUG
         
         # Cross-entropy: -sum_j P_ij * log(Q_ij)
         # Add epsilon to avoid log(0)
