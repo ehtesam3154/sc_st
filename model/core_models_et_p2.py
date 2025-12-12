@@ -788,31 +788,12 @@ def train_stageC_diffusion_generator(
     )
     loss_sw = uet.SlicedWassersteinLoss1D()
     loss_triplet = uet.OrdinalTripletLoss()
-    loss_knn_nca = uet.KNNSoftmaxLoss(tau=1.0, k=15)
+    # loss_knn_nca = uet.KNNSoftmaxLoss(tau=1.0, k=15)
+    # NEW: topology aware losses
+    loss_edge = uet.EdgeLengthLoss()
+    loss_topo = uet.TopologyLoss()
+    loss_shape_spectrum = uet.ShapeSpectrumLoss()
 
-    # ADD THIS BLOCK:
-    # if use_st:
-    # print("\n[Computing adaptive tau for KNN NCA loss]")
-    # st_knn_sq_dists = []
-    # for slide_id in st_dataset.targets_dict:
-    #     y_hat = st_dataset.targets_dict[slide_id].y_hat
-    #     D_ref = torch.cdist(y_hat, y_hat)
-    #     # Get k=15 nearest neighbors per point
-    #     knn_dists, _ = torch.topk(D_ref, k=16, dim=1, largest=False)  # +1 for self
-    #     knn_dists = knn_dists[:, 1:]  # Remove self
-    #     st_knn_sq_dists.append(knn_dists[:, :15].flatten() ** 2)
-    
-    # st_knn_sq_dists = torch.cat(st_knn_sq_dists).cpu().numpy()
-    # tau_median = float(np.median(st_knn_sq_dists))
-    # tau_mean = float(np.mean(st_knn_sq_dists))
-    
-    # print(f"  Reference k-NN squared distances (k=15):")
-    # print(f"    Median: {tau_median:.6f}")
-    # print(f"    Mean: {tau_mean:.6f}")
-    # print(f"    Suggested tau range: [{tau_median*0.1:.6f}, {tau_median:.6f}]")
-    # print(f"  Currently using tau={loss_knn_nca.tau:.6f}")
-    # print(f"  Consider setting tau={tau_median*0.5:.6f} (0.5 * median)\n")
-    # END BLOCK
 
     loss_dim = uet.IntrinsicDimensionLoss(k_neighbors=20, target_dim=2.0)
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
@@ -1116,7 +1097,11 @@ def train_stageC_diffusion_generator(
         'radial': 0.5,
         'knn_nca': 0.0,
         'repel': 0.0,      # NEW: ST repulsion loss
-        'shape': 0.0       # NEW: ST anisotropy/shape loss
+        'shape': 0.0,       # NEW: ST anisotropy/shape loss
+        # NEW
+        'edge': 0.8,       # Edge-length preservation (local metric)
+        'topo': 0.5,       # Topology preservation (persistent homology proxy)
+        'shape': 0.4,      # Shape spectrum (anisotropy matching)
     }
 
     # Heat warmup schedule
@@ -1150,7 +1135,10 @@ def train_stageC_diffusion_generator(
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
             'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [], 'knn_nca': [], 
-            'repel': [], 'shape': []  # NEW: ST shape constraints
+            'repel': [], 'shape': [],  # NEW: ST shape constraints
+            'edge': [],     # NEW
+            'topo': [],     # NEW
+            'shape_spectrum': []
         }
     }
 
@@ -1201,6 +1189,9 @@ def train_stageC_diffusion_generator(
         'edm_tail': 0.1,
         'gen_align': 0.1,
         'radial': 0.1,
+        'edge': 0.1,
+        'topo': 0.1,
+        'shape': 0.1
         # dim and triangle are regularizers - keep manual for now
     }
     ema_sc = {
@@ -1222,6 +1213,9 @@ def train_stageC_diffusion_generator(
         'edm_tail': 0.12,       # EDM tail loss at ~12%
         'gen_align': 0.06,      # Procrustes alignment at ~6%
         'radial': 0.04,         # Radial histogram at ~4%
+        'edge': 0.12,      # Similar to edm_tail (local geometry)
+        'topo': 0.10,      # Similar to sw_st (distribution matching)
+        'shape': 0.06,
     }
 
     TARGET_SC = {
@@ -1476,6 +1470,10 @@ def train_stageC_diffusion_generator(
             L_radial = torch.zeros((), device=device)
             L_repel = torch.tensor(0.0, device=device)   # NEW: ST repulsion
             L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
+            L_edge = torch.tensor(0.0, device=device)   # NEW: Edge-length loss
+            L_topo = torch.tensor(0.0, device=device)   # NEW: Topology loss  
+            L_shape_spectrum = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
+
       
             # Denoise to get V_hat
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -1529,35 +1527,6 @@ def train_stageC_diffusion_generator(
                     mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                     V_geom = (V_hat_f32 - mean) * m_float             # (B,N,D), centered, scale-preserving
 
-                    # After: V_geom = (V_hat_f32 - mean) * m_float
-                    # if global_step % LOG_EVERY == 0:
-                    # with torch.no_grad():
-                    #     V_geom_valid = V_geom[mask.bool()]
-                    #     radii = torch.norm(V_geom_valid, dim=-1)
-                    #     print(f"[DEBUG Radii]")
-                    #     print(f"  Mean radius: {radii.mean().item():.6f}")
-                    #     print(f"  Std radius: {radii.std().item():.6f}")
-                    #     print(f"  Radius CV: {radii.std().item() / radii.mean().item():.2%}")
-                        
-                    #     if radii.std() / radii.mean() < 0.2:
-                    #         print(f"  WARNING: Points clustered on sphere (low radius variation)")
-
-
-                    # ADD THIS:
-                    # if global_step % LOG_EVERY == 0:
-                    #     with torch.no_grad():
-                    #         # Check if V_geom has variation
-                    #         V_geom_valid = V_geom[mask.bool()]  # Only valid coordinates
-                    #         print(f"\n[DEBUG V_geom] step={global_step}")
-                    #         print(f"  Shape: {V_geom.shape}")
-                    #         print(f"  Mean: {V_geom_valid.mean().item():.6f} (should be ~0)")
-                    #         print(f"  Std: {V_geom_valid.std().item():.6f}")
-                    #         print(f"  Min: {V_geom_valid.min().item():.6f}")
-                    #         print(f"  Max: {V_geom_valid.max().item():.6f}")
-                            
-                    #         # Check if all coordinates are identical (collapse)
-                    #         if V_geom_valid.std() < 1e-4:
-                    #             print(f"  WARNING: V_geom has collapsed (std < 1e-4)!")
 
                     Gt = G_target.float()
                     B, N, _ = V_geom.shape
@@ -1653,7 +1622,6 @@ def train_stageC_diffusion_generator(
                     gate_sum = geo_gate.sum().clamp(min=1.0)
                     L_gram = (per_set_relative_loss * geo_gate).sum() / gate_sum
                     
-                    # L_gram = per_set_relative_loss.mean()  # scalar, O(1) magnitude
                     
                     # --- DEBUG 5: Loss statistics ---
                     if DEBUG and (global_step % LOG_EVERY == 0):
@@ -1709,54 +1677,66 @@ def train_stageC_diffusion_generator(
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
 
 
-                # 2. Compute kNN NCA loss
-                L_knn_nca = torch.tensor(0.0, device=device)
-                knn_nca_count = 0
-
-                # Only run if batch actually has indices (SC loader must provide them)
-                if not is_sc and 'knn_indices' in batch:
+                # ==================== EDGE-LENGTH LOSS ====================
+                if WEIGHTS['edge'] > 0 and 'knn_indices' in batch:
                     with torch.autocast(device_type='cuda', enabled=False):
                         knn_indices_batch = batch['knn_indices'].to(device)
-                        # print(f"\n[DEBUG] knn_indices check:")
-                        # print(f"  Shape: {knn_indices_batch.shape}")
-                        # print(f"  Valid neighbors (>=0): {(knn_indices_batch >= 0).float().mean().item():.2%}")
-                        # print(f"  Sample knn_indices[0,0]: {knn_indices_batch[0,0,:5]}")
+                                                
+                        # Low-noise gating
+                        low_noise = (t_norm.squeeze() < 0.3)
+                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        geo_gate_edge = (low_noise & cond_only).float()
+                        gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
                         
-                        for b in range(len(mask)):
-                            m = mask[b]
-                            n_valid = m.sum().item()
-                            
-                            if n_valid < 5: 
-                                continue
-                            
-                            # Use the globally computed V_geom
-                            V_pred_b = V_geom[b, m]
-                            D_pred_b = torch.cdist(V_pred_b, V_pred_b)
-                            knn_b = knn_indices_batch[b, m]
-
-
-                            # Inside the training loop, before calling loss_knn_nca:
-                            with torch.no_grad():
-                                d_sq = D_pred_b ** 2
-                                d_sq_valid = d_sq[~torch.eye(d_sq.shape[0], device=device, dtype=torch.bool)]
-                                cv_batch = (d_sq_valid.std() / d_sq_valid.mean()).item()
-                                epoch_cv_sum += cv_batch
-                                epoch_nca_count += 1
-                            
-                            L_nca_b = loss_knn_nca(
-                                D_pred=D_pred_b,
-                                knn_indices=knn_b,
-                                mask=None,
-                                tau=tau_reference,
-                                k=15
-                            )
-                            
-                            L_knn_nca = L_knn_nca + L_nca_b
-                            knn_nca_count += 1
-                    
-                    if knn_nca_count > 0:
-                        L_knn_nca = L_knn_nca / knn_nca_count
-                # ===================================================================
+                        L_edge_raw = loss_edge(
+                            V_pred=V_geom,
+                            V_target=V_target_batch,  # Already computed!
+                            knn_indices=knn_indices_batch,
+                            mask=mask
+                        )
+                        
+                        L_edge = (L_edge_raw * geo_gate_edge).sum() / gate_sum_edge
+                
+                # ==================== TOPOLOGY LOSS ====================
+                if WEIGHTS['topo'] > 0:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        topo_info = batch.get('topo_info', None)
+                        
+                        # V_target_batch already computed above!
+                        
+                        # Low-noise gating (more aggressive for topology)
+                        low_noise = (t_norm.squeeze() < 0.2)
+                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        geo_gate_topo = (low_noise & cond_only).float()
+                        gate_sum_topo = geo_gate_topo.sum().clamp(min=1.0)
+                        
+                        L_topo_raw = loss_topo(
+                            V_pred=V_geom,
+                            V_target=V_target_batch,  # Already computed!
+                            mask=mask,
+                            topo_info=topo_info
+                        )
+                        
+                        L_topo = (L_topo_raw * geo_gate_topo).sum() / gate_sum_topo
+                
+                # ==================== SHAPE SPECTRUM LOSS ====================
+                if WEIGHTS['shape'] > 0:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        # V_target_batch already computed above!
+                        
+                        # Low-noise gating
+                        low_noise = (t_norm.squeeze() < 0.3)
+                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        geo_gate_shape = (low_noise & cond_only).float()
+                        gate_sum_shape = geo_gate_shape.sum().clamp(min=1.0)
+                        
+                        L_shape_spectrum_raw = loss_shape_spectrum(
+                            V_pred=V_geom,
+                            V_target=V_target_batch,  # Already computed!
+                            mask=mask
+                        )
+                        
+                        L_shape_spectrum = (L_shape_spectrum_raw * geo_gate_shape).sum() / gate_sum_shape
 
                 # Heat kernel loss (batched)
                 if WEIGHTS['heat'] > 0 and (global_step % heat_every_k) == 0:
@@ -2369,7 +2349,10 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['knn_nca'] * L_knn_nca +
                                 WEIGHTS['radial'] * L_radial +
                                 WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
-                                WEIGHTS['shape'] * L_shape)       # NEW: ST shape/anisotropy
+                                WEIGHTS['shape'] * L_shape + 
+                                WEIGHTS['edge'] * L_edge +           # NEW
+                                WEIGHTS['topo'] * L_topo +           # NEW
+                                WEIGHTS['shape'] * L_shape_spectrum )       # NEW: ST shape/anisotropy
 
             
             # Add SC dimension prior if this is an SC batch
@@ -2651,6 +2634,10 @@ def train_stageC_diffusion_generator(
             epoch_losses['radial'] += L_radial.item()
             epoch_losses['repel'] += L_repel.item()
             epoch_losses['shape'] += L_shape.item()
+            epoch_losses['edge'] += L_edge.item()
+            epoch_losses['topo'] += L_topo.item()
+            epoch_losses['shape'] += L_shape_spectrum.item()
+
 
 
 

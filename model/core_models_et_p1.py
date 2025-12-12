@@ -264,6 +264,7 @@ def train_encoder(
 # ==============================================================================
 
 @dataclass
+@dataclass
 class STTargets:
     """Precomputed geometric targets for an ST slide."""
     y_hat: torch.Tensor      # (n, 2) normalized coords
@@ -277,6 +278,13 @@ class STTargets:
     k: int                   # kNN parameter
     scale: float             # normalization scale factor
     knn_indices: torch.Tensor  # (n, k) k-NN indices for each spot
+    
+    # NEW: Persistent homology topology info (for full slide)
+    topo_pairs_0: torch.Tensor  # (m0, 2) index pairs for 0D features (connected components)
+    topo_dists_0: torch.Tensor  # (m0,) birth distances for 0D features
+    topo_pairs_1: torch.Tensor  # (m1, 2) index pairs for 1D features (loops)
+    topo_dists_1: torch.Tensor  # (m1,) birth distances for 1D features
+
 
 
 class STStageBPrecomputer:
@@ -376,22 +384,35 @@ class STStageBPrecomputer:
         # 5. Z indices (for linking to encoder)
         Z_indices = torch.arange(st_coords.shape[0], device=device)
         
-        targets = STTargets(
-            slide_id=slide_id,
-            center=center,
-            scale=scale,
-            y_hat=y_hat,
-            G=G,
-            D=D,
-            H=H,
-            t_list=self.t_list,
-            k=self.k,
-            sigma_policy=self.sigma_policy,
-            triplets=triplets,
-            Z_indices=Z_indices,
-            knn_indices=knn_indices
+        # NEW: Compute persistent homology for full slide
+        print(f"  Computing persistent homology for slide {slide_id}...")
+        y_hat_np = y_hat.cpu().numpy()
+        topo_info = uet.compute_persistent_pairs(
+            y_hat_np,
+            max_pairs_0d=10,  # Top 10 connected component features
+            max_pairs_1d=5    # Top 5 loop features
         )
         
+        targets = STTargets(
+            y_hat=y_hat.cpu(),
+            G=G.cpu(),
+            D=D.cpu(),
+            H=H.cpu(),
+            H_bins=bins.cpu(),
+            L=L.to_dense().cpu() if L.is_sparse else L.cpu(),
+            t_list=self.t_list,
+            triplets=triplets.cpu(),
+            k=self.k,
+            scale=scale,
+            knn_indices=knn_indices.cpu(),
+            
+            # NEW: Add topology info
+            topo_pairs_0=torch.from_numpy(topo_info['pairs_0']).long(),
+            topo_dists_0=torch.from_numpy(topo_info['dists_0']).float(),
+            topo_pairs_1=torch.from_numpy(topo_info['pairs_1']).long(),
+            topo_dists_1=torch.from_numpy(topo_info['dists_1']).float(),
+        )
+
         return targets
     
     def precompute(
@@ -739,6 +760,52 @@ class STSetDataset(Dataset):
             't_list': targets.t_list
         }
 
+        # ------------------------------------------------------------------
+        # NEW: Extract topology pairs for this miniset
+        # ------------------------------------------------------------------
+        # Map global topology pairs to local indices
+        # Only keep pairs where BOTH points are in the miniset
+        
+        def extract_topo_pairs(pairs_global, dists_global, indices, global_to_local):
+            """Extract topology pairs that exist within miniset"""
+            if len(pairs_global) == 0:
+                return torch.zeros((0, 2), dtype=torch.long), torch.zeros(0, dtype=torch.float32)
+            
+            pairs_local = []
+            dists_local = []
+            
+            for idx_pair, (i_global, j_global) in enumerate(pairs_global):
+                # Check if both points are in miniset
+                i_local = global_to_local[i_global.item()]
+                j_local = global_to_local[j_global.item()]
+                
+                if i_local != -1 and j_local != -1:
+                    pairs_local.append([i_local, j_local])
+                    dists_local.append(dists_global[idx_pair])
+            
+            if len(pairs_local) == 0:
+                return torch.zeros((0, 2), dtype=torch.long), torch.zeros(0, dtype=torch.float32)
+            
+            return (
+                torch.tensor(pairs_local, dtype=torch.long),
+                torch.tensor(dists_local, dtype=torch.float32)
+            )
+        
+        # global_to_local is already defined above (line 683-684)
+        topo_pairs_0_local, topo_dists_0_local = extract_topo_pairs(
+            targets.topo_pairs_0, targets.topo_dists_0, indices, global_to_local
+        )
+        topo_pairs_1_local, topo_dists_1_local = extract_topo_pairs(
+            targets.topo_pairs_1, targets.topo_dists_1, indices, global_to_local
+        )
+        
+        topo_info = {
+            'pairs_0': topo_pairs_0_local,
+            'dists_0': topo_dists_0_local,
+            'pairs_1': topo_pairs_1_local,
+            'dists_1': topo_dists_1_local,
+        }
+
         return {
             'Z_set': Z_set,
             'is_landmark': is_landmark,
@@ -752,8 +819,8 @@ class STSetDataset(Dataset):
             'n': len(indices),
             'overlap_info': overlap_info,
             'knn_indices': knn_local,
+            'topo_info': topo_info,  # NEW
         }
-
 
             
 def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -771,6 +838,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     triplets_batch = []
     H_bins_batch = []
     overlap_info_batch = []
+    topo_info_batch = [] 
 
     #init padded tensors
     Z_batch = torch.zeros(batch_size, n_max, h_dim, device=device)
@@ -806,6 +874,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         triplets_batch.append(item['triplets'])
         H_bins_batch.append(item['H_bins'])
         overlap_info_batch.append(item['overlap_info'])
+        topo_info_batch.append(item.get('topo_info', None))  # NEW!
         knn_batch[i, :n] = item['knn_indices']
     
     return {
@@ -823,6 +892,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'is_landmark': is_landmark_batch,  # ADD THIS
         'is_sc': False,
         'knn_indices': knn_batch,
+        'topo_info': topo_info_batch,
     }
 
 class SCSetDataset(Dataset):

@@ -3108,128 +3108,296 @@ class RadialHistogramLoss(nn.Module):
         
         return V_canon
 
-class KNNSoftmaxLoss(nn.Module):
+
+class EdgeLengthLoss(nn.Module):
     """
-    NCA/SNE-style neighbor preservation loss.
-    
-    For each anchor point i, defines target distribution P_ij over neighbors
-    (uniform over k-NN, zero elsewhere), and predicted distribution Q_ij 
-    from softmax over predicted distances.
-    
-    Loss = sum_i sum_j P_ij * (-log Q_ij)  (cross-entropy)
-    
-    Args:
-        tau: Temperature for softmax (smaller = sharper)
-        k: Number of nearest neighbors to preserve
+    Local edge-length loss (replaces KNN NCA).
+    Preserves actual edge lengths instead of just rank ordering.
+    Uses log-ratio to fight gram_scale naturally.
     """
     
-    def __init__(self, tau: float = 1.0, k: int = 10):
+    def __init__(self, eps: float = 1e-4):
         super().__init__()
-        self.tau = tau
-        self.k = k
+        self.eps = eps
     
     def forward(
         self,
-        D_pred: torch.Tensor,
+        V_pred: torch.Tensor,
+        V_target: torch.Tensor,
         knn_indices: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        tau: Optional[float] = None,
-        k: Optional[int] = None
+        mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute NCA-style neighbor softmax loss.
-        
         Args:
-            D_pred: (B, N, N) or (N, N) predicted distance matrix
-            knn_indices: (B, N, k_precomputed) or (N, k_precomputed) ground truth k-NN indices
-            mask: (B, N) or (N,) optional validity mask
-            tau: Optional temperature override
-            k: Optional k override - will use first k neighbors from knn_indices
+            V_pred: (B, N, D) predicted coordinates
+            V_target: (B, N, D) target coordinates  
+            knn_indices: (B, N, k) neighbor indices from ST GT
+            mask: (B, N) boolean mask
             
         Returns:
-            loss: Scalar cross-entropy loss
+            loss: scalar edge length loss
         """
-        if tau is None:
-            tau = self.tau
-        if k is None:
-            k = self.k
+        B, N, k = knn_indices.shape
+        device = V_pred.device
         
-        # ADD THIS BLOCK - Slice knn_indices to use only first k neighbors
-        if knn_indices.shape[-1] > k:
-            knn_indices = knn_indices[..., :k]  # Take first k neighbors only
-        elif knn_indices.shape[-1] < k:
-            # If precomputed k is smaller than requested k, use what we have
-            k = knn_indices.shape[-1]
-        # END OF NEW BLOCK
+        # Create row indices (i)
+        i = torch.arange(N, device=device).unsqueeze(1).expand(N, k)  # (N, k)
+        j = knn_indices  # (B, N, k)
         
-        is_batched = D_pred.dim() == 3
+        loss_per_batch = []
         
-        if not is_batched:
-            # Add batch dimension
-            D_pred = D_pred.unsqueeze(0)          # (1, N, N)
-            knn_indices = knn_indices.unsqueeze(0)  # (1, N, k)
-            if mask is not None:
-                mask = mask.unsqueeze(0)  # (1, N)
-        
-        B, N, _ = D_pred.shape
-        device = D_pred.device
-        
-        # Create target distribution P_ij: uniform over k-NN, zero elsewhere
-        # Shape: (B, N, N)
-        P = torch.zeros(B, N, N, device=device, dtype=D_pred.dtype)
-        
-        # For each batch and each anchor i, set P[b,i,j]=1/k for j in knn_indices[b,i]
-        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, N, k)
-        anchor_idx = torch.arange(N, device=device).view(1, N, 1).expand(B, N, k)
-        
-        # Handle invalid kNN indices (padded with -1)
-        valid_knn = knn_indices >= 0  # (B, N, k)
-
-        # Set P values only for valid neighbors
         for b in range(B):
-            for i in range(N):
-                valid_mask = valid_knn[b, i]  # (k,) boolean mask
-                valid_neighbors = knn_indices[b, i, valid_mask]  # Get only valid neighbor indices
-                if len(valid_neighbors) > 0:
-                    P[b, i, valid_neighbors] = 1.0 / len(valid_neighbors)
+            m_b = mask[b]
+            n_valid = m_b.sum().item()
+            
+            if n_valid < 2:
+                continue
+            
+            # Get valid nodes
+            V_pred_b = V_pred[b, m_b]  # (n_valid, D)
+            V_target_b = V_target[b, m_b]  # (n_valid, D)
+            knn_b = knn_indices[b, m_b]  # (n_valid, k)
+            
+            # Map global indices to local
+            global_to_local = torch.full((N,), -1, dtype=torch.long, device=device)
+            valid_idx = torch.where(m_b)[0]
+            global_to_local[valid_idx] = torch.arange(n_valid, device=device)
+            
+            knn_local = global_to_local[knn_b]  # (n_valid, k)
+            
+            # Filter out invalid neighbors (-1)
+            valid_neighbors = (knn_local >= 0)  # (n_valid, k)
+            
+            if not valid_neighbors.any():
+                continue
+            
+            # Gather coordinates
+            i_local = torch.arange(n_valid, device=device).unsqueeze(1).expand(n_valid, k)
+            
+            # Only compute for valid edges
+            edge_mask = valid_neighbors
+            i_edges = i_local[edge_mask]  # (num_edges,)
+            j_edges = knn_local[edge_mask]  # (num_edges,)
+            
+            if len(i_edges) == 0:
+                continue
+            
+            # Compute edge lengths
+            x_i_pred = V_pred_b[i_edges]  # (num_edges, D)
+            x_j_pred = V_pred_b[j_edges]
+            x_i_target = V_target_b[i_edges]
+            x_j_target = V_target_b[j_edges]
+            
+            d_pred = (x_i_pred - x_j_pred).norm(dim=-1)  # (num_edges,)
+            d_target = (x_i_target - x_j_target).norm(dim=-1)
+            
+            # Log-ratio loss (ratio-preserving)
+            log_diff = torch.log(d_pred + self.eps) - torch.log(d_target + self.eps)
+            loss_b = (log_diff ** 2).mean()
+            loss_per_batch.append(loss_b)
         
-        # Negative squared distances (for numerical stability)
-        neg_sq_dist = -(D_pred ** 2) / tau  # (B, N, N)
+        if len(loss_per_batch) == 0:
+            return torch.tensor(0.0, device=device)
         
-        # Mask out self-connections (diagonal)
-        eye = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
-        neg_sq_dist = neg_sq_dist.masked_fill(eye, -float('inf'))
-        
-        # Apply validity mask if provided
-        if mask is not None:
-            # Mask both anchors and neighbors
-            anchor_mask = mask.unsqueeze(2)  # (B, N, 1)
-            neighbor_mask = mask.unsqueeze(1)  # (B, 1, N)
-            valid_pairs = anchor_mask & neighbor_mask  # (B, N, N)
-            neg_sq_dist = neg_sq_dist.masked_fill(~valid_pairs, -float('inf'))
-        
-        # Softmax to get Q
-        Q = F.softmax(neg_sq_dist, dim=2)  # (B, N, N)
+        return torch.stack(loss_per_batch).mean()
+       
 
-        # Accumulate Q entropy for epoch averaging
-        if torch.cuda.current_device() == 0:
-            with torch.no_grad():
-                Q_entropy = -(Q * torch.log(Q + 1e-12)).sum(dim=2).mean().item()
-                Q_max_entropy = torch.log(torch.tensor(N - 1.0)).item()
-                qent_ratio = Q_entropy / Q_max_entropy
+def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int=10, max_pairs_1d: int=5):
+    """
+    Compute persistent homology pairs for a single miniset.
+    Uses Vietoris-Rips filtration.
+    
+    Args:
+        coords: (n, 2) numpy array of ST coordinates
+        max_pairs_0d: max number of 0D pairs to keep (connected components)
+        max_pairs_1d: max number of 1D pairs to keep (loops/holes)
+    
+    Returns:
+        dict with:
+            'pairs_0': (m0, 2) index pairs for 0D features
+            'dists_0': (m0,) birth distances for 0D features
+            'pairs_1': (m1, 2) index pairs for 1D features
+            'dists_1': (m1,) birth distances for 1D features
+    """
+    from ripser import ripser
+    from scipy.spatial.distance import squareform, cdist
+
+    n = coords.shape[0]
+
+    if n < 3:
+        return {
+            'pairs_0': np.zeros((0, 2), dtype=np.int64),
+            'dists_0': np.zeros(0, dtype=np.float32),
+            'pairs_1': np.zeros((0, 2), dtype=np.int64),
+            'dists_1': np.zeros(0, dtype=np.float32),
+        }
+
+    #compute distance matrix
+    D = squareform(pdist(coords, metric='euclidean'))
+
+    #compute persistent homology (up to 1D)
+    result = ripser(D, maxdim=1, distance_matrix = True)
+    diagrams = result['dgms']
+
+    #extract 0D and 1D persistent diagrams
+    dgm0 = diagrams[0] #0D: connected components
+    dgms1 = diagrams[1] if len(diagrams) > 1 else np.zeros((0, 2))
+
+    def extract_top_pairs(dgm, max_pairs, dimension):
+        '''extract top-m most persistent features from diagram'''
+        if len(dgm) == 0:
+            return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
+
+        #filter out infinite death times
+        finite_mask = np.isfinite(dgm[:, 1])
+        dgm_finite = dgm[finite_mask]
+
+        if len(dgm_finite) == 0:
+            return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
+
+        #compute persistence (death - birth)
+        persistence = dgm_finite[:, 1] - dgm_finite[:, 0]
+
+        #sort by persistence (descending)
+        sorted_idx = np.zrgsort(-persistence)
+        top_k = min(max_pairs, len(sorted_idx))
+        top_idx = sorted_idx[: top_k]
+
+        #get birth/death distances
+        births = dgm_finite[top_idx, 0]
+        deaths = dgm_finite[top_idx, 1]
+
+        #for each persistent feature, find representative point pairs
+        #simplified: use birth distances to find closest point pairs
+        pairs = []
+        dists = []
+
+        for birth, death in zip(births, deaths):
+            #find pair of points whose distance approx birth
+            #simple heuristic: find closest pair in D that matches birth distance
+            diff = np.abs(D - birth)
+            np.fill_diagonal(diff, np.inf) 
+            i, j = np.unravel_index(np.argmin(diff), D.shape)
+
+            if i > j:
+                i, j = j, i #ensure i < j
+
+            pairs.append([i, j])
+            dists.append(D[i, j])
+
+        return np.array(pairs, dtype=np.int64), np.array(dists, dtype=np.float32)
+    
+    #extract 0D pairs (connected components)
+    pairs_0, dists_0 = extract_top_pairs(dgm0, max_pairs_0d, 0)
+
+    #extract 1D pairs (loops)
+    pairs_1, dists_1 = extract_top_pairs(dgm0, max_pairs_1d, 1)
+
+    return {
+        'pairs_0': pairs_0,
+        'dists_0': dists_0,
+        'pairs_1': pairs_1,
+        'dists_1': dists_1,
+    }
+
+
+class TopologyLoss(nn.Module):
+    """
+    Topological loss using persistent homology pairings.
+    
+    Real implementation following ChatGPT's design:
+    - Uses precomputed persistent pairs from offline preprocessing
+    - Matches distances of topologically important point pairs
+    - Preserves connectivity (0D) and loops/holes (1D)
+    """
+    
+    def __init__(self, eps: float = 1e-4):
+        super().__init__()
+        self.eps = eps
+    
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: torch.Tensor,
+        mask: torch.Tensor,
+        topo_info: Optional[List[Dict]] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            V_pred: (B, N, D) predicted coordinates
+            V_target: (B, N, D) target coordinates (not used, pairs already have target dists)
+            mask: (B, N) boolean mask
+            topo_info: List[Dict] with keys:
+                - 'pairs_0': (m0, 2) index pairs for 0D features
+                - 'dists_0': (m0,) target distances for 0D
+                - 'pairs_1': (m1, 2) index pairs for 1D features
+                - 'dists_1': (m1,) target distances for 1D
+        
+        Returns:
+            loss: scalar topology loss
+        """
+        if topo_info is None:
+            # Fall back to placeholder if no precomputed pairs
+            return torch.tensor(0.0, device=V_pred.device)
+        
+        B, N, D = V_pred.shape
+        device = V_pred.device
+        
+        loss_per_batch = []
+        
+        for b in range(B):
+            m_b = mask[b]
+            n_valid = m_b.sum().item()
+            
+            if n_valid < 3 or b >= len(topo_info):
+                continue
+            
+            info_b = topo_info[b]
+            V_pred_b = V_pred[b, m_b]  # (n_valid, D)
+            
+            # Get precomputed pairs
+            pairs_0 = info_b.get('pairs_0', None)
+            dists_0 = info_b.get('dists_0', None)
+            pairs_1 = info_b.get('pairs_1', None)
+            dists_1 = info_b.get('dists_1', None)
+            
+            losses_b = []
+            
+            # 0D features (connected components)
+            if pairs_0 is not None and len(pairs_0) > 0:
+                pairs_0_t = torch.from_numpy(pairs_0).long().to(device) if isinstance(pairs_0, np.ndarray) else pairs_0
+                dists_0_t = torch.from_numpy(dists_0).float().to(device) if isinstance(dists_0, np.ndarray) else dists_0
                 
-                # Store for later averaging
-                global _nca_qent_accum
-                _nca_qent_accum.append(qent_ratio)
+                # Compute predicted distances
+                x0_i = V_pred_b[pairs_0_t[:, 0]]  # (m0, D)
+                x0_j = V_pred_b[pairs_0_t[:, 1]]
+                d0_pred = (x0_i - x0_j).norm(dim=-1)  # (m0,)
+                
+                # Log-ratio loss (as ChatGPT specified)
+                l0 = ((torch.log(d0_pred + self.eps) - torch.log(dists_0_t + self.eps)) ** 2).mean()
+                losses_b.append(l0)
+            
+            # 1D features (loops/holes)
+            if pairs_1 is not None and len(pairs_1) > 0:
+                pairs_1_t = torch.from_numpy(pairs_1).long().to(device) if isinstance(pairs_1, np.ndarray) else pairs_1
+                dists_1_t = torch.from_numpy(dists_1).float().to(device) if isinstance(dists_1, np.ndarray) else dists_1
+                
+                x1_i = V_pred_b[pairs_1_t[:, 0]]
+                x1_j = V_pred_b[pairs_1_t[:, 1]]
+                d1_pred = (x1_i - x1_j).norm(dim=-1)
+                
+                l1 = ((torch.log(d1_pred + self.eps) - torch.log(dists_1_t + self.eps)) ** 2).mean()
+                losses_b.append(l1)
+            
+            # Average 0D and 1D losses (ChatGPT's formula: 0.5 * (l0.mean() + l1.mean()))
+            if len(losses_b) > 0:
+                loss_per_batch.append(torch.stack(losses_b).mean())
         
-        # Cross-entropy: -sum_j P_ij * log(Q_ij)
-        # Add epsilon to avoid log(0)
-        loss_per_anchor = -(P * torch.log(Q + 1e-12)).sum(dim=2)  # (B, N)
+        if len(loss_per_batch) == 0:
+            return torch.tensor(0.0, device=device)
         
-        # Average over valid anchors
-        if mask is not None:
-            loss = (loss_per_anchor * mask).sum() / mask.sum().clamp(min=1.0)
-        else:
-            loss = loss_per_anchor.mean()
-        
-        return loss
+        return torch.stack(loss_per_batch).mean()
+
+
+
+    
