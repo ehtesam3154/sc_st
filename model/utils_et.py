@@ -3398,6 +3398,78 @@ class TopologyLoss(nn.Module):
         
         return torch.stack(loss_per_batch).mean()
 
-
+class ShapeSpectrumLoss(nn.Module):
+    """
+    Shape spectrum loss - Match eigenvalue ratios of Gram matrices.
+    Enforces anisotropy (elongation) to match ST patches.
+    
+    Uses covariance matrix eigenvalues to measure elongation.
+    """
+    
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+    
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: torch.Tensor,
+        mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            V_pred: (B, N, D) predicted coordinates (centered)
+            V_target: (B, N, D) target coordinates (centered)
+            mask: (B, N) boolean mask
+            
+        Returns:
+            loss: scalar shape loss
+        """
+        B, N, D = V_pred.shape
+        device = V_pred.device
+        
+        loss_per_batch = []
+        
+        for b in range(B):
+            m_b = mask[b]
+            n_valid = m_b.sum().item()
+            
+            if n_valid < 3:  # Need at least 3 points
+                continue
+            
+            V_pred_b = V_pred[b, m_b]  # (n_valid, D)
+            V_target_b = V_target[b, m_b]
+            
+            # Compute covariance matrices (coordinates already centered)
+            C_pred = (V_pred_b.T @ V_pred_b) / n_valid  # (D, D)
+            C_target = (V_target_b.T @ V_target_b) / n_valid
+            
+            try:
+                # Eigendecompose
+                eigvals_pred = torch.linalg.eigvalsh(C_pred)  # (D,) ascending
+                eigvals_target = torch.linalg.eigvalsh(C_target)
+                
+                # Get top 2 eigenvalues (largest variance directions)
+                lambda1_pred = eigvals_pred[-1].clamp_min(self.eps)
+                lambda2_pred = eigvals_pred[-2].clamp_min(self.eps)
+                lambda1_target = eigvals_target[-1].clamp_min(self.eps)
+                lambda2_target = eigvals_target[-2].clamp_min(self.eps)
+                
+                # Anisotropy ratio (how elongated vs round)
+                r_pred = lambda1_pred / lambda2_pred
+                r_target = lambda1_target / lambda2_target
+                
+                # Log-ratio penalty (scale-invariant)
+                loss_b = (torch.log(r_pred) - torch.log(r_target)) ** 2
+                loss_per_batch.append(loss_b)
+                
+            except Exception as e:
+                # Skip if eigendecomposition fails
+                continue
+        
+        if len(loss_per_batch) == 0:
+            return torch.tensor(0.0, device=device)
+        
+        return torch.stack(loss_per_batch).mean()
 
     
