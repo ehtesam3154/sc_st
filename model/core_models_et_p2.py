@@ -818,7 +818,12 @@ def train_stageC_diffusion_generator(
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
     loss_radial = uet.RadialHistogramLoss(num_bins=20)
 
-    
+    # NEW: ChatGPT topology losses
+    loss_edge = uet.EdgeLengthLoss()
+    loss_topo = uet.TopologyLoss()
+    loss_shape_spectrum = uet.ShapeSpectrumLoss()
+
+
     # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
     from core_models_et_p1 import collate_minisets, collate_sc_minisets
@@ -1114,9 +1119,13 @@ def train_stageC_diffusion_generator(
         'dim': 0.0,
         'triangle': 0.0,
         'radial': 0.5,
-        'knn_nca': 0.0,
-        'repel': 0.0,      # NEW: ST repulsion loss
-        'shape': 0.0       # NEW: ST anisotropy/shape loss
+        'knn_nca': 0.0,       # DEPRECATED: replaced by edge loss
+        'repel': 0.0,          # NEW: ST repulsion loss
+        'shape': 0.0,          # NEW: ST anisotropy/shape loss
+        # ChatGPT topology losses
+        'edge': 0.8,           # NEW: Edge-length preservation (replaces knn_nca)
+        'topo': 0.5,           # NEW: Topology preservation (persistent homology)
+        'shape_spectrum': 0.4  # NEW: Shape spectrum (eigenvalue ratios)
     }
 
     # Heat warmup schedule
@@ -1149,8 +1158,9 @@ def train_stageC_diffusion_generator(
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [], 'knn_nca': [], 
-            'repel': [], 'shape': []  # NEW: ST shape constraints
+            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [], 'knn_nca': [],
+            'repel': [], 'shape': [],  # OLD: ST shape constraints
+            'edge': [], 'topo': [], 'shape_spectrum': []  # NEW: ChatGPT topology losses
         }
     }
 
@@ -1471,6 +1481,10 @@ def train_stageC_diffusion_generator(
             L_st_dist = torch.tensor(0.0, device=device)
             L_edm_tail = torch.tensor(0.0, device=device)
             L_gen_align = torch.tensor(0.0, device=device)
+            # NEW: ChatGPT topology losses
+            L_edge = torch.tensor(0.0, device=device)
+            L_topo = torch.tensor(0.0, device=device)
+            L_shape_spectrum = torch.tensor(0.0, device=device)
             L_dim = torch.zeros((), device=device)
             L_triangle = torch.zeros((), device=device)
             L_radial = torch.zeros((), device=device)
@@ -1928,6 +1942,55 @@ def train_stageC_diffusion_generator(
                         else:
                             L_radial = torch.tensor(0.0, device=device)
 
+                        # ==================== CHATGPT TOPOLOGY LOSSES ====================
+                        # C1: Edge-length preservation (local metric, replaces knn_nca)
+                        if WEIGHTS['edge'] > 0 and 'knn_indices' in batch:
+                            knn_indices_batch = batch['knn_indices'].to(device)
+                            low_noise = (t_norm.squeeze() < 0.3)
+                            cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                            geo_gate_edge = (low_noise & cond_only).float()
+                            gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
+
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                L_edge_raw = loss_edge(
+                                    V_pred=V_geom,
+                                    V_target=V_target_batch,
+                                    knn_indices=knn_indices_batch,
+                                    mask=mask
+                                )
+                                L_edge = (L_edge_raw * geo_gate_edge).sum() / gate_sum_edge
+
+                        # C2: Topology preservation (persistent homology)
+                        if WEIGHTS['topo'] > 0 and 'topo_info' in batch:
+                            topo_info = batch['topo_info']
+                            low_noise = (t_norm.squeeze() < 0.2)  # More aggressive for topology
+                            cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                            geo_gate_topo = (low_noise & cond_only).float()
+                            gate_sum_topo = geo_gate_topo.sum().clamp(min=1.0)
+
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                L_topo_raw = loss_topo(
+                                    V_pred=V_geom,
+                                    V_target=V_target_batch,
+                                    mask=mask,
+                                    topo_info=topo_info
+                                )
+                                L_topo = (L_topo_raw * geo_gate_topo).sum() / gate_sum_topo
+
+                        # C3: Shape spectrum loss (anisotropy matching)
+                        if WEIGHTS['shape_spectrum'] > 0:
+                            low_noise = (t_norm.squeeze() < 0.3)
+                            cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                            geo_gate_shape = (low_noise & cond_only).float()
+                            gate_sum_shape = geo_gate_shape.sum().clamp(min=1.0)
+
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                L_shape_spectrum_raw = loss_shape_spectrum(
+                                    V_pred=V_geom,
+                                    V_target=V_target_batch,
+                                    mask=mask
+                                )
+                                L_shape_spectrum = (L_shape_spectrum_raw * geo_gate_shape).sum() / gate_sum_shape
 
                         if DEBUG and (global_step % LOG_EVERY == 0):
                             print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
@@ -2360,16 +2423,19 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['sw_st'] * L_sw_st +
                                 WEIGHTS['sw_sc'] * L_sw_sc +
                                 WEIGHTS['overlap'] * L_overlap +
-                                WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
+                                WEIGHTS['ordinal_sc'] * L_ordinal_sc +
                                 WEIGHTS['st_dist'] * L_st_dist +
-                                WEIGHTS['edm_tail'] * L_edm_tail +      
+                                WEIGHTS['edm_tail'] * L_edm_tail +
                                 WEIGHTS['gen_align'] * L_gen_align +
                                 WEIGHTS['dim'] * L_dim +
                                 WEIGHTS['triangle'] * L_triangle +
                                 WEIGHTS['knn_nca'] * L_knn_nca +
                                 WEIGHTS['radial'] * L_radial +
                                 WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
-                                WEIGHTS['shape'] * L_shape)       # NEW: ST shape/anisotropy
+                                WEIGHTS['shape'] * L_shape +       # NEW: ST shape/anisotropy
+                                WEIGHTS['edge'] * L_edge +         # NEW: ChatGPT edge loss
+                                WEIGHTS['topo'] * L_topo +         # NEW: ChatGPT topology loss
+                                WEIGHTS['shape_spectrum'] * L_shape_spectrum)  # NEW: ChatGPT shape spectrum
 
             
             # Add SC dimension prior if this is an SC batch
@@ -2651,6 +2717,10 @@ def train_stageC_diffusion_generator(
             epoch_losses['radial'] += L_radial.item()
             epoch_losses['repel'] += L_repel.item()
             epoch_losses['shape'] += L_shape.item()
+            # NEW: ChatGPT topology losses
+            epoch_losses['edge'] += L_edge.item()
+            epoch_losses['topo'] += L_topo.item()
+            epoch_losses['shape_spectrum'] += L_shape_spectrum.item()
 
 
 
@@ -2717,13 +2787,18 @@ def train_stageC_diffusion_generator(
                 avg_triangle = epoch_losses['triangle'] / max(n_batches, 1)
                 avg_radial = epoch_losses['radial'] / max(n_batches, 1)
                 avg_knn_nca = epoch_losses['knn_nca'] / max(n_batches, 1)
-                
+                # NEW: ChatGPT topology losses
+                avg_edge = epoch_losses['edge'] / max(n_batches, 1)
+                avg_topo = epoch_losses['topo'] / max(n_batches, 1)
+                avg_shape_spectrum = epoch_losses['shape_spectrum'] / max(n_batches, 1)
+
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
                 print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f} | knn_nca={avg_knn_nca:.4f}")
                 print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
                 print(f"  dim={avg_dim:.4f} | triangle={avg_triangle:.4f} | radial={avg_radial:.4f}")
+                print(f"  [ChatGPT] edge={avg_edge:.4f} | topo={avg_topo:.4f} | shape_spectrum={avg_shape_spectrum:.4f}")
 
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
@@ -2906,14 +2981,17 @@ def train_stageC_diffusion_generator(
             WEIGHTS['sw_sc']    * epoch_losses['sw_sc']    +
             WEIGHTS['overlap']  * epoch_losses['overlap']  +
             WEIGHTS['ordinal_sc'] * epoch_losses['ordinal_sc'] +
-            WEIGHTS['st_dist']  * epoch_losses['st_dist']  +   
+            WEIGHTS['st_dist']  * epoch_losses['st_dist']  +
             WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
             WEIGHTS['gen_align']* epoch_losses['gen_align']+
             WEIGHTS['dim']      * epoch_losses['dim']      +
             WEIGHTS['triangle'] * epoch_losses['triangle'] +
             WEIGHTS['radial']   * epoch_losses['radial']   +
-            WEIGHTS['repel']    * epoch_losses['repel']    +   
-            WEIGHTS['shape']    * epoch_losses['shape']        
+            WEIGHTS['repel']    * epoch_losses['repel']    +
+            WEIGHTS['shape']    * epoch_losses['shape']    +
+            WEIGHTS['edge']     * epoch_losses['edge']     +
+            WEIGHTS['topo']     * epoch_losses['topo']     +
+            WEIGHTS['shape_spectrum'] * epoch_losses['shape_spectrum']
         )
 
         # Override the history['epoch_avg']['total'] with correct value

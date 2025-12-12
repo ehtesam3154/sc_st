@@ -277,6 +277,11 @@ class STTargets:
     k: int                   # kNN parameter
     scale: float             # normalization scale factor
     knn_indices: torch.Tensor  # (n, k) k-NN indices for each spot
+    # NEW: Topology fields for persistent homology
+    topo_pairs_0: torch.Tensor  # (m0, 2) index pairs for 0D features
+    topo_dists_0: torch.Tensor  # (m0,) birth distances for 0D
+    topo_pairs_1: torch.Tensor  # (m1, 2) index pairs for 1D features
+    topo_dists_1: torch.Tensor  # (m1,) birth distances for 1D
 
 
 class STStageBPrecomputer:
@@ -468,6 +473,12 @@ class STStageBPrecomputer:
                 if len(indices) < knn_k:
                     knn_indices[i, len(indices):] = -1
 
+            # NEW: Compute persistent homology for topology preservation
+            print(f"[Stage B] Computing persistent homology for slide {slide_id}...")
+            y_hat_np = y_hat.cpu().numpy()
+            topo_info = uet.compute_persistent_pairs(y_hat_np, max_pairs_0d=10, max_pairs_1d=5)
+            print(f"[Stage B]   0D pairs: {topo_info['pairs_0'].shape[0]}, 1D pairs: {topo_info['pairs_1'].shape[0]}")
+
             targets = STTargets(
                 y_hat=y_hat.cpu(),
                 G=G.cpu(),
@@ -479,7 +490,12 @@ class STStageBPrecomputer:
                 triplets=triplets.cpu(),
                 k=self.k,
                 scale=scale,
-                knn_indices=knn_indices.cpu()
+                knn_indices=knn_indices.cpu(),
+                # NEW: Topology fields
+                topo_pairs_0=torch.from_numpy(topo_info['pairs_0']).long(),
+                topo_dists_0=torch.from_numpy(topo_info['dists_0']).float(),
+                topo_pairs_1=torch.from_numpy(topo_info['pairs_1']).long(),
+                topo_dists_1=torch.from_numpy(topo_info['dists_1']).float()
             )
             
             targets_dict[slide_id] = targets
@@ -739,6 +755,44 @@ class STSetDataset(Dataset):
             't_list': targets.t_list
         }
 
+        # NEW: Extract topology pairs for this miniset
+        # Map global indices to local indices
+        def extract_topo_pairs(pairs_global, dists_global, indices, global_to_local):
+            """Keep only pairs where BOTH points are in the miniset."""
+            if pairs_global.shape[0] == 0:
+                return torch.zeros((0, 2), dtype=torch.long), torch.zeros(0, dtype=torch.float)
+
+            # Check which pairs have both points in miniset
+            i_global = pairs_global[:, 0]
+            j_global = pairs_global[:, 1]
+
+            # Map to local indices
+            i_local = global_to_local[i_global]
+            j_local = global_to_local[j_global]
+
+            # Keep pairs where both are valid (>= 0)
+            valid_mask = (i_local >= 0) & (j_local >= 0)
+
+            pairs_local = torch.stack([i_local[valid_mask], j_local[valid_mask]], dim=1)
+            dists_local = dists_global[valid_mask]
+
+            return pairs_local, dists_local
+
+        # global_to_local mapping already exists from kNN extraction above
+        topo_pairs_0_local, topo_dists_0_local = extract_topo_pairs(
+            targets.topo_pairs_0, targets.topo_dists_0, indices, global_to_local
+        )
+        topo_pairs_1_local, topo_dists_1_local = extract_topo_pairs(
+            targets.topo_pairs_1, targets.topo_dists_1, indices, global_to_local
+        )
+
+        topo_info = {
+            'pairs_0': topo_pairs_0_local,
+            'dists_0': topo_dists_0_local,
+            'pairs_1': topo_pairs_1_local,
+            'dists_1': topo_dists_1_local,
+        }
+
         return {
             'Z_set': Z_set,
             'is_landmark': is_landmark,
@@ -752,6 +806,7 @@ class STSetDataset(Dataset):
             'n': len(indices),
             'overlap_info': overlap_info,
             'knn_indices': knn_local,
+            'topo_info': topo_info,  # NEW!
         }
 
 
@@ -771,6 +826,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     triplets_batch = []
     H_bins_batch = []
     overlap_info_batch = []
+    topo_info_batch = []  # NEW!
 
     #init padded tensors
     Z_batch = torch.zeros(batch_size, n_max, h_dim, device=device)
@@ -781,11 +837,6 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
     n_batch = torch.zeros(batch_size, dtype=torch.long)
     is_landmark_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)  # ADD THIS
-
-    L_info_batch = []
-    triplets_batch = []
-    H_bins_batch = []
-    overlap_info_batch = []
 
     knn_k = batch[0]['knn_indices'].shape[1]  # Get k from first item
     knn_batch = torch.full((batch_size, n_max, knn_k), -1, dtype=torch.long, device=device)
@@ -807,7 +858,8 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         H_bins_batch.append(item['H_bins'])
         overlap_info_batch.append(item['overlap_info'])
         knn_batch[i, :n] = item['knn_indices']
-    
+        topo_info_batch.append(item.get('topo_info', None))  # NEW!
+
     return {
         'Z_set': Z_batch,
         'V_target': V_batch,
@@ -823,6 +875,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'is_landmark': is_landmark_batch,  # ADD THIS
         'is_sc': False,
         'knn_indices': knn_batch,
+        'topo_info': topo_info_batch,  # NEW!
     }
 
 class SCSetDataset(Dataset):

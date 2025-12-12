@@ -3225,11 +3225,417 @@ class KNNSoftmaxLoss(nn.Module):
         # Cross-entropy: -sum_j P_ij * log(Q_ij)
         # Add epsilon to avoid log(0)
         loss_per_anchor = -(P * torch.log(Q + 1e-12)).sum(dim=2)  # (B, N)
-        
+
         # Average over valid anchors
         if mask is not None:
             loss = (loss_per_anchor * mask).sum() / mask.sum().clamp(min=1.0)
         else:
             loss = loss_per_anchor.mean()
-        
+
         return loss
+
+
+# ==============================================================================
+# TOPOLOGY-PRESERVING LOSSES (ChatGPT's improvements)
+# ==============================================================================
+
+def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pairs_1d: int = 5):
+    """
+    Compute persistent homology pairs using Vietoris-Rips filtration.
+
+    Returns topologically important point pairs:
+    - 0D features (connected components): birth-death pairs
+    - 1D features (loops/holes): birth-death pairs
+
+    Args:
+        coords: (n, d) numpy array of coordinates
+        max_pairs_0d: Maximum number of 0D pairs to return
+        max_pairs_1d: Maximum number of 1D pairs to return
+
+    Returns:
+        dict with keys:
+            'pairs_0': (m0, 2) int64 array of point index pairs for 0D features
+            'dists_0': (m0,) float32 array of birth distances for 0D features
+            'pairs_1': (m1, 2) int64 array of point index pairs for 1D features
+            'dists_1': (m1,) float32 array of birth distances for 1D features
+    """
+    try:
+        from ripser import ripser
+    except ImportError:
+        raise ImportError("ripser library required. Install with: pip install ripser")
+
+    # Compute persistent homology
+    result = ripser(coords, maxdim=1)
+
+    # Extract diagrams
+    dgm_0 = result['dgms'][0]  # 0D (connected components)
+    dgm_1 = result['dgms'][1]  # 1D (loops)
+
+    # Compute persistence (death - birth)
+    pers_0 = dgm_0[:, 1] - dgm_0[:, 0]
+    pers_1 = dgm_1[:, 1] - dgm_1[:, 0]
+
+    # Remove infinite persistence (the last 0D component that never dies)
+    finite_mask_0 = np.isfinite(dgm_0[:, 1])
+    dgm_0 = dgm_0[finite_mask_0]
+    pers_0 = pers_0[finite_mask_0]
+
+    finite_mask_1 = np.isfinite(dgm_1[:, 1])
+    dgm_1 = dgm_1[finite_mask_1]
+    pers_1 = pers_1[finite_mask_1]
+
+    # Sort by persistence (most persistent first)
+    if len(pers_0) > 0:
+        sort_idx_0 = np.argsort(-pers_0)
+        dgm_0 = dgm_0[sort_idx_0]
+        pers_0 = pers_0[sort_idx_0]
+
+    if len(pers_1) > 0:
+        sort_idx_1 = np.argsort(-pers_1)
+        dgm_1 = dgm_1[sort_idx_1]
+        pers_1 = pers_1[sort_idx_1]
+
+    # Take top-k most persistent features
+    dgm_0 = dgm_0[:max_pairs_0d]
+    dgm_1 = dgm_1[:max_pairs_1d]
+
+    # For simplicity, we'll create "pseudo-pairs" by pairing each feature with a dummy index
+    # In a real topological autoencoder, you'd track which edges/simplices created these features
+    # Here we use a simpler approximation: pair with nearest point to birth location
+
+    n = coords.shape[0]
+
+    # 0D features: For each component, find two points at roughly the birth distance
+    pairs_0_list = []
+    dists_0_list = []
+
+    for birth, death in dgm_0:
+        # Find a pair of points approximately at distance 'birth'
+        # Sample random pair and check if distance is close to birth
+        attempts = 0
+        max_attempts = 100
+        best_pair = None
+        best_dist_diff = float('inf')
+
+        while attempts < max_attempts:
+            i, j = np.random.choice(n, size=2, replace=False)
+            dist_ij = np.linalg.norm(coords[i] - coords[j])
+            dist_diff = abs(dist_ij - birth)
+
+            if dist_diff < best_dist_diff:
+                best_dist_diff = dist_diff
+                best_pair = (i, j)
+
+            if dist_diff < birth * 0.1:  # Within 10% tolerance
+                break
+
+            attempts += 1
+
+        if best_pair is not None:
+            pairs_0_list.append(best_pair)
+            dists_0_list.append(birth)
+
+    # 1D features: Similar approach
+    pairs_1_list = []
+    dists_1_list = []
+
+    for birth, death in dgm_1:
+        attempts = 0
+        max_attempts = 100
+        best_pair = None
+        best_dist_diff = float('inf')
+
+        while attempts < max_attempts:
+            i, j = np.random.choice(n, size=2, replace=False)
+            dist_ij = np.linalg.norm(coords[i] - coords[j])
+            dist_diff = abs(dist_ij - birth)
+
+            if dist_diff < best_dist_diff:
+                best_dist_diff = dist_diff
+                best_pair = (i, j)
+
+            if dist_diff < birth * 0.1:
+                break
+
+            attempts += 1
+
+        if best_pair is not None:
+            pairs_1_list.append(best_pair)
+            dists_1_list.append(birth)
+
+    # Convert to arrays
+    if len(pairs_0_list) > 0:
+        pairs_0 = np.array(pairs_0_list, dtype=np.int64)
+        dists_0 = np.array(dists_0_list, dtype=np.float32)
+    else:
+        pairs_0 = np.zeros((0, 2), dtype=np.int64)
+        dists_0 = np.zeros(0, dtype=np.float32)
+
+    if len(pairs_1_list) > 0:
+        pairs_1 = np.array(pairs_1_list, dtype=np.int64)
+        dists_1 = np.array(dists_1_list, dtype=np.float32)
+    else:
+        pairs_1 = np.zeros((0, 2), dtype=np.int64)
+        dists_1 = np.zeros(0, dtype=np.float32)
+
+    return {
+        'pairs_0': pairs_0,
+        'dists_0': dists_0,
+        'pairs_1': pairs_1,
+        'dists_1': dists_1
+    }
+
+
+class EdgeLengthLoss(nn.Module):
+    """
+    Local edge-length preservation loss.
+
+    Matches pairwise distances of k-NN edges using log-ratio loss.
+    This is more stable than ranking-based losses (like NCA) and naturally
+    fights gram_scale collapse.
+
+    Loss = mean_i mean_{j in kNN(i)} [log(d_pred_ij / d_target_ij)]^2
+    """
+
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: torch.Tensor,
+        knn_indices: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            V_pred: (B, N, D) predicted coordinates
+            V_target: (B, N, D) target coordinates
+            knn_indices: (B, N, k) k-NN indices (in local indexing)
+            mask: (B, N) validity mask
+
+        Returns:
+            Scalar loss
+        """
+        B, N, D = V_pred.shape
+        device = V_pred.device
+        k = knn_indices.shape[2]
+
+        # Compute pairwise distances
+        D_pred = torch.cdist(V_pred, V_pred)  # (B, N, N)
+        D_target = torch.cdist(V_target, V_target)  # (B, N, N)
+
+        # Gather k-NN distances
+        # knn_indices: (B, N, k) with values in [0, N-1] or -1 for invalid
+
+        # Create batch indices
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, N, k)
+        anchor_idx = torch.arange(N, device=device).view(1, N, 1).expand(B, N, k)
+
+        # Mask out invalid neighbors (-1)
+        valid_neighbors = (knn_indices >= 0)  # (B, N, k)
+        knn_indices_clamped = knn_indices.clamp(min=0)  # Replace -1 with 0 temporarily
+
+        # Gather distances
+        d_pred = D_pred[batch_idx, anchor_idx, knn_indices_clamped]  # (B, N, k)
+        d_target = D_target[batch_idx, anchor_idx, knn_indices_clamped]  # (B, N, k)
+
+        # Log-ratio loss
+        log_ratio = torch.log((d_pred + self.epsilon) / (d_target + self.epsilon))
+        loss_per_edge = log_ratio ** 2  # (B, N, k)
+
+        # Apply masks
+        if mask is not None:
+            # Anchor must be valid
+            anchor_valid = mask.unsqueeze(2)  # (B, N, 1)
+            edge_valid = anchor_valid & valid_neighbors  # (B, N, k)
+        else:
+            edge_valid = valid_neighbors
+
+        # Average over valid edges
+        loss = (loss_per_edge * edge_valid).sum() / edge_valid.sum().clamp(min=1.0)
+
+        return loss
+
+
+class TopologyLoss(nn.Module):
+    """
+    Topology preservation loss using precomputed persistent homology pairs.
+
+    Matches distances of topologically important point pairs identified
+    by Vietoris-Rips persistent homology.
+
+    Loss = weighted sum of squared distance differences for critical pairs
+    """
+
+    def __init__(self, weight_0d: float = 1.0, weight_1d: float = 0.5, epsilon: float = 1e-6):
+        super().__init__()
+        self.weight_0d = weight_0d
+        self.weight_1d = weight_1d
+        self.epsilon = epsilon
+
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: torch.Tensor,
+        mask: torch.Tensor,
+        topo_info: List[Optional[Dict]]
+    ) -> torch.Tensor:
+        """
+        Args:
+            V_pred: (B, N, D) predicted coordinates
+            V_target: (B, N, D) target coordinates
+            mask: (B, N) validity mask
+            topo_info: List of B dicts, each containing:
+                - 'pairs_0': (m0, 2) tensor of point pairs for 0D features
+                - 'dists_0': (m0,) tensor of target distances for 0D
+                - 'pairs_1': (m1, 2) tensor of point pairs for 1D features
+                - 'dists_1': (m1,) tensor of target distances for 1D
+
+        Returns:
+            Scalar loss
+        """
+        device = V_pred.device
+        B = V_pred.shape[0]
+
+        total_loss = 0.0
+        total_count = 0
+
+        for b in range(B):
+            if topo_info[b] is None:
+                continue
+
+            info = topo_info[b]
+            pairs_0 = info['pairs_0'].to(device)  # (m0, 2)
+            dists_0 = info['dists_0'].to(device)  # (m0,)
+            pairs_1 = info['pairs_1'].to(device)  # (m1, 2)
+            dists_1 = info['dists_1'].to(device)  # (m1,)
+
+            # 0D features
+            if pairs_0.shape[0] > 0:
+                i_idx = pairs_0[:, 0]  # (m0,)
+                j_idx = pairs_0[:, 1]  # (m0,)
+
+                # Check if indices are valid
+                n_valid = mask[b].sum().item()
+                valid_pairs_0 = (i_idx < n_valid) & (j_idx < n_valid)
+
+                if valid_pairs_0.sum() > 0:
+                    i_idx = i_idx[valid_pairs_0]
+                    j_idx = j_idx[valid_pairs_0]
+                    target_dists = dists_0[valid_pairs_0]
+
+                    # Compute predicted distances
+                    v_i = V_pred[b, i_idx]  # (m0_valid, D)
+                    v_j = V_pred[b, j_idx]  # (m0_valid, D)
+                    pred_dists = torch.norm(v_i - v_j, dim=1)  # (m0_valid,)
+
+                    # Squared error
+                    loss_0 = ((pred_dists - target_dists) ** 2).sum()
+                    total_loss += self.weight_0d * loss_0
+                    total_count += len(i_idx)
+
+            # 1D features
+            if pairs_1.shape[0] > 0:
+                i_idx = pairs_1[:, 0]
+                j_idx = pairs_1[:, 1]
+
+                n_valid = mask[b].sum().item()
+                valid_pairs_1 = (i_idx < n_valid) & (j_idx < n_valid)
+
+                if valid_pairs_1.sum() > 0:
+                    i_idx = i_idx[valid_pairs_1]
+                    j_idx = j_idx[valid_pairs_1]
+                    target_dists = dists_1[valid_pairs_1]
+
+                    v_i = V_pred[b, i_idx]
+                    v_j = V_pred[b, j_idx]
+                    pred_dists = torch.norm(v_i - v_j, dim=1)
+
+                    loss_1 = ((pred_dists - target_dists) ** 2).sum()
+                    total_loss += self.weight_1d * loss_1
+                    total_count += len(i_idx)
+
+        # Average over all pairs across batch
+        if total_count > 0:
+            return total_loss / total_count
+        else:
+            return torch.tensor(0.0, device=device)
+
+
+class ShapeSpectrumLoss(nn.Module):
+    """
+    Shape spectrum loss: matches eigenvalue ratios of covariance matrices.
+
+    Enforces anisotropy (elongation) to match ST patches.
+    Uses ratio of top-2 eigenvalues to be scale-invariant.
+
+    Loss = MSE between log(λ1/λ2) of pred and target
+    """
+
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(
+        self,
+        V_pred: torch.Tensor,
+        V_target: torch.Tensor,
+        mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            V_pred: (B, N, D) predicted coordinates (already centered)
+            V_target: (B, N, D) target coordinates (already centered)
+            mask: (B, N) validity mask
+
+        Returns:
+            Scalar loss
+        """
+        B, N, D = V_pred.shape
+        device = V_pred.device
+
+        loss_total = 0.0
+        count = 0
+
+        for b in range(B):
+            n_valid = mask[b].sum().item()
+            if n_valid < 3:
+                continue
+
+            V_p = V_pred[b, :n_valid]  # (n, D)
+            V_t = V_target[b, :n_valid]  # (n, D)
+
+            # Center
+            V_p = V_p - V_p.mean(dim=0, keepdim=True)
+            V_t = V_t - V_t.mean(dim=0, keepdim=True)
+
+            # Covariance matrices
+            C_pred = (V_p.T @ V_p) / n_valid  # (D, D)
+            C_target = (V_t.T @ V_t) / n_valid  # (D, D)
+
+            # Eigenvalues (sorted descending)
+            eigvals_pred = torch.linalg.eigvalsh(C_pred)
+            eigvals_target = torch.linalg.eigvalsh(C_target)
+
+            eigvals_pred = torch.flip(eigvals_pred, dims=[0])  # Descending
+            eigvals_target = torch.flip(eigvals_target, dims=[0])
+
+            # Ratio of top 2 eigenvalues (anisotropy measure)
+            if D >= 2:
+                ratio_pred = (eigvals_pred[0] + self.epsilon) / (eigvals_pred[1] + self.epsilon)
+                ratio_target = (eigvals_target[0] + self.epsilon) / (eigvals_target[1] + self.epsilon)
+
+                # Log-space to make it scale-invariant
+                log_ratio_pred = torch.log(ratio_pred)
+                log_ratio_target = torch.log(ratio_target)
+
+                loss_b = (log_ratio_pred - log_ratio_target) ** 2
+                loss_total += loss_b
+                count += 1
+
+        if count > 0:
+            return loss_total / count
+        else:
+            return torch.tensor(0.0, device=device)
