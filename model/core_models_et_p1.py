@@ -384,35 +384,23 @@ class STStageBPrecomputer:
         # 5. Z indices (for linking to encoder)
         Z_indices = torch.arange(st_coords.shape[0], device=device)
         
-        # NEW: Compute persistent homology for full slide
-        print(f"  Computing persistent homology for slide {slide_id}...")
-        y_hat_np = y_hat.cpu().numpy()
-        topo_info = uet.compute_persistent_pairs(
-            y_hat_np,
-            max_pairs_0d=10,  # Top 10 connected component features
-            max_pairs_1d=5    # Top 5 loop features
-        )
         
         targets = STTargets(
-            y_hat=y_hat.cpu(),
-            G=G.cpu(),
-            D=D.cpu(),
-            H=H.cpu(),
-            H_bins=bins.cpu(),
-            L=L.to_dense().cpu() if L.is_sparse else L.cpu(),
-            t_list=self.t_list,
-            triplets=triplets.cpu(),
-            k=self.k,
+            slide_id=slide_id,
+            center=center,
             scale=scale,
-            knn_indices=knn_indices.cpu(),
-            
-            # NEW: Add topology info
-            topo_pairs_0=torch.from_numpy(topo_info['pairs_0']).long(),
-            topo_dists_0=torch.from_numpy(topo_info['dists_0']).float(),
-            topo_pairs_1=torch.from_numpy(topo_info['pairs_1']).long(),
-            topo_dists_1=torch.from_numpy(topo_info['dists_1']).float(),
+            y_hat=y_hat,
+            G=G,
+            D=D,
+            H=H,
+            t_list=self.t_list,
+            k=self.k,
+            sigma_policy=self.sigma_policy,
+            triplets=triplets,
+            Z_indices=Z_indices,
+            knn_indices=knn_indices
         )
-
+        
         return targets
     
     def precompute(
@@ -489,6 +477,12 @@ class STStageBPrecomputer:
                 if len(indices) < knn_k:
                     knn_indices[i, len(indices):] = -1
 
+            # NEW: Compute persistent homology for topology preservation
+            print(f"[Stage B] Computing persistent homology for slide {slide_id}...")
+            y_hat_np = y_hat.cpu().numpy()
+            topo_info = uet.compute_persistent_pairs(y_hat_np, max_pairs_0d=10, max_pairs_1d=5)
+            print(f"[Stage B]   0D pairs: {topo_info['pairs_0'].shape[0]}, 1D pairs: {topo_info['pairs_1'].shape[0]}")
+
             targets = STTargets(
                 y_hat=y_hat.cpu(),
                 G=G.cpu(),
@@ -500,7 +494,11 @@ class STStageBPrecomputer:
                 triplets=triplets.cpu(),
                 k=self.k,
                 scale=scale,
-                knn_indices=knn_indices.cpu()
+                knn_indices=knn_indices.cpu(),
+                topo_pairs_0=torch.from_numpy(topo_info['pairs_0']).long(),
+                topo_dists_0=torch.from_numpy(topo_info['dists_0']).float(),
+                topo_pairs_1=torch.from_numpy(topo_info['pairs_1']).long(),
+                topo_dists_1=torch.from_numpy(topo_info['dists_1']).float()
             )
             
             targets_dict[slide_id] = targets
@@ -849,11 +847,6 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
     n_batch = torch.zeros(batch_size, dtype=torch.long)
     is_landmark_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)  # ADD THIS
-
-    L_info_batch = []
-    triplets_batch = []
-    H_bins_batch = []
-    overlap_info_batch = []
 
     knn_k = batch[0]['knn_indices'].shape[1]  # Get k from first item
     knn_batch = torch.full((batch_size, n_max, knn_k), -1, dtype=torch.long, device=device)

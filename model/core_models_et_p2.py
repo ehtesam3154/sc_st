@@ -1089,7 +1089,7 @@ def train_stageC_diffusion_generator(
         'sw_sc': 0.3,
         'overlap': 0.25,
         'ordinal_sc': 0.5,
-        'st_dist': 0.03,
+        'st_dist': 0.0,
         'edm_tail': 0.3,
         'gen_align': 0.0,
         'dim': 0.0,
@@ -1099,9 +1099,9 @@ def train_stageC_diffusion_generator(
         'repel': 0.0,      # NEW: ST repulsion loss
         'shape': 0.0,       # NEW: ST anisotropy/shape loss
         # NEW
-        'edge': 0.8,       # Edge-length preservation (local metric)
-        'topo': 0.5,       # Topology preservation (persistent homology proxy)
-        'shape': 0.4,      # Shape spectrum (anisotropy matching)
+        'edge': 0.5,       # Edge-length preservation (local metric)
+        'topo': 0.3,       # Topology preservation (persistent homology proxy)
+        'shape_spec': 0.3,      # Shape spectrum (anisotropy matching)
     }
 
     # Heat warmup schedule
@@ -1138,7 +1138,7 @@ def train_stageC_diffusion_generator(
             'repel': [], 'shape': [],  # NEW: ST shape constraints
             'edge': [],     # NEW
             'topo': [],     # NEW
-            'shape_spectrum': []
+            'shape_spec': []
         }
     }
 
@@ -1191,6 +1191,7 @@ def train_stageC_diffusion_generator(
         'radial': 0.1,
         'edge': 0.1,
         'topo': 0.1,
+        'shape_spec': 0.1,
         'shape': 0.1
         # dim and triangle are regularizers - keep manual for now
     }
@@ -1472,7 +1473,7 @@ def train_stageC_diffusion_generator(
             L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
             L_edge = torch.tensor(0.0, device=device)   # NEW: Edge-length loss
             L_topo = torch.tensor(0.0, device=device)   # NEW: Topology loss  
-            L_shape_spectrum = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
+            L_shape_spec = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
 
       
             # Denoise to get V_hat
@@ -1676,6 +1677,24 @@ def train_stageC_diffusion_generator(
                         # Use the same weighted approach to avoid divergence
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
 
+                # ==================== COMPUTE V_TARGET_BATCH ONCE ====================
+                # Needed by: edge loss, topo loss, shape loss, etc.
+                # Only compute if at least one of these losses is active
+                need_v_target = (WEIGHTS['edge'] > 0 or WEIGHTS['topo'] > 0 or 
+                                WEIGHTS['shape_spec'] > 0 or WEIGHTS['edm_tail'] > 0 or
+                                WEIGHTS['gen_align'] > 0)
+                
+                if need_v_target:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        V_target_batch = torch.zeros_like(V_geom)  # (B, N, D)
+                        
+                        for i in range(batch_size_real):
+                            n_valid = int(n_list[i].item())
+                            if n_valid < 3:
+                                continue
+                            G_i = G_target[i, :n_valid, :n_valid].float()
+                            V_tgt_i = uet.factor_from_gram(G_i, D_latent)  # (n_valid, D)
+                            V_target_batch[i, :n_valid] = V_tgt_i
 
                 # ==================== EDGE-LENGTH LOSS ====================
                 if WEIGHTS['edge'] > 0 and 'knn_indices' in batch:
@@ -1736,7 +1755,7 @@ def train_stageC_diffusion_generator(
                             mask=mask
                         )
                         
-                        L_shape_spectrum = (L_shape_spectrum_raw * geo_gate_shape).sum() / gate_sum_shape
+                        L_shape_spec = (L_shape_spectrum_raw * geo_gate_shape).sum() / gate_sum_shape
 
                 # Heat kernel loss (batched)
                 if WEIGHTS['heat'] > 0 and (global_step % heat_every_k) == 0:
@@ -2352,7 +2371,7 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['shape'] * L_shape + 
                                 WEIGHTS['edge'] * L_edge +           # NEW
                                 WEIGHTS['topo'] * L_topo +           # NEW
-                                WEIGHTS['shape'] * L_shape_spectrum )       # NEW: ST shape/anisotropy
+                                WEIGHTS['shape_spec'] * L_shape_spec )       # NEW: ST shape/anisotropy
 
             
             # Add SC dimension prior if this is an SC batch
@@ -2390,6 +2409,11 @@ def train_stageC_diffusion_generator(
                 vgn_edm = vhat_gn(L_edm_tail) if not is_sc else 0.0
                 vgn_align = vhat_gn(L_gen_align) if not is_sc else 0.0
                 vgn_radial = vhat_gn(L_radial) if not is_sc else 0.0
+
+                # NEW: Gradient probes for new losses
+                vgn_edge = vhat_gn(L_edge) if not is_sc else 0.0
+                vgn_topo = vhat_gn(L_topo) if not is_sc else 0.0
+                vgn_shape_spectrum = vhat_gn(L_shape_spec) if not is_sc else 0.0
  
                 # SC-side gradient norms
                 vgn_swsc = vhat_gn(L_sw_sc) if is_sc else 0.0
@@ -2402,7 +2426,8 @@ def train_stageC_diffusion_generator(
                 if not is_sc:
                     print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} gram={vgn_gram:.3e} gram_scale={vgn_gram_scale:.3e} "
                         f"heat={vgn_heat:.3e} sw_st={vgn_swst:.3e} st_dist={vgn_stdist:.3e} "
-                        f"edm={vgn_edm:.3e} align={vgn_align:.3e} radial={vgn_radial:.3e}")
+                        f"edm={vgn_edm:.3e} align={vgn_align:.3e} radial={vgn_radial:.3e}"
+                        f"edge={vgn_edge:.3e} topo={vgn_topo:.3e} shape_spec={vgn_shape_spectrum:.3e}")
                 else:
                     print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} sw_sc={vgn_swsc:.3e} "
                         f"overlap={vgn_overlap:.3e} ord={vgn_ord:.3e}")
@@ -2418,6 +2443,9 @@ def train_stageC_diffusion_generator(
                     ema_grads['edm_tail'] = max(vgn_edm, 1e-12)
                     ema_grads['gen_align'] = max(vgn_align, 1e-12)
                     ema_grads['radial'] = max(vgn_radial, 1e-12)
+                    ema_grads['edge'] = max(vgn_edge, 1e-12)
+                    ema_grads['topo'] = max(vgn_topo, 1e-12)
+                    ema_grads['shape_spec'] = max(vgn_shape_spectrum, 1e-12)
                     if DEBUG:
                         print(f"[ema_init] score={ema_grads['score']:.3e} gram={ema_grads['gram']:.3e} "
                             f"gram_scale={ema_grads['gram_scale']:.3e} heat={ema_grads['heat']:.3e} "
@@ -2510,6 +2538,9 @@ def train_stageC_diffusion_generator(
                         'edm_tail': (0.05, 0.8),      # EDM tail - moderate
                         'gen_align': (0.05, 0.6),     # Procrustes alignment - moderate
                         'radial': (0.2, 2.0),         # Radial histogram - moderate
+                        'edge': (0.3, 1.5),           # Keep edge consistency moderate
+                        'topo': (0.2, 1.0),           # Topology can be expensive, keep check
+                        'shape_spec': (0.2, 1.0), # Shape spectrum bounds
                     }
  
                     def _update(key):
@@ -2530,7 +2561,7 @@ def train_stageC_diffusion_generator(
                     if rank == 0:
                         # Update all ST-side autobalanced losses
                         for key in ['gram', 'gram_scale', 'heat', 'sw_st', 'st_dist',
-                                    'edm_tail', 'gen_align', 'radial']:
+                                    'edm_tail', 'gen_align', 'radial', 'edge', 'topo', 'shape_spec']:
                             _update(key)
  
                     try:
@@ -2539,12 +2570,16 @@ def train_stageC_diffusion_generator(
                             w = torch.tensor([
                                 WEIGHTS['gram'], WEIGHTS['gram_scale'], WEIGHTS['heat'],
                                 WEIGHTS['sw_st'], WEIGHTS['st_dist'], WEIGHTS['edm_tail'],
-                                WEIGHTS['gen_align'], WEIGHTS['radial']
+                                WEIGHTS['gen_align'], WEIGHTS['radial'],
+                                WEIGHTS['edge'], WEIGHTS['topo'], WEIGHTS['shape_spec']
                             ], device=device, dtype=torch.float32)
+
                             dist.broadcast(w, src=0)
+
                             (WEIGHTS['gram'], WEIGHTS['gram_scale'], WEIGHTS['heat'],
                              WEIGHTS['sw_st'], WEIGHTS['st_dist'], WEIGHTS['edm_tail'],
-                             WEIGHTS['gen_align'], WEIGHTS['radial']) = map(float, w.tolist())
+                             WEIGHTS['gen_align'], WEIGHTS['radial'],
+                             WEIGHTS['edge'], WEIGHTS['topo'], WEIGHTS['shape_spec']) = map(float, w.tolist())
                     except Exception:
                         pass
  
@@ -2636,7 +2671,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['shape'] += L_shape.item()
             epoch_losses['edge'] += L_edge.item()
             epoch_losses['topo'] += L_topo.item()
-            epoch_losses['shape'] += L_shape_spectrum.item()
+            epoch_losses['shape_spec'] += L_shape_spec.item()
 
 
 
@@ -2704,6 +2739,9 @@ def train_stageC_diffusion_generator(
                 avg_triangle = epoch_losses['triangle'] / max(n_batches, 1)
                 avg_radial = epoch_losses['radial'] / max(n_batches, 1)
                 avg_knn_nca = epoch_losses['knn_nca'] / max(n_batches, 1)
+                epoch_losses['edge'] += L_edge.item()
+                epoch_losses['topo'] += L_topo.item()
+                epoch_losses['shape_spec'] += L_shape_spec.item()
                 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
@@ -2861,7 +2899,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
@@ -2900,7 +2938,10 @@ def train_stageC_diffusion_generator(
             WEIGHTS['triangle'] * epoch_losses['triangle'] +
             WEIGHTS['radial']   * epoch_losses['radial']   +
             WEIGHTS['repel']    * epoch_losses['repel']    +   
-            WEIGHTS['shape']    * epoch_losses['shape']        
+            WEIGHTS['shape']    * epoch_losses['shape']     +
+            WEIGHTS['shape_spec'] * epoch_losses['shape_spec'] +
+            WEIGHTS['edge'] * epoch_losses['edge'] +
+            WEIGHTS['topo'] * epoch_losses['topo']
         )
 
         # Override the history['epoch_avg']['total'] with correct value

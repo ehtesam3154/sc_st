@@ -3202,7 +3202,11 @@ class EdgeLengthLoss(nn.Module):
         return torch.stack(loss_per_batch).mean()
        
 
-def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int=10, max_pairs_1d: int=5):
+# ==============================================================================
+# PERSISTENT HOMOLOGY PREPROCESSING (OFFLINE)
+# ==============================================================================
+
+def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pairs_1d: int = 5):
     """
     Compute persistent homology pairs for a single miniset.
     Uses Vietoris-Rips filtration.
@@ -3220,79 +3224,80 @@ def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int=10, max_pairs
             'dists_1': (m1,) birth distances for 1D features
     """
     from ripser import ripser
-    from scipy.spatial.distance import squareform, cdist
-
+    from scipy.spatial.distance import squareform, pdist
+    
     n = coords.shape[0]
-
+    
     if n < 3:
+        # Too few points, return empty
         return {
             'pairs_0': np.zeros((0, 2), dtype=np.int64),
             'dists_0': np.zeros(0, dtype=np.float32),
             'pairs_1': np.zeros((0, 2), dtype=np.int64),
             'dists_1': np.zeros(0, dtype=np.float32),
         }
-
-    #compute distance matrix
+    
+    # Compute distance matrix
     D = squareform(pdist(coords, metric='euclidean'))
-
-    #compute persistent homology (up to 1D)
-    result = ripser(D, maxdim=1, distance_matrix = True)
-    diagrams = result['dgms']
-
-    #extract 0D and 1D persistent diagrams
-    dgm0 = diagrams[0] #0D: connected components
-    dgms1 = diagrams[1] if len(diagrams) > 1 else np.zeros((0, 2))
-
+    
+    # Compute persistent homology (up to dimension 1)
+    result = ripser(D, maxdim=1, distance_matrix=True)
+    diagrams = result['dgms']  # List of (birth, death) arrays
+    
+    # Extract 0D and 1D persistence diagrams
+    dgm0 = diagrams[0]  # 0D: connected components
+    dgm1 = diagrams[1] if len(diagrams) > 1 else np.zeros((0, 2))  # 1D: loops
+    
     def extract_top_pairs(dgm, max_pairs, dimension):
-        '''extract top-m most persistent features from diagram'''
+        """Extract top-m most persistent features from diagram"""
         if len(dgm) == 0:
             return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
-
-        #filter out infinite death times
+        
+        # Filter out infinite death times
         finite_mask = np.isfinite(dgm[:, 1])
         dgm_finite = dgm[finite_mask]
-
+        
         if len(dgm_finite) == 0:
             return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
-
-        #compute persistence (death - birth)
+        
+        # Compute persistence (death - birth)
         persistence = dgm_finite[:, 1] - dgm_finite[:, 0]
-
-        #sort by persistence (descending)
-        sorted_idx = np.zrgsort(-persistence)
+        
+        # Sort by persistence (descending)
+        sorted_idx = np.argsort(-persistence)
         top_k = min(max_pairs, len(sorted_idx))
-        top_idx = sorted_idx[: top_k]
-
-        #get birth/death distances
+        top_idx = sorted_idx[:top_k]
+        
+        # Get birth/death distances
         births = dgm_finite[top_idx, 0]
         deaths = dgm_finite[top_idx, 1]
-
-        #for each persistent feature, find representative point pairs
-        #simplified: use birth distances to find closest point pairs
+        
+        # For each persistent feature, find representative point pairs
+        # Simplified: use birth distance to find closest point pairs
         pairs = []
         dists = []
-
+        
         for birth, death in zip(births, deaths):
-            #find pair of points whose distance approx birth
-            #simple heuristic: find closest pair in D that matches birth distance
+            # Find pair of points whose distance ≈ birth
+            # Simple heuristic: find closest pair in D that matches birth distance
             diff = np.abs(D - birth)
-            np.fill_diagonal(diff, np.inf) 
+            np.fill_diagonal(diff, np.inf)  # Exclude diagonal
             i, j = np.unravel_index(np.argmin(diff), D.shape)
-
+            
             if i > j:
-                i, j = j, i #ensure i < j
-
+                i, j = j, i  # Ensure i < j
+            
             pairs.append([i, j])
             dists.append(D[i, j])
-
+        
         return np.array(pairs, dtype=np.int64), np.array(dists, dtype=np.float32)
     
-    #extract 0D pairs (connected components)
+    # Extract 0D pairs (connected components)
     pairs_0, dists_0 = extract_top_pairs(dgm0, max_pairs_0d, 0)
-
-    #extract 1D pairs (loops)
-    pairs_1, dists_1 = extract_top_pairs(dgm0, max_pairs_1d, 1)
-
+    
+    # Extract 1D pairs (loops)
+    pairs_1, dists_1 = extract_top_pairs(dgm1, max_pairs_1d, 1)
+    
     return {
         'pairs_0': pairs_0,
         'dists_0': dists_0,
@@ -3398,6 +3403,7 @@ class TopologyLoss(nn.Module):
         
         return torch.stack(loss_per_batch).mean()
 
+
 class ShapeSpectrumLoss(nn.Module):
     """
     Shape spectrum loss - Match eigenvalue ratios of Gram matrices.
@@ -3471,5 +3477,3 @@ class ShapeSpectrumLoss(nn.Module):
             return torch.tensor(0.0, device=device)
         
         return torch.stack(loss_per_batch).mean()
-
-    
