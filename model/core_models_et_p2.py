@@ -788,31 +788,12 @@ def train_stageC_diffusion_generator(
     )
     loss_sw = uet.SlicedWassersteinLoss1D()
     loss_triplet = uet.OrdinalTripletLoss()
-    loss_knn_nca = uet.KNNSoftmaxLoss(tau=1.0, k=15)
+    # loss_knn_nca = uet.KNNSoftmaxLoss(tau=1.0, k=15)
+    # NEW: topology aware losses
+    loss_edge = uet.EdgeLengthLoss()
+    loss_topo = uet.TopologyLoss()
+    loss_shape_spectrum = uet.ShapeSpectrumLoss()
 
-    # ADD THIS BLOCK:
-    # if use_st:
-    # print("\n[Computing adaptive tau for KNN NCA loss]")
-    # st_knn_sq_dists = []
-    # for slide_id in st_dataset.targets_dict:
-    #     y_hat = st_dataset.targets_dict[slide_id].y_hat
-    #     D_ref = torch.cdist(y_hat, y_hat)
-    #     # Get k=15 nearest neighbors per point
-    #     knn_dists, _ = torch.topk(D_ref, k=16, dim=1, largest=False)  # +1 for self
-    #     knn_dists = knn_dists[:, 1:]  # Remove self
-    #     st_knn_sq_dists.append(knn_dists[:, :15].flatten() ** 2)
-    
-    # st_knn_sq_dists = torch.cat(st_knn_sq_dists).cpu().numpy()
-    # tau_median = float(np.median(st_knn_sq_dists))
-    # tau_mean = float(np.mean(st_knn_sq_dists))
-    
-    # print(f"  Reference k-NN squared distances (k=15):")
-    # print(f"    Median: {tau_median:.6f}")
-    # print(f"    Mean: {tau_mean:.6f}")
-    # print(f"    Suggested tau range: [{tau_median*0.1:.6f}, {tau_median:.6f}]")
-    # print(f"  Currently using tau={loss_knn_nca.tau:.6f}")
-    # print(f"  Consider setting tau={tau_median*0.5:.6f} (0.5 * median)\n")
-    # END BLOCK
 
     loss_dim = uet.IntrinsicDimensionLoss(k_neighbors=20, target_dim=2.0)
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
@@ -1079,24 +1060,48 @@ def train_stageC_diffusion_generator(
     # }
 
 
+    # WEIGHTS = {
+    #     'score': 1.0,
+    #     'gram': 0.5,
+    #     'gram_scale': 0.5,
+    #     'heat': 0.0,
+    #     'sw_st': 0.0,
+    #     'sw_sc': 0.25,
+    #     'overlap': 0.25,
+    #     'ordinal_sc': 0.5,
+    #     'st_dist': 0.0,
+    #     'edm_tail': 0.0,
+    #     'gen_align': 0.0,
+    #     'dim': 0.0,
+    #     'triangle': 0.0,
+    #     'radial': 0.0,
+    #     'knn_nca': 0.7,
+    #     'repel': 0.0,      # NEW: ST repulsion loss
+    #     'shape': 0.0       # NEW: ST anisotropy/shape loss
+    # }
+
     WEIGHTS = {
         'score': 1.0,
         'gram': 0.5,
-        'gram_scale': 0.5,
-        'heat': 0.0,
+        'gram_scale': 0.3,
+        'heat': 0.25,
         'sw_st': 0.0,
-        'sw_sc': 0.25,
+        'sw_sc': 0.3,
         'overlap': 0.25,
         'ordinal_sc': 0.5,
         'st_dist': 0.0,
-        'edm_tail': 0.0,
+        'edm_tail': 0.3,
         'gen_align': 0.0,
         'dim': 0.0,
         'triangle': 0.0,
-        'radial': 0.0,
-        'knn_nca': 0.7,
+        'radial': 0.5,
+        'knn_nca': 0.0,
         'repel': 0.0,      # NEW: ST repulsion loss
-        'shape': 0.0       # NEW: ST anisotropy/shape loss
+        'shape': 0.0,       # NEW: ST anisotropy/shape loss
+        # NEW
+        'edge': 0.5,       # Edge-length preservation (local metric)
+        'topo': 0.3,       # Topology preservation (persistent homology proxy)
+        'shape_spec': 0.3,      # Shape spectrum (anisotropy matching)
     }
 
     # Heat warmup schedule
@@ -1130,7 +1135,10 @@ def train_stageC_diffusion_generator(
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
             'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [], 'knn_nca': [], 
-            'repel': [], 'shape': []  # NEW: ST shape constraints
+            'repel': [], 'shape': [],  # NEW: ST shape constraints
+            'edge': [],     # NEW
+            'topo': [],     # NEW
+            'shape_spec': []
         }
     }
 
@@ -1181,6 +1189,10 @@ def train_stageC_diffusion_generator(
         'edm_tail': 0.1,
         'gen_align': 0.1,
         'radial': 0.1,
+        'edge': 0.1,
+        'topo': 0.1,
+        'shape_spec': 0.1,
+        'shape': 0.1
         # dim and triangle are regularizers - keep manual for now
     }
     ema_sc = {
@@ -1202,6 +1214,9 @@ def train_stageC_diffusion_generator(
         'edm_tail': 0.12,       # EDM tail loss at ~12%
         'gen_align': 0.06,      # Procrustes alignment at ~6%
         'radial': 0.04,         # Radial histogram at ~4%
+        'edge': 0.12,      # Similar to edm_tail (local geometry)
+        'topo': 0.10,      # Similar to sw_st (distribution matching)
+        'shape': 0.06,
     }
 
     TARGET_SC = {
@@ -1212,7 +1227,7 @@ def train_stageC_diffusion_generator(
     AUTOBALANCE_EVERY = 100
     AUTOBALANCE_START = 200
 
-    USE_AUTOBALANCE = False
+    USE_AUTOBALANCE = True
 
     #self conditioning probability
     p_sc = 0.5 #prob of using self-conditioning in training
@@ -1456,6 +1471,10 @@ def train_stageC_diffusion_generator(
             L_radial = torch.zeros((), device=device)
             L_repel = torch.tensor(0.0, device=device)   # NEW: ST repulsion
             L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
+            L_edge = torch.tensor(0.0, device=device)   # NEW: Edge-length loss
+            L_topo = torch.tensor(0.0, device=device)   # NEW: Topology loss  
+            L_shape_spec = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
+
       
             # Denoise to get V_hat
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -1509,35 +1528,6 @@ def train_stageC_diffusion_generator(
                     mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                     V_geom = (V_hat_f32 - mean) * m_float             # (B,N,D), centered, scale-preserving
 
-                    # After: V_geom = (V_hat_f32 - mean) * m_float
-                    # if global_step % LOG_EVERY == 0:
-                    # with torch.no_grad():
-                    #     V_geom_valid = V_geom[mask.bool()]
-                    #     radii = torch.norm(V_geom_valid, dim=-1)
-                    #     print(f"[DEBUG Radii]")
-                    #     print(f"  Mean radius: {radii.mean().item():.6f}")
-                    #     print(f"  Std radius: {radii.std().item():.6f}")
-                    #     print(f"  Radius CV: {radii.std().item() / radii.mean().item():.2%}")
-                        
-                    #     if radii.std() / radii.mean() < 0.2:
-                    #         print(f"  WARNING: Points clustered on sphere (low radius variation)")
-
-
-                    # ADD THIS:
-                    # if global_step % LOG_EVERY == 0:
-                    #     with torch.no_grad():
-                    #         # Check if V_geom has variation
-                    #         V_geom_valid = V_geom[mask.bool()]  # Only valid coordinates
-                    #         print(f"\n[DEBUG V_geom] step={global_step}")
-                    #         print(f"  Shape: {V_geom.shape}")
-                    #         print(f"  Mean: {V_geom_valid.mean().item():.6f} (should be ~0)")
-                    #         print(f"  Std: {V_geom_valid.std().item():.6f}")
-                    #         print(f"  Min: {V_geom_valid.min().item():.6f}")
-                    #         print(f"  Max: {V_geom_valid.max().item():.6f}")
-                            
-                    #         # Check if all coordinates are identical (collapse)
-                    #         if V_geom_valid.std() < 1e-4:
-                    #             print(f"  WARNING: V_geom has collapsed (std < 1e-4)!")
 
                     Gt = G_target.float()
                     B, N, _ = V_geom.shape
@@ -1633,7 +1623,6 @@ def train_stageC_diffusion_generator(
                     gate_sum = geo_gate.sum().clamp(min=1.0)
                     L_gram = (per_set_relative_loss * geo_gate).sum() / gate_sum
                     
-                    # L_gram = per_set_relative_loss.mean()  # scalar, O(1) magnitude
                     
                     # --- DEBUG 5: Loss statistics ---
                     if DEBUG and (global_step % LOG_EVERY == 0):
@@ -1688,55 +1677,85 @@ def train_stageC_diffusion_generator(
                         # Use the same weighted approach to avoid divergence
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
 
+                # ==================== COMPUTE V_TARGET_BATCH ONCE ====================
+                # Needed by: edge loss, topo loss, shape loss, etc.
+                # Only compute if at least one of these losses is active
+                need_v_target = (WEIGHTS['edge'] > 0 or WEIGHTS['topo'] > 0 or 
+                                WEIGHTS['shape_spec'] > 0 or WEIGHTS['edm_tail'] > 0 or
+                                WEIGHTS['gen_align'] > 0)
+                
+                if need_v_target:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        V_target_batch = torch.zeros_like(V_geom)  # (B, N, D)
+                        
+                        for i in range(batch_size_real):
+                            n_valid = int(n_list[i].item())
+                            if n_valid < 3:
+                                continue
+                            G_i = G_target[i, :n_valid, :n_valid].float()
+                            V_tgt_i = uet.factor_from_gram(G_i, D_latent)  # (n_valid, D)
+                            V_target_batch[i, :n_valid] = V_tgt_i
 
-                # 2. Compute kNN NCA loss
-                L_knn_nca = torch.tensor(0.0, device=device)
-                knn_nca_count = 0
-
-                # Only run if batch actually has indices (SC loader must provide them)
-                if not is_sc and 'knn_indices' in batch:
+                # ==================== EDGE-LENGTH LOSS ====================
+                if WEIGHTS['edge'] > 0 and 'knn_indices' in batch:
                     with torch.autocast(device_type='cuda', enabled=False):
                         knn_indices_batch = batch['knn_indices'].to(device)
-                        # print(f"\n[DEBUG] knn_indices check:")
-                        # print(f"  Shape: {knn_indices_batch.shape}")
-                        # print(f"  Valid neighbors (>=0): {(knn_indices_batch >= 0).float().mean().item():.2%}")
-                        # print(f"  Sample knn_indices[0,0]: {knn_indices_batch[0,0,:5]}")
+                                                
+                        # Low-noise gating
+                        low_noise = (t_norm.squeeze() < 0.3)
+                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        geo_gate_edge = (low_noise & cond_only).float()
+                        gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
                         
-                        for b in range(len(mask)):
-                            m = mask[b]
-                            n_valid = m.sum().item()
-                            
-                            if n_valid < 5: 
-                                continue
-                            
-                            # Use the globally computed V_geom
-                            V_pred_b = V_geom[b, m]
-                            D_pred_b = torch.cdist(V_pred_b, V_pred_b)
-                            knn_b = knn_indices_batch[b, m]
-
-
-                            # Inside the training loop, before calling loss_knn_nca:
-                            with torch.no_grad():
-                                d_sq = D_pred_b ** 2
-                                d_sq_valid = d_sq[~torch.eye(d_sq.shape[0], device=device, dtype=torch.bool)]
-                                cv_batch = (d_sq_valid.std() / d_sq_valid.mean()).item()
-                                epoch_cv_sum += cv_batch
-                                epoch_nca_count += 1
-                            
-                            L_nca_b = loss_knn_nca(
-                                D_pred=D_pred_b,
-                                knn_indices=knn_b,
-                                mask=None,
-                                tau=tau_reference,
-                                k=15
-                            )
-                            
-                            L_knn_nca = L_knn_nca + L_nca_b
-                            knn_nca_count += 1
-                    
-                    if knn_nca_count > 0:
-                        L_knn_nca = L_knn_nca / knn_nca_count
-                # ===================================================================
+                        L_edge_raw = loss_edge(
+                            V_pred=V_geom,
+                            V_target=V_target_batch,  # Already computed!
+                            knn_indices=knn_indices_batch,
+                            mask=mask
+                        )
+                        
+                        L_edge = (L_edge_raw * geo_gate_edge).sum() / gate_sum_edge
+                
+                # ==================== TOPOLOGY LOSS ====================
+                if WEIGHTS['topo'] > 0:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        topo_info = batch.get('topo_info', None)
+                        
+                        # V_target_batch already computed above!
+                        
+                        # Low-noise gating (more aggressive for topology)
+                        low_noise = (t_norm.squeeze() < 0.2)
+                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        geo_gate_topo = (low_noise & cond_only).float()
+                        gate_sum_topo = geo_gate_topo.sum().clamp(min=1.0)
+                        
+                        L_topo_raw = loss_topo(
+                            V_pred=V_geom,
+                            V_target=V_target_batch,  # Already computed!
+                            mask=mask,
+                            topo_info=topo_info
+                        )
+                        
+                        L_topo = (L_topo_raw * geo_gate_topo).sum() / gate_sum_topo
+                
+                # ==================== SHAPE SPECTRUM LOSS ====================
+                if WEIGHTS['shape'] > 0:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        # V_target_batch already computed above!
+                        
+                        # Low-noise gating
+                        low_noise = (t_norm.squeeze() < 0.3)
+                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        geo_gate_shape = (low_noise & cond_only).float()
+                        gate_sum_shape = geo_gate_shape.sum().clamp(min=1.0)
+                        
+                        L_shape_spectrum_raw = loss_shape_spectrum(
+                            V_pred=V_geom,
+                            V_target=V_target_batch,  # Already computed!
+                            mask=mask
+                        )
+                        
+                        L_shape_spec = (L_shape_spectrum_raw * geo_gate_shape).sum() / gate_sum_shape
 
                 # Heat kernel loss (batched)
                 if WEIGHTS['heat'] > 0 and (global_step % heat_every_k) == 0:
@@ -2349,7 +2368,10 @@ def train_stageC_diffusion_generator(
                                 WEIGHTS['knn_nca'] * L_knn_nca +
                                 WEIGHTS['radial'] * L_radial +
                                 WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
-                                WEIGHTS['shape'] * L_shape)       # NEW: ST shape/anisotropy
+                                WEIGHTS['shape'] * L_shape + 
+                                WEIGHTS['edge'] * L_edge +           # NEW
+                                WEIGHTS['topo'] * L_topo +           # NEW
+                                WEIGHTS['shape_spec'] * L_shape_spec )       # NEW: ST shape/anisotropy
 
             
             # Add SC dimension prior if this is an SC batch
@@ -2387,6 +2409,11 @@ def train_stageC_diffusion_generator(
                 vgn_edm = vhat_gn(L_edm_tail) if not is_sc else 0.0
                 vgn_align = vhat_gn(L_gen_align) if not is_sc else 0.0
                 vgn_radial = vhat_gn(L_radial) if not is_sc else 0.0
+
+                # NEW: Gradient probes for new losses
+                vgn_edge = vhat_gn(L_edge) if not is_sc else 0.0
+                vgn_topo = vhat_gn(L_topo) if not is_sc else 0.0
+                vgn_shape_spectrum = vhat_gn(L_shape_spec) if not is_sc else 0.0
  
                 # SC-side gradient norms
                 vgn_swsc = vhat_gn(L_sw_sc) if is_sc else 0.0
@@ -2399,7 +2426,8 @@ def train_stageC_diffusion_generator(
                 if not is_sc:
                     print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} gram={vgn_gram:.3e} gram_scale={vgn_gram_scale:.3e} "
                         f"heat={vgn_heat:.3e} sw_st={vgn_swst:.3e} st_dist={vgn_stdist:.3e} "
-                        f"edm={vgn_edm:.3e} align={vgn_align:.3e} radial={vgn_radial:.3e}")
+                        f"edm={vgn_edm:.3e} align={vgn_align:.3e} radial={vgn_radial:.3e}"
+                        f"edge={vgn_edge:.3e} topo={vgn_topo:.3e} shape_spec={vgn_shape_spectrum:.3e}")
                 else:
                     print(f"[vhatprobe][{batch_type}] score={vgn_score:.3e} sw_sc={vgn_swsc:.3e} "
                         f"overlap={vgn_overlap:.3e} ord={vgn_ord:.3e}")
@@ -2415,6 +2443,9 @@ def train_stageC_diffusion_generator(
                     ema_grads['edm_tail'] = max(vgn_edm, 1e-12)
                     ema_grads['gen_align'] = max(vgn_align, 1e-12)
                     ema_grads['radial'] = max(vgn_radial, 1e-12)
+                    ema_grads['edge'] = max(vgn_edge, 1e-12)
+                    ema_grads['topo'] = max(vgn_topo, 1e-12)
+                    ema_grads['shape_spec'] = max(vgn_shape_spectrum, 1e-12)
                     if DEBUG:
                         print(f"[ema_init] score={ema_grads['score']:.3e} gram={ema_grads['gram']:.3e} "
                             f"gram_scale={ema_grads['gram_scale']:.3e} heat={ema_grads['heat']:.3e} "
@@ -2507,6 +2538,9 @@ def train_stageC_diffusion_generator(
                         'edm_tail': (0.05, 0.8),      # EDM tail - moderate
                         'gen_align': (0.05, 0.6),     # Procrustes alignment - moderate
                         'radial': (0.2, 2.0),         # Radial histogram - moderate
+                        'edge': (0.3, 1.5),           # Keep edge consistency moderate
+                        'topo': (0.2, 1.0),           # Topology can be expensive, keep check
+                        'shape_spec': (0.2, 1.0), # Shape spectrum bounds
                     }
  
                     def _update(key):
@@ -2527,7 +2561,7 @@ def train_stageC_diffusion_generator(
                     if rank == 0:
                         # Update all ST-side autobalanced losses
                         for key in ['gram', 'gram_scale', 'heat', 'sw_st', 'st_dist',
-                                    'edm_tail', 'gen_align', 'radial']:
+                                    'edm_tail', 'gen_align', 'radial', 'edge', 'topo', 'shape_spec']:
                             _update(key)
  
                     try:
@@ -2536,12 +2570,16 @@ def train_stageC_diffusion_generator(
                             w = torch.tensor([
                                 WEIGHTS['gram'], WEIGHTS['gram_scale'], WEIGHTS['heat'],
                                 WEIGHTS['sw_st'], WEIGHTS['st_dist'], WEIGHTS['edm_tail'],
-                                WEIGHTS['gen_align'], WEIGHTS['radial']
+                                WEIGHTS['gen_align'], WEIGHTS['radial'],
+                                WEIGHTS['edge'], WEIGHTS['topo'], WEIGHTS['shape_spec']
                             ], device=device, dtype=torch.float32)
+
                             dist.broadcast(w, src=0)
+
                             (WEIGHTS['gram'], WEIGHTS['gram_scale'], WEIGHTS['heat'],
                              WEIGHTS['sw_st'], WEIGHTS['st_dist'], WEIGHTS['edm_tail'],
-                             WEIGHTS['gen_align'], WEIGHTS['radial']) = map(float, w.tolist())
+                             WEIGHTS['gen_align'], WEIGHTS['radial'],
+                             WEIGHTS['edge'], WEIGHTS['topo'], WEIGHTS['shape_spec']) = map(float, w.tolist())
                     except Exception:
                         pass
  
@@ -2631,6 +2669,10 @@ def train_stageC_diffusion_generator(
             epoch_losses['radial'] += L_radial.item()
             epoch_losses['repel'] += L_repel.item()
             epoch_losses['shape'] += L_shape.item()
+            epoch_losses['edge'] += L_edge.item()
+            epoch_losses['topo'] += L_topo.item()
+            epoch_losses['shape_spec'] += L_shape_spec.item()
+
 
 
 
@@ -2697,6 +2739,9 @@ def train_stageC_diffusion_generator(
                 avg_triangle = epoch_losses['triangle'] / max(n_batches, 1)
                 avg_radial = epoch_losses['radial'] / max(n_batches, 1)
                 avg_knn_nca = epoch_losses['knn_nca'] / max(n_batches, 1)
+                epoch_losses['edge'] += L_edge.item()
+                epoch_losses['topo'] += L_topo.item()
+                epoch_losses['shape_spec'] += L_shape_spec.item()
                 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
@@ -2854,7 +2899,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
@@ -2893,7 +2938,10 @@ def train_stageC_diffusion_generator(
             WEIGHTS['triangle'] * epoch_losses['triangle'] +
             WEIGHTS['radial']   * epoch_losses['radial']   +
             WEIGHTS['repel']    * epoch_losses['repel']    +   
-            WEIGHTS['shape']    * epoch_losses['shape']        
+            WEIGHTS['shape']    * epoch_losses['shape']     +
+            WEIGHTS['shape_spec'] * epoch_losses['shape_spec'] +
+            WEIGHTS['edge'] * epoch_losses['edge'] +
+            WEIGHTS['topo'] * epoch_losses['topo']
         )
 
         # Override the history['epoch_avg']['total'] with correct value
@@ -3232,6 +3280,8 @@ def sample_sc_edm_patchwise(
     return_coords: bool = True,
     DEBUG_FLAG: bool = True,
     DEBUG_EVERY: int = 10,
+    seed: Optional[int] = None,
+    fixed_patch_graph: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Stage D: Patch-based SC inference via global alignment.
@@ -3253,9 +3303,17 @@ def sample_sc_edm_patchwise(
     import utils_et as uet
     from typing import List, Dict
 
+    import random
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if "cuda" in device:
+            torch.cuda.manual_seed_all(seed)
 
 
-    print(f"[PATCHWISE] THIS IS THE NEW LOGIC BROTHER Running on device={device}, starting inference...", flush=True)
+    print(f"[PATCHWISE] FINAL IDK WHAT IS GOING ON Running on device={device}, starting inference...", flush=True)
 
     encoder.eval()
     context_encoder.eval()
@@ -3296,39 +3354,48 @@ def sample_sc_edm_patchwise(
     nbr_idx = uet.build_topk_index(Z_all, K=K_nbrs)  # (N, K_nbrs)
 
     # ------------------------------------------------------------------
-    # 3) Define overlapping patches S_k
+    # 3) Define overlapping patches S_k (or reload from file)
     # ------------------------------------------------------------------
-    total_slots = int(np.ceil(coverage_per_cell * n_sc))
-    n_patches_est = max(int(np.ceil(total_slots / patch_size)), 1)
+    if fixed_patch_graph is not None:
+        # Reload pre-computed patch graph
+        patch_indices = [p.to(torch.long) for p in fixed_patch_graph["patch_indices"]]
+        memberships = fixed_patch_graph["memberships"]
+        K = len(patch_indices)
+        if DEBUG_FLAG:
+            print(f"[PATCH] Loaded fixed patch graph: K={K} patches")
+    else:
+        # Build patches from scratch
+        total_slots = int(np.ceil(coverage_per_cell * n_sc))
+        n_patches_est = max(int(np.ceil(total_slots / patch_size)), 1)
 
-    if DEBUG_FLAG:
-        print(f"[PATCH] estimated n_patches={n_patches_est} (total_slots={total_slots})")
+        if DEBUG_FLAG:
+            print(f"[PATCH] estimated n_patches={n_patches_est} (total_slots={total_slots})")
 
-    centers = torch.randint(low=0, high=n_sc, size=(n_patches_est,), dtype=torch.long)
+        centers = torch.randint(low=0, high=n_sc, size=(n_patches_est,), dtype=torch.long)
 
-    patch_indices: List[torch.Tensor] = []
-    memberships: List[List[int]] = [[] for _ in range(n_sc)]
+        patch_indices: List[torch.Tensor] = []
+        memberships: List[List[int]] = [[] for _ in range(n_sc)]
 
-    # First pass: random patches around centers
-    for k, c in enumerate(centers.tolist()):
-        S_k = nbr_idx[c, :patch_size]
-        S_k = torch.unique(S_k, sorted=False)
-        patch_indices.append(S_k)
-        for idx in S_k.tolist():
-            memberships[idx].append(k)
-
-    # Ensure every cell appears in at least one patch
-    for i in range(n_sc):
-        if len(memberships[i]) == 0:
-            k = len(patch_indices)
-            S_k = nbr_idx[i, :patch_size]
+        # First pass: random patches around centers
+        for k, c in enumerate(centers.tolist()):
+            S_k = nbr_idx[c, :patch_size]
             S_k = torch.unique(S_k, sorted=False)
             patch_indices.append(S_k)
-            memberships[i].append(k)
             for idx in S_k.tolist():
                 memberships[idx].append(k)
 
-    K = len(patch_indices)
+        # Ensure every cell appears in at least one patch
+        for i in range(n_sc):
+            if len(memberships[i]) == 0:
+                k = len(patch_indices)
+                S_k = nbr_idx[i, :patch_size]
+                S_k = torch.unique(S_k, sorted=False)
+                patch_indices.append(S_k)
+                memberships[i].append(k)
+                for idx in S_k.tolist():
+                    memberships[idx].append(k)
+
+        K = len(patch_indices)
 
     if DEBUG_FLAG:
         cover_counts = torch.tensor([len(memberships[i]) for i in range(n_sc)], dtype=torch.float32)
@@ -3346,6 +3413,47 @@ def sample_sc_edm_patchwise(
               f"p50={patch_sizes.quantile(0.50).item():.0f} "
               f"p75={patch_sizes.quantile(0.75).item():.0f} "
               f"max={patch_sizes.max().item():.0f}")
+        
+    # ------------------------------------------------------------------
+    # DEBUG 1: Patch graph summary
+    # ------------------------------------------------------------------
+    if DEBUG_FLAG:
+        cover_counts = torch.tensor([len(memberships[i]) for i in range(n_sc)], dtype=torch.float32)
+        patch_sizes = torch.tensor([len(S_k) for S_k in patch_indices], dtype=torch.float32)
+
+        print(f"\n[PATCH] final n_patches={K}")
+        print(f"[PATCH] per-cell coverage stats: "
+              f"min={cover_counts.min().item():.1f} "
+              f"p25={cover_counts.quantile(0.25).item():.1f} "
+              f"p50={cover_counts.quantile(0.50).item():.1f} "
+              f"p75={cover_counts.quantile(0.75).item():.1f} "
+              f"max={cover_counts.max().item():.1f}")
+        print(f"[PATCH] cells with coverage==1: {(cover_counts==1).sum().item()} "
+              f"({(cover_counts==1).float().mean().item()*100:.1f}%)")
+        print(f"[PATCH] patch size stats: "
+              f"min={patch_sizes.min().item():.0f} "
+              f"p25={patch_sizes.quantile(0.25).item():.0f} "
+              f"p50={patch_sizes.quantile(0.50).item():.0f} "
+              f"p75={patch_sizes.quantile(0.75).item():.0f} "
+              f"max={patch_sizes.max().item():.0f}")
+        
+        # Save patch graph for reproducibility testing
+        incidence = torch.zeros(n_sc, K, dtype=torch.bool)
+        for k_idx, S_k in enumerate(patch_indices):
+            incidence[S_k, k_idx] = True
+        
+        torch.save(
+            {
+                "patch_indices": [p.cpu() for p in patch_indices],
+                "memberships": memberships,
+                "incidence": incidence.cpu(),
+                "n_sc": n_sc,
+                "patch_size": patch_size,
+                "seed": seed
+            },
+            f"debug_patch_graph_seed{seed}.pt",
+        )
+        print("[DEBUG] Saved patch graph to debug patch graph")
 
     # ------------------------------------------------------------------
     # 4) For each patch: run diffusion sampling (all points free),
@@ -3413,6 +3521,20 @@ def sample_sc_edm_patchwise(
             V_centered = V_final - V_final.mean(dim=0, keepdim=True)
             patch_coords.append(V_centered.detach().cpu())
 
+            # DEBUG 2: Per-patch sample diagnostics
+            if DEBUG_FLAG and (k < 5 or k % max(1, K // 5) == 0):
+                rms = V_centered.pow(2).mean().sqrt().item()
+
+                # Coord covariance eigs to see anisotropy / effective dimension
+                cov_k = torch.cov(V_centered.float().T)
+                eigs_k = torch.linalg.eigvalsh(cov_k)
+                dim_eff = float((eigs_k.sum() ** 2) / (eigs_k ** 2).sum())
+                aniso = float(eigs_k.max() / (eigs_k.min().clamp(min=1e-8)))
+
+                print(f"[PATCH-SAMPLE] k={k}/{K} m_k={m_k} "
+                      f"rms={rms:.3f} dim_eff={dim_eff:.2f} aniso={aniso:.1f} "
+                      f"eigs_min={eigs_k.min().item():.3e} eigs_max={eigs_k.max().item():.3e}")
+
             if DEBUG_FLAG and (k % max(1, K // 5) == 0):
                 rms = V_centered.pow(2).mean().sqrt().item()
                 print(f"  [PATCH {k}/{K}] RMS={rms:.3f} (centered, natural scale)")
@@ -3421,12 +3543,161 @@ def sample_sc_edm_patchwise(
                 mean_norm = V_centered.mean(dim=0).norm().item()
                 print(f"[PATCH] k={k}/{K} m_k={m_k} "
                       f"coords_rms={rms:.3f} center_norm={mean_norm:.3e}")
+                
 
             # del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final, V_canon
-            del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final
+            # del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final
 
             if 'cuda' in device:
                 torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # DEBUG: Save patch coords (AFTER all patches sampled, BEFORE alignment)
+    # ------------------------------------------------------------------
+    if DEBUG_FLAG:
+        all_rms = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
+        print(f"\n[PATCH-SAMPLE] Final RMS distribution across patches: "
+              f"min={all_rms.min().item():.3f} "
+              f"p25={all_rms.quantile(0.25).item():.3f} "
+              f"p50={all_rms.quantile(0.50).item():.3f} "
+              f"p75={all_rms.quantile(0.75).item():.3f} "
+              f"max={all_rms.max().item():.3f}")
+        
+        torch.save(
+            {
+                "patch_indices": [p.cpu() for p in patch_indices],
+                "patch_coords": [pc.cpu() for pc in patch_coords],
+                "seed": seed,
+            },
+            f"debug_patch_coords_seed{seed}.pt",
+        )
+        print(f"[DEBUG] Saved patch coords to debug_patch_coords_seed{seed}.pt\n")
+
+    # Compute median patch RMS as target scale for global alignment
+    patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
+    rms_target = patch_rms_list.median().item()
+
+    if DEBUG_FLAG:
+        print(f"[ALIGN] Target RMS for global space: {rms_target:.3f} (median of patches)")
+
+
+    # DEBUG 3: RMS distribution across all patches
+    if DEBUG_FLAG:
+        all_rms = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
+        print(f"\n[PATCH-SAMPLE] RMS distribution across patches: "
+            f"min={all_rms.min().item():.3f} "
+            f"p25={all_rms.quantile(0.25).item():.3f} "
+            f"p50={all_rms.quantile(0.50).item():.3f} "
+            f"p75={all_rms.quantile(0.75).item():.3f} "
+            f"max={all_rms.max().item():.3f}")
+        
+        # Save patch coords for reproducibility testing
+        torch.save(
+            {
+                "patch_indices": [p.cpu() for p in patch_indices],
+                "patch_coords": [pc.cpu() for pc in patch_coords],
+            },
+            "debug_patch_coords.pt",
+        )
+        print("[DEBUG] Saved patch coords to debug_patch_coords.pt\n")
+
+    # ===== DIAGNOSTIC: Patch-level geometry BEFORE any stitching =====
+    if DEBUG_FLAG and K > 1:
+        print("\n" + "="*60)
+        print("PATCH OVERLAP DIAGNOSTIC (pre-alignment)")
+        print("="*60)
+        
+        # Find pairs of overlapping patches
+        overlap_corrs = []
+        
+        for k1 in range(min(10, K)):  # Check first 10 patches
+            S_k1 = set(patch_indices[k1].cpu().tolist())
+            V_k1 = patch_coords[k1].cpu()  # (m_k1, D)
+            
+            for k2 in range(k1+1, min(k1+5, K)):  # Check next 4 patches
+                S_k2 = set(patch_indices[k2].cpu().tolist())
+                
+                # Find shared cells
+                shared = S_k1 & S_k2
+                if len(shared) < 20:  # Need enough overlap
+                    continue
+                
+                shared_list = sorted(list(shared))
+                
+                # Get positions in each patch
+                S_k1_list = patch_indices[k1].cpu().tolist()
+                S_k2_list = patch_indices[k2].cpu().tolist()
+                
+                pos_k1 = [S_k1_list.index(s) for s in shared_list]
+                pos_k2 = [S_k2_list.index(s) for s in shared_list]
+                
+                # Extract shared cell coords from each patch
+                V_shared_k1 = V_k1[pos_k1]  # (n_shared, D)
+                V_shared_k2 = patch_coords[k2].cpu()[pos_k2]
+                
+                # Compute pairwise distances within shared cells
+                D_k1 = torch.cdist(V_shared_k1, V_shared_k1).numpy()
+                D_k2 = torch.cdist(V_shared_k2, V_shared_k2).numpy()
+                
+                # Compare distances (upper triangle)
+                tri = np.triu_indices(len(shared_list), k=1)
+                if len(tri[0]) > 10:
+                    from scipy.stats import pearsonr
+                    corr = pearsonr(D_k1[tri], D_k2[tri])[0]
+                    overlap_corrs.append(corr)
+        
+        if overlap_corrs:
+            overlap_corrs = np.array(overlap_corrs)
+            print(f"[OVERLAP] Checked {len(overlap_corrs)} patch pairs")
+            print(f"[OVERLAP] Distance correlation in shared cells:")
+            print(f"  min={overlap_corrs.min():.3f} "
+                f"p25={np.percentile(overlap_corrs, 25):.3f} "
+                f"median={np.median(overlap_corrs):.3f} "
+                f"p75={np.percentile(overlap_corrs, 75):.3f} "
+                f"max={overlap_corrs.max():.3f}")
+            
+            if np.median(overlap_corrs) < 0.7:
+                print("\n⚠️  WARNING: Low overlap consistency!")
+                print("    Patches disagree about shared cells' neighborhoods")
+                print("    → Problem is in DIFFUSION MODEL (Stage C)")
+            elif np.median(overlap_corrs) > 0.85:
+                print("\n✓ Good overlap consistency")
+                print("    Patches agree about shared cells")
+                print("    → If final result is bad, problem is in STITCHING")
+            else:
+                print("\n⚠️  Moderate overlap consistency")
+                print("    Some disagreement between patches")
+        
+        print("="*60 + "\n")
+
+    # DEBUG: Patch-level correlation to GT (if GT is available)
+    if DEBUG_FLAG and hasattr(sc_gene_expr, 'gt_coords'):
+        from scipy.spatial.distance import cdist
+        from scipy.stats import pearsonr
+        
+        gt_coords = sc_gene_expr.gt_coords  # Assume passed in somehow
+        patch_local_corrs = []
+        
+        for k in range(K):
+            S_k_np = patch_indices[k].cpu().numpy()
+            V_k = patch_coords[k].cpu().numpy()  # (m_k, D_latent)
+            gt_k = gt_coords[S_k_np]  # (m_k, 2)
+            
+            D_pred = cdist(V_k, V_k)
+            D_gt = cdist(gt_k, gt_k)
+            
+            tri = np.triu_indices(len(S_k_np), k=1)
+            if len(tri[0]) > 0:
+                r = pearsonr(D_pred[tri], D_gt[tri])[0]
+                patch_local_corrs.append(r)
+        
+        patch_local_corrs = np.array(patch_local_corrs)
+        print(f"\n[PATCH-LOCAL] Pearson vs GT: "
+              f"min={patch_local_corrs.min():.3f} "
+              f"p25={np.percentile(patch_local_corrs, 25):.3f} "
+              f"p50={np.median(patch_local_corrs):.3f} "
+              f"p75={np.percentile(patch_local_corrs, 75):.3f} "
+              f"max={patch_local_corrs.max():.3f}")
 
     # ------------------------------------------------------------------
     # 5) Global alignment: alternately solve patch transforms and X
@@ -3465,11 +3736,19 @@ def sample_sc_edm_patchwise(
     mask_seen = W_global.squeeze(-1) > 0
     X_global[mask_seen] /= W_global[mask_seen]
 
-    # global recentering (keep learned scale)
+    # global recentering
     X_global = X_global - X_global.mean(dim=0, keepdim=True)
-    rms = X_global.pow(2).mean().sqrt().item()
+    rms_init = X_global.pow(2).mean().sqrt().item()
+
+    # Rescale to match median patch RMS (data-driven)
+    scale_factor = (rms_target / (rms_init + 1e-8))
+    scale_factor = torch.clamp(torch.tensor(scale_factor), 0.25, 4.0).item()  # Safety bounds
+    X_global = X_global * scale_factor
+
+    rms_final = X_global.pow(2).mean().sqrt().item()
     if DEBUG_FLAG:
-        print(f"[ALIGN] Init X_global: coords_rms={rms:.3f} (centrality-weighted)")
+        print(f"[ALIGN] Init X_global: rms_raw={rms_init:.3f} "
+            f"→ rescaled to {rms_final:.3f} (target={rms_target:.3f}, scale={scale_factor:.3f})")
 
     # 5.2 Alternating Procrustes alignment (SIMPLIFIED: fixed scale, single iteration)
     s_global = 1.0
@@ -3483,6 +3762,7 @@ def sample_sc_edm_patchwise(
 
         R_list: List[torch.Tensor] = []
         t_list: List[torch.Tensor] = []
+        s_list: List[torch.Tensor] = []
         
         # For global alignment loss tracking
         per_patch_mse = []
@@ -3512,8 +3792,13 @@ def sample_sc_edm_patchwise(
             Xc = X_k - mu_X
             Vc = V_k - mu_V
 
+            # Apply sqrt weights for proper weighted Procrustes
+            w_sqrt = weights_k.sqrt()
+            Xc_w = Xc * w_sqrt
+            Vc_w = Vc * w_sqrt
+
             # Weighted cross-covariance
-            C = (Xc.T * weights_k.squeeze(-1)) @ Vc    # (D, D)
+            C = Xc_w.T @ Vc_w
             
             # SVD for rotation
             U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
@@ -3522,14 +3807,36 @@ def sample_sc_edm_patchwise(
                 U[:, -1] *= -1
                 R_k = U @ Vh
 
-            # NO numerator/denominator accumulation - scale is fixed!
+            # Compute per-patch scale (no clamp initially - let's see natural values)
+            numer = S_vals.sum()
+            denom = (Vc_w ** 2).sum().clamp_min(1e-8)
+            s_k_raw = numer / denom
+
+            # Gentle safety clamp (wide range to allow data-driven values)
+            s_k = s_k_raw.clamp(0.3, 3.0)
+
             R_list.append(R_k)
+            s_list.append(s_k)
 
         # ======================================================================
         # NO GLOBAL SCALE RECOMPUTATION - use fixed s_global = 1.0
         # ======================================================================
         if DEBUG_FLAG and it == 0:
-            print(f"[ALIGN] Using FIXED s_global={s_global} (not recomputed from patches)")
+            # print(f"[ALIGN] Using FIXED s_global={s_global} (not recomputed from patches)")
+            s_tensor = torch.stack(s_list)
+            print(f"[ALIGN] per-patch s_k: "
+                  f"min={s_tensor.min().item():.3f} "
+                  f"p25={s_tensor.quantile(0.25).item():.3f} "
+                  f"p50={s_tensor.quantile(0.50).item():.3f} "
+                  f"p75={s_tensor.quantile(0.75).item():.3f} "
+                  f"max={s_tensor.max().item():.3f}")
+            
+            # Show how many are hitting clamps
+            n_clamp_low = (s_tensor < 0.31).sum().item()
+            n_clamp_high = (s_tensor > 2.99).sum().item()
+            if n_clamp_low > 0 or n_clamp_high > 0:
+                print(f"[ALIGN] WARNING: {n_clamp_low} patches hit lower clamp, "
+                    f"{n_clamp_high} hit upper clamp - consider adjusting bounds")
 
         # ======================================================================
         # Step A (cont.): Compute translations and track alignment error
@@ -3539,6 +3846,7 @@ def sample_sc_edm_patchwise(
             V_k = patch_coords[k].to(X_global.device)
             X_k = X_global[S_k]
             R_k = R_list[k]
+            s_k = s_list[k]
 
             # Recompute centrality weights (or cache from above)
             center_k = V_k.mean(dim=0, keepdim=True)
@@ -3551,12 +3859,12 @@ def sample_sc_edm_patchwise(
             mu_X = (weights_k * X_k).sum(dim=0, keepdim=True) / w_sum
             mu_V = (weights_k * V_k).sum(dim=0, keepdim=True) / w_sum
 
-            # Translation using FIXED s_global = 1.0
-            t_k = (mu_X - s_global * (mu_V @ R_k.T)).squeeze(0)
+            # Translation using this patch's scale
+            t_k = (mu_X - s_k * (mu_V @ R_k.T)).squeeze(0)
             t_list.append(t_k)
 
             # Track patch alignment error with current X_global
-            X_hat_k = s_global * (V_k @ R_k.T) + t_k  # (m_k, D)
+            X_hat_k = s_k * (V_k @ R_k.T) + t_k  # (m_k, D)
             sqerr = (X_hat_k - X_k).pow(2).sum(dim=1)  # (m_k,)
             patch_mse = sqerr.mean().item()
             per_patch_mse.append(patch_mse)
@@ -3567,6 +3875,23 @@ def sample_sc_edm_patchwise(
                 f"p10={per_patch_mse_t.quantile(0.10).item():.4e} "
                 f"p50={per_patch_mse_t.quantile(0.50).item():.4e} "
                 f"p90={per_patch_mse_t.quantile(0.90).item():.4e}")
+
+            # DEBUG 5: Transform magnitudes
+            R_norms = []
+            t_norms = []
+            for k_t in range(K):
+                R_k_t = R_list[k_t]
+                t_k_t = t_list[k_t]
+                # how far from identity?
+                R_norms.append((R_k_t - torch.eye(D_latent, device=R_k_t.device)).pow(2).sum().sqrt().item())
+                t_norms.append(t_k_t.norm().item())
+            R_norms_t = torch.tensor(R_norms)
+            t_norms_t = torch.tensor(t_norms)
+            print(f"[ALIGN-TRANSFORMS] iter={it+1} "
+                f"R_dev_from_I: p50={R_norms_t.quantile(0.5).item():.3f} "
+                f"p90={R_norms_t.quantile(0.9).item():.3f} "
+                f"t_norm: p50={t_norms_t.quantile(0.5).item():.3f} "
+                f"p90={t_norms_t.quantile(0.9).item():.3f}")
 
         # ======================================================================
         # Step B: update X from all patch transforms (centrality-weighted)
@@ -3581,6 +3906,7 @@ def sample_sc_edm_patchwise(
             V_k = patch_coords[k].to(device_X)           # (m_k, D)
             R_k = R_list[k].to(device_X)                 # (D, D)
             t_k = t_list[k].to(device_X)                 # (D,)
+            s_k = s_list[k].to(device_X)                 # scalar
 
             # Centrality weights in local patch coordinates
             center_k = V_k.mean(dim=0, keepdim=True)     # (1, D)
@@ -3589,8 +3915,8 @@ def sample_sc_edm_patchwise(
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)        # (m_k, 1)
 
-            # Transformed patch in global frame using FIXED s_global = 1.0
-            X_hat_k = s_global * (V_k @ R_k.T) + t_k     # (m_k, D)
+            # Transformed patch in global frame using this patch's scale
+            X_hat_k = s_k * (V_k @ R_k.T) + t_k     # (m_k, D)
 
             # Weighted accumulation
             new_X.index_add_(0, S_k, X_hat_k * weights_k)
@@ -3604,11 +3930,40 @@ def sample_sc_edm_patchwise(
 
 
         new_X = new_X - new_X.mean(dim=0, keepdim=True)
+        
+        # Enforce target scale at every iteration (data-driven)
+        rms_current = new_X.pow(2).mean().sqrt()
+        scale_correction = rms_target / (rms_current + 1e-8)
+        new_X = new_X * scale_correction
+        
         X_global = new_X
 
         if DEBUG_FLAG:
             rms_new = new_X.pow(2).mean().sqrt().item()
             print(f"[new ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (global scale)")
+
+        # DEBUG 4: Patch consistency after alignment iteration
+        patch_fit_errs = []
+        for k_check in range(K):
+            S_k_check = patch_indices[k_check].to(device_X)
+            V_k_check = patch_coords[k_check].to(device_X)
+            X_k_check = X_global[S_k_check]
+
+            # Compare distances within patch before/after stitching
+            D_V = torch.cdist(V_k_check, V_k_check)
+            D_X = torch.cdist(X_k_check, X_k_check)
+            # normalize by RMS to ignore global scale
+            D_V = D_V / (D_V.pow(2).mean().sqrt().clamp_min(1e-6))
+            D_X = D_X / (D_X.pow(2).mean().sqrt().clamp_min(1e-6))
+            err = (D_V - D_X).abs().mean().item()
+            patch_fit_errs.append(err)
+
+        patch_fit_errs_t = torch.tensor(patch_fit_errs)
+        print(f"[ALIGN-CHECK] iter={it+1} patch dist mismatch: "
+              f"p10={patch_fit_errs_t.quantile(0.10).item():.4e} "
+              f"p50={patch_fit_errs_t.quantile(0.50).item():.4e} "
+              f"p90={patch_fit_errs_t.quantile(0.90).item():.4e} "
+              f"max={patch_fit_errs_t.max().item():.4e}")
 
     # ------------------------------------------------------------------
     # 6) Compute EDM and optional ST-scale alignment
@@ -3636,6 +3991,19 @@ def sample_sc_edm_patchwise(
                   f"scale={scale_factor:.3f}")
 
     result: Dict[str, torch.Tensor] = {"D_edm": D_edm}
+
+    # ------------------------------------------------------------------
+    # DEBUG: Save final EDM
+    # ------------------------------------------------------------------
+    if DEBUG_FLAG:
+        torch.save(
+            {
+                "D_edm": D_edm.cpu(),
+                "seed": seed,
+            },
+            f"debug_final_edm_seed{seed}.pt",
+        )
+        print(f"[DEBUG] Saved final EDM to debug_final_edm_seed{seed}.pt")
 
     # ------------------------------------------------------------------
     # 7) Debug stats and optional 2D coords
