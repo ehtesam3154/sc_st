@@ -4,15 +4,27 @@ import torch
 from lightning.fabric import Fabric
 import scanpy as sc
 from core_models_et_p3 import GEMSModel
-# from mouse_brain import train_gems_mousebrain  # optional, if you want its helpers
+from scipy.ndimage import gaussian_filter1d
+import torch.distributed as dist
+import pandas as pd
+import anndata as ad
+import numpy as np
+import utils_et as uet
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scanpy as sc
+import utils_et as uet
+
+
+
+
 import sys
-
 import argparse
-
 import shutil
 from pathlib import Path
 
-def ensure_disk_space(path, min_gb=10.0):
+def ensure_disk_space(path, min_gb=1.0):
     """Check free space, raise error if below threshold."""
     path = Path(path)
     if not path.exists():
@@ -53,7 +65,7 @@ def parse_args():
     parser.add_argument('--knn_k', type=int, default=12)
     parser.add_argument('--self_conditioning', action='store_true', default=True)
     parser.add_argument('--sc_feat_mode', type=str, default='concat', choices=['concat', 'mlp'])
-    parser.add_argument('--landmarks_L', type=int, default=0)
+    parser.add_argument('--landmarks_L', type=int, default=16)
 
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
@@ -414,74 +426,103 @@ def main(args=None):
             epochs_finetune = max(10, min(50, epochs_finetune))
         else:
             epochs_finetune = args.sc_finetune_epochs
-        
-        # Lower learning rate for fine-tuning
-        lr_finetune = lr / 3.0
-        
-        # Keep some ST samples to anchor geometry (1/3 of Phase 1)
-        num_st_finetune = args.num_st_samples // 2
-        
-        if fabric.is_global_zero:
-            print(f"[Phase 2] Config:")
-            print(f"  - Epochs: {epochs_finetune}")
-            print(f"  - Learning rate: {lr_finetune:.2e} (1/3 of Phase 1)")
-            print(f"  - ST samples: {num_st_finetune} (1/3 of Phase 1, to anchor geometry)")
-            print(f"  - SC samples: {args.num_sc_samples}")
-        
-        # ========== FREEZE GENERATOR ONLY ==========
-        if fabric.is_global_zero:
-            print(f"\n[Phase 2] Freezing generator...")
-        
-        for param in model.generator.parameters():
-            param.requires_grad = False
-        
-        if fabric.is_global_zero:
-            print(f"  ✓ Generator frozen")
-            print(f"  ✓ Score_net trainable")
-            print(f"  ✓ Context_encoder trainable")
-        
-        training_history = model.train_stageC(
-            st_gene_expr_dict=st_gene_expr_dict,
-            sc_gene_expr=sc_expr,
-            n_min=96, n_max=384,
-            num_st_samples=num_st_finetune,  # ← CHANGED from 0
-            num_sc_samples=args.num_sc_samples,
-            n_epochs=epochs_finetune,
-            batch_size=stageC_batch,
-            lr=lr_finetune,
-            n_timesteps=500,
-            sigma_min=0.01,
-            sigma_max=3.0,
-            outf=outdir,
-            fabric=fabric,
-            precision=precision,
-            phase_name="SC Fine-tune",
-            enable_early_stop=False,
-        )
-        
-        fabric.barrier()
-        
-        if fabric.is_global_zero:
-            print("\n" + "="*70)
-            print("PHASE 2 COMPLETE")
-            print("="*70)
+
+        if epochs_finetune == 0:
+            print("\n[INFO] Skipping Phase 2 training (sc_finetune_epochs=0)")
+            print("[INFO] Phase 2 checkpoint will be identical to Phase 1")
+            training_history = history_st
+
+            fabric.barrier()
+
+            if fabric.is_global_zero:
+                print("\n" + "="*70)
+                print("PHASE 2 SKIPPED - Copying Phase 1 checkpoint")
+                print("="*70)
+                
+                checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
+                checkpoint = {
+                    'encoder': model.encoder.state_dict(),
+                    'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
+                    'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
+                    'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
+                    'E_ST_best': E_ST_best,
+                    'epochs_finetune': 0,
+                    'lr_finetune': lr / 3.0,
+                    'history_st': history_st,
+                    'history_sc': history_st,
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"✓ Saved checkpoint (copy of Phase 1): {checkpoint_path}")
             
-            checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
-            checkpoint = {
-                'encoder': model.encoder.state_dict(),
-                'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
-                'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
-                'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
-                'E_ST_best': E_ST_best,
-                'epochs_finetune': epochs_finetune,
-                'lr_finetune': lr_finetune,
-                'history_st': history_st,
-                'history_sc': training_history,
-            }
-            torch.save(checkpoint, checkpoint_path)
-            print(f"✓ Saved checkpoint: {checkpoint_path}")
-        
-        fabric.barrier()
+            fabric.barrier()
+        else:
+            # Lower learning rate for fine-tuning
+            lr_finetune = lr / 3.0
+            
+            # Keep some ST samples to anchor geometry (1/3 of Phase 1)
+            num_st_finetune = args.num_st_samples // 2
+            
+            if fabric.is_global_zero:
+                print(f"[Phase 2] Config:")
+                print(f"  - Epochs: {epochs_finetune}")
+                print(f"  - Learning rate: {lr_finetune:.2e} (1/3 of Phase 1)")
+                print(f"  - ST samples: {num_st_finetune} (1/3 of Phase 1, to anchor geometry)")
+                print(f"  - SC samples: {args.num_sc_samples}")
+            
+            # ========== FREEZE GENERATOR ONLY ==========
+            if fabric.is_global_zero:
+                print(f"\n[Phase 2] Freezing generator...")
+            
+            for param in model.generator.parameters():
+                param.requires_grad = False
+            
+            if fabric.is_global_zero:
+                print(f"  ✓ Generator frozen")
+                print(f"  ✓ Score_net trainable")
+                print(f"  ✓ Context_encoder trainable")
+            
+            training_history = model.train_stageC(
+                st_gene_expr_dict=st_gene_expr_dict,
+                sc_gene_expr=sc_expr,
+                n_min=96, n_max=384,
+                num_st_samples=num_st_finetune,  # ← CHANGED from 0
+                num_sc_samples=args.num_sc_samples,
+                n_epochs=epochs_finetune,
+                batch_size=stageC_batch,
+                lr=lr_finetune,
+                n_timesteps=500,
+                sigma_min=0.01,
+                sigma_max=3.0,
+                outf=outdir,
+                fabric=fabric,
+                precision=precision,
+                phase_name="SC Fine-tune",
+                enable_early_stop=False,
+            )
+            
+            fabric.barrier()
+            
+            if fabric.is_global_zero:
+                print("\n" + "="*70)
+                print("PHASE 2 COMPLETE")
+                print("="*70)
+                
+                checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
+                checkpoint = {
+                    'encoder': model.encoder.state_dict(),
+                    'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
+                    'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
+                    'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
+                    'E_ST_best': E_ST_best,
+                    'epochs_finetune': epochs_finetune,
+                    'lr_finetune': lr_finetune,
+                    'history_st': history_st,
+                    'history_sc': training_history,
+                }
+                torch.save(checkpoint, checkpoint_path)
+                print(f"✓ Saved checkpoint: {checkpoint_path}")
+            
+            fabric.barrier()
     else:
         print("\n[INFO] Skipping Phase 2 (num_sc_samples=0)")
         training_history = history_st
@@ -532,7 +573,7 @@ def main(args=None):
         # Create timestamp for all outputs
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        ensure_disk_space(outdir, min_gb=10.0)
+        ensure_disk_space(outdir, min_gb=1.0)
 
         print("\n=== Inference (rank-0) with Multi-Sample Ranking ===")
 
@@ -555,14 +596,14 @@ def main(args=None):
 
                 sample_results = model.infer_sc_patchwise(
                     sc_gene_expr=sc_expr,
-                    n_timesteps_sample=400,
+                    n_timesteps_sample=500,
                     return_coords=True,
                     # patch_size=512,          # was batch_size; also your Stage D batch size
                     patch_size=256,
-                    coverage_per_cell=6.0,   # you can tune 3–6
-                    n_align_iters=1,        # can tune 5–15
+                    coverage_per_cell=5.0,   # you can tune 3–6
+                    n_align_iters=10,        # can tune 5–15
                     eta=0.0,
-                    guidance_scale=3.0,
+                    guidance_scale=2.0,
                     sigma_min=0.01,
                     sigma_max=3.0,
                 )
@@ -1114,100 +1155,171 @@ def main(args=None):
     #     # PLOT STAGE C TRAINING LOSSES (NO CHECKPOINT NEEDED)
     #     # ============================================================================
 
-    if fabric.is_global_zero:
-        print("\n=== Plotting Stage C training losses ===")
+        # ============================================================================
+        # AUTOMATED LOSS PLOTTING FUNCTION
+        # ============================================================================
         
-        # ============================================================================
-        # PLOT PHASE 1 (ST-ONLY) LOSSES
-        # ============================================================================
-        if history_st is not None and len(history_st['epoch']) > 0:
-            print("\n--- Plotting Phase 1 (ST-only) Losses ---")
-            epochs = history_st['epoch']
-            losses = history_st['epoch_avg']
+        def plot_training_losses(history: dict, phase_name: str, output_dir: str, timestamp: str, exclude_keys: list = None):
+            """
+            Automatically plot all losses from history dictionary.
             
-            # ST-specific losses
-            # ST-specific losses (including new shape constraints)
-            st_loss_names = ['total', 'score', 'gram', 'gram_scale', 'heat', 'sw_st', 'st_dist', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'repel', 'shape']
-            st_colors = ['black', 'blue', 'red', 'orange', 'green', 'purple', 'magenta', 'cyan', 'lime', 'brown', 'pink', 'gray', 'darkred', 'darkblue']
-
+            Args:
+                history: dict with 'epoch' and 'epoch_avg' keys
+                phase_name: e.g. "Phase 1: ST-Only" or "Phase 2: SC Fine-tune"
+                output_dir: directory to save plots
+                timestamp: timestamp string for filename
+                exclude_keys: list of keys to exclude from plotting (e.g. ['total'] if you want separate)
+            """
+            if history is None or len(history.get('epoch', [])) == 0:
+                print(f"No data to plot for {phase_name}")
+                return
             
-            # Increased grid to fit new losses
-            fig, axes = plt.subplots(5, 3, figsize=(20, 25))
-
-
-            fig.suptitle('Phase 1: ST-Only Training Losses', fontsize=18, fontweight='bold', y=0.995)
+            epochs = history['epoch']
+            losses = history['epoch_avg']
             
-            axes = axes.flatten()
-            for idx, (name, color) in enumerate(zip(st_loss_names, st_colors)):
-                if name in losses and len(losses[name]) > 0:
-                    ax = axes[idx]
-                    ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
-                    ax.set_xlabel('Epoch', fontsize=12)
-                    ax.set_ylabel('Loss', fontsize=12)
-                    ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
-                    ax.grid(True, alpha=0.3)
-                    
-                    if len(epochs) > 10:
-                        from scipy.ndimage import gaussian_filter1d
-                        smoothed = gaussian_filter1d(losses[name], sigma=2)
-                        ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
-                        ax.legend(fontsize=10)
+            # Get all loss names that have data
+            exclude_keys = exclude_keys or []
+            loss_names = [k for k in losses.keys() if len(losses.get(k, [])) > 0 and k not in exclude_keys]
             
-            # # Hide unused subplots
-            # for idx in range(len(st_loss_names), 12):
-            #     axes[idx].axis('off')
-
-            # Hide unused subplot (now we have 14 losses, 15 total subplots)
-            axes[14].axis('off')
-
-
-            plt.tight_layout()
-            st_plot_filename = f"stageC_phase1_ST_losses_{timestamp}.png"
-            st_plot_path = os.path.join(outdir, st_plot_filename)
-            plt.savefig(st_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved Phase 1 (ST) loss plot: {st_plot_path}")
-            plt.close()
-        
-        # ============================================================================
-        # PLOT PHASE 2 (SC FINE-TUNE) LOSSES (if it ran)
-        # ============================================================================
-        if args.num_sc_samples > 0 and training_history is not None and len(training_history['epoch']) > 0:
-            print("\n--- Plotting Phase 2 (SC Fine-tune) Losses ---")
-            epochs = training_history['epoch']
-            losses = training_history['epoch_avg']
+            if not loss_names:
+                print(f"No losses to plot for {phase_name}")
+                return
             
-            # SC-specific losses (no gram/heat/edm_tail/gen_align)
-            sc_loss_names = ['total', 'score', 'sw_sc', 'overlap', 'ordinal_sc']
-            sc_colors = ['black', 'blue', 'purple', 'brown', 'pink']
+            # Sort: put 'total' first if present, then alphabetically
+            if 'total' in loss_names:
+                loss_names.remove('total')
+                loss_names = ['total'] + sorted(loss_names)
+            else:
+                loss_names = sorted(loss_names)
             
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-            fig.suptitle('Phase 2: SC Fine-tuning Losses', fontsize=18, fontweight='bold', y=0.995)
-            axes = axes.flatten()
+            # Auto color palette (enough for many losses)
+            base_colors = [
+                'black', 'blue', 'red', 'green', 'orange', 'purple', 
+                'brown', 'pink', 'cyan', 'magenta', 'lime', 'olive',
+                'navy', 'teal', 'maroon', 'gold', 'indigo', 'coral',
+                'darkgreen', 'darkred', 'darkblue', 'darkorange', 'darkviolet', 'deepskyblue'
+            ]
+            colors = (base_colors * ((len(loss_names) // len(base_colors)) + 1))[:len(loss_names)]
             
-            for idx, (name, color) in enumerate(zip(sc_loss_names, sc_colors)):
-                if name in losses and len(losses[name]) > 0:
-                    ax = axes[idx]
-                    ax.plot(epochs, losses[name], color=color, linewidth=2, alpha=0.7, marker='o', markersize=4)
-                    ax.set_xlabel('Epoch', fontsize=12)
-                    ax.set_ylabel('Loss', fontsize=12)
-                    ax.set_title(f'{name.upper()} Loss', fontsize=14, fontweight='bold')
-                    ax.grid(True, alpha=0.3)
-                    
-                    if len(epochs) > 10:
-                        from scipy.ndimage import gaussian_filter1d
-                        smoothed = gaussian_filter1d(losses[name], sigma=2)
-                        ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
-                        ax.legend(fontsize=10)
+            # Grid layout: 3 columns, variable rows
+            n_plots = len(loss_names)
+            n_cols = 3
+            n_rows = (n_plots + n_cols - 1) // n_cols  # ceiling division
             
-            # Hide empty subplot
-            axes[5].axis('off')
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+            fig.suptitle(f'{phase_name} Training Losses', fontsize=18, fontweight='bold', y=0.995)
+            
+            # Flatten axes for easy indexing
+            if n_rows == 1 and n_cols == 1:
+                axes = [axes]
+            elif n_rows == 1 or n_cols == 1:
+                axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+            else:
+                axes = axes.flatten()
+            
+            for idx, (name, color) in enumerate(zip(loss_names, colors)):
+                ax = axes[idx]
+                data = losses[name]
+                
+                ax.plot(epochs, data, color=color, linewidth=2, alpha=0.7, marker='o', markersize=3)
+                ax.set_xlabel('Epoch', fontsize=11)
+                ax.set_ylabel('Loss', fontsize=11)
+                ax.set_title(f'{name.upper()}', fontsize=13, fontweight='bold')
+                ax.grid(True, alpha=0.3)
+                
+                # Add smoothed trend line if enough data
+                if len(epochs) > 10:
+                    smoothed = gaussian_filter1d(data, sigma=2)
+                    ax.plot(epochs, smoothed, '--', color=color, linewidth=2.5, alpha=0.5, label='Trend')
+                    ax.legend(fontsize=9)
+            
+            # Hide unused subplots
+            for idx in range(n_plots, len(axes)):
+                axes[idx].axis('off')
             
             plt.tight_layout()
-            sc_plot_filename = f"stageC_phase2_SC_losses_{timestamp}.png"
-            sc_plot_path = os.path.join(outdir, sc_plot_filename)
-            plt.savefig(sc_plot_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Saved Phase 2 (SC) loss plot: {sc_plot_path}")
+            
+            # Generate filename
+            phase_tag = phase_name.lower().replace(' ', '_').replace(':', '').replace('-', '')
+            plot_filename = f"stageC_{phase_tag}_losses_{timestamp}.png"
+            plot_path = os.path.join(output_dir, plot_filename)
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved {phase_name} loss plot: {plot_path}")
             plt.close()
+            
+            # Also create a combined log-scale plot
+            fig, ax = plt.subplots(1, 1, figsize=(14, 7))
+            for name, color in zip(loss_names, colors):
+                if name == 'total':
+                    continue  # skip total in combined plot
+                data = losses[name]
+                if len(data) > 0 and max(data) > 0:
+                    ax.plot(epochs, data, color=color, linewidth=2, label=name.upper(), 
+                        marker='o', markersize=2, markevery=max(1, len(epochs)//20))
+            
+            ax.set_xlabel('Epoch', fontsize=14, fontweight='bold')
+            ax.set_ylabel('Loss', fontsize=14, fontweight='bold')
+            ax.set_title(f'{phase_name} - All Losses (Log Scale)', fontsize=16, fontweight='bold')
+            ax.set_yscale('log')
+            ax.grid(True, alpha=0.3, which='both')
+            ax.legend(fontsize=10, ncol=min(4, len(loss_names)//2 + 1), loc='upper right')
+            
+            plt.tight_layout()
+            combined_filename = f"stageC_{phase_tag}_combined_{timestamp}.png"
+            combined_path = os.path.join(output_dir, combined_filename)
+            plt.savefig(combined_path, dpi=300, bbox_inches='tight')
+            print(f"✓ Saved {phase_name} combined plot: {combined_path}")
+            plt.close()
+
+        # ============================================================================
+        # PLOT STAGE C TRAINING LOSSES
+        # ============================================================================
+
+        if fabric.is_global_zero:
+            print("\n=== Plotting Stage C training losses ===")
+            
+            # Plot Phase 1 (ST-only) losses
+            if history_st is not None:
+                plot_training_losses(
+                    history=history_st,
+                    phase_name="Phase 1 ST-Only",
+                    output_dir=outdir,
+                    timestamp=timestamp
+                )
+            
+           # Plot Phase 2 (SC fine-tune) losses
+            if args.num_sc_samples > 0 and training_history is not None:
+                plot_training_losses(
+                    history=training_history,
+                    phase_name="Phase 2 SC Fine-tune",
+                    output_dir=outdir,
+                    timestamp=timestamp
+                )
+            
+            # ============================================================================
+            # SUMMARY STATISTICS
+            # ============================================================================
+            print("\n" + "="*70)
+            print("TRAINING SUMMARY")
+            print("="*70)
+            
+            def print_loss_summary(history: dict, phase_name: str):
+                if history is None or len(history.get('epoch', [])) == 0:
+                    return
+                print(f"\n--- {phase_name} ---")
+                losses = history['epoch_avg']
+                print(f"Total epochs: {len(history['epoch'])}")
+                
+                # Print final values for all non-empty losses
+                for name in sorted(losses.keys()):
+                    if len(losses[name]) > 0:
+                        print(f"  {name}: {losses[name][-1]:.6f}")
+            
+            print_loss_summary(history_st, "Phase 1: ST-Only Training")
+            if args.num_sc_samples > 0:
+                print_loss_summary(training_history, "Phase 2: SC Fine-tuning")
+            
+            print("="*70)
         
         # ============================================================================
         # SUMMARY STATISTICS

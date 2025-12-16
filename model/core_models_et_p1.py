@@ -278,7 +278,7 @@ class STTargets:
     k: int                   # kNN parameter
     scale: float             # normalization scale factor
     knn_indices: torch.Tensor  # (n, k) k-NN indices for each spot
-    
+    knn_spatial: torch.Tensor   # (n, k) k-NN indices from SPATIAL coordinates (not embeddings)
     # NEW: Persistent homology topology info (for full slide)
     topo_pairs_0: torch.Tensor  # (m0, 2) index pairs for 0D features (connected components)
     topo_dists_0: torch.Tensor  # (m0,) birth distances for 0D features
@@ -477,6 +477,13 @@ class STStageBPrecomputer:
                 if len(indices) < knn_k:
                     knn_indices[i, len(indices):] = -1
 
+            # NEW: Compute SPATIAL kNN (from coordinates, not embeddings)
+            print(f"[Stage B] Computing spatial kNN for slide {slide_id}...")
+            D_spatial = torch.cdist(y_hat, y_hat)  # (n, n)
+            D_spatial_noself = D_spatial + torch.eye(n_spots, device=y_hat.device) * 1e10
+            _, knn_spatial = torch.topk(D_spatial_noself, k=knn_k, dim=1, largest=False)
+            # knn_spatial is (n, k) indices in global slide indexing
+
             # NEW: Compute persistent homology for topology preservation
             print(f"[Stage B] Computing persistent homology for slide {slide_id}...")
             y_hat_np = y_hat.cpu().numpy()
@@ -495,6 +502,7 @@ class STStageBPrecomputer:
                 k=self.k,
                 scale=scale,
                 knn_indices=knn_indices.cpu(),
+                knn_spatial=knn_spatial.cpu(),
                 topo_pairs_0=torch.from_numpy(topo_info['pairs_0']).long(),
                 topo_dists_0=torch.from_numpy(topo_info['dists_0']).float(),
                 topo_pairs_1=torch.from_numpy(topo_info['pairs_1']).long(),
@@ -709,6 +717,10 @@ class STSetDataset(Dataset):
         knn_local = global_to_local[knn_global]  # (n, k)
         # Any neighbor not in this miniset will be -1 (invalid)
 
+        # Also get SPATIAL kNN for geometry losses
+        knn_spatial_global = targets.knn_spatial[indices]  # (n, k)
+        knn_spatial_local = global_to_local[knn_spatial_global]
+
         # ------------------------------------------------------------------
         # Landmarks via FPS in embedding space (unchanged)
         # ------------------------------------------------------------------
@@ -789,19 +801,39 @@ class STSetDataset(Dataset):
                 torch.tensor(dists_local, dtype=torch.float32)
             )
         
-        # global_to_local is already defined above (line 683-684)
-        topo_pairs_0_local, topo_dists_0_local = extract_topo_pairs(
-            targets.topo_pairs_0, targets.topo_dists_0, indices, global_to_local
-        )
-        topo_pairs_1_local, topo_dists_1_local = extract_topo_pairs(
-            targets.topo_pairs_1, targets.topo_dists_1, indices, global_to_local
+        # # global_to_local is already defined above (line 683-684)
+        # topo_pairs_0_local, topo_dists_0_local = extract_topo_pairs(
+        #     targets.topo_pairs_0, targets.topo_dists_0, indices, global_to_local
+        # )
+        # topo_pairs_1_local, topo_dists_1_local = extract_topo_pairs(
+        #     targets.topo_pairs_1, targets.topo_dists_1, indices, global_to_local
+        # )
+        
+        # topo_info = {
+        #     'pairs_0': topo_pairs_0_local,
+        #     'dists_0': topo_dists_0_local,
+        #     'pairs_1': topo_pairs_1_local,
+        #     'dists_1': topo_dists_1_local,
+        # }
+
+        # ------------------------------------------------------------------
+        # NEW: Compute PH directly on this miniset (not from full slide)
+        # ------------------------------------------------------------------
+        # Get miniset GT coordinates
+        y_hat_miniset = targets.y_hat[indices].cpu().numpy()  # (n, 2)
+        
+        # Compute PH pairs for THIS miniset (already in local indices)
+        topo_result = uet.compute_persistent_pairs(
+            y_hat_miniset, 
+            max_pairs_0d=min(20, n // 4),  # Scale with miniset size
+            max_pairs_1d=min(10, n // 8)
         )
         
         topo_info = {
-            'pairs_0': topo_pairs_0_local,
-            'dists_0': topo_dists_0_local,
-            'pairs_1': topo_pairs_1_local,
-            'dists_1': topo_dists_1_local,
+            'pairs_0': torch.from_numpy(topo_result['pairs_0']).long(),
+            'dists_0': torch.from_numpy(topo_result['dists_0']).float(),
+            'pairs_1': torch.from_numpy(topo_result['pairs_1']).long(),
+            'dists_1': torch.from_numpy(topo_result['dists_1']).float(),
         }
 
         return {
@@ -818,6 +850,7 @@ class STSetDataset(Dataset):
             'overlap_info': overlap_info,
             'knn_indices': knn_local,
             'topo_info': topo_info,  # NEW
+            'knn_spatial': knn_spatial_local
         }
 
             
@@ -850,9 +883,9 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
     knn_k = batch[0]['knn_indices'].shape[1]  # Get k from first item
     knn_batch = torch.full((batch_size, n_max, knn_k), -1, dtype=torch.long, device=device)
+    knn_spatial_batch = torch.full((batch_size, n_max, knn_k), -1, dtype=torch.long, device=device)
 
 
-    
     for i, item in enumerate(batch):
         n = item['n']
         Z_batch[i, :n] = item['Z_set']
@@ -869,7 +902,11 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         overlap_info_batch.append(item['overlap_info'])
         topo_info_batch.append(item.get('topo_info', None))  # NEW!
         knn_batch[i, :n] = item['knn_indices']
+
+        if 'knn_spatial' in item:
+            knn_spatial_batch[i, :n, :] = item['knn_spatial'][:n, :]
     
+
     return {
         'Z_set': Z_batch,
         'V_target': V_batch,
@@ -886,6 +923,7 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'is_sc': False,
         'knn_indices': knn_batch,
         'topo_info': topo_info_batch,
+        'knn_spatial': knn_spatial_batch,
     }
 
 class SCSetDataset(Dataset):

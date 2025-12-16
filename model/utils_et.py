@@ -3157,13 +3157,10 @@ class EdgeLengthLoss(nn.Module):
             V_pred_b = V_pred[b, m_b]  # (n_valid, D)
             V_target_b = V_target[b, m_b]  # (n_valid, D)
             knn_b = knn_indices[b, m_b]  # (n_valid, k)
-            
-            # Map global indices to local
-            global_to_local = torch.full((N,), -1, dtype=torch.long, device=device)
-            valid_idx = torch.where(m_b)[0]
-            global_to_local[valid_idx] = torch.arange(n_valid, device=device)
-            
-            knn_local = global_to_local[knn_b]  # (n_valid, k)
+
+            # knn_b is already in local indices [0..n_valid-1] with -1 for invalid
+            # DO NOT remap - just use directly
+            knn_local = knn_b
             
             # Filter out invalid neighbors (-1)
             valid_neighbors = (knn_local >= 0)  # (n_valid, k)
@@ -3179,8 +3176,42 @@ class EdgeLengthLoss(nn.Module):
             i_edges = i_local[edge_mask]  # (num_edges,)
             j_edges = knn_local[edge_mask]  # (num_edges,)
             
-            if len(i_edges) == 0:
+            # Drop self-edges and validate bounds
+            not_self = (i_edges != j_edges)
+            i_edges = i_edges[not_self]
+            j_edges = j_edges[not_self]
+            
+            # Bounds check: ensure j_edges are valid indices
+            valid_j = (j_edges >= 0) & (j_edges < n_valid)
+            i_edges = i_edges[valid_j]
+            j_edges = j_edges[valid_j]
+            
+            if i_edges.numel() == 0:
                 continue
+            
+            # # Map global indices to local
+            # global_to_local = torch.full((N,), -1, dtype=torch.long, device=device)
+            # valid_idx = torch.where(m_b)[0]
+            # global_to_local[valid_idx] = torch.arange(n_valid, device=device)
+            
+            # knn_local = global_to_local[knn_b]  # (n_valid, k)
+            
+            # # Filter out invalid neighbors (-1)
+            # valid_neighbors = (knn_local >= 0)  # (n_valid, k)
+            
+            # if not valid_neighbors.any():
+            #     continue
+            
+            # # Gather coordinates
+            # i_local = torch.arange(n_valid, device=device).unsqueeze(1).expand(n_valid, k)
+            
+            # # Only compute for valid edges
+            # edge_mask = valid_neighbors
+            # i_edges = i_local[edge_mask]  # (num_edges,)
+            # j_edges = knn_local[edge_mask]  # (num_edges,)
+            
+            # if len(i_edges) == 0:
+            #     continue
             
             # Compute edge lengths
             x_i_pred = V_pred_b[i_edges]  # (num_edges, D)
@@ -3206,30 +3237,127 @@ class EdgeLengthLoss(nn.Module):
 # PERSISTENT HOMOLOGY PREPROCESSING (OFFLINE)
 # ==============================================================================
 
+# def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pairs_1d: int = 5):
+#     """
+#     Compute persistent homology pairs for a single miniset.
+#     Uses Vietoris-Rips filtration.
+    
+#     Args:
+#         coords: (n, 2) numpy array of ST coordinates
+#         max_pairs_0d: max number of 0D pairs to keep (connected components)
+#         max_pairs_1d: max number of 1D pairs to keep (loops/holes)
+    
+#     Returns:
+#         dict with:
+#             'pairs_0': (m0, 2) index pairs for 0D features
+#             'dists_0': (m0,) birth distances for 0D features
+#             'pairs_1': (m1, 2) index pairs for 1D features
+#             'dists_1': (m1,) birth distances for 1D features
+#     """
+#     from ripser import ripser
+#     from scipy.spatial.distance import squareform, pdist
+    
+#     n = coords.shape[0]
+    
+#     if n < 3:
+#         # Too few points, return empty
+#         return {
+#             'pairs_0': np.zeros((0, 2), dtype=np.int64),
+#             'dists_0': np.zeros(0, dtype=np.float32),
+#             'pairs_1': np.zeros((0, 2), dtype=np.int64),
+#             'dists_1': np.zeros(0, dtype=np.float32),
+#         }
+    
+#     # Compute distance matrix
+#     D = squareform(pdist(coords, metric='euclidean'))
+    
+#     # Compute persistent homology (up to dimension 1)
+#     result = ripser(D, maxdim=1, distance_matrix=True)
+#     diagrams = result['dgms']  # List of (birth, death) arrays
+    
+#     # Extract 0D and 1D persistence diagrams
+#     dgm0 = diagrams[0]  # 0D: connected components
+#     dgm1 = diagrams[1] if len(diagrams) > 1 else np.zeros((0, 2))  # 1D: loops
+    
+#     def extract_top_pairs(dgm, max_pairs, dimension):
+#         """Extract top-m most persistent features from diagram"""
+#         if len(dgm) == 0:
+#             return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
+        
+#         # Filter out infinite death times
+#         finite_mask = np.isfinite(dgm[:, 1])
+#         dgm_finite = dgm[finite_mask]
+        
+#         if len(dgm_finite) == 0:
+#             return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
+        
+#         # Compute persistence (death - birth)
+#         persistence = dgm_finite[:, 1] - dgm_finite[:, 0]
+        
+#         # Sort by persistence (descending)
+#         sorted_idx = np.argsort(-persistence)
+#         top_k = min(max_pairs, len(sorted_idx))
+#         top_idx = sorted_idx[:top_k]
+        
+#         # Get birth/death distances
+#         births = dgm_finite[top_idx, 0]
+#         deaths = dgm_finite[top_idx, 1]
+        
+#         # For each persistent feature, find representative point pairs
+#         # Simplified: use birth distance to find closest point pairs
+#         pairs = []
+#         dists = []
+        
+#         for birth, death in zip(births, deaths):
+#             # Find pair of points whose distance ≈ birth
+#             # Simple heuristic: find closest pair in D that matches birth distance
+#             diff = np.abs(D - birth)
+#             np.fill_diagonal(diff, np.inf)  # Exclude diagonal
+#             i, j = np.unravel_index(np.argmin(diff), D.shape)
+            
+#             if i > j:
+#                 i, j = j, i  # Ensure i < j
+            
+#             pairs.append([i, j])
+#             dists.append(D[i, j])
+        
+#         return np.array(pairs, dtype=np.int64), np.array(dists, dtype=np.float32)
+    
+#     # Extract 0D pairs (connected components)
+#     pairs_0, dists_0 = extract_top_pairs(dgm0, max_pairs_0d, 0)
+    
+#     # Extract 1D pairs (loops)
+#     pairs_1, dists_1 = extract_top_pairs(dgm1, max_pairs_1d, 1)
+    
+#     return {
+#         'pairs_0': pairs_0,
+#         'dists_0': dists_0,
+#         'pairs_1': pairs_1,
+#         'dists_1': dists_1,
+#     }
+
+
 def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pairs_1d: int = 5):
     """
     Compute persistent homology pairs for a single miniset.
-    Uses Vietoris-Rips filtration.
+    
+    0D: Uses MST edges (correct surrogate for connected component merges)
+    1D: Uses GUDHI if available, otherwise returns empty (ripser heuristic is wrong)
     
     Args:
-        coords: (n, 2) numpy array of ST coordinates
-        max_pairs_0d: max number of 0D pairs to keep (connected components)
-        max_pairs_1d: max number of 1D pairs to keep (loops/holes)
+        coords: (n, 2) numpy array of coordinates
+        max_pairs_0d: max number of 0D pairs (MST edges)
+        max_pairs_1d: max number of 1D pairs (loop representatives)
     
     Returns:
-        dict with:
-            'pairs_0': (m0, 2) index pairs for 0D features
-            'dists_0': (m0,) birth distances for 0D features
-            'pairs_1': (m1, 2) index pairs for 1D features
-            'dists_1': (m1,) birth distances for 1D features
+        dict with pairs_0, dists_0, pairs_1, dists_1
     """
-    from ripser import ripser
-    from scipy.spatial.distance import squareform, pdist
+    from scipy.spatial.distance import pdist, squareform
+    from scipy.sparse.csgraph import minimum_spanning_tree
     
     n = coords.shape[0]
     
     if n < 3:
-        # Too few points, return empty
         return {
             'pairs_0': np.zeros((0, 2), dtype=np.int64),
             'dists_0': np.zeros(0, dtype=np.float32),
@@ -3240,63 +3368,87 @@ def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pai
     # Compute distance matrix
     D = squareform(pdist(coords, metric='euclidean'))
     
-    # Compute persistent homology (up to dimension 1)
-    result = ripser(D, maxdim=1, distance_matrix=True)
-    diagrams = result['dgms']  # List of (birth, death) arrays
+    # ==================== 0D: MST EDGES ====================
+    # MST edges are the correct 0D persistence pairing surrogate
+    # (each edge in MST corresponds to merging two connected components)
+    T = minimum_spanning_tree(D).tocoo()
     
-    # Extract 0D and 1D persistence diagrams
-    dgm0 = diagrams[0]  # 0D: connected components
-    dgm1 = diagrams[1] if len(diagrams) > 1 else np.zeros((0, 2))  # 1D: loops
+    # Collect MST edges with their weights
+    mst_edges = list(zip(T.row, T.col, T.data))
     
-    def extract_top_pairs(dgm, max_pairs, dimension):
-        """Extract top-m most persistent features from diagram"""
-        if len(dgm) == 0:
-            return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
+    # Sort by weight DESCENDING (largest edges = most persistent merges)
+    mst_edges = sorted(mst_edges, key=lambda x: -x[2])
+    
+    # Take top edges
+    top_0d = mst_edges[:max_pairs_0d]
+    
+    if len(top_0d) > 0:
+        pairs_0 = np.array([[min(i, j), max(i, j)] for i, j, _ in top_0d], dtype=np.int64)
+        dists_0 = np.array([w for _, _, w in top_0d], dtype=np.float32)
+    else:
+        pairs_0 = np.zeros((0, 2), dtype=np.int64)
+        dists_0 = np.zeros(0, dtype=np.float32)
+    
+    # ==================== 1D: GUDHI IF AVAILABLE ====================
+    pairs_1 = np.zeros((0, 2), dtype=np.int64)
+    dists_1 = np.zeros(0, dtype=np.float32)
+    
+    try:
+        import gudhi
         
-        # Filter out infinite death times
-        finite_mask = np.isfinite(dgm[:, 1])
-        dgm_finite = dgm[finite_mask]
+        # Build Rips complex
+        rips = gudhi.RipsComplex(points=coords, max_edge_length=np.max(D) * 0.5)
+        st = rips.create_simplex_tree(max_dimension=2)
+        st.compute_persistence()
         
-        if len(dgm_finite) == 0:
-            return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
+        # Get persistence pairs for dimension 1 (loops)
+        pairs = st.persistence_pairs()
         
-        # Compute persistence (death - birth)
-        persistence = dgm_finite[:, 1] - dgm_finite[:, 0]
+        # Filter for dim-1 pairs (birth simplex has 2 vertices, death simplex has 3)
+        dim1_pairs = []
+        for birth_simplex, death_simplex in pairs:
+            if len(birth_simplex) == 2 and len(death_simplex) == 3:
+                # Birth simplex is an edge
+                birth_filt = st.filtration(birth_simplex)
+                death_filt = st.filtration(death_simplex)
+                persistence = death_filt - birth_filt
+                
+                if persistence > 0 and np.isfinite(persistence):
+                    # Use the birth edge vertices as the pair
+                    i, j = birth_simplex
+                    dim1_pairs.append((min(i, j), max(i, j), birth_filt, persistence))
         
-        # Sort by persistence (descending)
-        sorted_idx = np.argsort(-persistence)
-        top_k = min(max_pairs, len(sorted_idx))
-        top_idx = sorted_idx[:top_k]
+        # Sort by persistence descending
+        dim1_pairs = sorted(dim1_pairs, key=lambda x: -x[3])[:max_pairs_1d]
         
-        # Get birth/death distances
-        births = dgm_finite[top_idx, 0]
-        deaths = dgm_finite[top_idx, 1]
-        
-        # For each persistent feature, find representative point pairs
-        # Simplified: use birth distance to find closest point pairs
-        pairs = []
-        dists = []
-        
-        for birth, death in zip(births, deaths):
-            # Find pair of points whose distance ≈ birth
-            # Simple heuristic: find closest pair in D that matches birth distance
-            diff = np.abs(D - birth)
-            np.fill_diagonal(diff, np.inf)  # Exclude diagonal
-            i, j = np.unravel_index(np.argmin(diff), D.shape)
+        if len(dim1_pairs) > 0:
+            pairs_1 = np.array([[p[0], p[1]] for p in dim1_pairs], dtype=np.int64)
+            dists_1 = np.array([p[2] for p in dim1_pairs], dtype=np.float32)  # birth filtration value
             
-            if i > j:
-                i, j = j, i  # Ensure i < j
+    except ImportError:
+        # GUDHI not available - use boundary-based fallback
+        # Find convex hull boundary edges as a simple topology proxy
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(coords)
             
-            pairs.append([i, j])
-            dists.append(D[i, j])
-        
-        return np.array(pairs, dtype=np.int64), np.array(dists, dtype=np.float32)
-    
-    # Extract 0D pairs (connected components)
-    pairs_0, dists_0 = extract_top_pairs(dgm0, max_pairs_0d, 0)
-    
-    # Extract 1D pairs (loops)
-    pairs_1, dists_1 = extract_top_pairs(dgm1, max_pairs_1d, 1)
+            # Hull vertices form boundary - use edges between consecutive hull vertices
+            hull_verts = hull.vertices
+            boundary_edges = []
+            for idx in range(len(hull_verts)):
+                i = hull_verts[idx]
+                j = hull_verts[(idx + 1) % len(hull_verts)]
+                d = D[i, j]
+                boundary_edges.append((min(i, j), max(i, j), d))
+            
+            # Sort by distance descending (longest boundary edges)
+            boundary_edges = sorted(boundary_edges, key=lambda x: -x[2])[:max_pairs_1d]
+            
+            if len(boundary_edges) > 0:
+                pairs_1 = np.array([[e[0], e[1]] for e in boundary_edges], dtype=np.int64)
+                dists_1 = np.array([e[2] for e in boundary_edges], dtype=np.float32)
+        except Exception:
+            pass  # Keep empty
     
     return {
         'pairs_0': pairs_0,
@@ -3304,7 +3456,6 @@ def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pai
         'pairs_1': pairs_1,
         'dists_1': dists_1,
     }
-
 
 class TopologyLoss(nn.Module):
     """
@@ -3367,32 +3518,82 @@ class TopologyLoss(nn.Module):
             dists_1 = info_b.get('dists_1', None)
             
             losses_b = []
+
+            # Helper to move tensor to device (handles both numpy and torch)
+            def _to_dev(x, dtype=None):
+                if x is None:
+                    return None
+                if isinstance(x, np.ndarray):
+                    x = torch.from_numpy(x)
+                if dtype is not None:
+                    x = x.to(dtype)
+                return x.to(device, non_blocking=True)
             
             # 0D features (connected components)
             if pairs_0 is not None and len(pairs_0) > 0:
-                pairs_0_t = torch.from_numpy(pairs_0).long().to(device) if isinstance(pairs_0, np.ndarray) else pairs_0
-                dists_0_t = torch.from_numpy(dists_0).float().to(device) if isinstance(dists_0, np.ndarray) else dists_0
+                pairs_0_t = _to_dev(pairs_0, torch.long)
+                dists_0_t = _to_dev(dists_0, torch.float32)
                 
-                # Compute predicted distances
-                x0_i = V_pred_b[pairs_0_t[:, 0]]  # (m0, D)
-                x0_j = V_pred_b[pairs_0_t[:, 1]]
-                d0_pred = (x0_i - x0_j).norm(dim=-1)  # (m0,)
+                # Bounds check: filter out invalid indices
+                valid_mask = (pairs_0_t[:, 0] >= 0) & (pairs_0_t[:, 0] < n_valid) & \
+                             (pairs_0_t[:, 1] >= 0) & (pairs_0_t[:, 1] < n_valid)
+                pairs_0_t = pairs_0_t[valid_mask]
+                dists_0_t = dists_0_t[valid_mask]
                 
-                # Log-ratio loss (as ChatGPT specified)
-                l0 = ((torch.log(d0_pred + self.eps) - torch.log(dists_0_t + self.eps)) ** 2).mean()
-                losses_b.append(l0)
+                if pairs_0_t.numel() > 0:
+                    # Compute predicted distances
+                    x0_i = V_pred_b[pairs_0_t[:, 0]]  # (m0, D)
+                    x0_j = V_pred_b[pairs_0_t[:, 1]]
+                    d0_pred = (x0_i - x0_j).norm(dim=-1)  # (m0,)
+                    
+                    # Log-ratio loss
+                    l0 = ((torch.log(d0_pred + self.eps) - torch.log(dists_0_t + self.eps)) ** 2).mean()
+                    losses_b.append(l0)
             
             # 1D features (loops/holes)
             if pairs_1 is not None and len(pairs_1) > 0:
-                pairs_1_t = torch.from_numpy(pairs_1).long().to(device) if isinstance(pairs_1, np.ndarray) else pairs_1
-                dists_1_t = torch.from_numpy(dists_1).float().to(device) if isinstance(dists_1, np.ndarray) else dists_1
+                pairs_1_t = _to_dev(pairs_1, torch.long)
+                dists_1_t = _to_dev(dists_1, torch.float32)
                 
-                x1_i = V_pred_b[pairs_1_t[:, 0]]
-                x1_j = V_pred_b[pairs_1_t[:, 1]]
-                d1_pred = (x1_i - x1_j).norm(dim=-1)
+                # Bounds check
+                valid_mask = (pairs_1_t[:, 0] >= 0) & (pairs_1_t[:, 0] < n_valid) & \
+                             (pairs_1_t[:, 1] >= 0) & (pairs_1_t[:, 1] < n_valid)
+                pairs_1_t = pairs_1_t[valid_mask]
+                dists_1_t = dists_1_t[valid_mask]
                 
-                l1 = ((torch.log(d1_pred + self.eps) - torch.log(dists_1_t + self.eps)) ** 2).mean()
-                losses_b.append(l1)
+                if pairs_1_t.numel() > 0:
+                    x1_i = V_pred_b[pairs_1_t[:, 0]]
+                    x1_j = V_pred_b[pairs_1_t[:, 1]]
+                    d1_pred = (x1_i - x1_j).norm(dim=-1)
+                    
+                    l1 = ((torch.log(d1_pred + self.eps) - torch.log(dists_1_t + self.eps)) ** 2).mean()
+                    losses_b.append(l1)
+            
+            # # 0D features (connected components)
+            # if pairs_0 is not None and len(pairs_0) > 0:
+            #     pairs_0_t = torch.from_numpy(pairs_0).long().to(device) if isinstance(pairs_0, np.ndarray) else pairs_0
+            #     dists_0_t = torch.from_numpy(dists_0).float().to(device) if isinstance(dists_0, np.ndarray) else dists_0
+                
+            #     # Compute predicted distances
+            #     x0_i = V_pred_b[pairs_0_t[:, 0]]  # (m0, D)
+            #     x0_j = V_pred_b[pairs_0_t[:, 1]]
+            #     d0_pred = (x0_i - x0_j).norm(dim=-1)  # (m0,)
+                
+            #     # Log-ratio loss (as ChatGPT specified)
+            #     l0 = ((torch.log(d0_pred + self.eps) - torch.log(dists_0_t + self.eps)) ** 2).mean()
+            #     losses_b.append(l0)
+            
+            # # 1D features (loops/holes)
+            # if pairs_1 is not None and len(pairs_1) > 0:
+            #     pairs_1_t = torch.from_numpy(pairs_1).long().to(device) if isinstance(pairs_1, np.ndarray) else pairs_1
+            #     dists_1_t = torch.from_numpy(dists_1).float().to(device) if isinstance(dists_1, np.ndarray) else dists_1
+                
+            #     x1_i = V_pred_b[pairs_1_t[:, 0]]
+            #     x1_j = V_pred_b[pairs_1_t[:, 1]]
+            #     d1_pred = (x1_i - x1_j).norm(dim=-1)
+                
+            #     l1 = ((torch.log(d1_pred + self.eps) - torch.log(dists_1_t + self.eps)) ** 2).mean()
+            #     losses_b.append(l1)
             
             # Average 0D and 1D losses (ChatGPT's formula: 0.5 * (l0.mean() + l1.mean()))
             if len(losses_b) > 0:
@@ -3420,13 +3621,15 @@ class ShapeSpectrumLoss(nn.Module):
         self,
         V_pred: torch.Tensor,
         V_target: torch.Tensor,
-        mask: torch.Tensor
+        mask: torch.Tensor,
+        debug: bool = False
     ) -> torch.Tensor:
         """
         Args:
             V_pred: (B, N, D) predicted coordinates (centered)
             V_target: (B, N, D) target coordinates (centered)
             mask: (B, N) boolean mask
+            debug: if True, print detailed diagnostics
             
         Returns:
             loss: scalar shape loss
@@ -3434,48 +3637,84 @@ class ShapeSpectrumLoss(nn.Module):
         B, N, D = V_pred.shape
         device = V_pred.device
         
+        if debug:
+            print(f"\n[ShapeSpecLoss DEBUG] Input shapes: V_pred={tuple(V_pred.shape)}, V_target={tuple(V_target.shape)}, mask={tuple(mask.shape)}")
+        
         loss_per_batch = []
+        debug_info = {
+            'skipped_too_few': 0,
+            'skipped_exception': 0,
+            'computed': 0,
+            'aniso_pred_list': [],
+            'aniso_targ_list': [],
+            'loss_values': []
+        }
         
         for b in range(B):
             m_b = mask[b]
             n_valid = m_b.sum().item()
             
-            if n_valid < 3:  # Need at least 3 points
+            if n_valid < 3:
+                debug_info['skipped_too_few'] += 1
                 continue
             
-            V_pred_b = V_pred[b, m_b]  # (n_valid, D)
+            V_pred_b = V_pred[b, m_b]
             V_target_b = V_target[b, m_b]
             
-            # Compute covariance matrices (coordinates already centered)
-            C_pred = (V_pred_b.T @ V_pred_b) / n_valid  # (D, D)
+            if debug and b < 3:
+                print(f"  Sample {b}: n_valid={n_valid}, V_pred_b shape={tuple(V_pred_b.shape)}")
+                print(f"    V_pred_b stats: mean={V_pred_b.mean().item():.3e}, std={V_pred_b.std().item():.3e}, norm={V_pred_b.norm().item():.3e}")
+                print(f"    V_target_b stats: mean={V_target_b.mean().item():.3e}, std={V_target_b.std().item():.3e}, norm={V_target_b.norm().item():.3e}")
+            
+            C_pred = (V_pred_b.T @ V_pred_b) / n_valid
             C_target = (V_target_b.T @ V_target_b) / n_valid
             
-            try:
-                # Eigendecompose
-                eigvals_pred = torch.linalg.eigvalsh(C_pred)  # (D,) ascending
-                eigvals_target = torch.linalg.eigvalsh(C_target)
-                
-                # Get top 2 eigenvalues (largest variance directions)
-                lambda1_pred = eigvals_pred[-1].clamp_min(self.eps)
-                lambda2_pred = eigvals_pred[-2].clamp_min(self.eps)
-                lambda1_target = eigvals_target[-1].clamp_min(self.eps)
-                lambda2_target = eigvals_target[-2].clamp_min(self.eps)
-                
-                # Anisotropy ratio (how elongated vs round)
-                r_pred = lambda1_pred / lambda2_pred
-                r_target = lambda1_target / lambda2_target
-                
-                # Log-ratio penalty (scale-invariant)
-                loss_b = (torch.log(r_pred) - torch.log(r_target)) ** 2
-                loss_per_batch.append(loss_b)
-                
-            except Exception as e:
-                # Skip if eigendecomposition fails
-                continue
+            if debug and b < 3:
+                print(f"    C_pred: diag={C_pred.diag()}, trace={C_pred.trace().item():.3e}")
+                print(f"    C_target: diag={C_target.diag()}, trace={C_target.trace().item():.3e}")
+            
+            eigvals_pred = torch.linalg.eigvalsh(C_pred)
+            eigvals_target = torch.linalg.eigvalsh(C_target)
+            
+            lambda1_pred = eigvals_pred[-1].clamp_min(self.eps)
+            lambda2_pred = eigvals_pred[-2].clamp_min(self.eps)
+            lambda1_target = eigvals_target[-1].clamp_min(self.eps)
+            lambda2_target = eigvals_target[-2].clamp_min(self.eps)
+            
+            r_pred = lambda1_pred / lambda2_pred
+            r_target = lambda1_target / lambda2_target
+            
+            loss_b = (torch.log(r_pred) - torch.log(r_target)) ** 2
+            
+            if debug and b < 3:
+                print(f"    Eigenvalues pred (top 2): {lambda1_pred.item():.3e}, {lambda2_pred.item():.3e} → ratio={r_pred.item():.3f}")
+                print(f"    Eigenvalues targ (top 2): {lambda1_target.item():.3e}, {lambda2_target.item():.3e} → ratio={r_target.item():.3f}")
+                print(f"    Loss for sample {b}: {loss_b.item():.6e}")
+            
+            loss_per_batch.append(loss_b)
+            debug_info['computed'] += 1
+            debug_info['aniso_pred_list'].append(r_pred.item())
+            debug_info['aniso_targ_list'].append(r_target.item())
+            debug_info['loss_values'].append(loss_b.item())
+        
+        if debug:
+            print(f"\n[ShapeSpecLoss SUMMARY]")
+            print(f"  Computed: {debug_info['computed']}/{B}")
+            print(f"  Skipped (too few points): {debug_info['skipped_too_few']}")
+            if debug_info['computed'] > 0:
+                print(f"  Anisotropy pred: min={min(debug_info['aniso_pred_list']):.3f}, max={max(debug_info['aniso_pred_list']):.3f}, mean={sum(debug_info['aniso_pred_list'])/len(debug_info['aniso_pred_list']):.3f}")
+                print(f"  Anisotropy targ: min={min(debug_info['aniso_targ_list']):.3f}, max={max(debug_info['aniso_targ_list']):.3f}, mean={sum(debug_info['aniso_targ_list'])/len(debug_info['aniso_targ_list']):.3f}")
+                print(f"  Loss values: min={min(debug_info['loss_values']):.3e}, max={max(debug_info['loss_values']):.3e}, mean={sum(debug_info['loss_values'])/len(debug_info['loss_values']):.3e}")
         
         if len(loss_per_batch) == 0:
+            if debug:
+                print(f"  RETURNING 0 (no valid batches)")
             return torch.tensor(0.0, device=device)
         
-        return torch.stack(loss_per_batch).mean()
+        final_loss = torch.stack(loss_per_batch).mean()
+        if debug:
+            print(f"  Final loss: {final_loss.item():.6e}")
+        
+        return final_loss
 
     

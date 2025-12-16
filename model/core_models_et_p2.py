@@ -1205,18 +1205,37 @@ def train_stageC_diffusion_generator(
  
     # Target gradient ratios relative to score loss
     # These control how much each loss contributes to the gradient
+    # TARGET = {
+    #     'gram': 0.05,           # Keep Gram gradients at ~5% of score
+    #     'gram_scale': 0.03,     # Scale regularizer weaker
+    #     'heat': 0.15,           # Heat kernel at ~15% of score
+    #     'sw_st': 0.10,          # Sliced-Wasserstein at ~10%
+    #     'st_dist': 0.08,        # ST distance classification at ~8%
+    #     'edm_tail': 0.12,       # EDM tail loss at ~12%
+    #     'gen_align': 0.06,      # Procrustes alignment at ~6%
+    #     'radial': 0.04,         # Radial histogram at ~4%
+    #     'edge': 0.12,      # Similar to edm_tail (local geometry)
+    #     'topo': 0.10,      # Similar to sw_st (distribution matching)
+    #     'shape_spec': 0.06,
+    # }
+
     TARGET = {
-        'gram': 0.05,           # Keep Gram gradients at ~5% of score
-        'gram_scale': 0.03,     # Scale regularizer weaker
-        'heat': 0.15,           # Heat kernel at ~15% of score
-        'sw_st': 0.10,          # Sliced-Wasserstein at ~10%
-        'st_dist': 0.08,        # ST distance classification at ~8%
-        'edm_tail': 0.12,       # EDM tail loss at ~12%
-        'gen_align': 0.06,      # Procrustes alignment at ~6%
-        'radial': 0.04,         # Radial histogram at ~4%
-        'edge': 0.12,      # Similar to edm_tail (local geometry)
-        'topo': 0.10,      # Similar to sw_st (distribution matching)
-        'shape': 0.06,
+        # Global losses - REDUCED (your global structure is OK)
+        'gram': 0.03,           # was 0.05 - reduce global Gram influence
+        'gram_scale': 0.02,     # was 0.03
+        'heat': 0.10,           # was 0.15 - heat is multi-scale, keep moderate
+        'sw_st': 0.05,          # was 0.10 - reduce global distribution matching
+        'radial': 0.02,         # was 0.04 - reduce radial histogram
+        
+        # Local losses - INCREASED (your local structure is bad)
+        'edge': 0.25,           # was 0.12 - DOUBLE for local edge preservation
+        'topo': 0.20,           # was 0.10 - DOUBLE for topology (MST edges are local-ish)
+        
+        # Keep these moderate
+        'st_dist': 0.06,        # was 0.08
+        'edm_tail': 0.08,       # was 0.12 - tail is semi-local
+        'gen_align': 0.04,      # was 0.06
+        'shape_spec': 0.04,     # was 0.06 (shape is global, not helping local)
     }
 
     TARGET_SC = {
@@ -1498,7 +1517,7 @@ def train_stageC_diffusion_generator(
                 # ===== ST STEP: Score + Gram + Heat + SW_ST =====
 
                 #ST distogram loss
-                if not is_sc and dist_aux is not None and 'dist_logits' in dist_aux:
+                if not is_sc and WEIGHTS['st_dist'] > 0 and dist_aux is not None and 'dist_logits' in dist_aux:
                     dist_logits = dist_aux['dist_logits']  # (B, N, N, dist_bins)
                     bin_ids_target = dist_aux['bin_ids']   # (B, N, N)
                     
@@ -1697,13 +1716,22 @@ def train_stageC_diffusion_generator(
                             V_target_batch[i, :n_valid] = V_tgt_i
 
                 # ==================== EDGE-LENGTH LOSS ====================
-                if WEIGHTS['edge'] > 0 and 'knn_indices' in batch:
-                    with torch.autocast(device_type='cuda', enabled=False):
-                        knn_indices_batch = batch['knn_indices'].to(device)
+                # if WEIGHTS['edge'] > 0 and 'knn_indices' in batch:
+                #     with torch.autocast(device_type='cuda', enabled=False):
+                #         knn_indices_batch = batch['knn_indices'].to(device)
                                                 
                         # Low-noise gating
-                        low_noise = (t_norm.squeeze() < 0.3)
-                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        # low_noise = (t_norm.squeeze() < 0.3)
+                        # cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        # geo_gate_edge = (low_noise & cond_only).float()
+
+                        # Low-noise gating - use actual drop_mask for consistency with CFG
+                if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        # Use SPATIAL kNN for geometry, not expression kNN
+                        knn_indices_batch = batch['knn_spatial'].to(device)
+                        low_noise = (t_norm.squeeze() < 0.6)
+                        cond_only = (drop_mask.view(-1) < 0.5)  # True when NOT dropped
                         geo_gate_edge = (low_noise & cond_only).float()
                         gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
                         
@@ -1724,8 +1752,13 @@ def train_stageC_diffusion_generator(
                         # V_target_batch already computed above!
                         
                         # Low-noise gating (more aggressive for topology)
-                        low_noise = (t_norm.squeeze() < 0.2)
-                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        # low_noise = (t_norm.squeeze() < 0.2)
+                        # cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        # geo_gate_topo = (low_noise & cond_only).float()
+
+                        # Low-noise gating (more aggressive for topology)
+                        low_noise = (t_norm.squeeze() < 0.4)
+                        cond_only = (drop_mask.view(-1) < 0.5)  # True when NOT dropped
                         geo_gate_topo = (low_noise & cond_only).float()
                         gate_sum_topo = geo_gate_topo.sum().clamp(min=1.0)
                         
@@ -1739,13 +1772,18 @@ def train_stageC_diffusion_generator(
                         L_topo = (L_topo_raw * geo_gate_topo).sum() / gate_sum_topo
                 
                 # ==================== SHAPE SPECTRUM LOSS ====================
-                if WEIGHTS['shape'] > 0:
+                if WEIGHTS['shape_spec'] > 0:
                     with torch.autocast(device_type='cuda', enabled=False):
                         # V_target_batch already computed above!
                         
                         # Low-noise gating
-                        low_noise = (t_norm.squeeze() < 0.3)
-                        cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        # low_noise = (t_norm.squeeze() < 0.3)
+                        # cond_only = (torch.rand(batch_size_real, device=device) >= p_uncond)
+                        # geo_gate_shape = (low_noise & cond_only).float()
+
+                        # Low-noise gating
+                        low_noise = (t_norm.squeeze() < 0.6)
+                        cond_only = (drop_mask.view(-1) < 0.5)  # True when NOT dropped
                         geo_gate_shape = (low_noise & cond_only).float()
                         gate_sum_shape = geo_gate_shape.sum().clamp(min=1.0)
                         
@@ -1756,6 +1794,50 @@ def train_stageC_diffusion_generator(
                         )
                         
                         L_shape_spec = (L_shape_spectrum_raw * geo_gate_shape).sum() / gate_sum_shape
+
+                        # ==================== DEBUG PRINTS FOR NEW LOSSES ====================
+                        if (global_step % 50 == 0) and (not is_sc):
+                            # Topo pair counts
+                            ti = batch.get("topo_info", None)
+                            if ti is None:
+                                print("[DBG] topo_info=None")
+                            else:
+                                c0 = [int(x["pairs_0"].shape[0]) if x is not None else -1 for x in ti]
+                                c1 = [int(x["pairs_1"].shape[0]) if x is not None else -1 for x in ti]
+                                print(f"[DBG] topo pairs_0: {c0}, pairs_1: {c1}")
+
+                                # Check uniqueness and distance ranges for first sample
+                                info0 = ti[0]
+                                if info0 is not None:
+                                    p0 = info0["pairs_0"].detach().cpu().numpy()
+                                    p1 = info0["pairs_1"].detach().cpu().numpy()
+                                    d0 = info0["dists_0"].detach().cpu().numpy()
+                                    d1 = info0["dists_1"].detach().cpu().numpy()
+                                    
+                                    u0 = len(set(map(tuple, map(sorted, p0.tolist())))) if len(p0) > 0 else 0
+                                    u1 = len(set(map(tuple, map(sorted, p1.tolist())))) if len(p1) > 0 else 0
+                                    print(f"[DBG] topo uniq pairs: {u0}/{len(p0)} (0D) and {u1}/{len(p1)} (1D)")
+                                    
+                                    if len(d0) > 0:
+                                        print(f"[DBG] topo d0 range: [{d0.min():.4f}, {d0.max():.4f}]")
+                                    if len(d1) > 0:
+                                        print(f"[DBG] topo d1 range: [{d1.min():.4f}, {d1.max():.4f}]")
+                            
+                            # Gate hit rates
+                            edge_hits = geo_gate_edge.sum().item() if 'geo_gate_edge' in dir() else 0
+                            topo_hits = geo_gate_topo.sum().item() if 'geo_gate_topo' in dir() else 0
+                            shape_hits = geo_gate_shape.sum().item() if 'geo_gate_shape' in dir() else 0
+                            print(f"[DBG] gates: edge={edge_hits:.0f} topo={topo_hits:.0f} shape={shape_hits:.0f} / {batch_size_real}")
+                            
+                            # Raw losses
+                            print(f"[DBG] raw: gram={float(L_gram.detach().cpu()):.4e} "
+                                f"edge={float(L_edge.detach().cpu()):.4e} "
+                                f"topo={float(L_topo.detach().cpu()):.4e} "
+                                f"shape={float(L_shape_spec.detach().cpu()):.4e}")
+                            
+                            # Weights
+                            print(f"[DBG] W: gram={WEIGHTS['gram']:.3g} edge={WEIGHTS['edge']:.3g} "
+                                f"topo={WEIGHTS['topo']:.3g} shape_spec={WEIGHTS['shape_spec']:.3g}")
 
                 # Heat kernel loss (batched)
                 if WEIGHTS['heat'] > 0 and (global_step % heat_every_k) == 0:
@@ -1850,44 +1932,50 @@ def train_stageC_diffusion_generator(
 
                         # ==================== NEW: EDM TAIL LOSS ====================
                         # Penalize compression of far distances
-                        with torch.autocast(device_type='cuda', enabled=False):
-                            # We already have V_geom (centered V_hat) from Gram loss above
-                            # Need to build V_target from G_target for each sample
-                            V_target_batch = torch.zeros_like(V_geom)  # (B, N, D)
-                            
-                            for i in range(batch_size_real):
-                                n_valid = int(n_list[i].item())
-                                if n_valid < 3:
-                                    continue
-                                G_i = G_target[i, :n_valid, :n_valid].float()
-                                V_tgt_i = uet.factor_from_gram(G_i, D_latent)  # (n_valid, D)
-                                V_target_batch[i, :n_valid] = V_tgt_i
-                            
-                            # Compute EDM tail loss
-                            L_edm_tail = uet.compute_edm_tail_loss(
-                                V_pred=V_geom,           # centered V_hat
-                                V_target=V_target_batch,  # from factor_from_gram
-                                mask=mask,
-                                tail_quantile=0.85,       # top 20% distances
-                                weight_tail=2.0
-                            )
+                        if WEIGHTS['edm_tail'] > 0:
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                # We already have V_geom (centered V_hat) from Gram loss above
+                                # Need to build V_target from G_target for each sample
+                                V_target_batch = torch.zeros_like(V_geom)  # (B, N, D)
+                                
+                                for i in range(batch_size_real):
+                                    n_valid = int(n_list[i].item())
+                                    if n_valid < 3:
+                                        continue
+                                    G_i = G_target[i, :n_valid, :n_valid].float()
+                                    V_tgt_i = uet.factor_from_gram(G_i, D_latent)  # (n_valid, D)
+                                    V_target_batch[i, :n_valid] = V_tgt_i
+                                
+                                # Compute EDM tail loss
+                                L_edm_tail = uet.compute_edm_tail_loss(
+                                    V_pred=V_geom,           # centered V_hat
+                                    V_target=V_target_batch,  # from factor_from_gram
+                                    mask=mask,
+                                    tail_quantile=0.85,       # top 20% distances
+                                    weight_tail=2.0
+                                )
+                        else:
+                            L_edm_tail = torch.tensor(0.0, device=device)
                         
                         # ==================== NEW: GENERATOR ALIGNMENT LOSS ====================
                         # Align generator output V_0 to target geometry via Procrustes
-                        with torch.autocast(device_type='cuda', enabled=False):
-                            # Center V_0 (generator output before noise)
-                            V_0_f32 = V_0.float()
-                            m_float = mask.float().unsqueeze(-1)
-                            valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
-                            mean_V0 = (V_0_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
-                            V_0_centered = (V_0_f32 - mean_V0) * m_float
-                            
-                            # V_target_batch already computed above for EDM tail loss
-                            L_gen_align = uet.procrustes_alignment_loss(
-                                V_pred=V_0_centered,
-                                V_target=V_target_batch,
-                                mask=mask
-                            )
+                        if WEIGHTS['gen_align'] > 0:
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                # Center V_0 (generator output before noise)
+                                V_0_f32 = V_0.float()
+                                m_float = mask.float().unsqueeze(-1)
+                                valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+                                mean_V0 = (V_0_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+                                V_0_centered = (V_0_f32 - mean_V0) * m_float
+                                
+                                # V_target_batch already computed above for EDM tail loss
+                                L_gen_align = uet.procrustes_alignment_loss(
+                                    V_pred=V_0_centered,
+                                    V_target=V_target_batch,
+                                    mask=mask
+                                )
+                        else:
+                            L_gen_align = torch.tensor(0.0, device=device)
 
                         # ==================== NEW MANIFOLD-AWARE REGULARIZERS ====================
                         # B1: Intrinsic dimension regularizer
@@ -2529,18 +2617,37 @@ def train_stageC_diffusion_generator(
                 if (not is_sc) and (global_step >= AUTOBALANCE_START) and (global_step % AUTOBALANCE_EVERY == 0):
                     # Define bounds for each loss (min_weight, max_weight)
                     # Conservative bounds prevent any single loss from dominating
+                    # bounds = {
+                    #     'gram': (6.0, 20.0),          # Original range
+                    #     'gram_scale': (0.05, 0.8),    # Scale regularizer - keep modest
+                    #     'heat': (0.6, 3.0),           # Original range
+                    #     'sw_st': (0.8, 3.0),          # Original range
+                    #     'st_dist': (0.01, 0.5),       # Distance classification - moderate
+                    #     'edm_tail': (0.05, 0.8),      # EDM tail - moderate
+                    #     'gen_align': (0.05, 0.6),     # Procrustes alignment - moderate
+                    #     'radial': (0.2, 2.0),         # Radial histogram - moderate
+                    #     'edge': (0.3, 1.5),           # Keep edge consistency moderate
+                    #     'topo': (0.2, 1.0),           # Topology can be expensive, keep check
+                    #     'shape_spec': (0.2, 1.0), # Shape spectrum bounds
+                    # }
+
                     bounds = {
-                        'gram': (6.0, 20.0),          # Original range
-                        'gram_scale': (0.05, 0.8),    # Scale regularizer - keep modest
-                        'heat': (0.6, 3.0),           # Original range
-                        'sw_st': (0.8, 3.0),          # Original range
-                        'st_dist': (0.01, 0.5),       # Distance classification - moderate
-                        'edm_tail': (0.05, 0.8),      # EDM tail - moderate
-                        'gen_align': (0.05, 0.6),     # Procrustes alignment - moderate
-                        'radial': (0.2, 2.0),         # Radial histogram - moderate
-                        'edge': (0.3, 1.5),           # Keep edge consistency moderate
-                        'topo': (0.2, 1.0),           # Topology can be expensive, keep check
-                        'shape_spec': (0.2, 1.0), # Shape spectrum bounds
+                        # Global losses - TIGHTER upper bounds (don't let them dominate)
+                        'gram': (0.3, 3.0),         # was (6.0, 20.0) - much lower ceiling
+                        'gram_scale': (0.02, 0.5),  # was (0.05, 0.8)
+                        'heat': (0.3, 2.0),         # was (0.6, 3.0)
+                        'sw_st': (0.2, 1.5),        # was (0.8, 3.0)
+                        'radial': (0.1, 1.0),       # was (0.2, 2.0)
+                        
+                        # Local losses - WIDER bounds (let them grow stronger)
+                        'edge': (0.5, 4.0),         # was (0.3, 1.5) - allow much higher
+                        'topo': (0.3, 3.0),         # was (0.2, 1.0) - allow much higher
+                        
+                        # Others - keep reasonable
+                        'st_dist': (0.01, 0.4),
+                        'edm_tail': (0.05, 0.6),
+                        'gen_align': (0.03, 0.4),
+                        'shape_spec': (0.1, 0.8),
                     }
  
                     def _update(key):
@@ -2739,43 +2846,45 @@ def train_stageC_diffusion_generator(
                 avg_triangle = epoch_losses['triangle'] / max(n_batches, 1)
                 avg_radial = epoch_losses['radial'] / max(n_batches, 1)
                 avg_knn_nca = epoch_losses['knn_nca'] / max(n_batches, 1)
-                epoch_losses['edge'] += L_edge.item()
-                epoch_losses['topo'] += L_topo.item()
-                epoch_losses['shape_spec'] += L_shape_spec.item()
-                
+
+                avg_edge = epoch_losses['edge'] / max(n_batches, 1)
+                avg_topo = epoch_losses['topo'] / max(n_batches, 1)
+                avg_shape_spec = epoch_losses['shape_spec'] / max(n_batches, 1)
+
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
                 print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f} | knn_nca={avg_knn_nca:.4f}")
                 print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
                 print(f"  dim={avg_dim:.4f} | triangle={avg_triangle:.4f} | radial={avg_radial:.4f}")
+                print(f"  edge={avg_edge:.4f} | topo={avg_topo:.4f} | shape_spec={avg_shape_spec:.4f}")
 
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
 
             # Add this summary print every 10 epochs
-            if epoch % 2 == 0:
-                # Compute averages
-                cv_avg = (epoch_cv_sum / max(epoch_nca_count, 1)) * 100  # Convert to percentage
-                loss_nca = epoch_nca_loss_sum / max(epoch_nca_count, 1)
+            # if epoch % 10 == 0:
+            #     # Compute averages
+            #     cv_avg = (epoch_cv_sum / max(epoch_nca_count, 1)) * 100  # Convert to percentage
+            #     loss_nca = epoch_nca_loss_sum / max(epoch_nca_count, 1)
                 
-                # Get Q entropy average from global accumulator
-                from utils_et import _nca_qent_accum
-                if len(_nca_qent_accum) > 0:
-                    qent_avg = (sum(_nca_qent_accum) / len(_nca_qent_accum)) * 100  # Convert to %
-                    _nca_qent_accum.clear()  # Reset for next epoch
-                else:
-                    qent_avg = 100.0  # Default if no data
+            #     # Get Q entropy average from global accumulator
+            #     from utils_et import _nca_qent_accum
+            #     if len(_nca_qent_accum) > 0:
+            #         qent_avg = (sum(_nca_qent_accum) / len(_nca_qent_accum)) * 100  # Convert to %
+            #         _nca_qent_accum.clear()  # Reset for next epoch
+            #     else:
+            #         qent_avg = 100.0  # Default if no data
                 
-                print(f"\n{'='*60}")
-                print(f"EPOCH {epoch} PROGRESS CHECK")
-                print(f"{'='*60}")
-                print(f"Metric          | Current | Target  | Status")
-                print(f"----------------|---------|---------|--------")
-                print(f"d² CV          | {cv_avg:.1f}%   | >30%    | {'✓' if cv_avg > 30 else '⚠️'}")
-                print(f"Q entropy ratio| {qent_avg:.1f}% | <70%    | {'✓' if qent_avg < 70 else '⚠️'}")
-                print(f"NCA loss       | {loss_nca:.2f}  | <3.5    | {'✓' if loss_nca < 3.5 else '⚠️'}")
-                print(f"{'='*60}\n")
+                # print(f"\n{'='*60}")
+                # print(f"EPOCH {epoch} PROGRESS CHECK")
+                # print(f"{'='*60}")
+                # print(f"Metric          | Current | Target  | Status")
+                # print(f"----------------|---------|---------|--------")
+                # print(f"d² CV          | {cv_avg:.1f}%   | >30%    | {'✓' if cv_avg > 30 else '⚠️'}")
+                # print(f"Q entropy ratio| {qent_avg:.1f}% | <70%    | {'✓' if qent_avg < 70 else '⚠️'}")
+                # print(f"NCA loss       | {loss_nca:.2f}  | <3.5    | {'✓' if loss_nca < 3.5 else '⚠️'}")
+                # print(f"{'='*60}\n")
             
             if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
                 # Use total weighted loss as validation metric
@@ -2849,11 +2958,6 @@ def train_stageC_diffusion_generator(
             # if rank == 0:
             #     print(f"\n[Schedule] Enabling heat loss at epoch {epoch+1}")
             WEIGHTS['heat'] = HEAT_TARGET_WEIGHT
-
-        # Adjust weights after initial epochs
-        if epoch == 5:
-            print("\n⚡ [Weight Adjustment] Reducing overlap weight from 0.25 → 0.15")
-            # WEIGHTS['overlap'] = 0.15
 
         # MLflow logging
         if logger and (fabric is None or fabric.is_global_zero):
@@ -3280,7 +3384,6 @@ def sample_sc_edm_patchwise(
     return_coords: bool = True,
     DEBUG_FLAG: bool = True,
     DEBUG_EVERY: int = 10,
-    seed: Optional[int] = None,
     fixed_patch_graph: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -3304,13 +3407,6 @@ def sample_sc_edm_patchwise(
     from typing import List, Dict
 
     import random
-
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if "cuda" in device:
-            torch.cuda.manual_seed_all(seed)
 
 
     print(f"[PATCHWISE] FINAL IDK WHAT IS GOING ON Running on device={device}, starting inference...", flush=True)
