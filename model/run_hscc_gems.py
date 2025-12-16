@@ -266,11 +266,11 @@ def main(args=None):
             n_epochs=stageA_epochs,
             batch_size=256,
             lr=1e-4,
-            sigma=0.75,
+            sigma=None,
             alpha=0.8,
             ratio_start=0.0,
             ratio_end=1.0,
-            mmdbatch=1000,
+            mmdbatch=1.0,
             outf=outdir,
         )
 
