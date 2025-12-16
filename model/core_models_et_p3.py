@@ -508,6 +508,7 @@ class GEMSModel:
         guidance_scale: float = 3.0,
         debug_flag: bool = True,
         debug_every: int = 10,
+        fixed_patch_graph: Optional[dict] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         SC inference using patch-based global alignment (no masked/frozen points).
@@ -535,7 +536,9 @@ class GEMSModel:
             return_coords=return_coords,
             DEBUG_FLAG=debug_flag,
             DEBUG_EVERY=debug_every,
+            fixed_patch_graph=fixed_patch_graph,
         )
+
 
         return res
     
