@@ -396,6 +396,8 @@ class GEMSModel:
         self.context_encoder.load_state_dict(checkpoint['context_encoder'])
         self.generator.load_state_dict(checkpoint['generator'])
         self.score_net.load_state_dict(checkpoint['score_net'])
+        if 'sigma_data' in checkpoint:
+            self.sigma_data = checkpoint['sigma_data']
         
         # Load config if available
         if 'cfg' in checkpoint:
@@ -464,40 +466,6 @@ class GEMSModel:
         print("GEMS TRAINING COMPLETE!")
         print("="*60)
     
-
-
-    def infer_sc_anchored(
-        self,
-        sc_gene_expr: torch.Tensor,
-        n_timesteps_sample: int = 160,
-        sigma_min: float = 0.01,
-        sigma_max: float = 5.0,
-        return_coords: bool = True,
-        anchor_size: int = 384,
-        batch_size: int = 512,
-        eta: float = 0.0,
-        guidance_scale: float = 8.0,
-    ) -> Dict[str, torch.Tensor]:
-        
-        from core_models_et_p2 import sample_sc_edm_anchored
-        
-        return sample_sc_edm_anchored(
-            sc_gene_expr=sc_gene_expr,
-            encoder=self.encoder,
-            context_encoder=self.context_encoder,
-            score_net=self.score_net,
-            n_timesteps_sample=n_timesteps_sample,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            return_coords=return_coords,
-            anchor_size=anchor_size,
-            batch_size=batch_size,
-            eta=eta,
-            device=self.device,
-            guidance_scale=guidance_scale,
-            DEBUG_FLAG=True,
-            DEBUG_EVERY=10,
-        )
     
     def infer_sc_patchwise(
         self,
@@ -520,8 +488,26 @@ class GEMSModel:
         """
         from core_models_et_p2 import sample_sc_edm_patchwise
 
+        # Prepare CORAL params if enabled
+        coral_params = None
+        if hasattr(self, 'coral_enabled') and self.coral_enabled:
+            coral_params = {
+                'mu_sc': self.coral_mu_sc,
+                'mu_st': self.coral_mu_st,
+                'A': self.coral_A,
+                'B': self.coral_B,
+            }
+            print("[CORAL] Applying CORAL transformation during SC inference")
+
         # If you have a stored ST scale, you can pass it; otherwise None
         target_st_p95 = getattr(self, "target_st_p95", None)
+
+        sigma_data = getattr(self, 'sigma_data', None)
+
+        if sigma_data is None:
+            raise ValueError("sigma_data not set - load from checkpoint or compute from data")
+
+
 
         res = sample_sc_edm_patchwise(
             sc_gene_expr=sc_gene_expr,
@@ -532,6 +518,7 @@ class GEMSModel:
             n_timesteps_sample=n_timesteps_sample,
             sigma_min=sigma_min,
             sigma_max=sigma_max,
+            sigma_data=sigma_data,
             guidance_scale=guidance_scale,
             eta=eta,
             device=self.device,
@@ -542,8 +529,8 @@ class GEMSModel:
             DEBUG_FLAG=debug_flag,
             DEBUG_EVERY=debug_every,
             fixed_patch_graph=fixed_patch_graph,
+            coral_params=coral_params,
         )
-
 
         return res
     
@@ -582,6 +569,239 @@ class GEMSModel:
         )
         
         return result
+
+
+    # ==========================================================================
+    # CORAL TRANSFORMATION FOR SC INFERENCE
+    # ==========================================================================
+
+    def compute_coral_params_from_st(
+        self,
+        st_gene_expr_dict: Dict[int, torch.Tensor],
+        n_samples: int = 2000,
+        n_min: int = 96,
+        n_max: int = 384,
+    ):
+        """
+        Compute ST context distribution statistics for CORAL.
+        Sample ST mini-sets and encode them to get context distribution.
+        
+        Args:
+            st_gene_expr_dict: Dict of ST gene expression per slide
+            n_samples: Number of ST mini-sets to sample
+            n_min, n_max: Mini-set size range
+        """
+        print("\n" + "="*70)
+        print("COMPUTING CORAL PARAMETERS FROM ST DATA")
+        print("="*70)
+        
+        from core_models_et_p1 import STSetDataset
+        
+        # Ensure on CPU
+        st_gene_expr_dict_cpu = {
+            k: v.cpu() if torch.is_tensor(v) else v 
+            for k, v in st_gene_expr_dict.items()
+        }
+        
+        # Create ST dataset
+        st_dataset = STSetDataset(
+            targets_dict=self.targets_dict,
+            encoder=self.encoder,
+            st_gene_expr_dict=st_gene_expr_dict_cpu,
+            n_min=n_min,
+            n_max=n_max,
+            D_latent=self.D_latent,
+            num_samples=n_samples,
+            knn_k=12,
+            device=self.device,
+            landmarks_L=0,
+        )
+        
+        # Collect ST context tokens
+        st_contexts = []
+        self.encoder.eval()
+        self.context_encoder.eval()
+        
+        with torch.no_grad():
+            for idx in range(len(st_dataset)):
+                miniset = st_dataset[idx]
+                n = miniset['n']
+                
+                # Get gene expression
+                slide_id = miniset['overlap_info']['slide_id']
+                indices = miniset['overlap_info']['indices'][:n]
+                gene_expr = st_gene_expr_dict_cpu[slide_id][indices].to(self.device)
+                
+                # Encode
+                Z = self.encoder(gene_expr)
+                mask = torch.ones(n, dtype=torch.bool, device=self.device)
+                
+                # Context
+                Z_batch = Z.unsqueeze(0)
+                mask_batch = mask.unsqueeze(0)
+                H = self.context_encoder(Z_batch, mask_batch)
+                
+                st_contexts.append(H.squeeze(0).cpu())
+        
+        # Concatenate all contexts
+        st_H = torch.cat(st_contexts, dim=0)  # (N_st, c_dim)
+        
+        print(f"✓ Collected {st_H.shape[0]} ST context tokens")
+        
+        # Compute statistics
+        mu_st = st_H.mean(dim=0).to(self.device)
+        st_H_centered = st_H - mu_st.cpu()
+        cov_st = (st_H_centered.T @ st_H_centered) / (st_H.shape[0] - 1)
+        cov_st = cov_st.to(self.device)
+        
+        print(f"✓ mu_st shape: {mu_st.shape}")
+        print(f"✓ cov_st shape: {cov_st.shape}")
+        
+        # Store
+        self.coral_mu_st = mu_st
+        self.coral_cov_st = cov_st
+        
+        print("✓ CORAL ST parameters computed and stored")
+        print("="*70)
+
+    def build_coral_transform(
+        self,
+        sc_gene_expr: torch.Tensor,
+        n_samples: int = 2000,
+        n_min: int = 96,
+        n_max: int = 384,
+        shrink: float = 0.01,
+        eps: float = 1e-5,
+    ):
+        """
+        Build CORAL transformation matrices from SC distribution.
+        Must call compute_coral_params_from_st() first.
+        
+        Args:
+            sc_gene_expr: SC gene expression tensor
+            n_samples: Number of SC mini-sets to sample
+            shrink: Covariance shrinkage factor
+            eps: Numerical stability epsilon
+        """
+        if not hasattr(self, 'coral_mu_st') or not hasattr(self, 'coral_cov_st'):
+            raise RuntimeError("Must call compute_coral_params_from_st() first")
+        
+        print("\n" + "="*70)
+        print("BUILDING CORAL TRANSFORMATION FROM SC DATA")
+        print("="*70)
+        
+        from core_models_et_p1 import SCSetDataset
+        
+        sc_gene_expr_cpu = sc_gene_expr.cpu() if torch.is_tensor(sc_gene_expr) else sc_gene_expr
+        
+        # Create SC dataset
+        sc_dataset = SCSetDataset(
+            sc_gene_expr=sc_gene_expr_cpu,
+            encoder=self.encoder,
+            n_min=n_min,
+            n_max=n_max,
+            num_samples=n_samples,
+            device=self.device,
+            landmarks_L=0,
+        )
+        
+        # Collect SC context tokens
+        sc_contexts = []
+        self.encoder.eval()
+        self.context_encoder.eval()
+        
+        with torch.no_grad():
+            for idx in range(len(sc_dataset)):
+                miniset = sc_dataset[idx]
+                n_A = miniset['n_A']
+                
+                # Get gene expression
+                indices_A = miniset['global_indices_A'][:n_A]
+                gene_expr = sc_gene_expr_cpu[indices_A].to(self.device)
+                
+                # Encode
+                Z = self.encoder(gene_expr)
+                mask = torch.ones(n_A, dtype=torch.bool, device=self.device)
+                
+                # Context
+                Z_batch = Z.unsqueeze(0)
+                mask_batch = mask.unsqueeze(0)
+                H = self.context_encoder(Z_batch, mask_batch)
+                
+                sc_contexts.append(H.squeeze(0).cpu())
+        
+        # Concatenate all contexts
+        sc_H = torch.cat(sc_contexts, dim=0)  # (N_sc, c_dim)
+        
+        print(f"✓ Collected {sc_H.shape[0]} SC context tokens")
+        
+        # Compute SC statistics
+        mu_sc = sc_H.mean(dim=0).to(self.device)
+        sc_H_centered = sc_H - mu_sc.cpu()
+        cov_sc = (sc_H_centered.T @ sc_H_centered) / (sc_H.shape[0] - 1)
+        cov_sc = cov_sc.to(self.device)
+        
+        print(f"✓ mu_sc shape: {mu_sc.shape}")
+        print(f"✓ cov_sc shape: {cov_sc.shape}")
+        
+        # Build transform with shrinkage
+        D = cov_sc.shape[0]
+        I = torch.eye(D, device=self.device, dtype=torch.float32)
+        
+        cov_sc_shrunk = (1 - shrink) * cov_sc + shrink * I
+        cov_st_shrunk = (1 - shrink) * self.coral_cov_st + shrink * I
+        
+        # Compute A = C_sc^{-1/2} and B = C_st^{1/2}
+        def sqrtm_psd(C, eps):
+            evals, evecs = torch.linalg.eigh(C)
+            evals = torch.clamp(evals, min=eps)
+            return (evecs * torch.sqrt(evals)) @ evecs.T
+        
+        def invsqrtm_psd(C, eps):
+            evals, evecs = torch.linalg.eigh(C)
+            evals = torch.clamp(evals, min=eps)
+            return (evecs * (1.0 / torch.sqrt(evals))) @ evecs.T
+        
+        A = invsqrtm_psd(cov_sc_shrunk, eps=eps)  # C_sc^{-1/2}
+        B = sqrtm_psd(cov_st_shrunk, eps=eps)      # C_st^{1/2}
+        
+        # Store transform
+        self.coral_mu_sc = mu_sc
+        self.coral_A = A
+        self.coral_B = B
+        self.coral_enabled = True
+        
+        print(f"✓ A (C_sc^{{-1/2}}) shape: {A.shape}")
+        print(f"✓ B (C_st^{{1/2}}) shape: {B.shape}")
+        print("✓ CORAL transformation matrices computed")
+        print("="*70)
+
+    @staticmethod
+    def apply_coral_transform(H, mu_sc, A, B, mu_st):
+        """
+        Apply CORAL transformation: (H - mu_sc) @ A @ B + mu_st
+        
+        Args:
+            H: (B, N, D) or (B, D) context tensor
+            mu_sc, A, B, mu_st: CORAL parameters
+        
+        Returns:
+            H_transformed: Same shape as H
+        """
+        if H.dim() == 2:
+            # (B, D)
+            H_centered = H - mu_sc
+            return H_centered @ A @ B + mu_st
+        elif H.dim() == 3:
+            # (B, N, D)
+            B_size, N, D = H.shape
+            H_flat = H.reshape(-1, D)
+            H_centered = H_flat - mu_sc
+            H_transformed_flat = H_centered @ A @ B + mu_st
+            return H_transformed_flat.reshape(B_size, N, D)
+        else:
+            raise ValueError(f"Unsupported H shape: {H.shape}")
+
 
     # ==========================================================================
     # STAGE C v2: ST-ONLY TRAINING WITH GRAPH-AWARE LOSSES
@@ -666,67 +886,7 @@ class GEMSModel:
     # SC ENCODER FINE-TUNING v2
     # ==========================================================================
     
-    def finetune_encoder_on_sc_v2(
-        self,
-        sc_gene_expr: torch.Tensor,
-        D_st_reference: torch.Tensor,
-        n_min: int = 96,
-        n_max: int = 384,
-        num_sc_samples: int = 5000,
-        n_epochs: int = 50,
-        batch_size: int = 8,
-        lr: float = 3e-5,
-        outf: str = 'output',
-        fabric: Optional['Fabric'] = None,
-        precision: str = '16-mixed',
-        w_overlap: float = 1.0,
-        w_geom: float = 1.0,
-        w_dim: float = 0.1,
-    ):
-        """
-        SC Encoder Fine-tuning with Frozen Geometry Prior.
-        
-        Generator and score_net weights are FROZEN but used as differentiable 
-        functions so gradients flow through them into encoder/context_encoder.
-        """
-        from core_models_et_p2_v2 import finetune_encoder_on_sc
-        from core_models_et_p1 import SCSetDataset
-        
-        # Create SC dataset
-        sc_dataset = SCSetDataset(
-            sc_gene_expr=sc_gene_expr.cpu(),
-            encoder=self.encoder,
-            n_min=n_min,
-            n_max=n_max,
-            overlap_min=20,
-            overlap_max=128,
-            num_samples=num_sc_samples,
-            K_nbrs=2048,
-            device=self.device,
-            landmarks_L=0,
-        )
-        
-        history = finetune_encoder_on_sc(
-            encoder=self.encoder,
-            context_encoder=self.context_encoder,
-            generator=self.generator,
-            score_net=self.score_net,
-            sc_gene_expr=sc_gene_expr,
-            sc_dataset=sc_dataset,
-            D_st_reference=D_st_reference,
-            n_epochs=n_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            device=self.device,
-            outf=outf,
-            fabric=fabric,
-            precision=precision,
-            w_overlap=w_overlap,
-            w_geom=w_geom,
-            w_dim=w_dim,
-        )
-        
-        return history
+
 
 
 

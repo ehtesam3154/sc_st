@@ -59,6 +59,63 @@ debug_state = {
     'last_gram_trace_ratio': 85.0 
 }
 
+# ===================================================================
+# DIAGNOSTIC HELPER FUNCTIONS FOR PATCH-BASED INFERENCE
+# ===================================================================
+
+def knn_sets(X, k=10):
+    """Get k-NN sets for each point."""
+    D = torch.cdist(X, X)
+    idx = D.topk(k+1, largest=False).indices[:, 1:]
+    return [set(row.tolist()) for row in idx]
+
+def mean_jaccard(knnA, knnB):
+    """Compute mean Jaccard similarity between two lists of neighbor sets."""
+    js = []
+    for a, b in zip(knnA, knnB):
+        inter = len(a & b)
+        uni = len(a | b)
+        js.append(inter / max(1, uni))
+    return float(np.mean(js))
+
+def compute_overlap_graph_stats(patch_indices, n_sc, min_overlap=20):
+    """Compute patch graph connectivity statistics."""
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import connected_components
+    
+    K = len(patch_indices)
+    overlap_sizes = []
+    edges = []
+    
+    # Compute all pairwise overlaps
+    for i in range(K):
+        for j in range(i+1, K):
+            S_i = set(patch_indices[i].tolist())
+            S_j = set(patch_indices[j].tolist())
+            overlap = len(S_i & S_j)
+            overlap_sizes.append(overlap)
+            
+            if overlap >= min_overlap:
+                edges.append((i, j))
+    
+    # Build adjacency matrix
+    adj = sp.lil_matrix((K, K), dtype=bool)
+    for i, j in edges:
+        adj[i, j] = True
+        adj[j, i] = True
+    
+    # Connected components
+    n_components, labels = connected_components(adj, directed=False)
+    component_sizes = np.bincount(labels)
+    giant_component_size = component_sizes.max() if len(component_sizes) > 0 else 0
+    
+    return {
+        'overlap_sizes': overlap_sizes,
+        'n_components': n_components,
+        'giant_component_size': giant_component_size,
+        'giant_component_frac': giant_component_size / K if K > 0 else 0,
+    }
+
 def _cuda_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -405,6 +462,8 @@ class DiffusionScoreNet(nn.Module):
             self.alpha_bias = nn.Parameter(torch.tensor(0.1))
 
         #ST distogram head for supervised bin prediction
+        self.st_dist_head = None
+        #ST distogram head for supervised bin prediction
         if use_st_dist_head:
             d_emb = 32
             self.st_dist_head = nn.Sequential(
@@ -595,6 +654,45 @@ class DiffusionScoreNet(nn.Module):
         
         return eps_hat
     
+    def forward_edm(
+            self,
+            x: torch.Tensor,           # (B, N, D) noisy input
+            sigma: torch.Tensor,       # (B,) noise level
+            H: torch.Tensor,           # (B, N, c_dim) context
+            mask: torch.Tensor,        # (B, N)
+            sigma_data: float,         # data std
+            self_cond: torch.Tensor = None,
+        ) -> torch.Tensor:
+            """
+            EDM-preconditioned forward pass.
+            Returns denoised estimate x0_pred.
+            
+            D_θ(x, σ) = c_skip · x + c_out · F_θ(c_in · x; c_noise, H)
+            """
+            B, N, D = x.shape
+            
+            # Compute preconditioning
+            c_skip, c_out, c_in, c_noise = uet.edm_precond(sigma, sigma_data)
+            # c_skip, c_out, c_in: (B, 1, 1)
+            # c_noise: (B, 1)
+            
+            # Scale input
+            x_in = c_in * x  # (B, N, D)
+            
+            # Call underlying network with c_noise as time embedding
+            # The network expects t in shape (B, 1), c_noise is already (B, 1)
+            F_x = self.forward(x_in, c_noise, H, mask, self_cond=self_cond)
+            
+            # If forward returns tuple (for dist_aux), extract just the prediction
+            if isinstance(F_x, tuple):
+                F_x = F_x[0]
+            
+            # EDM denoiser output
+            x0_pred = c_skip * x + c_out * F_x
+            x0_pred = x0_pred * mask.unsqueeze(-1).float()
+            
+            return x0_pred
+    
 # ==============================================================================
 # STAGE C: TRAINING FUNCTION
 # ==============================================================================
@@ -668,8 +766,8 @@ def train_stageC_diffusion_generator(
     batch_size: int = 4,
     lr: float = 1e-4,
     n_timesteps: int = 500,  # CHANGED from 600
-    sigma_min: float = 0.01,
-    sigma_max: float = 5.0,
+    sigma_min: float = 0.002, #edm default
+    sigma_max: float = 80.0, #edm default (wll be clamped by sigma_data)
     device: str = 'cuda',
     outf: str = 'output',
     fabric: Optional['Fabric'] = None,
@@ -681,6 +779,10 @@ def train_stageC_diffusion_generator(
     early_stop_min_epochs: int = 12,
     early_stop_patience: int = 6,
     early_stop_threshold: float = 0.01,  # 1% relative improvement
+    # NEW: EDM parameters
+    P_mean: float = -1.2,          # Log-normal mean for sigma sampling
+    P_std: float = 1.2,            # Log-normal std for sigma sampling
+    use_edm: bool = True,          # Enable EDM mode
 ):
     
     # Initialize debug tracking
@@ -700,31 +802,34 @@ def train_stageC_diffusion_generator(
 
     # Collect all ST reference coordinates
     all_ref_coords = []
+    print("\n[Computing reference-based tau for KNN NCA]")
+
+    slide_d15_medians = []
     for slide_id in st_dataset.targets_dict:
-        y_hat = st_dataset.targets_dict[slide_id].y_hat  # True ST coordinates
-        all_ref_coords.append(y_hat)
-
-    all_ref_coords = torch.cat(all_ref_coords, dim=0).to(device)  # (N_total, 2)
-
-    # Compute k-NN distances in reference
-    with torch.no_grad():
-        N_ref = all_ref_coords.shape[0]
-        D_ref = torch.cdist(all_ref_coords, all_ref_coords)  # (N, N)
-        # D_ref = D_ref + torch.eye(N_ref, device=device) * 1e6  # Mask diagonal
-        D_ref[torch.arange(N_ref), torch.arange(N_ref)] = float('inf')
-
+        y_hat = st_dataset.targets_dict[slide_id].y_hat.to(device)  # (n_slide, 2)
+        n_slide = y_hat.shape[0]
         
-        # Get 15-th nearest neighbor distance for each point
-        knn_dists, _ = torch.topk(D_ref, k=15, dim=1, largest=False)  # (N, 15)
-        d_15th = knn_dists[:, -1]  # Distance to 15th neighbor for each point
+        if n_slide < 20:
+            continue
         
-        # Take median across all points
-        r_15_median = d_15th.median().item()
-        tau_reference = r_15_median ** 2  # Square it for d² scale
-        
-        print(f"  Reference 15-NN median distance: {r_15_median:.6f}")
-        print(f"  Setting tau = d²_median = {tau_reference:.6f}")
-        print(f"  (This tau is FIXED and based on true tissue structure)\n")
+        with torch.no_grad():
+            D_slide = torch.cdist(y_hat, y_hat)  # (n_slide, n_slide)
+            D_slide[torch.arange(n_slide), torch.arange(n_slide)] = float('inf')
+            
+            knn_dists, _ = torch.topk(D_slide, k=min(15, n_slide-1), dim=1, largest=False)
+            d_15th = knn_dists[:, -1]
+            slide_d15_medians.append(d_15th.median().item())
+
+    if slide_d15_medians:
+        r_15_median = float(np.median(slide_d15_medians))
+    else:
+        r_15_median = 1.0  # fallback
+
+    tau_reference = r_15_median ** 2
+
+    print(f"  Per-slide 15-NN median distances: {slide_d15_medians}")
+    print(f"  Global median: {r_15_median:.6f}")
+    print(f"  Setting tau = {tau_reference:.6f}\n")
 
     """
     Train diffusion generator with mixed ST/SC regimen.
@@ -769,7 +874,8 @@ def train_stageC_diffusion_generator(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
     
     # VE SDE
-    sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), n_timesteps, device=device))
+    if not use_edm:
+        sigmas = torch.exp(torch.linspace(np.log(sigma_min), np.log(sigma_max), n_timesteps, device=device))
 
     # DEBUG: First-time sigma info
     if DEBUG:
@@ -1144,7 +1250,7 @@ def train_stageC_diffusion_generator(
 
     # Compute sigma_data once at start
     print("Computing sigma_data from data statistics...")
-
+    
     def sync_scalar(value: float, device: str) -> float:
         t = torch.tensor([value], device=device, dtype=torch.float32)
         if dist.is_initialized():
@@ -1155,22 +1261,33 @@ def train_stageC_diffusion_generator(
         if fabric is None or fabric.is_global_zero:
             sample_stds = []
             if use_st:
-                it = iter(st_loader)  # Create iterator ONCE
+                it = iter(st_loader)
                 for _ in range(min(10, len(st_loader))):
                     sample_batch = next(it, None)
                     if sample_batch is None:
                         break
-                    G_batch = sample_batch['G_target'].to(device, non_blocking=True)
-                    for i in range(min(4, G_batch.shape[0])):
-                        V_temp = uet.factor_from_gram(G_batch[i], score_net.D_latent)
-                        sample_stds.append(V_temp.std().item())
+                    V_batch = sample_batch['V_target'].to(device, non_blocking=True)
+                    mask_batch = sample_batch['mask'].to(device, non_blocking=True)
+                    for i in range(min(4, V_batch.shape[0])):
+                        m = mask_batch[i]
+                        if m.sum() > 0:
+                            V_temp = V_batch[i, m]
+                            sample_stds.append(V_temp.std().item())
             sigma_data = float(np.median(sample_stds)) if sample_stds else 1.0
         else:
             sigma_data = 0.0
 
-
     sigma_data = sync_scalar(sigma_data, device)
-    print(f"[StageC] sigma_data (from ST Gram factors) = {sigma_data:.4f}")
+
+    # EDM: Clamp sigma_max based on sigma_data
+    if use_edm:
+        sigma_max = min(sigma_max, sigma_data * 100)  # Reasonable upper bound
+        sigma_min = max(sigma_min, sigma_data * 0.001)  # Reasonable lower bound
+    
+    print(f"[StageC] sigma_data = {sigma_data:.4f}")
+    print(f"[StageC] sigma_min = {sigma_min:.6f}, sigma_max = {sigma_max:.2f}")
+    if use_edm:
+        print(f"[StageC] EDM mode ENABLED: P_mean={P_mean}, P_std={P_std}")
 
 
     #--amp scaler choice based on precision---
@@ -1343,17 +1460,36 @@ def train_stageC_diffusion_generator(
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
                 # Context encoding
                 H = context_encoder(Z_set, mask)
-                
-                # Sample noise level with quadratic bias toward low noise
-                u = torch.rand(batch_size_real, device=device)
-                t_cont = (u ** 2) * (n_timesteps - 1)
-                t_idx = t_cont.long()
-                t_norm = t_cont / (n_timesteps - 1)
-                sigma_t = sigmas[t_idx].view(-1, 1, 1)
-                
-                # Generate V_0 using generator (works for both ST and SC)
-                V_0 = generator(H, mask)
-                # NEW: Only mask out padded entries, DO NOT normalize scale per mini-set
+
+                # === Define self-conditioning flag ONCE ===
+                use_self_cond = (torch.rand(1, device=device).item() < p_sc)
+
+                # === EDM: sample sigma from log-normal ===
+                if use_edm:
+                    sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
+                    sigma = sigma.clamp(sigma_min, sigma_max)
+                    sigma_t = sigma.view(-1, 1, 1)
+                    
+                    # Create t_norm proxy for gating/debug (log-space normalization)
+                    log_sigma = sigma.log()
+                    log_min = math.log(sigma_min)
+                    log_max = math.log(sigma_max)
+                    t_norm = ((log_sigma - log_min) / (log_max - log_min + 1e-8)).clamp(0, 1)  # (B,)
+                else:
+                    # Old: quadratic bias toward low noise
+                    u = torch.rand(batch_size_real, device=device)
+                    t_cont = (u ** 2) * (n_timesteps - 1)
+                    t_idx = t_cont.long()
+                    t_norm = t_cont / (n_timesteps - 1)
+                    sigma_t = sigmas[t_idx].view(-1, 1, 1)
+
+                # ===== EDM: x0 FROM ST TARGET, NOT GENERATOR =====
+                if use_edm and not is_sc:
+                    # ST batch: x0 is the ground truth geometry
+                    V_0 = batch['V_target'].to(device)
+                else:
+                    # SC batch or non-EDM: use generator
+                    V_0 = generator(H, mask)
                 
                 # Debug: Check V_0 scale variation (first 10 steps only)
                 if DEBUG and global_step < 10:
@@ -1388,62 +1524,92 @@ def train_stageC_diffusion_generator(
                    n_dropped = drop_mask.sum().item()
                 #    print(f"[CFG] step={global_step} dropped={int(n_dropped)}/{batch_size_real} contexts")
 
-                # Self-conditioning logic
-                use_self_cond = torch.rand(1, device=device).item() < p_sc
+                # === forward pass ===
+                if use_edm:
+                    # EDM: use preconditioned forward, get x0_pred directly
+                    sigma_flat = sigma_t.view(-1)
 
-                if use_self_cond and score_net.self_conditioning:
-                    # First pass without self-conditioning to get V_0 prediction
-                    with torch.no_grad():
-                        eps_hat_0 = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None)
-                        V_pred_0 = V_t - sigma_t * eps_hat_0
-                    
-                    # Second pass with self-conditioning
-                    # eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=V_pred_0)
-
-                    result = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=V_pred_0, return_dist_aux=(not is_sc))
-                    if isinstance(result, tuple):
-                        eps_pred, dist_aux = result
+                    if use_self_cond and score_net.self_conditioning:
+                        with torch.no_grad():
+                            x0_pred_0 = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, self_cond=None)
+                        x0_pred = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, self_cond=x0_pred_0)
                     else:
-                        eps_pred = result
-                        dist_aux = None
+                        x0_pred = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, self_cond=None)
+
+                    # for geom losses, V_hat is x0_pred
+                    V_hat = x0_pred
+                    dist_aux = None
                 else:
-                    # Single pass without self-conditioning
-                    # eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None)
-                    result = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None, return_dist_aux=(not is_sc))
-                    if isinstance(result, tuple):
-                        eps_pred, dist_aux = result
+                    # Self-conditioning logic
+                    use_self_cond = torch.rand(1, device=device).item() < p_sc
+
+                    if use_self_cond and score_net.self_conditioning:
+                        # First pass without self-conditioning to get V_0 prediction
+                        with torch.no_grad():
+                            eps_hat_0 = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None)
+                            V_pred_0 = V_t - sigma_t * eps_hat_0
+
+                        result = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=V_pred_0, return_dist_aux=(not is_sc))
+                        if isinstance(result, tuple):
+                            eps_pred, dist_aux = result
+                        else:
+                            eps_pred = result
+                            dist_aux = None
                     else:
-                        eps_pred = result
-                        dist_aux = None
+                        # Single pass without self-conditioning
+                        # eps_pred = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None)
+                        result = score_net(V_t, t_norm.unsqueeze(1), H_train, mask, self_cond=None, return_dist_aux=(not is_sc))
+                        if isinstance(result, tuple):
+                            eps_pred, dist_aux = result
+                        else:
+                            eps_pred = result
+                            dist_aux = None
 
        
             # ===== SCORE LOSS (in fp32 for numerical stability) =====
             with torch.autocast(device_type='cuda', enabled=False):
-                sigma_t_fp32 = sigma_t.float()
-                eps_pred_fp32 = eps_pred.float()
-                eps_fp32 = eps.float()
                 mask_fp32 = mask.float()
+                if use_edm:
+                    # EDM: Loss on denoised prediction vs ground truth
+                    x0_pred_fp32 = x0_pred.float()
+                    V_0_fp32 = V_0.float()
+                    sigma_flat = sigma_t.view(-1).float()
+                    
+                    # EDM weight: (σ² + σ_d²) / (σ · σ_d)²
+                    w = uet.edm_loss_weight(sigma_flat, sigma_data)  # (B,)
+                    w = w.view(-1, 1)  # (B, 1)
+                    w = w.clamp(max=1000.0)  # Prevent extreme weights
+                    
+                    # MSE on (x0_pred - x0)
+                    err2 = (x0_pred_fp32 - V_0_fp32).pow(2).mean(dim=2)  # (B, N)
+                    L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum()
 
-                # ===== CORRECT EDM WEIGHTING FOR NOISE PREDICTION =====
-                sigma_t_squeezed = sigma_t_fp32.squeeze(-1)  # (B, N) or (B,)
-                if sigma_t_squeezed.dim() == 1:
-                    sigma_t_squeezed = sigma_t_squeezed.unsqueeze(-1)  # (B, 1)
+                else:
+                    sigma_t_fp32 = sigma_t.float()
+                    eps_pred_fp32 = eps_pred.float()
+                    eps_fp32 = eps.float()
+                    mask_fp32 = mask.float()
 
-                # Simple EDM weight for noise prediction
-                # w(σ) = (σ² + σ_d²) / σ_d², with σ_d = 1
-                w = (sigma_t_squeezed**2 + sigma_data**2) / (sigma_data**2)  # here sigma_data=1
+                    # ===== CORRECT EDM WEIGHTING FOR NOISE PREDICTION =====
+                    sigma_t_squeezed = sigma_t_fp32.squeeze(-1)  # (B, N) or (B,)
+                    if sigma_t_squeezed.dim() == 1:
+                        sigma_t_squeezed = sigma_t_squeezed.unsqueeze(-1)  # (B, 1)
 
-                # Just cap very large weights; no SNR magic
-                w = w.clamp(max=100.0)
+                    # Simple EDM weight for noise prediction
+                    # w(σ) = (σ² + σ_d²) / σ_d², with σ_d = 1
+                    w = (sigma_t_squeezed**2 + sigma_data**2) / (sigma_data**2)  # here sigma_data=1
 
-                # Compute loss
-                err2 = (eps_pred_fp32 - eps_fp32).pow(2).mean(dim=2)  # (B, N)
+                    # Just cap very large weights; no SNR magic
+                    w = w.clamp(max=100.0)
 
-                # Handle broadcasting
-                if w.shape[-1] == 1:
-                    w = w.expand_as(err2)
+                    # Compute loss
+                    err2 = (eps_pred_fp32 - eps_fp32).pow(2).mean(dim=2)  # (B, N)
 
-                L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum()
+                    # Handle broadcasting
+                    if w.shape[-1] == 1:
+                        w = w.expand_as(err2)
+
+                    L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum()
 
                 # === SANITY CHECK ===
                 if DEBUG and (global_step % LOG_EVERY == 0) and (not is_sc):
@@ -1496,9 +1662,10 @@ def train_stageC_diffusion_generator(
 
       
             # Denoise to get V_hat
-            with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                V_hat = V_t - sigma_t * eps_pred
-                V_hat = V_hat * mask.unsqueeze(-1).float()
+            if not use_edm:
+                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                    V_hat = V_t - sigma_t * eps_pred
+                    V_hat = V_hat * mask.unsqueeze(-1).float()
 
             # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
             # 1. Canonicalize V_hat (Center per set) - NOW GLOBAL for ST and SC
@@ -3164,7 +3331,8 @@ def train_stageC_diffusion_generator(
                     'context_encoder': context_encoder.state_dict(),
                     'score_net': score_net.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'history': history
+                    'history': history,
+                    'sigma_data': sigma_data,
                 }
                 torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
     
@@ -3282,6 +3450,10 @@ def sample_sc_edm_single_patch(
     Z_set = Z_all.unsqueeze(0)  # (1, n_sc, h)
     mask = torch.ones(1, n_sc, dtype=torch.bool, device=device)
     H = context_encoder(Z_set, mask)  # (1, n_sc, c_dim)
+
+    # Apply CORAL if available
+    if hasattr(context_encoder, 'coral_transform') and context_encoder.coral_transform is not None:
+        H = context_encoder.coral_transform(H)
     
     # 3) Diffusion sampling
     sigmas = torch.exp(torch.linspace(
@@ -3368,6 +3540,7 @@ def sample_sc_edm_patchwise(
     encoder: "SharedEncoder",
     context_encoder: "SetEncoderContext",
     score_net: "DiffusionScoreNet",
+    sigma_data: float,
     target_st_p95: Optional[float] = None,
     n_timesteps_sample: int = 160,
     sigma_min: float = 0.01,
@@ -3385,6 +3558,7 @@ def sample_sc_edm_patchwise(
     DEBUG_FLAG: bool = True,
     DEBUG_EVERY: int = 10,
     fixed_patch_graph: Optional[dict] = None,
+    coral_params: Optional[Dict] = None
 ) -> Dict[str, torch.Tensor]:
     """
     Stage D: Patch-based SC inference via global alignment.
@@ -3453,20 +3627,14 @@ def sample_sc_edm_patchwise(
     # 3) Define overlapping patches S_k (or reload from file)
     # ------------------------------------------------------------------
     if fixed_patch_graph is not None:
-        # Reload pre-computed patch graph
+        # RELOAD existing patch graph - do NOT rebuild
         patch_indices = [p.to(torch.long) for p in fixed_patch_graph["patch_indices"]]
         memberships = fixed_patch_graph["memberships"]
         K = len(patch_indices)
-        if DEBUG_FLAG:
-            print(f"[PATCH] Loaded fixed patch graph: K={K} patches")
+        print(f"[PATCHWISE] Loaded fixed patch graph with {K} patches")
     else:
-        # Build patches from scratch
-        total_slots = int(np.ceil(coverage_per_cell * n_sc))
-        n_patches_est = max(int(np.ceil(total_slots / patch_size)), 1)
-
-        if DEBUG_FLAG:
-            print(f"[PATCH] estimated n_patches={n_patches_est} (total_slots={total_slots})")
-
+        # BUILD new patch graph
+        n_patches_est = int(math.ceil((coverage_per_cell * n_sc) / patch_size))
         centers = torch.randint(low=0, high=n_sc, size=(n_patches_est,), dtype=torch.long)
 
         patch_indices: List[torch.Tensor] = []
@@ -3492,6 +3660,65 @@ def sample_sc_edm_patchwise(
                     memberships[idx].append(k)
 
         K = len(patch_indices)
+        print(f"[PATCHWISE] Built new patch graph with {K} patches")
+        # Reload pre-computed patch graph
+        patch_indices = [p.to(torch.long) for p in fixed_patch_graph["patch_indices"]]
+        memberships = fixed_patch_graph["memberships"]
+        K = len(patch_indices)
+        if DEBUG_FLAG:
+            print(f"[PATCH] Loaded fixed patch graph: K={K} patches")
+
+        # ===================================================================
+        # DIAGNOSTIC A: PATCH GRAPH ANALYSIS
+        # ===================================================================
+        if DEBUG_FLAG:
+            print("\n" + "="*70)
+            print("DIAGNOSTIC A: PATCH GRAPH ANALYSIS")
+            print("="*70)
+            
+            stats = compute_overlap_graph_stats(patch_indices, n_sc, min_overlap=20)
+            overlap_sizes = stats['overlap_sizes']
+            
+            # A1: Overlap size distribution
+            print(f"\n[A1] Overlap Statistics:")
+            print(f"  Total patch pairs: {len(overlap_sizes)}")
+            print(f"  Mean overlap: {np.mean(overlap_sizes):.1f}")
+            print(f"  Median overlap: {np.median(overlap_sizes):.1f}")
+            print(f"  % pairs with ≥20: {100*np.mean(np.array(overlap_sizes) >= 20):.1f}%")
+            print(f"  % pairs with ≥50: {100*np.mean(np.array(overlap_sizes) >= 50):.1f}%")
+            print(f"  % pairs with ≥100: {100*np.mean(np.array(overlap_sizes) >= 100):.1f}%")
+            
+            # Plot overlap distribution
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            
+            axes[0].hist(overlap_sizes, bins=50, edgecolor='black', alpha=0.7)
+            axes[0].axvline(20, color='red', linestyle='--', label='Min overlap=20')
+            axes[0].set_xlabel('Overlap Size')
+            axes[0].set_ylabel('Count')
+            axes[0].set_title('Patch Overlap Distribution')
+            axes[0].legend()
+            axes[0].grid(alpha=0.3)
+            
+            # A2: Connectivity
+            print(f"\n[A2] Patch Graph Connectivity (min_overlap=20):")
+            print(f"  # Connected components: {stats['n_components']}")
+            print(f"  Giant component size: {stats['giant_component_size']}/{K} ({stats['giant_component_frac']*100:.1f}%)")
+            
+            # Plot component sizes
+            if stats['n_components'] > 1:
+                print("  ⚠️  WARNING: Patch graph is fragmented!")
+            
+            axes[1].bar(['Giant', 'Other'], 
+                    [stats['giant_component_size'], K - stats['giant_component_size']],
+                    color=['green', 'red'], alpha=0.7)
+            axes[1].set_ylabel('# Patches')
+            axes[1].set_title(f'Patch Graph Components (n={stats["n_components"]})')
+            axes[1].grid(alpha=0.3, axis='y')
+            
+            plt.tight_layout()
+            plt.show()
+            print("="*70 + "\n")
 
     if DEBUG_FLAG:
         cover_counts = torch.tensor([len(memberships[i]) for i in range(n_sc)], dtype=torch.float32)
@@ -3545,9 +3772,8 @@ def sample_sc_edm_patchwise(
                 "incidence": incidence.cpu(),
                 "n_sc": n_sc,
                 "patch_size": patch_size,
-                "seed": seed
             },
-            f"debug_patch_graph_seed{seed}.pt",
+            f"debug_patch_graph_seed.pt",
         )
         print("[DEBUG] Saved patch graph to debug patch graph")
 
@@ -3555,12 +3781,15 @@ def sample_sc_edm_patchwise(
     # 4) For each patch: run diffusion sampling (all points free),
     #    then canonicalize to match training.
     # ------------------------------------------------------------------
-    sigmas = torch.exp(torch.linspace(
-        torch.log(torch.tensor(sigma_max, device=device)),
-        torch.log(torch.tensor(sigma_min, device=device)),
-        n_timesteps_sample,
-        device=device,
-    ))  # (T,)
+    # sigmas = torch.exp(torch.linspace(
+    #     torch.log(torch.tensor(sigma_max, device=device)),
+    #     torch.log(torch.tensor(sigma_min, device=device)),
+    #     n_timesteps_sample,
+    #     device=device,
+    # ))  # (T,)
+
+    # EDM Karras sigma schedule
+    sigmas = uet.edm_sigma_schedule(n_timesteps_sample, sigma_min, sigma_max, rho=7.0, device=device)
 
     patch_coords: List[torch.Tensor] = []
 
@@ -3576,45 +3805,106 @@ def sample_sc_edm_patchwise(
             Z_k_batched = Z_k.unsqueeze(0)      # (1, m_k, h)
             mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
             H_k = context_encoder(Z_k_batched, mask_k)
+            
+            # APPLY CORAL TRANSFORMATION IF ENABLED
+            if coral_params is not None:
+                from core_models_et_p3 import GEMSModel
+                H_k = GEMSModel.apply_coral_transform(
+                    H_k,
+                    mu_sc=coral_params['mu_sc'],
+                    A=coral_params['A'],
+                    B=coral_params['B'],
+                    mu_st=coral_params['mu_st']
+                )
 
             V_t = torch.randn(1, m_k, D_latent, device=device) * sigmas[0]
 
-            for t_idx in range(n_timesteps_sample):
-                sigma_t = sigmas[t_idx]
-                t_norm = torch.tensor([[t_idx / float(n_timesteps_sample - 1)]],
-                                      device=device)
+            # for t_idx in range(n_timesteps_sample):
+            #     sigma_t = sigmas[t_idx]
+            #     t_norm = torch.tensor([[t_idx / float(n_timesteps_sample - 1)]],
+            #                           device=device)
 
+            # sigma_data = 1.0  # Use stored or estimated value
+            
+            for i in range(n_timesteps_sample):
+                sigma_cur = sigmas[i]
+                sigma_next = sigmas[i + 1] if i < n_timesteps_sample - 1 else torch.tensor(0.0, device=device)
+                
+                # EDM denoised prediction with CFG
                 H_null = torch.zeros_like(H_k)
-                eps_uncond = score_net(V_t, t_norm, H_null, mask_k)
-                eps_cond   = score_net(V_t, t_norm, H_k,    mask_k)
-                eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
-                # Extra debug on first patch
-                if DEBUG_FLAG and k == 0 and t_idx < 3:
-                    du = eps_uncond.norm(dim=[1, 2]).mean().item()
-                    dc = eps_cond.norm(dim=[1, 2]).mean().item()
-                    diff = (eps_cond - eps_uncond).norm(dim=[1, 2]).mean().item()
-                    ratio = diff / (du + 1e-8)
-                    print(f"  [PATCH0] t={t_idx:3d} sigma={float(sigma_t):.4f} "
-                          f"||eps_u||={du:.3f} ||eps_c||={dc:.3f} "
-                          f"||diff||={diff:.3f} CFG_ratio={ratio:.3f}")
-
-                if t_idx < n_timesteps_sample - 1:
-                    sigma_next = sigmas[t_idx + 1]
-                    V_0_pred = V_t - sigma_t * eps
-                    V_t = V_0_pred + (sigma_next / sigma_t) * (V_t - V_0_pred)
+                x0_uncond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_null, mask_k, sigma_data)
+                x0_cond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_k, mask_k, sigma_data)
+                x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
+                
+                # Debug on first patch
+                if DEBUG_FLAG and k == 0 and i < 3:
+                    du = x0_uncond.norm(dim=[1, 2]).mean().item()
+                    dc = x0_cond.norm(dim=[1, 2]).mean().item()
+                    diff = (x0_cond - x0_uncond).norm(dim=[1, 2]).mean().item()
+                    print(f"  [PATCH0] i={i:3d} sigma={float(sigma_cur):.4f} "
+                          f"||x0_u||={du:.3f} ||x0_c||={dc:.3f} ||diff||={diff:.3f}")
+                
+                # EDM update
+                if sigma_next > 0:
+                    d_cur = (V_t - x0_pred) / sigma_cur
+                    V_t = V_t + (sigma_next - sigma_cur) * d_cur
+                    
                     if eta > 0:
-                        noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_t**2, min=0))
+                        noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_cur**2, min=0))
                         V_t = V_t + noise_scale * torch.randn_like(V_t)
                 else:
-                    V_t = V_t - sigma_t * eps
+                    V_t = x0_pred
+                
+            # for t_idx in range(n_timesteps_sample):
+            #     sigma_t = sigmas[t_idx]
+            #     t_norm = torch.tensor([[1.0 - t_idx / float(n_timesteps_sample - 1)]], device=device)
 
+            #     H_null = torch.zeros_like(H_k)
+            #     eps_uncond = score_net(V_t, t_norm, H_null, mask_k)
+            #     eps_cond   = score_net(V_t, t_norm, H_k,    mask_k)
+            #     eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+            #     # Extra debug on first patch
+            #     if DEBUG_FLAG and k == 0 and t_idx < 3:
+            #         du = eps_uncond.norm(dim=[1, 2]).mean().item()
+            #         dc = eps_cond.norm(dim=[1, 2]).mean().item()
+            #         diff = (eps_cond - eps_uncond).norm(dim=[1, 2]).mean().item()
+            #         ratio = diff / (du + 1e-8)
+            #         print(f"  [PATCH0] t={t_idx:3d} sigma={float(sigma_t):.4f} "
+            #               f"||eps_u||={du:.3f} ||eps_c||={dc:.3f} "
+            #               f"||diff||={diff:.3f} CFG_ratio={ratio:.3f}")
+
+            #     if t_idx < n_timesteps_sample - 1:
+            #         sigma_next = sigmas[t_idx + 1]
+            #         V_0_pred = V_t - sigma_t * eps
+            #         V_t = V_0_pred + (sigma_next / sigma_t) * (V_t - V_0_pred)
+            #         if eta > 0:
+            #             noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_t**2, min=0))
+            #             V_t = V_t + noise_scale * torch.randn_like(V_t)
+            #     else:
+            #         V_t = V_t - sigma_t * eps
+    
 
             # if DEBUG_FLAG and (k % max(1, K // 5) == 0):
             #     rms = V_canon.pow(2).mean().sqrt().item()
             # NEW: Only center, do NOT apply unit RMS (matches training)
             V_final = V_t.squeeze(0)  # (m_k, D)
             V_centered = V_final - V_final.mean(dim=0, keepdim=True)
+
+            # ===================================================================
+            # DIAGNOSTIC B: PATCH SAMPLING QUALITY (first 3 patches only)
+            # ===================================================================
+            if DEBUG_FLAG and k < 3:
+                print(f"\n[DIAGNOSTIC B] Patch {k} sampling analysis:")
+                
+                # B1: Check if patch is isotropic (blob)
+                cov = torch.cov(V_centered.float().T)
+                eigs = torch.linalg.eigvalsh(cov)
+                aniso_ratio = float(eigs.max() / (eigs.min() + 1e-8))
+                print(f"  Anisotropy ratio: {aniso_ratio:.2f} (higher=more structured)")
+                
+                if aniso_ratio < 2.0:
+                    print(f"  ⚠️  WARNING: Patch {k} is very isotropic (blob-like)!")
             patch_coords.append(V_centered.detach().cpu())
 
             # DEBUG 2: Per-patch sample diagnostics
@@ -3639,10 +3929,6 @@ def sample_sc_edm_patchwise(
                 mean_norm = V_centered.mean(dim=0).norm().item()
                 print(f"[PATCH] k={k}/{K} m_k={m_k} "
                       f"coords_rms={rms:.3f} center_norm={mean_norm:.3e}")
-                
-
-            # del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final, V_canon
-            # del Z_k, Z_k_batched, H_k, V_t, eps_uncond, eps_cond, eps, V_final
 
             if 'cuda' in device:
                 torch.cuda.empty_cache()
@@ -3663,11 +3949,96 @@ def sample_sc_edm_patchwise(
             {
                 "patch_indices": [p.cpu() for p in patch_indices],
                 "patch_coords": [pc.cpu() for pc in patch_coords],
-                "seed": seed,
             },
-            f"debug_patch_coords_seed{seed}.pt",
+            f"debug_patch_coords_seed.pt",
         )
-        print(f"[DEBUG] Saved patch coords to debug_patch_coords_seed{seed}.pt\n")
+        print(f"[DEBUG] Saved patch coords to debug_patch_coords_seed.pt\n")
+
+
+
+    # ===================================================================
+    # DIAGNOSTIC B3: OVERLAP NEIGHBOR AGREEMENT (JACCARD)
+    # ===================================================================
+    if DEBUG_FLAG:
+        print("\n" + "="*70)
+        print("DIAGNOSTIC B3: OVERLAP NEIGHBOR AGREEMENT")
+        print("="*70)
+        
+        overlap_jaccards = []
+        overlap_dist_corrs = []
+        
+        # Sample 20 random overlapping patch pairs
+        overlap_pairs = []
+        for i in range(min(K, 50)):
+            for j in range(i+1, min(K, 50)):
+                S_i = set(patch_indices[i].tolist())
+                S_j = set(patch_indices[j].tolist())
+                shared = S_i & S_j
+                if len(shared) >= 30:  # Need enough for meaningful kNN
+                    overlap_pairs.append((i, j, list(shared)))
+        
+        # Analyze up to 20 pairs
+        for i, j, shared_list in overlap_pairs[:20]:
+            # Get coords for shared cells in both patches
+
+            # Build position lookup dicts (O(1) lookup)
+            pos_i = {int(cid): p for p, cid in enumerate(patch_indices[i].tolist())}
+            pos_j = {int(cid): p for p, cid in enumerate(patch_indices[j].tolist())}
+
+            shared_idx_i = torch.tensor([pos_i[c] for c in shared_list], dtype=torch.long)
+            shared_idx_j = torch.tensor([pos_j[c] for c in shared_list], dtype=torch.long)
+            
+            V_i_shared = patch_coords[i][shared_idx_i]
+            V_j_shared = patch_coords[j][shared_idx_j]
+            
+            # Compute kNN Jaccard
+            knn_i = knn_sets(V_i_shared, k=min(10, len(shared_list)-1))
+            knn_j = knn_sets(V_j_shared, k=min(10, len(shared_list)-1))
+            jaccard = mean_jaccard(knn_i, knn_j)
+            overlap_jaccards.append(jaccard)
+            
+            # Also compute distance correlation
+            D_i = torch.cdist(V_i_shared, V_i_shared).cpu().numpy()
+            D_j = torch.cdist(V_j_shared, V_j_shared).cpu().numpy()
+            triu = np.triu_indices(len(shared_list), k=1)
+            dist_corr = np.corrcoef(D_i[triu], D_j[triu])[0, 1]
+            overlap_dist_corrs.append(dist_corr)
+        
+        if overlap_jaccards:
+            print(f"\n[B3] Analyzed {len(overlap_jaccards)} overlapping patch pairs:")
+            print(f"  kNN Jaccard: {np.mean(overlap_jaccards):.3f} ± {np.std(overlap_jaccards):.3f}")
+            print(f"  Distance corr: {np.mean(overlap_dist_corrs):.3f} ± {np.std(overlap_dist_corrs):.3f}")
+            
+            if np.mean(overlap_jaccards) < 0.3:
+                print("  ⚠️  LOW JACCARD: Patches disagree on neighborhoods → DIFFUSION PROBLEM")
+            elif np.mean(overlap_jaccards) > 0.6:
+                print("  ✓ GOOD JACCARD: Patches agree on neighborhoods")
+            
+            # Plot
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            
+            axes[0].hist(overlap_jaccards, bins=20, edgecolor='black', alpha=0.7, color='blue')
+            axes[0].axvline(np.mean(overlap_jaccards), color='red', linestyle='--', 
+                           label=f'Mean={np.mean(overlap_jaccards):.3f}')
+            axes[0].set_xlabel('kNN Jaccard')
+            axes[0].set_ylabel('Count')
+            axes[0].set_title('Overlap Neighbor Agreement (Jaccard)')
+            axes[0].legend()
+            axes[0].grid(alpha=0.3)
+            
+            axes[1].scatter(overlap_dist_corrs, overlap_jaccards, alpha=0.6)
+            axes[1].axhline(0.5, color='red', linestyle='--', alpha=0.5)
+            axes[1].axvline(0.8, color='red', linestyle='--', alpha=0.5)
+            axes[1].set_xlabel('Distance Correlation')
+            axes[1].set_ylabel('kNN Jaccard')
+            axes[1].set_title('Distance Corr vs Neighbor Agreement')
+            axes[1].grid(alpha=0.3)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        print("="*70 + "\n")
 
     # Compute median patch RMS as target scale for global alignment
     patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
@@ -3988,6 +4359,56 @@ def sample_sc_edm_patchwise(
                 f"p90={R_norms_t.quantile(0.9).item():.3f} "
                 f"t_norm: p50={t_norms_t.quantile(0.5).item():.3f} "
                 f"p90={t_norms_t.quantile(0.9).item():.3f}")
+            
+        # ===================================================================
+        # DIAGNOSTIC C: STITCHING QUALITY
+        # ===================================================================
+        if DEBUG_FLAG and it == 0:  # Only on first iteration
+            print(f"\n[DIAGNOSTIC C] Stitching Analysis (Iteration {it+1}):")
+            
+            # C2: Per-cell multi-patch disagreement
+            sum_x = torch.zeros(n_sc, D_latent, dtype=torch.float32, device=device)
+            sum_x2 = torch.zeros(n_sc, D_latent, dtype=torch.float32, device=device)
+            count = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
+            
+            for k_idx in range(K):
+                S_k = patch_indices[k_idx].to(device)
+                V_k = patch_coords[k_idx].to(device)
+                R_k = R_list[k_idx].to(device)
+                t_k = t_list[k_idx].to(device)
+                s_k = s_list[k_idx].to(device)
+                
+                X_hat = s_k * (V_k @ R_k.T) + t_k
+                
+                sum_x.index_add_(0, S_k, X_hat)
+                sum_x2.index_add_(0, S_k, X_hat**2)
+                count.index_add_(0, S_k, torch.ones(len(S_k), 1, device=device))
+            
+            mean = sum_x / count.clamp_min(1)
+            var = (sum_x2 / count.clamp_min(1)) - mean**2
+            cell_var = var.mean(dim=1).cpu().numpy()
+            
+            print(f"  Per-cell disagreement:")
+            print(f"    p50: {np.median(cell_var):.4f}")
+            print(f"    p90: {np.percentile(cell_var, 90):.4f}")
+            print(f"    p95: {np.percentile(cell_var, 95):.4f}")
+            
+            if np.median(cell_var) > 0.5:
+                print("  ⚠️  HIGH VARIANCE: Patches strongly disagree → STITCHING PROBLEM")
+            
+            # Plot
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(10, 4))
+            plt.hist(cell_var, bins=50, edgecolor='black', alpha=0.7, color='purple')
+            plt.axvline(np.median(cell_var), color='red', linestyle='--', 
+                       label=f'Median={np.median(cell_var):.3f}')
+            plt.xlabel('Per-cell Variance')
+            plt.ylabel('Count')
+            plt.title('Multi-Patch Coordinate Disagreement')
+            plt.legend()
+            plt.grid(alpha=0.3)
+            plt.tight_layout()
+            plt.show()
 
         # ======================================================================
         # Step B: update X from all patch transforms (centrality-weighted)
@@ -4095,11 +4516,10 @@ def sample_sc_edm_patchwise(
         torch.save(
             {
                 "D_edm": D_edm.cpu(),
-                "seed": seed,
             },
-            f"debug_final_edm_seed{seed}.pt",
+            f"debug_final_edm_seed.pt",
         )
-        print(f"[DEBUG] Saved final EDM to debug_final_edm_seed{seed}.pt")
+        print(f"[DEBUG] Saved final EDM to debug_final_edm_seed.pt")
 
     # ------------------------------------------------------------------
     # 7) Debug stats and optional 2D coords

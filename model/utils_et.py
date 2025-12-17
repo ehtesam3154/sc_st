@@ -356,6 +356,95 @@ def denormalize_coordinates(coords_norm: torch.Tensor, center: torch.Tensor, rad
     return coords_norm * radius + center
 
 
+
+
+# ==============================================================================
+# EDM PRECONDITIONING HELPERS (Karras et al. 2022)
+# ==============================================================================
+
+def edm_precond(sigma: torch.Tensor, sigma_data: float):
+    """
+    Compute EDM preconditioning scalars.
+    
+    Args:
+        sigma: (B,) or (B,1) or (B,1,1) noise levels
+        sigma_data: scalar, std of data distribution
+        
+    Returns:
+        c_skip, c_out, c_in, c_noise (all broadcastable to (B,1,1))
+    """
+    # Ensure sigma has shape (B, 1, 1) for broadcasting
+    if sigma.dim() == 1:
+        sigma = sigma.view(-1, 1, 1)
+    elif sigma.dim() == 2:
+        sigma = sigma.unsqueeze(-1)
+    
+    sigma_data_sq = sigma_data ** 2
+    sigma_sq = sigma ** 2
+    
+    c_skip = sigma_data_sq / (sigma_sq + sigma_data_sq)
+    c_out = sigma * sigma_data / (sigma_sq + sigma_data_sq).sqrt()
+    c_in = 1.0 / (sigma_sq + sigma_data_sq).sqrt()
+    c_noise = 0.25 * sigma.squeeze(-1).log()  # (B, 1) for time embedding
+    
+    return c_skip, c_out, c_in, c_noise
+
+
+def edm_loss_weight(sigma: torch.Tensor, sigma_data: float) -> torch.Tensor:
+    """
+    EDM loss weighting: (σ² + σ_d²) / (σ · σ_d)²
+    
+    Args:
+        sigma: (B,) or (B,1) noise levels
+        sigma_data: scalar
+        
+    Returns:
+        weight: (B,) or (B,1)
+    """
+    sigma = sigma.view(-1)
+    weight = (sigma ** 2 + sigma_data ** 2) / ((sigma * sigma_data) ** 2)
+    return weight
+
+
+def sample_sigma_lognormal(
+    batch_size: int,
+    P_mean: float = -1.2,
+    P_std: float = 1.2,
+    device: str = 'cuda'
+) -> torch.Tensor:
+    """
+    Sample σ from log-normal distribution (EDM default).
+    ln(σ) ~ N(P_mean, P_std²)
+    
+    Returns:
+        sigma: (batch_size,)
+    """
+    rnd_normal = torch.randn(batch_size, device=device)
+    sigma = (rnd_normal * P_std + P_mean).exp()
+    return sigma
+
+
+def edm_sigma_schedule(
+    num_steps: int,
+    sigma_min: float = 0.002,
+    sigma_max: float = 80.0,
+    rho: float = 7.0,
+    device: str = 'cuda'
+) -> torch.Tensor:
+    """
+    EDM Karras sigma schedule for sampling.
+    σ_i = (σ_max^(1/ρ) + i/(N-1) * (σ_min^(1/ρ) - σ_max^(1/ρ)))^ρ
+    
+    Returns:
+        sigmas: (num_steps,) decreasing from sigma_max to sigma_min
+    """
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
+    t_steps = (
+        sigma_max ** (1.0 / rho) + 
+        step_indices / (num_steps - 1) * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))
+    ) ** rho
+    return t_steps.float()
+
 # ==============================================================================
 # PART 2: GRAPH & ADJACENCY CONSTRUCTION
 # ==============================================================================
@@ -729,6 +818,7 @@ def build_topk_index(
     device = _get_device_for_build(Z_all)
     Z = Z_all.to(device, non_blocking=True).contiguous()
     Z = Z.float()  # AMP-safe & numerically stable for similarity
+    assert torch.isfinite(Z).all(), "Non-finite values in Z before normalize"
     N, d = Z.shape
 
     # Clamp args to dataset size
@@ -741,15 +831,18 @@ def build_topk_index(
 
     if rank == 0:
         if metric == "cosine":
-            Zn = F.normalize(Z, dim=1)
+            Zn = F.normalize(Z, dim=1, eps=1e-8)
+            assert torch.isfinite(Zn).all(), "Non-finite values after normalize"
             Zt = Zn.t().contiguous()                     # (d, N)
             chunks = []
             for s in range(0, N, block):
                 e = min(s + block, N)
-                # (b, N) similarities
-                S = Zn[s:e] @ Zt                         # CUDA GEMM
-                # NOTE: includes self; OK for our sampler
-                _, idx = torch.topk(S, K, dim=1, largest=True, sorted=False)
+                S = Zn[s:e] @ Zt                         # CUDA GEMM (b, N)
+                # Exclude self explicitly
+                rows_global = torch.arange(s, e, device=device)
+                S[torch.arange(e - s, device=device), rows_global] = -1e9
+                # sorted=True to avoid biased prefix slicing
+                _, idx = torch.topk(S, K, dim=1, largest=True, sorted=True)
                 chunks.append(idx)
             nbr_idx_cuda = torch.cat(chunks, dim=0)      # (N, K) on device
         else:  # 'l2'
@@ -757,7 +850,10 @@ def build_topk_index(
             for s in range(0, N, block):
                 e = min(s + block, N)
                 D = torch.cdist(Z[s:e], Z)               # (b, N)
-                _, idx = torch.topk(D, K, dim=1, largest=False, sorted=False)
+                # Exclude self
+                rows_global = torch.arange(s, e, device=device)
+                D[torch.arange(e - s, device=device), rows_global] = 1e10
+                _, idx = torch.topk(D, K, dim=1, largest=False, sorted=True)
                 nbr_idx_cuda[s:e] = idx
 
         # allocate the broadcast buffer on device
@@ -2310,80 +2406,6 @@ def compute_edm_tail_loss(
     return total_loss / valid_samples
 
 
-# def compute_edm_tail_loss(
-#     V_pred: torch.Tensor,      # (B, N, D)
-#     V_target: torch.Tensor,    # (B, N, D)
-#     mask: torch.Tensor,        # (B, N) bool
-#     tail_quantile: float = 0.80,
-#     weight_tail: float = 1.0,    # smaller than 2.0
-#     clip_quantile: float = 0.995 # clip extreme outliers
-# ) -> torch.Tensor:
-#     """
-#     Weighted MSE on pairwise distances, emphasizing far pairs in target.
-#     Distances are normalized by median(target_distances) to stabilize scale.
-#     """
-#     B, N, D = V_pred.shape
-#     device = V_pred.device
-
-#     total_loss = V_pred.new_tensor(0.0)
-#     valid_samples = 0
-
-#     for b in range(B):
-#         m = mask[b]
-#         n_valid = int(m.sum())
-#         if n_valid < 2:
-#             continue
-
-#         Vp = V_pred[b, m]    # (n_valid, D)
-#         Vt = V_target[b, m]  # (n_valid, D)
-
-#         Dp = torch.cdist(Vp, Vp)
-#         Dt = torch.cdist(Vt, Vt)
-
-#         triu = torch.triu(
-#             torch.ones_like(Dt, dtype=torch.bool), diagonal=1
-#         )
-#         d_p = Dp[triu]
-#         d_t = Dt[triu]
-
-#         if d_t.numel() == 0:
-#             continue
-
-#         # robust scale and optional clipping
-#         med = d_t.median()
-#         med = med.clamp_min(1e-6)
-#         d_t = d_t / med
-#         d_p = d_p / med
-
-#         if clip_quantile is not None:
-#             q_clip = torch.quantile(d_t, clip_quantile)
-#             keep = d_t <= q_clip
-#             d_t = d_t[keep]
-#             d_p = d_p[keep]
-#             if d_t.numel() == 0:
-#                 continue
-
-#         # far tail mask
-#         q_hi = torch.quantile(d_t, tail_quantile)
-#         is_tail = d_t >= q_hi
-
-#         diff_sq = (d_p - d_t) ** 2
-#         w = torch.where(
-#             is_tail,
-#             d_p.new_tensor(weight_tail),
-#             d_p.new_tensor(1.0)
-#         )
-#         loss_b = (w * diff_sq).mean()
-
-#         total_loss += loss_b
-#         valid_samples += 1
-
-#     if valid_samples == 0:
-#         return V_pred.new_tensor(0.0)
-
-#     return total_loss / valid_samples
-
-
 def procrustes_alignment_loss(
     V_pred: torch.Tensor,      # (B, N, D_latent) from generator
     V_target: torch.Tensor,    # (B, N, D_latent) from factor_from_gram
@@ -2905,23 +2927,12 @@ class TriangleAreaLoss(nn.Module):
         area_sq = s * (s - a) * (s - b) * (s - c)  # (T,)
         area_sq = area_sq.clamp(min=0.0)  # prevent negative from numerical errors
         A = torch.sqrt(area_sq + 1e-12)  # (T,)
-        
-        # Normalize by scale to make dimensionless (DIFFERENTIABLE)
-        # avg_edge = (a + b + c) / 3.0  # (T,)
-        # scale = (avg_edge ** 2).clamp(min=1e-8)  # (T,)
-        # A_normalized = A / scale  # (T,)
-
 
         # Normalize by scale to make dimensionless (DIFFERENTIABLE)
         avg_edge = (a + b + c) / 3.0  # (T,)
         scale = (avg_edge ** 2).clamp(min=1e-8)  # (T,)
         A_normalized = A / scale  # (T,)
  
-        # DEBUG: Occasionally log raw vs normalized areas
-        # if torch.rand(1).item() < 0.005:  # 0.5% of calls
-        #     print(f"[Triangle DEBUG] Raw area: mean={A.mean().item():.6f}, "
-        #           f"Normalized: mean={A_normalized.mean().item():.6f}, "
-        #           f"avg_edge mean={avg_edge.mean().item():.4f}")
         
         return A_normalized  # (T,) - TENSOR with gradient graph intact
 
@@ -3056,8 +3067,6 @@ class RadialHistogramLoss(nn.Module):
         bin_centers = torch.linspace(0.0, 1.0, num_bins, device=device)
         
         # Compute distance from each value to each bin center
-        # values: (N,) -> (N, 1)
-        # bin_centers: (num_bins,) -> (1, num_bins)
         dist = (values.unsqueeze(1) - bin_centers.unsqueeze(0)).abs()  # (N, num_bins)
         
         # Soft assignment using Gaussian kernel
@@ -3188,31 +3197,7 @@ class EdgeLengthLoss(nn.Module):
             
             if i_edges.numel() == 0:
                 continue
-            
-            # # Map global indices to local
-            # global_to_local = torch.full((N,), -1, dtype=torch.long, device=device)
-            # valid_idx = torch.where(m_b)[0]
-            # global_to_local[valid_idx] = torch.arange(n_valid, device=device)
-            
-            # knn_local = global_to_local[knn_b]  # (n_valid, k)
-            
-            # # Filter out invalid neighbors (-1)
-            # valid_neighbors = (knn_local >= 0)  # (n_valid, k)
-            
-            # if not valid_neighbors.any():
-            #     continue
-            
-            # # Gather coordinates
-            # i_local = torch.arange(n_valid, device=device).unsqueeze(1).expand(n_valid, k)
-            
-            # # Only compute for valid edges
-            # edge_mask = valid_neighbors
-            # i_edges = i_local[edge_mask]  # (num_edges,)
-            # j_edges = knn_local[edge_mask]  # (num_edges,)
-            
-            # if len(i_edges) == 0:
-            #     continue
-            
+                        
             # Compute edge lengths
             x_i_pred = V_pred_b[i_edges]  # (num_edges, D)
             x_j_pred = V_pred_b[j_edges]
@@ -3718,3 +3703,130 @@ class ShapeSpectrumLoss(nn.Module):
         return final_loss
 
     
+# ==============================================================================
+# CORAL: Covariance Alignment for Context Distribution Shift
+# ==============================================================================
+
+class ContextCORAL(torch.nn.Module):
+    """
+    CORAL (CORrelation ALignment) for aligning SC context distribution to ST.
+    
+    Transforms SC contexts: (x - μ_sc) @ C_sc^{-1/2} @ C_st^{1/2} + μ_st
+    
+    Usage:
+        coral = ContextCORAL.from_datasets(st_contexts, sc_contexts)
+        sc_ctx_aligned = coral(sc_ctx)
+    """
+    
+    def __init__(self, mu_sc, cov_sc, mu_st, cov_st, eps=1e-5, shrink=0.01):
+        super().__init__()
+        D = cov_sc.shape[0]
+        I = torch.eye(D, device=cov_sc.device, dtype=cov_sc.dtype)
+        
+        # Add shrinkage for numerical stability
+        cov_sc = (1 - shrink) * cov_sc + shrink * I
+        cov_st = (1 - shrink) * cov_st + shrink * I
+        
+        # Compute transform matrices
+        A = self._invsqrtm_psd(cov_sc, eps=eps)  # C_sc^{-1/2}
+        B = self._sqrtm_psd(cov_st, eps=eps)     # C_st^{1/2}
+        
+        self.register_buffer("mu_sc", mu_sc)
+        self.register_buffer("mu_st", mu_st)
+        self.register_buffer("A", A)
+        self.register_buffer("B", B)
+    
+    @staticmethod
+    def _sqrtm_psd(C, eps=1e-5):
+        """Compute matrix square root of PSD matrix."""
+        evals, evecs = torch.linalg.eigh(C)
+        evals = torch.clamp(evals, min=eps)
+        return (evecs * torch.sqrt(evals)) @ evecs.T
+    
+    @staticmethod
+    def _invsqrtm_psd(C, eps=1e-5):
+        """Compute inverse matrix square root of PSD matrix."""
+        evals, evecs = torch.linalg.eigh(C)
+        evals = torch.clamp(evals, min=eps)
+        return (evecs * (1.0 / torch.sqrt(evals))) @ evecs.T
+    
+    def forward(self, ctx):
+        """
+        Apply CORAL transformation.
+        
+        Args:
+            ctx: (B, D) or (B, N, D) context tensor
+            
+        Returns:
+            ctx_aligned: transformed context
+        """
+        if ctx.dim() == 2:
+            # (B, D) case
+            x = ctx - self.mu_sc
+            return x @ self.A @ self.B + self.mu_st
+        elif ctx.dim() == 3:
+            # (B, N, D) case
+            Bsz, N, D = ctx.shape
+            x = ctx.reshape(-1, D) - self.mu_sc
+            y = x @ self.A @ self.B + self.mu_st
+            return y.reshape(Bsz, N, D)
+        else:
+            raise ValueError(f"Unexpected context shape: {ctx.shape}")
+    
+    @classmethod
+    def from_datasets(cls, st_contexts, sc_contexts, eps=1e-5, shrink=0.01, device='cuda'):
+        """
+        Build CORAL transform from ST and SC context samples.
+        
+        Args:
+            st_contexts: (N_st, D) or list of (n_i, D) tensors
+            sc_contexts: (N_sc, D) or list of (n_i, D) tensors
+            
+        Returns:
+            ContextCORAL instance
+        """
+        # Flatten if list
+        if isinstance(st_contexts, list):
+            st_contexts = torch.cat(st_contexts, dim=0)
+        if isinstance(sc_contexts, list):
+            sc_contexts = torch.cat(sc_contexts, dim=0)
+        
+        # Move to device
+        st_contexts = st_contexts.to(device)
+        sc_contexts = sc_contexts.to(device)
+        
+        # Compute statistics
+        mu_st = st_contexts.mean(dim=0)
+        mu_sc = sc_contexts.mean(dim=0)
+        
+        st_centered = st_contexts - mu_st
+        sc_centered = sc_contexts - mu_sc
+        
+        cov_st = (st_centered.T @ st_centered) / (st_contexts.shape[0] - 1)
+        cov_sc = (sc_centered.T @ sc_centered) / (sc_contexts.shape[0] - 1)
+        
+        return cls(mu_sc, cov_sc, mu_st, cov_st, eps=eps, shrink=shrink)
+    
+    def save(self, path):
+        """Save CORAL parameters."""
+        torch.save({
+            'mu_sc': self.mu_sc,
+            'mu_st': self.mu_st,
+            'A': self.A,
+            'B': self.B,
+        }, path)
+    
+    @classmethod
+    def load(cls, path, device='cuda'):
+        """Load CORAL parameters."""
+        data = torch.load(path, map_location=device)
+        
+        # Reconstruct from saved A, B matrices
+        coral = cls.__new__(cls)
+        torch.nn.Module.__init__(coral)
+        coral.register_buffer("mu_sc", data['mu_sc'])
+        coral.register_buffer("mu_st", data['mu_st'])
+        coral.register_buffer("A", data['A'])
+        coral.register_buffer("B", data['B'])
+        
+        return coral
