@@ -18,7 +18,7 @@ from core_models_et_p1 import (
 #     train_stageC_diffusion_generator
 # )
 
-from core_models_et_p2_v2 import (
+from core_models_et_p2 import (
     SetEncoderContext, MetricSetGenerator, DiffusionScoreNet
 )
 from core_models_et_p2 import train_stageC_diffusion_generator

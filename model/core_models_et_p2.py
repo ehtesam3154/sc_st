@@ -1237,9 +1237,6 @@ def train_stageC_diffusion_generator(
     history = {
         'epoch': [],
         'batch_losses': [],
-        'sigma_data': [],
-        'sigma_min': [],
-        'sigma_max': [],
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
@@ -3201,9 +3198,9 @@ def train_stageC_diffusion_generator(
         debug_state['overlap_count_this_epoch'] = 0
         # -----------------------------------------------------------------------
 
-        history['sigma_data'] = sigma_data
-        history['sigma_min'] = sigma_min
-        history['sigma_max'] = sigma_max
+        # history['sigma_data'] = sigma_data
+        # history['sigma_min'] = sigma_min
+        # history['sigma_max'] = sigma_max
 
         # DEBUG: Epoch summary
         if DEBUG:
@@ -3316,6 +3313,8 @@ def train_stageC_diffusion_generator(
                     'optimizer': optimizer.state_dict(),
                     'history': history,
                     'sigma_data': sigma_data,
+                    'sigma_min': sigma_min,
+                    'sigma_max': sigma_max,
                 }
                 torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
     
@@ -3362,8 +3361,12 @@ def train_stageC_diffusion_generator(
         fabric.barrier()
         print(f"[DEBUG train_stageC POST-LOOP] Rank {fabric.global_rank} - AFTER post-loop barrier")
 
+    history['sigma_data'] = sigma_data
+    history['sigma_min'] = sigma_min
+    history['sigma_max'] = sigma_max
 
-    return history if _is_rank0() else None
+    # return history if _is_rank0() else None
+    return history
 
 
 # ==============================================================================
@@ -3644,12 +3647,6 @@ def sample_sc_edm_patchwise(
 
         K = len(patch_indices)
         print(f"[PATCHWISE] Built new patch graph with {K} patches")
-        # Reload pre-computed patch graph
-        patch_indices = [p.to(torch.long) for p in fixed_patch_graph["patch_indices"]]
-        memberships = fixed_patch_graph["memberships"]
-        K = len(patch_indices)
-        if DEBUG_FLAG:
-            print(f"[PATCH] Loaded fixed patch graph: K={K} patches")
 
         # ===================================================================
         # DIAGNOSTIC A: PATCH GRAPH ANALYSIS
