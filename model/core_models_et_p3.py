@@ -371,6 +371,17 @@ class GEMSModel:
             early_stop_patience=early_stop_patience,
             early_stop_threshold=early_stop_threshold,
         )
+
+        # Store sigma_data for inference
+        # if 'sigma_data' in history:
+        #     self.sigma_data = history['sigma_data']
+
+        # Store EDM parameters for inference
+        self.sigma_data = history.get('sigma_data', 1.0)
+        self.sigma_min = history.get('sigma_min', 0.002)
+        self.sigma_max = history.get('sigma_max', 80.0)
+
+        print(f"[EDM] Stored: sigma_data={self.sigma_data:.4f}, sigma_min={self.sigma_min:.6f}, sigma_max={self.sigma_max:.2f}")
         
         print("Stage C complete.")
 
@@ -385,6 +396,9 @@ class GEMSModel:
             'generator': self.generator.state_dict(),
             'score_net': self.score_net.state_dict(),
             'cfg': self.cfg,  # ADD THIS
+            'sigma_data': getattr(self, 'sigma_data', None),
+            'sigma_min': getattr(self, 'sigma_min', None), 
+            'sigma_max': getattr(self, 'sigma_max', None),
         }
         torch.save(checkpoint, path)
         print(f"Model saved to {path}")
@@ -398,6 +412,10 @@ class GEMSModel:
         self.score_net.load_state_dict(checkpoint['score_net'])
         if 'sigma_data' in checkpoint:
             self.sigma_data = checkpoint['sigma_data']
+        if 'sigma_min' in checkpoint:
+            self.sigma_min = checkpoint['sigma_min']
+        if 'sigma_max' in checkpoint:
+            self.sigma_max = checkpoint['sigma_max']
         
         # Load config if available
         if 'cfg' in checkpoint:
@@ -471,8 +489,8 @@ class GEMSModel:
         self,
         sc_gene_expr: torch.Tensor,
         n_timesteps_sample: int = 160,
-        sigma_min: float = 0.01,
-        sigma_max: float = 5.0,
+        sigma_min: float = None,
+        sigma_max: float = None,
         return_coords: bool = True,
         patch_size: int = 384,
         coverage_per_cell: float = 4.0,
@@ -503,6 +521,14 @@ class GEMSModel:
         target_st_p95 = getattr(self, "target_st_p95", None)
 
         sigma_data = getattr(self, 'sigma_data', None)
+
+        # Use model's EDM parameters if not provided
+        if sigma_min is None:
+            sigma_min = getattr(self, 'sigma_min', 0.002)
+        if sigma_max is None:
+            sigma_max = getattr(self, 'sigma_max', 80.0)
+        
+        print(f"[Inference] Using sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.2f}, sigma_data={sigma_data:.4f}")
 
         if sigma_data is None:
             raise ValueError("sigma_data not set - load from checkpoint or compute from data")

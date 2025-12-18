@@ -353,8 +353,8 @@ def main(args=None):
         batch_size=stageC_batch,
         lr=lr,
         n_timesteps=500,
-        sigma_min=0.01,
-        sigma_max=3.0,
+        sigma_min=0.002,
+        sigma_max=80.0,
         outf=outdir,
         fabric=fabric,
         precision=precision,
@@ -384,6 +384,9 @@ def main(args=None):
             'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
             'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
             'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
+            'sigma_data': getattr(model, 'sigma_data', None),
+            'sigma_min': getattr(model, 'sigma_min', None),     # ADD
+            'sigma_max': getattr(model, 'sigma_max', None),     # ADD
             'E_ST_best': E_ST_best,
             'lr_ST': lr,
             'history_st': history_st,
@@ -439,20 +442,20 @@ def main(args=None):
                 print("PHASE 2 SKIPPED - Copying Phase 1 checkpoint")
                 print("="*70)
                 
-                checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
-                checkpoint = {
-                    'encoder': model.encoder.state_dict(),
-                    'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
-                    'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
-                    'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
-                    'E_ST_best': E_ST_best,
-                    'epochs_finetune': 0,
-                    'lr_finetune': lr / 3.0,
-                    'history_st': history_st,
-                    'history_sc': history_st,
-                }
-                torch.save(checkpoint, checkpoint_path)
-                print(f"✓ Saved checkpoint (copy of Phase 1): {checkpoint_path}")
+                # checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
+                # checkpoint = {
+                #     'encoder': model.encoder.state_dict(),
+                #     'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
+                #     'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
+                #     'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
+                #     'E_ST_best': E_ST_best,
+                #     'epochs_finetune': 0,
+                #     'lr_finetune': lr / 3.0,
+                #     'history_st': history_st,
+                #     'history_sc': history_st,
+                # }
+                # torch.save(checkpoint, checkpoint_path)
+                # print(f"✓ Saved checkpoint (copy of Phase 1): {checkpoint_path}")
             
             fabric.barrier()
         else:
@@ -491,8 +494,8 @@ def main(args=None):
                 batch_size=stageC_batch,
                 lr=lr_finetune,
                 n_timesteps=500,
-                sigma_min=0.01,
-                sigma_max=3.0,
+                sigma_min=0.002,
+                sigma_max=80.0,
                 outf=outdir,
                 fabric=fabric,
                 precision=precision,
@@ -577,8 +580,32 @@ def main(args=None):
 
         print("\n=== Inference (rank-0) with Multi-Sample Ranking ===")
 
-        if True:
+        # ===== COMPUTE CORAL PARAMETERS =====
+        print("\n" + "="*70)
+        print("COMPUTING CORAL TRANSFORMATION PARAMETERS")
+        print("="*70)
 
+        # Compute ST distribution
+        model.compute_coral_params_from_st(
+            st_gene_expr_dict=st_gene_expr_dict,
+            n_samples=2000,
+            n_min=96,
+            n_max=384,
+        )
+
+        # Compute SC distribution and build transform
+        model.build_coral_transform(
+            sc_gene_expr=sc_expr,
+            n_samples=2000,
+            n_min=96,
+            n_max=384,
+            shrink=0.01,
+            eps=1e-5,
+        )
+
+        print("✓ CORAL transformation ready for SC inference")
+
+        if True:
             # Multi-sample inference with quality ranking
             K_samples = 1  # Number of samples to generate
             all_results = []
@@ -594,6 +621,14 @@ def main(args=None):
 
                 n_cells = sc_expr.shape[0]
 
+                # After loading checkpoint, restore EDM params to model
+                if 'sigma_data' in checkpoint:
+                    model.sigma_data = checkpoint['sigma_data']
+                if 'sigma_min' in checkpoint:
+                    model.sigma_min = checkpoint['sigma_min']
+                if 'sigma_max' in checkpoint:
+                    model.sigma_max = checkpoint['sigma_max']
+
                 sample_results = model.infer_sc_patchwise(
                     sc_gene_expr=sc_expr,
                     n_timesteps_sample=500,
@@ -604,8 +639,8 @@ def main(args=None):
                     n_align_iters=10,        # can tune 5–15
                     eta=0.0,
                     guidance_scale=2.0,
-                    sigma_min=0.01,
-                    sigma_max=3.0,
+                    # sigma_min=0.01,
+                    # sigma_max=3.0,
                 )
                 
                 # Compute EDM cone penalty as quality score (lower is better)
@@ -1295,6 +1330,7 @@ def main(args=None):
                     output_dir=outdir,
                     timestamp=timestamp
                 )
+
             
             # ============================================================================
             # SUMMARY STATISTICS

@@ -362,46 +362,49 @@ def denormalize_coordinates(coords_norm: torch.Tensor, center: torch.Tensor, rad
 # EDM PRECONDITIONING HELPERS (Karras et al. 2022)
 # ==============================================================================
 
+
 def edm_precond(sigma: torch.Tensor, sigma_data: float):
     """
-    Compute EDM preconditioning scalars.
+    Compute EDM preconditioning scalars - matches NVIDIA EDMPrecond exactly.
     
     Args:
-        sigma: (B,) or (B,1) or (B,1,1) noise levels
+        sigma: (B,) noise levels
         sigma_data: scalar, std of data distribution
         
     Returns:
-        c_skip, c_out, c_in, c_noise (all broadcastable to (B,1,1))
+        c_skip, c_out, c_in: (B, 1, 1) for broadcasting with (B, N, D)
+        c_noise: (B, 1) for time embedding
     """
-    # Ensure sigma has shape (B, 1, 1) for broadcasting
-    if sigma.dim() == 1:
-        sigma = sigma.view(-1, 1, 1)
-    elif sigma.dim() == 2:
-        sigma = sigma.unsqueeze(-1)
+    # Force (B,) shape and float32
+    sigma = sigma.reshape(-1).to(torch.float32)
     
-    sigma_data_sq = sigma_data ** 2
-    sigma_sq = sigma ** 2
+    # Reshape for broadcasting: (B,) -> (B, 1, 1)
+    sigma_3d = sigma.view(-1, 1, 1)
     
-    c_skip = sigma_data_sq / (sigma_sq + sigma_data_sq)
-    c_out = sigma * sigma_data / (sigma_sq + sigma_data_sq).sqrt()
-    c_in = 1.0 / (sigma_sq + sigma_data_sq).sqrt()
-    c_noise = 0.25 * sigma.squeeze(-1).log()  # (B, 1) for time embedding
+    # NVIDIA formulas exactly
+    c_skip = sigma_data ** 2 / (sigma_3d ** 2 + sigma_data ** 2)
+    c_out = sigma_3d * sigma_data / (sigma_3d ** 2 + sigma_data ** 2).sqrt()
+    c_in = 1.0 / (sigma_data ** 2 + sigma_3d ** 2).sqrt()
+    c_noise = sigma.log() / 4  # (B,) -> will be (B, 1) after view
+    c_noise = c_noise.view(-1, 1)
     
     return c_skip, c_out, c_in, c_noise
 
 
 def edm_loss_weight(sigma: torch.Tensor, sigma_data: float) -> torch.Tensor:
     """
-    EDM loss weighting: (σ² + σ_d²) / (σ · σ_d)²
+    EDM loss weighting - matches NVIDIA EDMLoss exactly.
+    
+    weight = (σ² + σ_d²) / (σ · σ_d)²
     
     Args:
-        sigma: (B,) or (B,1) noise levels
+        sigma: (B,) or (B,1,...) noise levels
         sigma_data: scalar
         
     Returns:
-        weight: (B,) or (B,1)
+        weight: (B,)
     """
-    sigma = sigma.view(-1)
+    sigma = sigma.reshape(-1).to(torch.float32)
     weight = (sigma ** 2 + sigma_data ** 2) / ((sigma * sigma_data) ** 2)
     return weight
 
@@ -413,7 +416,7 @@ def sample_sigma_lognormal(
     device: str = 'cuda'
 ) -> torch.Tensor:
     """
-    Sample σ from log-normal distribution (EDM default).
+    Sample σ from log-normal distribution - matches NVIDIA EDMLoss exactly.
     ln(σ) ~ N(P_mean, P_std²)
     
     Returns:
@@ -432,18 +435,21 @@ def edm_sigma_schedule(
     device: str = 'cuda'
 ) -> torch.Tensor:
     """
-    EDM Karras sigma schedule for sampling.
-    σ_i = (σ_max^(1/ρ) + i/(N-1) * (σ_min^(1/ρ) - σ_max^(1/ρ)))^ρ
+    EDM Karras sigma schedule for sampling - matches NVIDIA generate.py exactly.
+    
+    σ_i = (σ_max^(1/ρ) + i/(N-1) · (σ_min^(1/ρ) - σ_max^(1/ρ)))^ρ
     
     Returns:
-        sigmas: (num_steps,) decreasing from sigma_max to sigma_min
+        sigmas: (num_steps + 1,) decreasing from sigma_max to sigma_min, then 0
     """
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
     t_steps = (
         sigma_max ** (1.0 / rho) + 
         step_indices / (num_steps - 1) * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))
     ) ** rho
-    return t_steps.float()
+    # Append 0 at the end (t_N = 0) - this is critical for final denoising
+    t_steps = torch.cat([t_steps, torch.zeros(1, dtype=torch.float64, device=device)])
+    return t_steps.to(torch.float32)
 
 # ==============================================================================
 # PART 2: GRAPH & ADJACENCY CONSTRUCTION

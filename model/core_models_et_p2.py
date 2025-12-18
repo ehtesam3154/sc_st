@@ -1237,6 +1237,9 @@ def train_stageC_diffusion_generator(
     history = {
         'epoch': [],
         'batch_losses': [],
+        'sigma_data': [],
+        'sigma_min': [],
+        'sigma_max': [],
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
@@ -3028,30 +3031,6 @@ def train_stageC_diffusion_generator(
 
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
-
-            # Add this summary print every 10 epochs
-            # if epoch % 10 == 0:
-            #     # Compute averages
-            #     cv_avg = (epoch_cv_sum / max(epoch_nca_count, 1)) * 100  # Convert to percentage
-            #     loss_nca = epoch_nca_loss_sum / max(epoch_nca_count, 1)
-                
-            #     # Get Q entropy average from global accumulator
-            #     from utils_et import _nca_qent_accum
-            #     if len(_nca_qent_accum) > 0:
-            #         qent_avg = (sum(_nca_qent_accum) / len(_nca_qent_accum)) * 100  # Convert to %
-            #         _nca_qent_accum.clear()  # Reset for next epoch
-            #     else:
-            #         qent_avg = 100.0  # Default if no data
-                
-                # print(f"\n{'='*60}")
-                # print(f"EPOCH {epoch} PROGRESS CHECK")
-                # print(f"{'='*60}")
-                # print(f"Metric          | Current | Target  | Status")
-                # print(f"----------------|---------|---------|--------")
-                # print(f"d² CV          | {cv_avg:.1f}%   | >30%    | {'✓' if cv_avg > 30 else '⚠️'}")
-                # print(f"Q entropy ratio| {qent_avg:.1f}% | <70%    | {'✓' if qent_avg < 70 else '⚠️'}")
-                # print(f"NCA loss       | {loss_nca:.2f}  | <3.5    | {'✓' if loss_nca < 3.5 else '⚠️'}")
-                # print(f"{'='*60}\n")
             
             if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
                 # Use total weighted loss as validation metric
@@ -3221,6 +3200,10 @@ def train_stageC_diffusion_generator(
         # reset overlap batch counter for next epoch
         debug_state['overlap_count_this_epoch'] = 0
         # -----------------------------------------------------------------------
+
+        history['sigma_data'] = sigma_data
+        history['sigma_min'] = sigma_min
+        history['sigma_max'] = sigma_max
 
         # DEBUG: Epoch summary
         if DEBUG:
