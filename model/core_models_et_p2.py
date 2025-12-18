@@ -511,7 +511,25 @@ class DiffusionScoreNet(nn.Module):
             ISAB(c_dim, c_dim, n_heads, isab_m, ln=ln)
             for _ in range(n_blocks)
         ])
-        
+
+        #FiLM conditioning layers (per block modulation)
+        # input [H, t_emb] concatenated -> output: gamma, beta for modulation
+        # H is (B, N, c_dim), t_emb is (B, 1, c_dim) -> expanded to (B, N, c_dim)
+        # so FiLM input is 2 * c_dim, output is 2 * c_dim (gamma + beta)
+        self.film_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(2 * c_dim, c_dim),
+                nn.SiLU(),
+                nn.Linear(c_dim, 2 * c_dim)
+            )
+            for _ in range(n_blocks)
+        ])
+
+        # init film output layers to near-zero for stable training
+        for film in self.film_layers:
+            nn.init.zeros_(film[-1].weight)
+            nn.init.zeros_(film[-1].bias)
+
         # Output head: predict noise ε
         self.output_head = nn.Sequential(
             nn.Linear(c_dim, c_dim),
@@ -638,9 +656,19 @@ class DiffusionScoreNet(nn.Module):
             X = self.bias_sab(X, mask=mask, attn_bias=None)
         X = X * mask.unsqueeze(-1).float()
         
-        # Step 4: Apply ISAB blocks with attention bias
-        for isab in self.denoise_blocks:
+        # Step 4: Apply ISAB blocks with film conditioning
+        # build film conditioning input: concatenate H and time embedding (per-point)
+        film_cond = torch.cat([H, t_emb_expanded], dim=-1)
+
+        for i, isab in enumerate(self.denoise_blocks):
+            #apply ISAB block
             X = isab(X, mask=mask, attn_bias=None)
+            X = X * mask.unsqueeze(-1).float()
+
+            #apply film modulation: x= x * (1 + gamma) + beta
+            gamma_beta = self.film_layers[i](film_cond)  # (B, N, 2*c_dim)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)    # each (B, N, c_dim)
+            X = X * (1.0 + gamma) + beta
             X = X * mask.unsqueeze(-1).float()
         
         # Step 5: Output head
@@ -753,6 +781,557 @@ def plot_losses(history, plot_dir, current_epoch):
     plt.close()
     
     print(f"Plots saved to {plot_dir}/")
+
+
+# ==============================================================================
+# FiLM/CFG VERIFICATION: LOCAL METRICS EVALUATION
+# ==============================================================================
+
+@torch.no_grad()
+def evaluate_local_metrics_for_film(
+    score_net: 'DiffusionScoreNet',
+    context_encoder: 'SetEncoderContext',
+    st_loader: torch.utils.data.DataLoader,
+    sigma_data: float,
+    device: str = 'cuda',
+    n_batches: int = 10,
+    k_neighbors: int = 12,
+    sigma_eval: float = 0.1,  # Low noise for evaluation (clear signal)
+) -> dict:
+    """
+    Evaluate local geometry metrics to verify FiLM conditioning effectiveness.
+    
+    This checks:
+    1. kNN-edge correlation: Do predicted kNN distances correlate with GT?
+    2. Shortest-distance quantile correlation: Local structure preservation
+    3. Conditional vs unconditional difference at various noise levels
+    
+    Args:
+        score_net: The diffusion model with FiLM layers
+        context_encoder: Context encoder
+        st_loader: ST data loader
+        sigma_data: Data standard deviation for EDM
+        device: CUDA device
+        n_batches: Number of batches to evaluate
+        k_neighbors: k for kNN metrics
+        sigma_eval: Noise level for evaluation (lower = cleaner signal)
+        
+    Returns:
+        dict with metrics
+    """
+    from scipy.stats import pearsonr, spearmanr
+    import numpy as np
+    
+    score_net.eval()
+    context_encoder.eval()
+    
+    results = {
+        'knn_edge_pearson': [],
+        'knn_edge_spearman': [],
+        'shortest_q10_pearson': [],
+        'shortest_q25_pearson': [],
+        'cond_uncond_diff_abs': [],
+        'cond_uncond_diff_rel': [],
+    }
+    
+    batch_iter = iter(st_loader)
+    
+    for batch_idx in range(n_batches):
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            break
+            
+        Z_set = batch['Z_set'].to(device)
+        mask = batch['mask'].to(device)
+        V_target = batch['V_target'].to(device)
+        
+        B, N, D = V_target.shape
+        
+        # Context encoding
+        H = context_encoder(Z_set, mask)
+        
+        # Add noise at evaluation sigma
+        sigma = torch.full((B,), sigma_eval, device=device)
+        sigma_t = sigma.view(-1, 1, 1)
+        eps = torch.randn_like(V_target)
+        V_t = V_target + sigma_t * eps
+        V_t = V_t * mask.unsqueeze(-1).float()
+        
+        sigma_flat = sigma
+        
+        # Get conditional prediction
+        x0_cond = score_net.forward_edm(V_t, sigma_flat, H, mask, sigma_data, self_cond=None)
+        
+        # Get unconditional prediction
+        H_zero = torch.zeros_like(H)
+        x0_uncond = score_net.forward_edm(V_t, sigma_flat, H_zero, mask, sigma_data, self_cond=None)
+        
+        # Compute cond vs uncond difference
+        mask_exp = mask.unsqueeze(-1).float()
+        n_valid = mask_exp.sum()
+        diff_abs = ((x0_cond - x0_uncond).abs() * mask_exp).sum() / n_valid.clamp(min=1)
+        cond_norm = (x0_cond.abs() * mask_exp).sum() / n_valid.clamp(min=1)
+        diff_rel = diff_abs / (cond_norm + 1e-8)
+        
+        results['cond_uncond_diff_abs'].append(diff_abs.item())
+        results['cond_uncond_diff_rel'].append(diff_rel.item())
+        
+        # Per-sample local metrics
+        for b in range(B):
+            m = mask[b]
+            n_valid_b = m.sum().item()
+            if n_valid_b < k_neighbors + 1:
+                continue
+                
+            # Ground truth coordinates
+            V_gt = V_target[b, m].cpu().numpy()  # (n, D)
+            # Predicted coordinates (conditional)
+            V_pred = x0_cond[b, m].cpu().numpy()  # (n, D)
+            
+            n = V_gt.shape[0]
+            
+            # Compute pairwise distances
+            from scipy.spatial.distance import pdist, squareform
+            D_gt = squareform(pdist(V_gt, metric='euclidean'))
+            D_pred = squareform(pdist(V_pred, metric='euclidean'))
+            
+            # ===== kNN Edge Distance Correlation =====
+            # For each point, get k nearest neighbors in GT, compare distances
+            knn_gt_dists = []
+            knn_pred_dists = []
+            
+            for i in range(n):
+                # Get kNN indices in GT (excluding self)
+                gt_dists = D_gt[i].copy()
+                gt_dists[i] = np.inf  # exclude self
+                knn_idx = np.argsort(gt_dists)[:k_neighbors]
+                
+                # Collect GT and predicted distances for these edges
+                for j in knn_idx:
+                    knn_gt_dists.append(D_gt[i, j])
+                    knn_pred_dists.append(D_pred[i, j])
+            
+            if len(knn_gt_dists) > 10:
+                knn_gt_dists = np.array(knn_gt_dists)
+                knn_pred_dists = np.array(knn_pred_dists)
+                
+                # Pearson and Spearman correlation
+                try:
+                    pearson_r, _ = pearsonr(knn_gt_dists, knn_pred_dists)
+                    spearman_r, _ = spearmanr(knn_gt_dists, knn_pred_dists)
+                    results['knn_edge_pearson'].append(pearson_r)
+                    results['knn_edge_spearman'].append(spearman_r)
+                except:
+                    pass
+            
+            # ===== Shortest Distance Quantile Correlation =====
+            # Compare the shortest X% of all pairwise distances
+            triu_idx = np.triu_indices(n, k=1)
+            all_gt_dists = D_gt[triu_idx]
+            all_pred_dists = D_pred[triu_idx]
+            
+            # Sort by GT distance
+            sort_idx = np.argsort(all_gt_dists)
+            
+            # Q10: shortest 10%
+            n_pairs = len(all_gt_dists)
+            q10_n = max(int(n_pairs * 0.10), 10)
+            q25_n = max(int(n_pairs * 0.25), 20)
+            
+            q10_idx = sort_idx[:q10_n]
+            q25_idx = sort_idx[:q25_n]
+            
+            try:
+                r_q10, _ = pearsonr(all_gt_dists[q10_idx], all_pred_dists[q10_idx])
+                r_q25, _ = pearsonr(all_gt_dists[q25_idx], all_pred_dists[q25_idx])
+                results['shortest_q10_pearson'].append(r_q10)
+                results['shortest_q25_pearson'].append(r_q25)
+            except:
+                pass
+    
+    # Aggregate results
+    summary = {}
+    for key, values in results.items():
+        if values:
+            arr = np.array(values)
+            summary[key] = {
+                'mean': float(np.mean(arr)),
+                'std': float(np.std(arr)),
+                'min': float(np.min(arr)),
+                'max': float(np.max(arr)),
+                'n': len(arr)
+            }
+        else:
+            summary[key] = {'mean': None, 'std': None, 'min': None, 'max': None, 'n': 0}
+    
+    return summary
+
+
+def print_film_evaluation_report(metrics: dict, epoch: int = 0, step: int = 0):
+    """Print a formatted report of FiLM evaluation metrics."""
+    
+    print("\n" + "="*70)
+    print(f"[FiLM EVALUATION REPORT] epoch={epoch} step={step}")
+    print("="*70)
+    
+    # Conditioning effectiveness
+    cond_diff = metrics.get('cond_uncond_diff_abs', {})
+    cond_rel = metrics.get('cond_uncond_diff_rel', {})
+    
+    print("\n[1] CONDITIONING EFFECTIVENESS (cond vs uncond output difference)")
+    if cond_diff.get('mean') is not None:
+        print(f"    Absolute diff: {cond_diff['mean']:.6f} ± {cond_diff['std']:.6f}")
+        print(f"    Relative diff: {cond_rel['mean']*100:.2f}% ± {cond_rel['std']*100:.2f}%")
+        
+        if cond_diff['mean'] < 1e-5:
+            print(f"    ⚠️ FAIL: Conditioning has no effect!")
+        elif cond_rel['mean'] < 0.01:
+            print(f"    ⚠️ WEAK: Conditioning effect < 1%")
+        elif cond_rel['mean'] < 0.05:
+            print(f"    ⚡ MODERATE: Conditioning effect {cond_rel['mean']*100:.1f}%")
+        else:
+            print(f"    ✓ STRONG: Conditioning effect {cond_rel['mean']*100:.1f}%")
+    else:
+        print("    No data")
+    
+    # kNN edge correlation
+    knn_pearson = metrics.get('knn_edge_pearson', {})
+    knn_spearman = metrics.get('knn_edge_spearman', {})
+    
+    print("\n[2] kNN EDGE DISTANCE CORRELATION (local geometry)")
+    if knn_pearson.get('mean') is not None:
+        print(f"    Pearson:  {knn_pearson['mean']:.4f} ± {knn_pearson['std']:.4f} "
+              f"(range: [{knn_pearson['min']:.4f}, {knn_pearson['max']:.4f}])")
+        print(f"    Spearman: {knn_spearman['mean']:.4f} ± {knn_spearman['std']:.4f}")
+        
+        if knn_pearson['mean'] < 0.3:
+            print(f"    ⚠️ POOR: Local geometry poorly preserved")
+        elif knn_pearson['mean'] < 0.6:
+            print(f"    ⚡ MODERATE: Some local structure preserved")
+        elif knn_pearson['mean'] < 0.8:
+            print(f"    ✓ GOOD: Local structure well preserved")
+        else:
+            print(f"    ✓✓ EXCELLENT: Strong local geometry preservation")
+    else:
+        print("    No data")
+    
+    # Shortest distance quantiles
+    q10 = metrics.get('shortest_q10_pearson', {})
+    q25 = metrics.get('shortest_q25_pearson', {})
+    
+    print("\n[3] SHORTEST DISTANCE QUANTILE CORRELATION")
+    if q10.get('mean') is not None:
+        print(f"    Q10 (shortest 10%): {q10['mean']:.4f} ± {q10['std']:.4f}")
+        print(f"    Q25 (shortest 25%): {q25['mean']:.4f} ± {q25['std']:.4f}")
+        
+        # These should be higher than global correlation if local structure is good
+        if q10['mean'] > q25['mean']:
+            print(f"    ✓ Very short distances better correlated (good local structure)")
+        else:
+            print(f"    ⚠️ Short distances not better correlated than medium")
+    else:
+        print("    No data")
+    
+    print("\n" + "="*70 + "\n")
+
+
+# ==============================================================================
+# MULTI-STEP EDM EVALUATION (More realistic than single-step)
+# ==============================================================================
+
+@torch.no_grad()
+# ==============================================================================
+# MULTI-STEP EDM EVALUATION (Two modes: pure noise vs forward-noised)
+# ==============================================================================
+
+@torch.no_grad()
+def evaluate_local_metrics_multistep(
+    score_net: 'DiffusionScoreNet',
+    context_encoder: 'SetEncoderContext',
+    st_loader: torch.utils.data.DataLoader,
+    sigma_data: float,
+    device: str = 'cuda',
+    n_batches: int = 10,
+    k_neighbors: int = 12,
+    # EDM sampler settings
+    n_steps: int = 32,
+    sigma_max: float = 3.0,
+    sigma_min: float = 0.01,
+    rho: float = 7.0,
+    guidance_scale: float = 8.0,  # Match your actual inference guidance!
+) -> dict:
+    """
+    Evaluate local geometry metrics using FULL multi-step EDM sampling.
+    
+    Runs TWO evaluation modes:
+    1. PURE NOISE: Start from random noise (tests generation from scratch)
+    2. FORWARD-NOISED: Start from V_target + sigma_max * noise (tests denoising ability)
+    
+    If mode 2 works but mode 1 doesn't, the model can denoise but can't generate from scratch.
+    """
+    from scipy.stats import pearsonr, spearmanr
+    from scipy.spatial.distance import pdist, squareform
+    import numpy as np
+    
+    score_net.eval()
+    context_encoder.eval()
+    
+    # Results for both modes
+    results_pure_noise = {
+        'knn_edge_pearson': [],
+        'knn_edge_spearman': [],
+        'shortest_q10_pearson': [],
+        'shortest_q25_pearson': [],
+    }
+    results_forward_noised = {
+        'knn_edge_pearson': [],
+        'knn_edge_spearman': [],
+        'shortest_q10_pearson': [],
+        'shortest_q25_pearson': [],
+    }
+    
+    batch_iter = iter(st_loader)
+    
+    for batch_idx in range(n_batches):
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            break
+            
+        Z_set = batch['Z_set'].to(device)
+        mask = batch['mask'].to(device)
+        V_target = batch['V_target'].to(device)
+        
+        B, N, D = V_target.shape
+        
+        # Context encoding
+        H = context_encoder(Z_set, mask)
+        H_zero = torch.zeros_like(H)
+        
+        # EDM sigma schedule
+        sigmas = uet.edm_sigma_schedule(n_steps, sigma_min, sigma_max, rho=rho, device=device)
+        
+        # ==================== MODE 1: PURE NOISE ====================
+        x_pure = torch.randn_like(V_target) * sigmas[0]
+        x_pure = x_pure * mask.unsqueeze(-1).float()
+        
+        for i in range(len(sigmas) - 1):
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+            sigma_batch = sigma.expand(B)
+            
+            x0_cond = score_net.forward_edm(x_pure, sigma_batch, H, mask, sigma_data, self_cond=None)
+            if guidance_scale != 1.0:
+                x0_uncond = score_net.forward_edm(x_pure, sigma_batch, H_zero, mask, sigma_data, self_cond=None)
+                x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
+            else:
+                x0_pred = x0_cond
+            
+            d = (x_pure - x0_pred) / sigma
+            x_pure = x_pure + (sigma_next - sigma) * d
+            x_pure = x_pure * mask.unsqueeze(-1).float()
+        
+        V_sampled_pure = x_pure
+        
+        # ==================== MODE 2: FORWARD-NOISED TARGET ====================
+        # Start from V_target + sigma_max * noise (SDEdit-style)
+        eps_init = torch.randn_like(V_target)
+        x_fwd = V_target + sigmas[0] * eps_init
+        x_fwd = x_fwd * mask.unsqueeze(-1).float()
+        
+        for i in range(len(sigmas) - 1):
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+            sigma_batch = sigma.expand(B)
+            
+            x0_cond = score_net.forward_edm(x_fwd, sigma_batch, H, mask, sigma_data, self_cond=None)
+            if guidance_scale != 1.0:
+                x0_uncond = score_net.forward_edm(x_fwd, sigma_batch, H_zero, mask, sigma_data, self_cond=None)
+                x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
+            else:
+                x0_pred = x0_cond
+            
+            d = (x_fwd - x0_pred) / sigma
+            x_fwd = x_fwd + (sigma_next - sigma) * d
+            x_fwd = x_fwd * mask.unsqueeze(-1).float()
+        
+        V_sampled_fwd = x_fwd
+        
+        # ==================== COMPUTE METRICS FOR BOTH MODES ====================
+        for b in range(B):
+            m = mask[b]
+            n_valid_b = m.sum().item()
+            if n_valid_b < k_neighbors + 1:
+                continue
+                
+            V_gt = V_target[b, m].cpu().numpy()
+            V_pred_pure = V_sampled_pure[b, m].cpu().numpy()
+            V_pred_fwd = V_sampled_fwd[b, m].cpu().numpy()
+            
+            n = V_gt.shape[0]
+            
+            # Distance matrices
+            D_gt = squareform(pdist(V_gt, metric='euclidean'))
+            D_pred_pure = squareform(pdist(V_pred_pure, metric='euclidean'))
+            D_pred_fwd = squareform(pdist(V_pred_fwd, metric='euclidean'))
+            
+            # Helper function to compute metrics
+            def compute_local_metrics(D_gt, D_pred, k_neighbors):
+                n = D_gt.shape[0]
+                knn_gt_dists = []
+                knn_pred_dists = []
+                
+                for i in range(n):
+                    gt_dists = D_gt[i].copy()
+                    gt_dists[i] = np.inf
+                    knn_idx = np.argsort(gt_dists)[:k_neighbors]
+                    for j in knn_idx:
+                        knn_gt_dists.append(D_gt[i, j])
+                        knn_pred_dists.append(D_pred[i, j])
+                
+                metrics = {}
+                if len(knn_gt_dists) > 10:
+                    knn_gt_dists = np.array(knn_gt_dists)
+                    knn_pred_dists = np.array(knn_pred_dists)
+                    try:
+                        metrics['knn_pearson'], _ = pearsonr(knn_gt_dists, knn_pred_dists)
+                        metrics['knn_spearman'], _ = spearmanr(knn_gt_dists, knn_pred_dists)
+                    except:
+                        pass
+                
+                # Shortest quantiles
+                triu_idx = np.triu_indices(n, k=1)
+                all_gt = D_gt[triu_idx]
+                all_pred = D_pred[triu_idx]
+                sort_idx = np.argsort(all_gt)
+                
+                n_pairs = len(all_gt)
+                q10_n = max(int(n_pairs * 0.10), 10)
+                q25_n = max(int(n_pairs * 0.25), 20)
+                
+                try:
+                    metrics['q10'], _ = pearsonr(all_gt[sort_idx[:q10_n]], all_pred[sort_idx[:q10_n]])
+                    metrics['q25'], _ = pearsonr(all_gt[sort_idx[:q25_n]], all_pred[sort_idx[:q25_n]])
+                except:
+                    pass
+                
+                return metrics
+            
+            # Compute for pure noise
+            m_pure = compute_local_metrics(D_gt, D_pred_pure, k_neighbors)
+            if 'knn_pearson' in m_pure:
+                results_pure_noise['knn_edge_pearson'].append(m_pure['knn_pearson'])
+                results_pure_noise['knn_edge_spearman'].append(m_pure['knn_spearman'])
+            if 'q10' in m_pure:
+                results_pure_noise['shortest_q10_pearson'].append(m_pure['q10'])
+                results_pure_noise['shortest_q25_pearson'].append(m_pure['q25'])
+            
+            # Compute for forward-noised
+            m_fwd = compute_local_metrics(D_gt, D_pred_fwd, k_neighbors)
+            if 'knn_pearson' in m_fwd:
+                results_forward_noised['knn_edge_pearson'].append(m_fwd['knn_pearson'])
+                results_forward_noised['knn_edge_spearman'].append(m_fwd['knn_spearman'])
+            if 'q10' in m_fwd:
+                results_forward_noised['shortest_q10_pearson'].append(m_fwd['q10'])
+                results_forward_noised['shortest_q25_pearson'].append(m_fwd['q25'])
+    
+    # Aggregate results
+    def aggregate(results):
+        summary = {}
+        for key, values in results.items():
+            if values:
+                arr = np.array(values)
+                summary[key] = {
+                    'mean': float(np.mean(arr)),
+                    'std': float(np.std(arr)),
+                    'min': float(np.min(arr)),
+                    'max': float(np.max(arr)),
+                    'n': len(arr)
+                }
+            else:
+                summary[key] = {'mean': None, 'std': None, 'min': None, 'max': None, 'n': 0}
+        return summary
+    
+    return {
+        'pure_noise': aggregate(results_pure_noise),
+        'forward_noised': aggregate(results_forward_noised),
+    }
+
+
+
+
+def print_multistep_evaluation_report(metrics: dict, epoch: int = 0, step: int = 0, 
+                                       n_steps: int = 32, guidance_scale: float = 8.0):
+    """Print a formatted report of multi-step evaluation metrics (both modes)."""
+    
+    print("\n" + "="*70)
+    print(f"[MULTI-STEP EDM EVALUATION] epoch={epoch} step={step}")
+    print(f"  Sampler: {n_steps} steps, guidance_scale={guidance_scale}")
+    print("="*70)
+    
+    for mode_name, mode_key in [("PURE NOISE (generation)", "pure_noise"), 
+                                 ("FORWARD-NOISED (denoising)", "forward_noised")]:
+        mode_metrics = metrics.get(mode_key, {})
+        
+        print(f"\n{'─'*70}")
+        print(f"  MODE: {mode_name}")
+        print(f"{'─'*70}")
+        
+        knn_pearson = mode_metrics.get('knn_edge_pearson', {})
+        knn_spearman = mode_metrics.get('knn_edge_spearman', {})
+        
+        print(f"\n  [1] kNN EDGE DISTANCE CORRELATION")
+        if knn_pearson.get('mean') is not None:
+            print(f"      Pearson:  {knn_pearson['mean']:.4f} ± {knn_pearson['std']:.4f} "
+                  f"(range: [{knn_pearson['min']:.4f}, {knn_pearson['max']:.4f}])")
+            print(f"      Spearman: {knn_spearman['mean']:.4f} ± {knn_spearman['std']:.4f}")
+            
+            if knn_pearson['mean'] < 0.1:
+                print(f"      ⚠️ RANDOM: No structure learned")
+            elif knn_pearson['mean'] < 0.3:
+                print(f"      ⚠️ POOR: Local geometry poorly preserved")
+            elif knn_pearson['mean'] < 0.6:
+                print(f"      ⚡ MODERATE: Some local structure")
+            elif knn_pearson['mean'] < 0.8:
+                print(f"      ✓ GOOD: Local structure preserved")
+            else:
+                print(f"      ✓✓ EXCELLENT: Strong preservation")
+        else:
+            print("      No data")
+        
+        q10 = mode_metrics.get('shortest_q10_pearson', {})
+        q25 = mode_metrics.get('shortest_q25_pearson', {})
+        
+        print(f"\n  [2] SHORTEST DISTANCE QUANTILE CORRELATION")
+        if q10.get('mean') is not None:
+            print(f"      Q10 (shortest 10%): {q10['mean']:.4f} ± {q10['std']:.4f}")
+            print(f"      Q25 (shortest 25%): {q25['mean']:.4f} ± {q25['std']:.4f}")
+        else:
+            print("      No data")
+    
+    # Diagnosis
+    pure = metrics.get('pure_noise', {}).get('knn_edge_pearson', {}).get('mean')
+    fwd = metrics.get('forward_noised', {}).get('knn_edge_pearson', {}).get('mean')
+    
+    print(f"\n{'─'*70}")
+    print(f"  DIAGNOSIS:")
+    if pure is not None and fwd is not None:
+        if fwd > 0.3 and pure < 0.1:
+            print(f"  ⚠️ Model can DENOISE but cannot GENERATE from scratch")
+            print(f"     → Coarse/global structure learning is broken")
+            print(f"     → Try: lower sigma_max, more training, or generator init")
+        elif fwd < 0.1 and pure < 0.1:
+            print(f"  ⚠️ Model cannot denoise OR generate")
+            print(f"     → Check loss functions, sigma_data, network architecture")
+        elif fwd > 0.3 and pure > 0.3:
+            print(f"  ✓ Model can both denoise AND generate!")
+        else:
+            print(f"  ⚡ Partial learning - continue training")
+    print("="*70 + "\n")
+
+
+
 
 
 def train_stageC_diffusion_generator(
@@ -1231,7 +1810,12 @@ def train_stageC_diffusion_generator(
 
     
     # CFG config
-    p_uncond = 0.25
+    p_uncond = 0.10
+    sigma_gate = 5.0
+
+    # FiLM/CFG Debug config
+    DEBUG_FILM_EVERY = 100   # Check FiLM effect every N steps
+    DEBUG_FILM = True        # Enable/disable FiLM debugging
     
 
     history = {
@@ -1516,8 +2100,25 @@ def train_stageC_diffusion_generator(
                 V_t = V_t * mask.unsqueeze(-1).float()
 
                 # CFG: Drop context randomly during training
+                # Simple uniform dropout - no sigma gating (gating was sabotaging coarse learning)
                 drop_mask = (torch.rand(batch_size_real, device=device) < p_uncond).float().view(-1, 1, 1)
                 H_train = H * (1 - drop_mask)
+                
+                # DEBUG: CFG stats (first few steps)
+                if DEBUG and epoch == 0 and global_step < 10:
+                    n_dropped = drop_mask.sum().item()
+                    print(f"[CFG] step={global_step} dropped={int(n_dropped)}/{batch_size_real} contexts")
+
+                
+                # DEBUG: Log sigma-gated CFG stats (first few steps)
+                if DEBUG and epoch == 0 and global_step < 10:
+                    n_rand_drop = rand_drop.sum().item()
+                    n_sigma_high = sigma_high.sum().item()
+                    n_actual_drop = drop_mask.sum().item()
+                    print(f"[CFG-gated] step={global_step} rand_drop={int(n_rand_drop)}/{batch_size_real}, "
+                          f"sigma>{sigma_gate}={int(n_sigma_high)}/{batch_size_real}, "
+                          f"actual_drop={int(n_actual_drop)}/{batch_size_real}")
+
 
                 # DEBUG: CFG stats (first epoch only)
                 if DEBUG and epoch == 0 and global_step < 10:
@@ -1539,6 +2140,103 @@ def train_stageC_diffusion_generator(
                     # for geom losses, V_hat is x0_pred
                     V_hat = x0_pred
                     dist_aux = None
+
+                    # ==== film.cfg debug ====
+                    # verify that conditioning actually affects the output
+                    if DEBUG_FILM and (global_step % DEBUG_FILM_EVERY == 0) and (not is_sc):
+                        with torch.no_grad():
+                            score_net.eval()
+
+                            # use current batch data
+                            # V_0 is ground truth, V_t is noisy, H is context (un-dropped)
+                            # sigma_flat is the noise level
+
+                            # 1. conditional prediction (H = 0)
+                            x0_cond = score_net.forward_edm(
+                                V_t, sigma_flat, H, mask, sigma_data, self_cond=None
+                            )
+
+                            # 2) unconditional prediction (H = 0)
+                            H_zero = torch.zeros_like(H)
+                            x0_uncond = score_net.forward_edm(
+                                V_t, sigma_flat, H_zero, mask, sigma_data, self_cond=None
+                            )
+
+                            # 3) compute dofference stats
+                            # only on valid (masked) positions
+                            mask_expanded = mask.unsqueeze(-1).float()
+                            n_valid = mask_expanded.sum()
+
+                            diff_abs = (x0_cond - x0_uncond).abs()
+                            diff_mean = (diff_abs * mask_expanded).sum() / n_valid.clamp(min=1)
+
+                            cond_abs_mean = (x0_cond.abs() * mask_expanded).sum() / n_valid.clamp(min=1)
+                            uncond_abs_mean = (x0_uncond.abs() * mask_expanded).sum() / n_valid.clamp(min=1)
+
+                            rel_diff = diff_mean / (cond_abs_mean + 1e-8)
+
+                            #pre-compute differences 9to check if all samples show difference)
+                            diff_per_sample = []
+                            for b in range(V_t.shape[0]):
+                                m = mask[b]
+                                if m.sum() > 0:
+                                    d = (x0_cond[b, m] - x0_uncond[b, m]).abs().mean().item()
+                                    diff_per_sample.append(d)
+                            
+                            # 4. guidance sweep (cfg interpolation)
+                            # x0_guided = x0_uncond + scale * (x0_cond - x0_uncond)
+                            guidance_scales = [0.0, 1.0, 2.0, 4.0, 8.0]
+                            guided_norms = []
+                            for gs in guidance_scales:
+                                x0_guided = x0_uncond + gs * (x0_cond - x0_uncond)
+                                # compute mean absolute value of guided output
+                                guided_norm = (x0_guided.abs() * mask_expanded).sum() / n_valid.clamp(min=1)
+                                guided_norms.append(guided_norm.item())
+
+                            # 5. print comprehensive debg info
+                            print("\n" + "="*70)
+                            print(f"[FiLM/CFG DEBUG] step={global_step} epoch={epoch}")
+                            print("="*70)
+                            print(f"  Batch info: B={V_t.shape[0]}, N_max={V_t.shape[1]}, "
+                                  f"n_valid_total={int(n_valid.item())}")
+                            print(f"  Sigma range: [{sigma_flat.min().item():.4f}, {sigma_flat.max().item():.4f}]")
+                            print()
+                            print(f"  [COND vs UNCOND DIFFERENCE]")
+                            print(f"    |x0_cond|  mean: {cond_abs_mean.item():.6f}")
+                            print(f"    |x0_uncond| mean: {uncond_abs_mean.item():.6f}")
+                            print(f"    |cond - uncond| mean: {diff_mean.item():.6f}")
+                            print(f"    Relative diff: {rel_diff.item():.4f} ({rel_diff.item()*100:.2f}%)")
+                            print()
+                            
+                            if diff_per_sample:
+                                print(f"    Per-sample diffs: min={min(diff_per_sample):.6f}, "
+                                      f"max={max(diff_per_sample):.6f}, "
+                                      f"mean={sum(diff_per_sample)/len(diff_per_sample):.6f}")
+                            
+                            # Check if difference is meaningful
+                            if diff_mean.item() < 1e-6:
+                                print(f"    ⚠️ WARNING: Difference is near-zero! FiLM may not be working!")
+                            elif rel_diff.item() < 0.01:
+                                print(f"    ⚠️ WARNING: Relative difference < 1%! Weak conditioning!")
+                            else:
+                                print(f"    ✓ Conditioning appears to be active")
+                            
+                            print()
+                            print(f"  [GUIDANCE SWEEP] (should change smoothly)")
+                            for gs, norm in zip(guidance_scales, guided_norms):
+                                print(f"    scale={gs:>4.1f}: |x0_guided| mean = {norm:.6f}")
+                            
+                            # Check monotonicity (rough check - norms should generally increase with scale)
+                            diffs = [guided_norms[i+1] - guided_norms[i] for i in range(len(guided_norms)-1)]
+                            if all(d >= -1e-6 for d in diffs) or all(d <= 1e-6 for d in diffs):
+                                print(f"    ✓ Guidance sweep is monotonic")
+                            else:
+                                print(f"    ⚠️ Non-monotonic guidance sweep (may be OK)")
+                            
+                            print("="*70 + "\n")
+                            
+                            score_net.train()
+
                 else:
                     # Self-conditioning logic
                     use_self_cond = torch.rand(1, device=device).item() < p_sc
@@ -2654,7 +3352,15 @@ def train_stageC_diffusion_generator(
                     g_vhat_equiv = g_eps * inv_sigma  # ||∂L/∂V_hat|| = ||∂L/∂eps|| / σ
                     return float(g_vhat_equiv.norm().item())
 
-                vgn_score = vhat_gn_from_eps(L_score, eps_pred, sigma_t)                
+                # vgn_score = vhat_gn_from_eps(L_score, eps_pred, sigma_t)
+                # Score gradient: use direct V_hat gradient for EDM, chain-rule for eps-prediction
+                if use_edm:
+                    # EDM: L_score is computed directly on x0_pred (= V_hat), so use vhat_gn
+                    vgn_score = vhat_gn(L_score)
+                else:
+                    # Non-EDM: L_score is computed on eps_pred, need chain rule
+                    vgn_score = vhat_gn_from_eps(L_score, eps_pred, sigma_t)
+               
                 # ST-side gradient norms
                 vgn_gram = vhat_gn(L_gram) if not is_sc else 0.0
                 vgn_gram_scale = vhat_gn(L_gram_scale) if not is_sc else 0.0
@@ -3072,7 +3778,59 @@ def train_stageC_diffusion_generator(
                 if val_metric < early_stop_best:
                     early_stop_best = val_metric
                     print(f"[Early Stop] Warmup: best={early_stop_best:.4f} (min_epochs not reached)")
-          
+        
+
+
+            # ==================== PERIODIC FiLM EVALUATION ====================
+            EVAL_FILM_EVERY_EPOCHS = 5
+            
+            if DEBUG_FILM and ((epoch + 1) % EVAL_FILM_EVERY_EPOCHS == 0) and use_st:
+                print(f"\n[FiLM EVAL] Running detailed local metrics evaluation...")
+                
+                # 1) Single-step evaluation (fast)
+                eval_metrics_single = evaluate_local_metrics_for_film(
+                    score_net=score_net,
+                    context_encoder=context_encoder,
+                    st_loader=st_loader,
+                    sigma_data=sigma_data,
+                    device=device,
+                    n_batches=20,
+                    k_neighbors=12,
+                    sigma_eval=0.1,
+                )
+                print_film_evaluation_report(eval_metrics_single, epoch=epoch, step=global_step)
+                
+                # 2) Multi-step evaluation (BOTH modes, with high guidance like inference)
+                EVAL_GUIDANCE_SCALE = 8.0  # Match your actual inference!
+                print(f"\n[FiLM EVAL] Running MULTI-STEP evaluation (32 steps, CFG={EVAL_GUIDANCE_SCALE})...")
+                eval_metrics_multi = evaluate_local_metrics_multistep(
+                    score_net=score_net,
+                    context_encoder=context_encoder,
+                    st_loader=st_loader,
+                    sigma_data=sigma_data,
+                    device=device,
+                    n_batches=10,
+                    k_neighbors=12,
+                    n_steps=32,
+                    sigma_max=3.0,
+                    sigma_min=0.01,
+                    guidance_scale=EVAL_GUIDANCE_SCALE,  # High guidance!
+                )
+                print_multistep_evaluation_report(eval_metrics_multi, epoch=epoch, step=global_step,
+                                                   n_steps=32, guidance_scale=EVAL_GUIDANCE_SCALE)
+                
+                # Log to history
+                if 'film_eval' not in history:
+                    history['film_eval'] = []
+                history['film_eval'].append({
+                    'epoch': epoch,
+                    'step': global_step,
+                    'single_step': eval_metrics_single,
+                    'multi_step': eval_metrics_multi,
+                })
+
+
+
         # Broadcast stop decision to ALL ranks
         if fabric is not None:
             # Use dist.broadcast directly - fabric.broadcast is buggy
