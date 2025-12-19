@@ -1484,6 +1484,32 @@ def train_stageC_diffusion_generator(
     loss_triangle = uet.TriangleAreaLoss(num_triangles_per_sample=500, knn_k=12)
     loss_radial = uet.RadialHistogramLoss(num_bins=20)
 
+    # ==================== EMA SETUP ====================
+    import copy
+    ema_decay = 0.999  # Try 0.999 for small datasets, 0.9999 for large
+    score_net_ema = copy.deepcopy(score_net).eval()
+    for p in score_net_ema.parameters():
+        p.requires_grad_(False)
+    
+    # Also create EMA for context_encoder
+    context_encoder_ema = copy.deepcopy(context_encoder).eval()
+    for p in context_encoder_ema.parameters():
+        p.requires_grad_(False)
+    
+    print(f"[EMA] Created EMA copies with decay={ema_decay}")
+    
+    @torch.no_grad()
+    def ema_update(ema_model, model, decay: float):
+        """Update EMA model weights."""
+        msd = model.state_dict()
+        for k, v_ema in ema_model.state_dict().items():
+            v = msd[k]
+            if not torch.is_floating_point(v):
+                v_ema.copy_(v)
+            else:
+                v_ema.mul_(decay).add_(v, alpha=1.0 - decay)
+    # ===================================================
+
     
     # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
@@ -1765,29 +1791,53 @@ def train_stageC_diffusion_generator(
     #     'shape': 0.0       # NEW: ST anisotropy/shape loss
     # }
 
+    # WEIGHTS = {
+    #     'score': 1.0,
+    #     'gram': 0.5,
+    #     'gram_scale': 0.3,
+    #     'heat': 0.25,
+    #     'sw_st': 0.0,
+    #     'sw_sc': 0.3,
+    #     'overlap': 0.25,
+    #     'ordinal_sc': 0.5,
+    #     'st_dist': 0.0,
+    #     'edm_tail': 0.3,
+    #     'gen_align': 0.0,
+    #     'dim': 0.0,
+    #     'triangle': 0.0,
+    #     'radial': 0.5,
+    #     'knn_nca': 0.0,
+    #     'repel': 0.0,      # NEW: ST repulsion loss
+    #     'shape': 0.0,       # NEW: ST anisotropy/shape loss
+    #     # NEW
+    #     'edge': 0.5,       # Edge-length preservation (local metric)
+    #     'topo': 0.3,       # Topology preservation (persistent homology proxy)
+    #     'shape_spec': 0.3,      # Shape spectrum (anisotropy matching)
+    # }
+
     WEIGHTS = {
         'score': 1.0,
-        'gram': 0.5,
-        'gram_scale': 0.3,
-        'heat': 0.25,
+        'gram': 0.0,
+        'gram_scale': 0.0,
+        'heat': 0.0,
         'sw_st': 0.0,
-        'sw_sc': 0.3,
-        'overlap': 0.25,
-        'ordinal_sc': 0.5,
+        'sw_sc': 0.0,
+        'overlap': 0.0,
+        'ordinal_sc': 0.0,
         'st_dist': 0.0,
-        'edm_tail': 0.3,
+        'edm_tail': 0.0,
         'gen_align': 0.0,
         'dim': 0.0,
         'triangle': 0.0,
-        'radial': 0.5,
+        'radial': 0.0,
         'knn_nca': 0.0,
-        'repel': 0.0,      # NEW: ST repulsion loss
-        'shape': 0.0,       # NEW: ST anisotropy/shape loss
-        # NEW
-        'edge': 0.5,       # Edge-length preservation (local metric)
-        'topo': 0.3,       # Topology preservation (persistent homology proxy)
-        'shape_spec': 0.3,      # Shape spectrum (anisotropy matching)
+        'repel': 0.0,
+        'shape': 0.0,
+        'edge': 0.0,       # Can re-enable later at 0.02-0.1 for low-sigma only
+        'topo': 0.0,
+        'shape_spec': 0.0,
     }
+
 
     # Heat warmup schedule
     HEAT_WARMUP_EPOCHS = 10
@@ -1815,7 +1865,7 @@ def train_stageC_diffusion_generator(
 
     # FiLM/CFG Debug config
     DEBUG_FILM_EVERY = 100   # Check FiLM effect every N steps
-    DEBUG_FILM = True        # Enable/disable FiLM debugging
+    DEBUG_FILM = False      # Enable/disable FiLM debugging
     
 
     history = {
@@ -1947,7 +1997,7 @@ def train_stageC_diffusion_generator(
     AUTOBALANCE_EVERY = 100
     AUTOBALANCE_START = 200
 
-    USE_AUTOBALANCE = True
+    USE_AUTOBALANCE = False
 
     #self conditioning probability
     p_sc = 0.5 #prob of using self-conditioning in training
@@ -3630,6 +3680,13 @@ def train_stageC_diffusion_generator(
                 scaler.step(optimizer)
                 scaler.update()
             
+            # ==================== EMA UPDATE ====================
+            # IMPORTANT: Must happen AFTER optimizer.step() / scaler.step()
+            ema_update(score_net_ema, score_net, ema_decay)
+            ema_update(context_encoder_ema, context_encoder, ema_decay)
+            # ====================================================
+
+            
             # Log
             epoch_losses['total'] += L_total.item()
             epoch_losses['score'] += L_score.item()
@@ -4068,6 +4125,9 @@ def train_stageC_diffusion_generator(
                     'epoch': epoch,
                     'context_encoder': context_encoder.state_dict(),
                     'score_net': score_net.state_dict(),
+                    'context_encoder_ema': context_encoder_ema.state_dict(),
+                    'score_net_ema': score_net_ema.state_dict(),
+                    'ema_decay': ema_decay,
                     'optimizer': optimizer.state_dict(),
                     'history': history,
                     'sigma_data': sigma_data,
@@ -4082,9 +4142,16 @@ def train_stageC_diffusion_generator(
             'epoch': epoch,
             'context_encoder': context_encoder.state_dict(),
             'score_net': score_net.state_dict(),
+            'context_encoder_ema': context_encoder_ema.state_dict(),
+            'score_net_ema': score_net_ema.state_dict(),
+            'ema_decay': ema_decay,
             'optimizer': optimizer.state_dict(),
-            'history': history
+            'history': history,
+            'sigma_data': sigma_data,
+            'sigma_min': sigma_min,
+            'sigma_max': sigma_max,
         }
+
         torch.save(ckpt_final, os.path.join(outf, 'ckpt_final.pt'))
         print(f"Saved final checkpoint at epoch {epoch+1}")
 
@@ -4122,6 +4189,11 @@ def train_stageC_diffusion_generator(
     history['sigma_data'] = sigma_data
     history['sigma_min'] = sigma_min
     history['sigma_max'] = sigma_max
+
+    # Return EMA state dicts so GEMSModel can use them
+    history['score_net_ema_state'] = score_net_ema.state_dict()
+    history['context_encoder_ema_state'] = context_encoder_ema.state_dict()
+    history['ema_decay'] = ema_decay
 
     # return history if _is_rank0() else None
     return history
@@ -4564,34 +4636,86 @@ def sample_sc_edm_patchwise(
 
             # sigma_data = 1.0  # Use stored or estimated value
             
-            for i in range(n_timesteps_sample):
-                sigma_cur = sigmas[i]
-                sigma_next = sigmas[i + 1] if i < n_timesteps_sample - 1 else torch.tensor(0.0, device=device)
-                
-                # EDM denoised prediction with CFG
-                H_null = torch.zeros_like(H_k)
-                x0_uncond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_null, mask_k, sigma_data)
-                x0_cond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_k, mask_k, sigma_data)
-                x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
-                
+            # EDM Euler + Heun sampler
+            for i in range(len(sigmas) - 1):
+                sigma = sigmas[i]
+                sigma_next = sigmas[i + 1]
+                sigma_b = sigma.view(1)  # (B=1,)
+
+                # x0 predictions with CFG
+                x0_c = score_net.forward_edm(V_t, sigma_b, H_k, mask_k, sigma_data, self_cond=None)
+
+                if guidance_scale != 1.0:
+                    H_null = torch.zeros_like(H_k)
+                    x0_u = score_net.forward_edm(V_t, sigma_b, H_null, mask_k, sigma_data, self_cond=None)
+                    x0 = x0_u + guidance_scale * (x0_c - x0_u)
+                else:
+                    x0 = x0_c
+
                 # Debug on first patch
                 if DEBUG_FLAG and k == 0 and i < 3:
-                    du = x0_uncond.norm(dim=[1, 2]).mean().item()
-                    dc = x0_cond.norm(dim=[1, 2]).mean().item()
-                    diff = (x0_cond - x0_uncond).norm(dim=[1, 2]).mean().item()
-                    print(f"  [PATCH0] i={i:3d} sigma={float(sigma_cur):.4f} "
-                          f"||x0_u||={du:.3f} ||x0_c||={dc:.3f} ||diff||={diff:.3f}")
-                
-                # EDM update
+                    if guidance_scale != 1.0:
+                        du = x0_u.norm(dim=[1, 2]).mean().item()
+                        dc = x0_c.norm(dim=[1, 2]).mean().item()
+                        diff = (x0_c - x0_u).norm(dim=[1, 2]).mean().item()
+                        print(f"  [PATCH0] i={i:3d} sigma={float(sigma):.4f} "
+                              f"||x0_u||={du:.3f} ||x0_c||={dc:.3f} ||diff||={diff:.3f}")
+
+                # Euler step
+                d = (V_t - x0) / sigma.clamp_min(1e-8)
+                V_euler = V_t + (sigma_next - sigma) * d
+
+                # Heun corrector (skip if sigma_next==0)
                 if sigma_next > 0:
-                    d_cur = (V_t - x0_pred) / sigma_cur
-                    V_t = V_t + (sigma_next - sigma_cur) * d_cur
-                    
-                    if eta > 0:
-                        noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_cur**2, min=0))
-                        V_t = V_t + noise_scale * torch.randn_like(V_t)
+                    x0_next_c = score_net.forward_edm(V_euler, sigma_next.view(1), H_k, mask_k, sigma_data, self_cond=None)
+                    if guidance_scale != 1.0:
+                        x0_next_u = score_net.forward_edm(V_euler, sigma_next.view(1), H_null, mask_k, sigma_data, self_cond=None)
+                        x0_next = x0_next_u + guidance_scale * (x0_next_c - x0_next_u)
+                    else:
+                        x0_next = x0_next_c
+
+                    d2 = (V_euler - x0_next) / sigma_next.clamp_min(1e-8)
+                    V_t = V_t + (sigma_next - sigma) * 0.5 * (d + d2)
                 else:
-                    V_t = x0_pred
+                    V_t = V_euler
+
+                # Apply mask
+                V_t = V_t * mask_k.unsqueeze(-1).float()
+
+                
+                # Optional stochastic noise (if eta > 0)
+                if eta > 0 and sigma_next > 0:
+                    noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma**2, min=0))
+                    V_t = V_t + noise_scale * torch.randn_like(V_t)
+
+            # for i in range(n_timesteps_sample):
+            #     sigma_cur = sigmas[i]
+            #     sigma_next = sigmas[i + 1] if i < n_timesteps_sample - 1 else torch.tensor(0.0, device=device)
+                
+            #     # EDM denoised prediction with CFG
+            #     H_null = torch.zeros_like(H_k)
+            #     x0_uncond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_null, mask_k, sigma_data)
+            #     x0_cond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_k, mask_k, sigma_data)
+            #     x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
+                
+            #     # Debug on first patch
+            #     if DEBUG_FLAG and k == 0 and i < 3:
+            #         du = x0_uncond.norm(dim=[1, 2]).mean().item()
+            #         dc = x0_cond.norm(dim=[1, 2]).mean().item()
+            #         diff = (x0_cond - x0_uncond).norm(dim=[1, 2]).mean().item()
+            #         print(f"  [PATCH0] i={i:3d} sigma={float(sigma_cur):.4f} "
+            #               f"||x0_u||={du:.3f} ||x0_c||={dc:.3f} ||diff||={diff:.3f}")
+                
+            #     # EDM update
+            #     if sigma_next > 0:
+            #         d_cur = (V_t - x0_pred) / sigma_cur
+            #         V_t = V_t + (sigma_next - sigma_cur) * d_cur
+                    
+            #         if eta > 0:
+            #             noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_cur**2, min=0))
+            #             V_t = V_t + noise_scale * torch.randn_like(V_t)
+            #     else:
+            #         V_t = x0_pred
                 
             # for t_idx in range(n_timesteps_sample):
             #     sigma_t = sigmas[t_idx]

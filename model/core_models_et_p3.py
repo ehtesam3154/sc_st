@@ -106,7 +106,11 @@ class GEMSModel:
                 'landmarks_L': landmarks_L,
             }
         }
-        
+
+        # EMA copies (will be populated if loaded from checkpoint or after training)
+        self.score_net_ema = None
+        self.context_encoder_ema = None
+
         # Stage A: Shared encoder
         self.encoder = SharedEncoder(n_genes, n_embedding).to(device)
         
@@ -382,6 +386,23 @@ class GEMSModel:
         self.sigma_max = history.get('sigma_max', 80.0)
 
         print(f"[EDM] Stored: sigma_data={self.sigma_data:.4f}, sigma_min={self.sigma_min:.6f}, sigma_max={self.sigma_max:.2f}")
+
+        # Restore EMA models from training
+        import copy
+        if 'score_net_ema_state' in history:
+            self.score_net_ema = copy.deepcopy(self.score_net).eval()
+            for p in self.score_net_ema.parameters():
+                p.requires_grad_(False)
+            self.score_net_ema.load_state_dict(history['score_net_ema_state'])
+            print("[EMA] Restored score_net_ema from training")
+        
+        if 'context_encoder_ema_state' in history:
+            self.context_encoder_ema = copy.deepcopy(self.context_encoder).eval()
+            for p in self.context_encoder_ema.parameters():
+                p.requires_grad_(False)
+            self.context_encoder_ema.load_state_dict(history['context_encoder_ema_state'])
+            print("[EMA] Restored context_encoder_ema from training")
+
         
         print("Stage C complete.")
 
@@ -395,16 +416,23 @@ class GEMSModel:
             'context_encoder': self.context_encoder.state_dict(),
             'generator': self.generator.state_dict(),
             'score_net': self.score_net.state_dict(),
-            'cfg': self.cfg,  # ADD THIS
+            'cfg': self.cfg,
             'sigma_data': getattr(self, 'sigma_data', None),
             'sigma_min': getattr(self, 'sigma_min', None), 
             'sigma_max': getattr(self, 'sigma_max', None),
         }
+        # Save EMA if available
+        if self.score_net_ema is not None:
+            checkpoint['score_net_ema'] = self.score_net_ema.state_dict()
+        if self.context_encoder_ema is not None:
+            checkpoint['context_encoder_ema'] = self.context_encoder_ema.state_dict()
         torch.save(checkpoint, path)
         print(f"Model saved to {path}")
+
     
     def load(self, path: str):
         """Load all model components."""
+        import copy
         checkpoint = torch.load(path, map_location=self.device)
         self.encoder.load_state_dict(checkpoint['encoder'])
         self.context_encoder.load_state_dict(checkpoint['context_encoder'])
@@ -420,8 +448,24 @@ class GEMSModel:
         # Load config if available
         if 'cfg' in checkpoint:
             self.cfg = checkpoint['cfg']
+        
+        # Load EMA weights if available
+        if 'score_net_ema' in checkpoint:
+            self.score_net_ema = copy.deepcopy(self.score_net).eval()
+            for p in self.score_net_ema.parameters():
+                p.requires_grad_(False)
+            self.score_net_ema.load_state_dict(checkpoint['score_net_ema'])
+            print("  Loaded score_net_ema")
+        
+        if 'context_encoder_ema' in checkpoint:
+            self.context_encoder_ema = copy.deepcopy(self.context_encoder).eval()
+            for p in self.context_encoder_ema.parameters():
+                p.requires_grad_(False)
+            self.context_encoder_ema.load_state_dict(checkpoint['context_encoder_ema'])
+            print("  Loaded context_encoder_ema")
             
         print(f"Model loaded from {path}")
+
     
     # ==========================================================================
     # COMPLETE TRAINING PIPELINE
@@ -535,11 +579,19 @@ class GEMSModel:
 
 
 
+        # Use EMA weights for inference if available
+        ctx_enc = self.context_encoder_ema if self.context_encoder_ema is not None else self.context_encoder
+        sc_net = self.score_net_ema if self.score_net_ema is not None else self.score_net
+        
+        # Ensure EMA models are in eval mode
+        ctx_enc.eval()
+        sc_net.eval()
+        
         res = sample_sc_edm_patchwise(
             sc_gene_expr=sc_gene_expr,
             encoder=self.encoder,
-            context_encoder=self.context_encoder,
-            score_net=self.score_net,
+            context_encoder=ctx_enc,
+            score_net=sc_net,
             target_st_p95=target_st_p95,
             n_timesteps_sample=n_timesteps_sample,
             sigma_min=sigma_min,
@@ -557,6 +609,7 @@ class GEMSModel:
             fixed_patch_graph=fixed_patch_graph,
             coral_params=coral_params,
         )
+
 
         return res
     
