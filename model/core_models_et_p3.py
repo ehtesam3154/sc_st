@@ -592,6 +592,7 @@ class GEMSModel:
             encoder=self.encoder,
             context_encoder=ctx_enc,
             score_net=sc_net,
+            generator=self.generator,  # NEW: pass generator for refinement mode
             target_st_p95=target_st_p95,
             n_timesteps_sample=n_timesteps_sample,
             sigma_min=sigma_min,
@@ -609,8 +610,6 @@ class GEMSModel:
             fixed_patch_graph=fixed_patch_graph,
             coral_params=coral_params,
         )
-
-
         return res
     
 

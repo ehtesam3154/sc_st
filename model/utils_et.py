@@ -3129,6 +3129,9 @@ class EdgeLengthLoss(nn.Module):
     Local edge-length loss (replaces KNN NCA).
     Preserves actual edge lengths instead of just rank ordering.
     Uses log-ratio to fight gram_scale naturally.
+    
+    FIXED: Returns per-sample losses (B,) for proper gating.
+    NOTE: knn_indices are already LOCAL indices from dataset preprocessing.
     """
     
     def __init__(self, eps: float = 1e-4):
@@ -3146,35 +3149,32 @@ class EdgeLengthLoss(nn.Module):
         Args:
             V_pred: (B, N, D) predicted coordinates
             V_target: (B, N, D) target coordinates  
-            knn_indices: (B, N, k) neighbor indices from ST GT
+            knn_indices: (B, N, k) neighbor indices (already LOCAL from dataset)
             mask: (B, N) boolean mask
             
         Returns:
-            loss: scalar edge length loss
+            losses: (B,) per-sample edge length losses (for proper gating)
         """
         B, N, k = knn_indices.shape
         device = V_pred.device
         
-        # Create row indices (i)
-        i = torch.arange(N, device=device).unsqueeze(1).expand(N, k)  # (N, k)
-        j = knn_indices  # (B, N, k)
-        
-        loss_per_batch = []
+        # Output: per-sample losses
+        losses = torch.zeros(B, device=device)
         
         for b in range(B):
             m_b = mask[b]
-            n_valid = m_b.sum().item()
+            n_valid = int(m_b.sum().item())
             
             if n_valid < 2:
                 continue
             
             # Get valid nodes
-            V_pred_b = V_pred[b, m_b]  # (n_valid, D)
+            V_pred_b = V_pred[b, m_b]      # (n_valid, D)
             V_target_b = V_target[b, m_b]  # (n_valid, D)
-            knn_b = knn_indices[b, m_b]  # (n_valid, k)
+            knn_b = knn_indices[b, m_b]    # (n_valid, k)
 
             # knn_b is already in local indices [0..n_valid-1] with -1 for invalid
-            # DO NOT remap - just use directly
+            # DO NOT remap - dataset already did global->local conversion
             knn_local = knn_b
             
             # Filter out invalid neighbors (-1)
@@ -3188,15 +3188,15 @@ class EdgeLengthLoss(nn.Module):
             
             # Only compute for valid edges
             edge_mask = valid_neighbors
-            i_edges = i_local[edge_mask]  # (num_edges,)
+            i_edges = i_local[edge_mask]    # (num_edges,)
             j_edges = knn_local[edge_mask]  # (num_edges,)
             
-            # Drop self-edges and validate bounds
+            # Drop self-edges
             not_self = (i_edges != j_edges)
             i_edges = i_edges[not_self]
             j_edges = j_edges[not_self]
             
-            # Bounds check: ensure j_edges are valid indices
+            # Bounds check: ensure j_edges are valid local indices
             valid_j = (j_edges >= 0) & (j_edges < n_valid)
             i_edges = i_edges[valid_j]
             j_edges = j_edges[valid_j]
@@ -3205,23 +3205,119 @@ class EdgeLengthLoss(nn.Module):
                 continue
                         
             # Compute edge lengths
-            x_i_pred = V_pred_b[i_edges]  # (num_edges, D)
+            x_i_pred = V_pred_b[i_edges]      # (num_edges, D)
             x_j_pred = V_pred_b[j_edges]
             x_i_target = V_target_b[i_edges]
             x_j_target = V_target_b[j_edges]
             
-            d_pred = (x_i_pred - x_j_pred).norm(dim=-1)  # (num_edges,)
+            d_pred = (x_i_pred - x_j_pred).norm(dim=-1)      # (num_edges,)
             d_target = (x_i_target - x_j_target).norm(dim=-1)
             
             # Log-ratio loss (ratio-preserving)
             log_diff = torch.log(d_pred + self.eps) - torch.log(d_target + self.eps)
-            loss_b = (log_diff ** 2).mean()
-            loss_per_batch.append(loss_b)
+            losses[b] = (log_diff ** 2).mean()
         
-        if len(loss_per_batch) == 0:
-            return torch.tensor(0.0, device=device)
+        return losses  # (B,) - per-sample, NOT scalar
+
+
+# class EdgeLengthLoss(nn.Module):
+#     """
+#     Local edge-length loss (replaces KNN NCA).
+#     Preserves actual edge lengths instead of just rank ordering.
+#     Uses log-ratio to fight gram_scale naturally.
+#     """
+    
+#     def __init__(self, eps: float = 1e-4):
+#         super().__init__()
+#         self.eps = eps
+    
+#     def forward(
+#         self,
+#         V_pred: torch.Tensor,
+#         V_target: torch.Tensor,
+#         knn_indices: torch.Tensor,
+#         mask: torch.Tensor
+#     ) -> torch.Tensor:
+#         """
+#         Args:
+#             V_pred: (B, N, D) predicted coordinates
+#             V_target: (B, N, D) target coordinates  
+#             knn_indices: (B, N, k) neighbor indices from ST GT
+#             mask: (B, N) boolean mask
+            
+#         Returns:
+#             loss: scalar edge length loss
+#         """
+#         B, N, k = knn_indices.shape
+#         device = V_pred.device
         
-        return torch.stack(loss_per_batch).mean()
+#         # Create row indices (i)
+#         i = torch.arange(N, device=device).unsqueeze(1).expand(N, k)  # (N, k)
+#         j = knn_indices  # (B, N, k)
+        
+#         loss_per_batch = []
+        
+#         for b in range(B):
+#             m_b = mask[b]
+#             n_valid = m_b.sum().item()
+            
+#             if n_valid < 2:
+#                 continue
+            
+#             # Get valid nodes
+#             V_pred_b = V_pred[b, m_b]  # (n_valid, D)
+#             V_target_b = V_target[b, m_b]  # (n_valid, D)
+#             knn_b = knn_indices[b, m_b]  # (n_valid, k)
+
+#             # knn_b is already in local indices [0..n_valid-1] with -1 for invalid
+#             # DO NOT remap - just use directly
+#             knn_local = knn_b
+            
+#             # Filter out invalid neighbors (-1)
+#             valid_neighbors = (knn_local >= 0)  # (n_valid, k)
+            
+#             if not valid_neighbors.any():
+#                 continue
+            
+#             # Gather coordinates
+#             i_local = torch.arange(n_valid, device=device).unsqueeze(1).expand(n_valid, k)
+            
+#             # Only compute for valid edges
+#             edge_mask = valid_neighbors
+#             i_edges = i_local[edge_mask]  # (num_edges,)
+#             j_edges = knn_local[edge_mask]  # (num_edges,)
+            
+#             # Drop self-edges and validate bounds
+#             not_self = (i_edges != j_edges)
+#             i_edges = i_edges[not_self]
+#             j_edges = j_edges[not_self]
+            
+#             # Bounds check: ensure j_edges are valid indices
+#             valid_j = (j_edges >= 0) & (j_edges < n_valid)
+#             i_edges = i_edges[valid_j]
+#             j_edges = j_edges[valid_j]
+            
+#             if i_edges.numel() == 0:
+#                 continue
+                        
+#             # Compute edge lengths
+#             x_i_pred = V_pred_b[i_edges]  # (num_edges, D)
+#             x_j_pred = V_pred_b[j_edges]
+#             x_i_target = V_target_b[i_edges]
+#             x_j_target = V_target_b[j_edges]
+            
+#             d_pred = (x_i_pred - x_j_pred).norm(dim=-1)  # (num_edges,)
+#             d_target = (x_i_target - x_j_target).norm(dim=-1)
+            
+#             # Log-ratio loss (ratio-preserving)
+#             log_diff = torch.log(d_pred + self.eps) - torch.log(d_target + self.eps)
+#             loss_b = (log_diff ** 2).mean()
+#             loss_per_batch.append(loss_b)
+        
+#         if len(loss_per_batch) == 0:
+#             return torch.tensor(0.0, device=device)
+        
+#         return torch.stack(loss_per_batch).mean()
        
 
 # ==============================================================================
