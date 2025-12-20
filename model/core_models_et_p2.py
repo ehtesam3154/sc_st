@@ -2334,19 +2334,23 @@ def train_stageC_diffusion_generator(
             with torch.autocast(device_type='cuda', enabled=False):
                 mask_fp32 = mask.float()
                 if use_edm:
-                    # EDM: Loss on denoised prediction vs V_0 (generator output)
-                    # This matches non-EDM behavior: train to denoise back to generator manifold
+                    # EDM: Loss on denoised prediction
+                    # For ST: supervise with V_target (ground truth)
+                    # For SC: supervise with V_0 (generator output, since no GT)
                     x0_pred_fp32 = x0_pred.float()
-                    V_0_fp32 = V_0.float()  # REVERTED: use V_0 (= V_gen), not V_target
                     sigma_flat = sigma_t.view(-1).float()
-                    
+
                     # EDM weight: (σ² + σ_d²) / (σ · σ_d)²
                     w = uet.edm_loss_weight(sigma_flat, sigma_data)  # (B,)
                     w = w.view(-1, 1)  # (B, 1)
                     w = w.clamp(max=1000.0)  # Prevent extreme weights
-                    
-                    # Masked MSE per sample: compare to V_0 (generator output)
-                    err2 = (x0_pred_fp32 - V_0_fp32).pow(2).sum(dim=-1)  # (B, N)
+
+                    # Choose target: V_target for ST, V_0 for SC
+                    target_x0 = V_target if (not is_sc) else V_0
+                    target_fp32 = target_x0.float()
+
+                    # Masked MSE per sample
+                    err2 = (x0_pred_fp32 - target_fp32).pow(2).sum(dim=-1)  # (B, N)
                     L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum()
                 else:
                     sigma_t_fp32 = sigma_t.float()
@@ -4654,9 +4658,10 @@ def sample_sc_edm_patchwise(
                     mu_st=coral_params['mu_st']
                 )
 
-            # NEW: Start from generator proposal + noise (refinement mode)
+            # Start from generator proposal + noise (refinement mode)
             V_gen = generator(H_k, mask_k)  # Generator proposal
-            V_t = torch.randn(1, m_k, D_latent, device=device) * sigmas[0]
+            V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
+            V_t = V_t * mask_k.unsqueeze(-1).float()  # Mask out invalid positions
 
             # for t_idx in range(n_timesteps_sample):
             #     sigma_t = sigmas[t_idx]
