@@ -531,7 +531,9 @@ class STSetDataset(Dataset):
         num_samples: int = 10000,
         knn_k: int = 12,  # NEW parameter
         device: str = 'cuda',
-        landmarks_L: int=32
+        landmarks_L: int=32,
+        pool_mult: float = 4.0,
+        stochastic_tau: float = 1.0
     ):
         self.targets_dict = targets_dict
         self.encoder = encoder
@@ -544,6 +546,10 @@ class STSetDataset(Dataset):
         self.device = device
         self.slide_ids = list(targets_dict.keys())
         self.landmarks_L = 0
+
+        #store stoachastic sampling params
+        self.pool_mult = pool_mult
+        self.stochastic_tau = stochastic_tau
         
         # Precompute encoder embeddings for all slides
         self.Z_dict = {}
@@ -589,15 +595,31 @@ class STSetDataset(Dataset):
             # Sort by distance (nearest first)
             sort_order = torch.argsort(dists)          # ascending
             sorted_neighbors = idx_no_self[sort_order] # (m-1,)
+            sorted_dists = dists[sort_order]
 
-            # Always include the center + closest neighbors
-            n_neighbors = min(n - 1, sorted_neighbors.numel())
-            neighbors = sorted_neighbors[:n_neighbors]
+            # Determine pool size: min of (pool_mult * n, available neighbors)
+            n_neighbors_needed = n - 1  # We need n-1 neighbors (plus center)
+            K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n))
+            K_pool = max(K_pool, n_neighbors_needed)  # At least enough to sample from
 
+            #create the pool
+            pool = sorted_neighbors[: K_pool]
+            pool_d = sorted_dists[: K_pool]
+
+            if pool.numel() <= n_neighbors_needed:
+                neighbors = pool
+            else:
+                weights = torch.softmax(-pool_d / self.stochastic_tau, dim=0)
+
+                sampled_idx = torch.multinomial(weights, n_neighbors_needed, replacement=False)
+                neighbors = pool[sampled_idx]
+            
+            #combine center + sampled nhbrs
             indices = torch.cat([
                 torch.tensor([center_idx], dtype=torch.long),
                 neighbors
             ])
+
 
             # If we still have fewer than n (tiny slide), pad with random others
             if indices.numel() < n:
@@ -949,8 +971,8 @@ class SCSetDataset(Dataset):
     ):
         self.n_min = n_min
         self.n_max = n_max
-        self.n_large_min = n_large_min
-        self.n_large_max = n_large_max
+        self.n_large_min = n_min
+        self.n_large_max = n_max
         self.large_fraction = large_fraction
         self.overlap_min = overlap_min
         self.overlap_max = overlap_max
