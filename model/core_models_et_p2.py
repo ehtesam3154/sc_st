@@ -1362,6 +1362,7 @@ def train_stageC_diffusion_generator(
     P_mean: float = -1.2,          # Log-normal mean for sigma sampling
     P_std: float = 1.2,            # Log-normal std for sigma sampling
     use_edm: bool = True,          # Enable EDM mode
+    sigma_refine_max: float = None,  # Max sigma for EDM refinement (if None, uses 20.0 * sigma_data)
 ):
     
     # Initialize debug tracking
@@ -1817,7 +1818,7 @@ def train_stageC_diffusion_generator(
 
     WEIGHTS = {
         'score': 1.0,
-        'gram': 0.0,
+        'gram': 0.2,
         'gram_scale': 0.0,
         'heat': 0.0,
         'sw_st': 0.0,
@@ -1833,7 +1834,7 @@ def train_stageC_diffusion_generator(
         'knn_nca': 0.0,
         'repel': 0.0,
         'shape': 0.0,
-        'edge': 0.0,       # Can re-enable later at 0.02-0.1 for low-sigma only
+        'edge': 0.3,       # Can re-enable later at 0.02-0.1 for low-sigma only
         'topo': 0.0,
         'shape_spec': 0.0,
     }
@@ -1917,11 +1918,17 @@ def train_stageC_diffusion_generator(
     if use_edm:
         sigma_max = min(sigma_max, sigma_data * 100)  # Reasonable upper bound
         sigma_min = max(sigma_min, sigma_data * 0.001)  # Reasonable lower bound
+        # NEW: Set refinement sigma range (train as refiner, not full generator)
+        if sigma_refine_max is None:
+            sigma_refine_max = 20.0 * sigma_data  # Default: 1x sigma_data
+        sigma_refine_max = min(sigma_refine_max, sigma_max)  # Don't exceed sigma_max
     
     print(f"[StageC] sigma_data = {sigma_data:.4f}")
     print(f"[StageC] sigma_min = {sigma_min:.6f}, sigma_max = {sigma_max:.2f}")
     if use_edm:
         print(f"[StageC] EDM mode ENABLED: P_mean={P_mean}, P_std={P_std}")
+        print(f"[StageC] EDM refinement mode: sigma_refine_max = {sigma_refine_max:.4f}")
+
 
 
     #--amp scaler choice based on precision---
@@ -2101,13 +2108,13 @@ def train_stageC_diffusion_generator(
                 # === EDM: sample sigma from log-normal ===
                 if use_edm:
                     sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
-                    sigma = sigma.clamp(sigma_min, sigma_max)
+                    sigma = sigma.clamp(sigma_min, sigma_refine_max)
                     sigma_t = sigma.view(-1, 1, 1)
                     
                     # Create t_norm proxy for gating/debug (log-space normalization)
                     log_sigma = sigma.log()
                     log_min = math.log(sigma_min)
-                    log_max = math.log(sigma_max)
+                    log_max = math.log(sigma_refine_max)
                     t_norm = ((log_sigma - log_min) / (log_max - log_min + 1e-8)).clamp(0, 1)  # (B,)
                 else:
                     # Old: quadratic bias toward low noise
@@ -2117,13 +2124,22 @@ def train_stageC_diffusion_generator(
                     t_norm = t_cont / (n_timesteps - 1)
                     sigma_t = sigmas[t_idx].view(-1, 1, 1)
 
-                # ===== EDM: x0 FROM ST TARGET, NOT GENERATOR =====
+                # ===== EDM REFINEMENT: Noise around GENERATOR output, supervise with V_target =====
                 if use_edm and not is_sc:
-                    # ST batch: x0 is the ground truth geometry
-                    V_0 = batch['V_target'].to(device)
+                    # ST batch: 
+                    # - V_target is the ground truth (supervision target)
+                    # - V_gen is the generator's proposal (noise anchor)
+                    V_target = batch['V_target'].to(device)
+                    V_gen = generator(H, mask)  # Generator proposal (anchor for noising)
+                    V_anchor = V_gen  # We noise around the generator output
                 else:
-                    # SC batch or non-EDM: use generator
-                    V_0 = generator(H, mask)
+                    # SC batch or non-EDM: use generator for both
+                    V_gen = generator(H, mask)
+                    V_anchor = V_gen
+                    V_target = V_gen  # For SC, target = generator (no ground truth)
+                
+                # For backward compatibility, keep V_0 pointing to anchor
+                V_0 = V_anchor
                 
                 # Debug: Check V_0 scale variation (first 10 steps only)
                 if DEBUG and global_step < 10:
@@ -2144,9 +2160,9 @@ def train_stageC_diffusion_generator(
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
                 
-                # Add noise
-                eps = torch.randn_like(V_0)
-                V_t = V_0 + sigma_t * eps
+                # Add noise around the GENERATOR output (not V_target!)
+                eps = torch.randn_like(V_anchor)
+                V_t = V_anchor + sigma_t * eps  # Noise around generator proposal
                 V_t = V_t * mask.unsqueeze(-1).float()
 
                 # CFG: Drop context randomly during training
@@ -2318,9 +2334,10 @@ def train_stageC_diffusion_generator(
             with torch.autocast(device_type='cuda', enabled=False):
                 mask_fp32 = mask.float()
                 if use_edm:
-                    # EDM: Loss on denoised prediction vs ground truth
+                    # EDM: Loss on denoised prediction vs V_0 (generator output)
+                    # This matches non-EDM behavior: train to denoise back to generator manifold
                     x0_pred_fp32 = x0_pred.float()
-                    V_0_fp32 = V_0.float()
+                    V_0_fp32 = V_0.float()  # REVERTED: use V_0 (= V_gen), not V_target
                     sigma_flat = sigma_t.view(-1).float()
                     
                     # EDM weight: (σ² + σ_d²) / (σ · σ_d)²
@@ -2328,10 +2345,9 @@ def train_stageC_diffusion_generator(
                     w = w.view(-1, 1)  # (B, 1)
                     w = w.clamp(max=1000.0)  # Prevent extreme weights
                     
-                    # MSE on (x0_pred - x0)
-                    err2 = (x0_pred_fp32 - V_0_fp32).pow(2).mean(dim=2)  # (B, N)
+                    # Masked MSE per sample: compare to V_0 (generator output)
+                    err2 = (x0_pred_fp32 - V_0_fp32).pow(2).sum(dim=-1)  # (B, N)
                     L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum()
-
                 else:
                     sigma_t_fp32 = sigma_t.float()
                     eps_pred_fp32 = eps_pred.float()
@@ -2645,19 +2661,23 @@ def train_stageC_diffusion_generator(
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Use SPATIAL kNN for geometry, not expression kNN
                         knn_indices_batch = batch['knn_spatial'].to(device)
+                        
+                        # FIXED: Use sigma-based gating (now t_norm is correctly normalized)
                         low_noise = (t_norm.squeeze() < 0.6)
                         cond_only = (drop_mask.view(-1) < 0.5)  # True when NOT dropped
                         geo_gate_edge = (low_noise & cond_only).float()
                         gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
                         
-                        L_edge_raw = loss_edge(
+                        # FIXED: loss_edge now returns (B,) per-sample losses
+                        L_edge_per = loss_edge(
                             V_pred=V_geom,
-                            V_target=V_target_batch,  # Already computed!
+                            V_target=V_target_batch,
                             knn_indices=knn_indices_batch,
                             mask=mask
                         )
                         
-                        L_edge = (L_edge_raw * geo_gate_edge).sum() / gate_sum_edge
+                        # Proper per-sample gating
+                        L_edge = (L_edge_per * geo_gate_edge).sum() / gate_sum_edge
                 
                 # ==================== TOPOLOGY LOSS ====================
                 if WEIGHTS['topo'] > 0:
@@ -4356,6 +4376,7 @@ def sample_sc_edm_patchwise(
     encoder: "SharedEncoder",
     context_encoder: "SetEncoderContext",
     score_net: "DiffusionScoreNet",
+    generator: "GeometryGenerator",
     sigma_data: float,
     target_st_p95: Optional[float] = None,
     n_timesteps_sample: int = 160,
@@ -4598,8 +4619,14 @@ def sample_sc_edm_patchwise(
     #     device=device,
     # ))  # (T,)
 
-    # EDM Karras sigma schedule
-    sigmas = uet.edm_sigma_schedule(n_timesteps_sample, sigma_min, sigma_max, rho=7.0, device=device)
+    # EDM Karras sigma schedule - use refinement sigma range
+    # sigma_max should match training sigma_refine_max (typically 1.0 * sigma_data)
+    sigma_refine_max = min(sigma_max, 20.0 * sigma_data)  # Match training
+    sigmas = uet.edm_sigma_schedule(n_timesteps_sample, sigma_min, sigma_refine_max, rho=7.0, device=device)
+    
+    if DEBUG_FLAG:
+        print(f"[SAMPLE] Refinement mode: sigma range [{sigma_min:.4f}, {sigma_refine_max:.4f}]")
+
 
     patch_coords: List[torch.Tensor] = []
 
@@ -4627,6 +4654,8 @@ def sample_sc_edm_patchwise(
                     mu_st=coral_params['mu_st']
                 )
 
+            # NEW: Start from generator proposal + noise (refinement mode)
+            V_gen = generator(H_k, mask_k)  # Generator proposal
             V_t = torch.randn(1, m_k, D_latent, device=device) * sigmas[0]
 
             # for t_idx in range(n_timesteps_sample):
