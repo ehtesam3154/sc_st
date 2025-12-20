@@ -363,6 +363,10 @@ def main(args=None):
         early_stop_min_epochs=args.early_stop_min_epochs,
         early_stop_patience=args.early_stop_patience,
         early_stop_threshold=args.early_stop_threshold,
+        # NEW: Context augmentation
+        z_noise_std=0.02,       # Small noise (1-5% of feature RMS)
+        z_dropout_rate=0.1,     # 10% feature dropout
+        aug_prob=0.5,           # Apply to 50% of batches
     )
     
     fabric.barrier()

@@ -1331,6 +1331,47 @@ def print_multistep_evaluation_report(metrics: dict, epoch: int = 0, step: int =
     print("="*70 + "\n")
 
 
+# ==================== CONTEXT AUGMENTATION ====================
+def apply_context_augmentation(Z_set, mask, noise_std=0.02, dropout_rate=0.1):
+    """
+    Apply stochastic augmentation to Z_set (embedding inputs).
+    Only affects conditioning, not V_target (geometry stays unchanged).
+    
+    Args:
+        Z_set: (B, N, h_dim) embeddings
+        mask: (B, N) valid mask
+        noise_std: relative std for Gaussian noise
+        dropout_rate: fraction of features to zero out
+    
+    Returns:
+        Z_aug: augmented embeddings
+    """
+    B, N, h_dim = Z_set.shape
+    Z_aug = Z_set.clone()
+    
+    # Compute feature-wise RMS for relative noise scaling
+    # Only consider valid positions
+    mask_expanded = mask.unsqueeze(-1).float()  # (B, N, 1)
+    valid_count = mask_expanded.sum(dim=(0, 1)).clamp(min=1)  # (h_dim,)
+    feature_rms = ((Z_set ** 2) * mask_expanded).sum(dim=(0, 1)) / valid_count
+    feature_rms = torch.sqrt(feature_rms + 1e-8)  # (h_dim,)
+    
+    # Option 1: Add Gaussian noise (scaled by feature RMS)
+    if noise_std > 0:
+        noise = torch.randn_like(Z_aug) * (noise_std * feature_rms)
+        Z_aug = Z_aug + noise * mask_expanded
+    
+    # Option 2: Feature dropout (randomly zero out some features)
+    if dropout_rate > 0:
+        # Create dropout mask: (B, 1, h_dim) - same for all positions in a batch
+        dropout_mask = (torch.rand(B, 1, h_dim, device=Z_aug.device) > dropout_rate).float()
+        # Scale remaining features to preserve expected value
+        Z_aug = Z_aug * dropout_mask / (1.0 - dropout_rate + 1e-8)
+    
+    return Z_aug
+
+# print(f"[Context Aug] z_noise_std={z_noise_std}, z_dropout_rate={z_dropout_rate}, aug_prob={aug_prob}")
+# ==============================================================
 
 
 
@@ -1363,6 +1404,10 @@ def train_stageC_diffusion_generator(
     P_std: float = 1.2,            # Log-normal std for sigma sampling
     use_edm: bool = True,          # Enable EDM mode
     sigma_refine_max: float = None,  # Max sigma for EDM refinement (if None, uses 20.0 * sigma_data)
+    #context augmentation params
+    z_noise_std: float= 0.02, # guassian noise std (relative to feature rms)
+    z_dropout_rate: float = 0.1, # feature dropout rate (5-20%)
+    aug_prob: float = 0.5, #prob to apply augmentation per batch
 ):
     
     # Initialize debug tracking
@@ -2092,6 +2137,16 @@ def train_stageC_diffusion_generator(
                 
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
+
+            # Apply context augmentation stochastically
+            if torch.rand(1).item() < aug_prob:
+                Z_set = apply_context_augmentation(
+                    Z_set, mask, 
+                    noise_std=z_noise_std, 
+                    dropout_rate=z_dropout_rate
+                )
+
+
             n_list = batch['n']
             batch_size_real = Z_set.shape[0]
             

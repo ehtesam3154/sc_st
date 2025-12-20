@@ -284,6 +284,14 @@ class GEMSModel:
         early_stop_patience: int = 6,
         early_stop_threshold: float = 0.01,
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
+        # NEW: Stochastic kNN sampling parameters (for STSetDataset)
+        pool_mult: float = 4.0,
+        stochastic_tau: float = 1.0,
+        # NEW: Context augmentation parameters
+        z_noise_std: float = 0.02,
+        z_dropout_rate: float = 0.1,
+        aug_prob: float = 0.5,
+
 ):
         """
         Train diffusion generator with mixed ST/SC regimen.
@@ -316,7 +324,9 @@ class GEMSModel:
                 num_samples=num_st_samples,
                 knn_k=12,
                 device=self.device,
-                landmarks_L=self.cfg['dataset']['landmarks_L']
+                landmarks_L=self.cfg['dataset']['landmarks_L'],
+                pool_mult=pool_mult,
+                stochastic_tau=stochastic_tau,
             )
         else:
             st_dataset = None
@@ -374,6 +384,10 @@ class GEMSModel:
             early_stop_min_epochs=early_stop_min_epochs,
             early_stop_patience=early_stop_patience,
             early_stop_threshold=early_stop_threshold,
+            # NEW: Context augmentation
+            z_noise_std=z_noise_std,
+            z_dropout_rate=z_dropout_rate,
+            aug_prob=aug_prob,
         )
 
         # Store sigma_data for inference
