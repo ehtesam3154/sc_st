@@ -985,7 +985,7 @@ def factor_from_gram(G: torch.Tensor, D_latent: int) -> torch.Tensor:
         V = torch.cat([V, padding], dim=1)
     
     # Center rows (translation neutrality)
-    V = V - V.mean(dim=0, keepdim=True)
+    # V = V - V.mean(dim=0, keepdim=True)
     
     return V
 
@@ -3209,13 +3209,33 @@ class EdgeLengthLoss(nn.Module):
             x_j_pred = V_pred_b[j_edges]
             x_i_target = V_target_b[i_edges]
             x_j_target = V_target_b[j_edges]
-            
+
+            # Compute edge lengths
             d_pred = (x_i_pred - x_j_pred).norm(dim=-1)      # (num_edges,)
             d_target = (x_i_target - x_j_target).norm(dim=-1)
-            
-            # Log-ratio loss (ratio-preserving)
-            log_diff = torch.log(d_pred + self.eps) - torch.log(d_target + self.eps)
+
+            # ===== DATA-DRIVEN FLOOR =====
+            # Compute robust edge scale from target (p10)
+            s = torch.quantile(d_target.detach(), 0.10).clamp_min(1e-6)
+
+            # Floor as fraction of scale (unitless hyperparameter)
+            alpha = 0.25  # Tune this if needed
+            d_floor = (alpha * s).clamp_min(s * 1e-3)  # Ensure nonzero
+
+            # Clamp both pred and target
+            d_pred_c = d_pred.clamp_min(d_floor)
+            d_target_c = d_target.clamp_min(d_floor)
+
+            # Log-ratio loss
+            log_diff = torch.log(d_pred_c) - torch.log(d_target_c)
             losses[b] = (log_diff ** 2).mean()
+            
+            # d_pred = (x_i_pred - x_j_pred).norm(dim=-1)      # (num_edges,)
+            # d_target = (x_i_target - x_j_target).norm(dim=-1)
+            
+            # # Log-ratio loss (ratio-preserving)
+            # log_diff = torch.log(d_pred + self.eps) - torch.log(d_target + self.eps)
+            # losses[b] = (log_diff ** 2).mean()
         
         return losses  # (B,) - per-sample, NOT scalar
 
