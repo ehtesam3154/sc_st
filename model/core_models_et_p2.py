@@ -2926,60 +2926,80 @@ def train_stageC_diffusion_generator(
 
                         # k-NN preservation check (identity, not just distance)
                         # =================================================================
-                        # [DEBUG] 3-WAY KNN JACCARD DIAGNOSTIC
+                        # [DEBUG] 3-WAY KNN JACCARD DIAGNOSTIC & SCALE CHECKS
+                        # =================================================================
+                        # k-NN preservation check (identity, not just distance)
+                        # =================================================================
+                        # [DEBUG] 3-WAY KNN JACCARD DIAGNOSTIC & SCALE CHECKS
                         # =================================================================
                         if global_step % 25 == 0:
                             with torch.no_grad():
-                                # --- Helper Function (defined locally for easy copy-paste) ---
+                                # 1. Define Tensors
+                                # Use raw batch['V_target'] if available to ensure we check against pure GT
+                                Tgt = batch['V_target'].to(device) if 'V_target' in batch else V_target_batch
+
+                                # --- A. COMPUTE SCALE & ERROR RMS ---
+                                mask_f = mask.unsqueeze(-1).float()
+                                valid_elements = mask_f.sum() * Tgt.shape[-1]
+                                
+                                def get_rms(tensor):
+                                    return (tensor.pow(2) * mask_f).sum().div(valid_elements + 1e-8).sqrt().item()
+
+                                rms_tgt   = get_rms(Tgt)
+                                rms_hat   = get_rms(V_hat)
+                                rms_noise = get_rms(V_t - Tgt)     # Magnitude of added noise
+                                rms_pred  = get_rms(V_hat - Tgt)   # Magnitude of prediction error
+
+                                # Compute Median NN Distance on Target (for density scale reference)
+                                # We compute on the first valid sample to save compute
+                                median_nn = 0.0
+                                for b_idx in range(Tgt.shape[0]):
+                                    m_b = mask[b_idx].bool()
+                                    if m_b.sum() > 5:
+                                        tgt_b = Tgt[b_idx][m_b]
+                                        d_b = torch.cdist(tgt_b, tgt_b)
+                                        d_b.fill_diagonal_(float('inf')) # Ignore self
+                                        nn_dists = d_b.min(dim=1).values
+                                        median_nn = nn_dists.median().item()
+                                        break
+
+                                # --- B. Helper Function with ROBUST DIAGONAL HANDLING ---
                                 def run_jaccard_check(V_A, V_B, m_tensor, k=10, name=""):
                                     """Computes Jaccard similarity between kNN of V_A and kNN of V_B"""
-                                    # 1. Shape Correction: Force (B, N, D)
-                                    if V_A.dim() == 2: 
-                                        V_A = V_A.unsqueeze(0) # Assume (N, D) -> (1, N, D)
-                                    if V_B.dim() == 2: 
-                                        V_B = V_B.unsqueeze(0)
-                                    if m_tensor.dim() == 1:
-                                        m_tensor = m_tensor.unsqueeze(0)
+                                    # Shape corrections
+                                    if V_A.dim() == 2: V_A = V_A.unsqueeze(0)
+                                    if V_B.dim() == 2: V_B = V_B.unsqueeze(0)
+                                    if m_tensor.dim() == 1: m_tensor = m_tensor.unsqueeze(0)
 
-                                    # Safety check after unsqueeze
                                     if V_A.dim() != 3 or V_B.dim() != 3:
-                                        print(f"  [SKIP] {name}: Shape mismatch A={V_A.shape} B={V_B.shape}")
                                         return 0.0
                                     
                                     scores = []
                                     for b_idx in range(V_A.shape[0]):
-                                        # 1. Get the mask for this batch item
-                                        valid = m_tensor[b_idx].bool() # Shape (N,)
+                                        valid = m_tensor[b_idx].bool()
                                         n_pts = valid.sum().item()
                                         
-                                        # Need enough points for kNN
                                         if n_pts < k + 2: continue
                                         
-                                        # 2. Extract valid points safely
-                                        # V_A[b_idx] is (N, D)
-                                        # valid is (N,)
                                         try:
-                                            va = V_A[b_idx][valid].float() # Should result in (n_pts, D)
+                                            va = V_A[b_idx][valid].float()
                                             vb = V_B[b_idx][valid].float()
-                                        except IndexError as e:
-                                            # Fallback print to debug dimensions if it crashes again
-                                            print(f"  [CRASH] {name} b={b_idx}: V_A shape={V_A.shape}, V_A[b].shape={V_A[b_idx].shape}")
-                                            print(f"  [CRASH] mask[b].shape={valid.shape} valid_count={n_pts}")
-                                            raise e
+                                        except IndexError:
+                                            continue
 
-                                        # 3. Compute Distance Matrices
+                                        # Compute Distance Matrices
                                         da = torch.cdist(va, va)
                                         db = torch.cdist(vb, vb)
                                         
-                                        # 4. Get Top-K Indices (exclude self at index 0)
-                                        # largest=False -> smallest distances
-                                        _, idx_a = da.topk(min(k + 1, n_pts), largest=False)
-                                        _, idx_b = db.topk(min(k + 1, n_pts), largest=False)
+                                        # --- NEW: Set diagonal to Infinity (Robust ties/self handling) ---
+                                        da.fill_diagonal_(float('inf'))
+                                        db.fill_diagonal_(float('inf'))
                                         
-                                        idx_a = idx_a[:, 1:] # Drop self
-                                        idx_b = idx_b[:, 1:] # Drop self
+                                        # Get Top-K Indices (Now we get exactly k, no need to drop column 0)
+                                        _, idx_a = da.topk(min(k, n_pts-1), largest=False)
+                                        _, idx_b = db.topk(min(k, n_pts-1), largest=False)
                                         
-                                        # 5. Compute Jaccard
+                                        # Compute Jaccard
                                         sample_scores = []
                                         ia_list = idx_a.cpu().tolist()
                                         ib_list = idx_b.cpu().tolist()
@@ -2994,43 +3014,44 @@ def train_stageC_diffusion_generator(
                                     
                                     return sum(scores) / len(scores) if scores else 0.0
 
-                                # --- The 3-Way Check ---
-                                
-                                # 1. Define Tensors
-                                # Use raw batch['V_target'] if available to ensure we check against pure GT
-                                # If not available (e.g. SC batch), use V_target_batch which you computed earlier
-                                Tgt = batch['V_target'].to(device) if 'V_target' in batch else V_target_batch
-                                
-                                # 2. Compute Metrics
+                                # --- C. Compute Jaccard ---
                                 k_check = 10
-                                
-                                # A) Sanity: Target vs Target (MUST be 1.0)
                                 score_sanity = run_jaccard_check(Tgt, Tgt, mask, k=k_check, name="Sanity")
-                                
-                                # B) Noise Floor: Noisy Input (V_t) vs Target
-                                # This tells you how much structure is preserved in the input before the model works
                                 score_noise = run_jaccard_check(V_t, Tgt, mask, k=k_check, name="Input_Noise")
-                                
-                                # C) Performance: Prediction (V_hat) vs Target
-                                # This is what we care about
                                 score_pred = run_jaccard_check(V_hat, Tgt, mask, k=k_check, name="Prediction")
                                 
-                                # 3. Print Report
+                                # --- D. Print Report ---
                                 sigma_val = sigma_t.mean().item()
                                 print(f"\n[KNN DIAGNOSTIC] step={global_step} (sigma_avg={sigma_val:.3f})")
-                                print(f"  1. GT  vs GT   (Sanity): {score_sanity:.4f}  [Should be 1.0]")
-                                print(f"  2. V_t vs GT   (Input):  {score_noise:.4f}   [Baseline difficulty]")
-                                print(f"  3. Pred vs GT  (Output): {score_pred:.4f}   [Actual performance]")
+                                print(f"  --- Scale & Error Stats ---")
+                                print(f"  RMS(Tgt):   {rms_tgt:.4f} | Median NN(Tgt): {median_nn:.4f}")
+                                print(f"  RMS(Noise): {rms_noise:.4f} (Input |V_t - Tgt|)")
+                                print(f"  RMS(Pred):  {rms_hat:.4f} (Output Scale)")
+                                print(f"  RMS(Error): {rms_pred:.4f} (Output |V_hat - Tgt|)")
                                 
-                                # 4. Automated Diagnostics
+                                print(f"  --- Jaccard Scores (k={k_check}) ---")
+                                print(f"  1. GT  vs GT   (Sanity): {score_sanity:.4f}")
+                                print(f"  2. V_t vs GT   (Input):  {score_noise:.4f}")
+                                print(f"  3. Pred vs GT  (Output): {score_pred:.4f}")
+                                
+                                # --- E. Automated Diagnostics ---
                                 if score_sanity < 0.99:
-                                    print("  🔴 FAIL: Sanity check < 1.0. Your masks or indices are misaligned!")
+                                    print("  🔴 FAIL: Sanity check < 1.0. Indices misaligned!")
+                                
+                                # Check for Collapse (Output much smaller than Target)
+                                elif rms_hat < 0.1 * rms_tgt:
+                                     print(f"  🔴 FAIL: Model COLLAPSED to zero (RMS ratio {rms_hat/rms_tgt:.3f})")
+
+                                # Check for Destructive Prediction (Error > Noise)
+                                elif rms_pred > rms_noise:
+                                    print(f"  ⚠️ WARNING: Destructive! Output error ({rms_pred:.3f}) > Input noise ({rms_noise:.3f})")
+                                
                                 elif score_pred < score_noise:
-                                    print("  ⚠️ WARNING: Model output is WORSE than noisy input. (Destructive)")
+                                    print("  ⚠️ WARNING: Jaccard WORSE than input. Geometry scrambled.")
                                 elif score_pred > score_noise + 0.05:
-                                    print(f"  🟢 PASS: Model is improving structure (+{score_pred - score_noise:.3f})")
+                                    print(f"  🟢 PASS: Improving structure (+{score_pred - score_noise:.3f})")
                                 else:
-                                    print("  ⚪ NEUTRAL: Model output ≈ Input noise.")
+                                    print("  ⚪ NEUTRAL: Output ≈ Input.")
                                 print("="*60)
 
 
