@@ -1892,6 +1892,15 @@ def train_stageC_diffusion_generator(
                                 print("  ⚠️ CRITICAL: Generator has collapsed to zero!")
                             print("="*60)
 
+                if (global_step % 25 == 0) and (not is_sc) and (fabric is None or fabric.is_global_zero):
+                    with torch.no_grad():
+                        v_gen_scale = generator(H, mask)
+                        mask_f = mask.unsqueeze(-1).float()
+                        valid_count = mask_f.sum() * v_gen_scale.shape[-1]
+                        rms_gen = (v_gen_scale.pow(2) * mask_f).sum().div(valid_count).sqrt()
+                        rms_tgt = (V_target.pow(2) * mask_f).sum().div(valid_count).sqrt()
+                        print(f"[GEN SCALE] RMS={rms_gen:.4f} (target ~{rms_tgt:.4f}) ratio={rms_gen/rms_tgt:.4f}")
+
                 # ===== CFG: Drop context ONLY for score network =====
                 drop_probs = torch.rand(batch_size_real, device=device)
                 drop_bool = (drop_probs < p_uncond).float()
@@ -2706,19 +2715,19 @@ def train_stageC_diffusion_generator(
                         with torch.no_grad():
                             idx = 0  # first sample
                             V_p = V_geom[idx]  # (N, D)
-                            V_t = V_target_batch[idx]  # (N, D)
+                            V_tgt_sample = V_target_batch[idx]  # (N, D)
                             m0 = m_bool[idx]  # (N,)
                             
                             # Gram trace for this sample
                             G_p_diag = (V_p * V_p).sum(dim=1)  # ||v_i||^2
-                            G_t_diag = (V_t * V_t).sum(dim=1)
+                            G_t_diag = (V_tgt_sample * V_tgt_sample).sum(dim=1)
                             tr_p_sample = G_p_diag[m0].sum().item()
                             tr_t_sample = G_t_diag[m0].sum().item()
                             gram_ratio_sample = tr_p_sample / max(tr_t_sample, 1e-8)
                             
                             # Distance for this sample
                             D_p = torch.cdist(V_p[m0], V_p[m0])
-                            D_t = torch.cdist(V_t[m0], V_t[m0])
+                            D_t = torch.cdist(V_tgt_sample[m0], V_tgt_sample[m0])
                             n_valid = m0.sum().item()
                             mask_upper = torch.triu(torch.ones(n_valid, n_valid, device=D_p.device), diagonal=1).bool()
                             d_p_med = D_p[mask_upper].median().item()
@@ -3044,28 +3053,46 @@ def train_stageC_diffusion_generator(
                                         sigma_list.append(sig_b)
 
                                 if noise_diagnostics:
-                                    weights = torch.tensor([s**2 for _, _, s in noise_diagnostics])
-                                    weights = weights / weights.sum()
+                                    # Compute per-sample ratios (the TRUE test of noise correctness)
+                                    ratios = [d[0] / max(d[2], 1e-8) for d in noise_diagnostics]
+                                    ratio_med = torch.tensor(ratios).median().item()
+                                    ratio_mean = torch.tensor(ratios).mean().item()
+                                    ratio_std = torch.tensor(ratios).std().item()
                                     
-                                    avg_point_std = sum(w.item() * d[0] for w, d in zip(weights, noise_diagnostics))
-                                    avg_mean_norm = sum(w.item() * d[1] for w, d in zip(weights, noise_diagnostics))
+                                    # Compute mean_norm ratios (normalized by sigma and sqrt(D/n))
+                                    # For each sample: expected_mean_norm ≈ sigma * sqrt(D/n)
+                                    D_latent = Tgt.shape[-1]  # Usually 16
+                                    mean_norm_ratios = []
+                                    for noise_std, mean_norm, sig in noise_diagnostics:
+                                        # Find n for this sample (approximate from noise_diagnostics context)
+                                        # The mean_norm should be ~ sig * sqrt(D/n), so ratio should be ~sqrt(D/n)
+                                        # We normalize by sigma to get: mean_norm/sigma, which should be ~sqrt(D/n)
+                                        normalized = mean_norm / max(sig, 1e-8)
+                                        mean_norm_ratios.append(normalized)
+                                    
+                                    mean_norm_ratio_med = torch.tensor(mean_norm_ratios).median().item()
+                                    
                                     sigma_rms = sigma_t_orig.pow(2).mean().sqrt().item()
                                     
                                     print(f"  --- Noise Structure Analysis ---")
-                                    print(f"  sigma_rms: {sigma_rms:.4f} (should match RMS(Noise))")
-                                    print(f"  noise_point_std (weighted): {avg_point_std:.4f} (should be ~sigma for iid noise)")
-                                    print(f"  noise_mean_norm (weighted): {avg_mean_norm:.4f} (should be ~0 for iid noise)")
+                                    print(f"  sigma_rms: {sigma_rms:.4f}")
+                                    print(f"  Per-sample noise_std/sigma: median={ratio_med:.3f} mean={ratio_mean:.3f} std={ratio_std:.3f}")
+                                    print(f"  Per-sample mean_norm/sigma: median={mean_norm_ratio_med:.3f} (expected ~sqrt(D/n) ≈ 0.2-0.3)")
                                     
-                                    ratios = [d[0] / max(d[2], 1e-8) for d in noise_diagnostics]
-                                    ratio_med = torch.tensor(ratios).median().item()
-                                    print(f"  Per-sample noise/sigma ratio: median={ratio_med:.3f} (should be ~1.0)")
-                                    
+                                    # The TRUE test: per-sample ratio should be ~1.0
                                     if ratio_med < 0.7:
                                         print(f"  🔴 FAIL: Noise is TRANSLATION-LIKE (ratio={ratio_med:.3f})")
-                                    elif avg_mean_norm > 0.5 * sigma_rms:
-                                        print(f"  🔴 FAIL: Noise has LARGE MEAN SHIFT (mean_norm={avg_mean_norm:.4f})")
+                                    elif ratio_med > 1.3:
+                                        print(f"  🔴 FAIL: Noise is TOO LARGE (ratio={ratio_med:.3f})")
+                                    elif ratio_std > 0.3:
+                                        print(f"  ⚠️ WARNING: High variance in noise ratios (std={ratio_std:.3f})")
+                                    elif mean_norm_ratio_med > 1.0:
+                                        # mean_norm/sigma > 1.0 means the mean shift is larger than sigma itself
+                                        # This would indicate systematic bias, not random noise
+                                        print(f"  ⚠️ WARNING: Mean shift is large relative to sigma (ratio={mean_norm_ratio_med:.3f})")
                                     else:
                                         print(f"  ✅ PASS: Noise appears to be proper per-point iid")
+
 
                                 print(f"  --- Scale & Error Stats ---")
                                 print(f"  RMS(Tgt):   {rms_tgt:.4f} | Median NN(Tgt): {median_nn:.4f}")
@@ -3093,6 +3120,34 @@ def train_stageC_diffusion_generator(
                                 print("="*60)
 
 
+                                # ✅ ADD THIS HERE:
+                                print(f"\n  --- Per-Sigma Jaccard (bins) ---")
+                                sigma_bins = [
+                                    (0.0, 0.05),
+                                    (0.05, 0.1),
+                                    (0.1, 0.3),
+                                    (0.3, 0.6),
+                                    (0.6, 1.0),
+                                    (1.0, 2.0),
+                                    (2.0, 5.0)
+                                ]
+
+                                for bin_idx, (sigma_low, sigma_high) in enumerate(sigma_bins):
+                                    mask_bin = (sigma_t_orig.squeeze() >= sigma_low) & (sigma_t_orig.squeeze() < sigma_high)
+                                    if mask_bin.sum() > 0:
+                                        # Get samples in this sigma range
+                                        V_hat_bin = V_hat[mask_bin]
+                                        V_tgt_bin = V_target_orig[mask_bin]
+                                        mask_bin_expanded = mask_orig[mask_bin]
+                                        
+                                        # Compute Jaccard for this bin
+                                        jaccard_bin = run_jaccard_check(V_hat_bin, V_tgt_bin, mask_bin_expanded, k=k_check)
+                                        n_samples = mask_bin.sum().item()
+                                        sigma_mean = sigma_t_orig.squeeze()[mask_bin].mean().item()
+                                        
+                                        print(f"  Bin {bin_idx} σ∈[{sigma_low:.2f},{sigma_high:.2f}] "
+                                            f"(n={n_samples}, σ_avg={sigma_mean:.3f}): Jaccard={jaccard_bin:.3f}")
+
 
                         if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
@@ -3106,11 +3161,13 @@ def train_stageC_diffusion_generator(
                                         continue
                                     
                                     V_p = V_geom[b_idx][m_b]  # (n_valid, D)
-                                    V_t = V_target_batch[b_idx][m_b]  # (n_valid, D)
+                                    # V_t = V_target_batch[b_idx][m_b]  # (n_valid, D)
+                                    V_tgt_local = V_target_batch[b_idx][m_b]
                                     
                                     # Compute k-NN in pred and target space
                                     D_p = torch.cdist(V_p, V_p)
-                                    D_t = torch.cdist(V_t, V_t)
+                                    # D_t = torch.cdist(V_t, V_t)
+                                    D_t = torch.cdist(V_tgt_local, V_tgt_local)
                                     
                                     # Get k-NN indices (exclude self)
                                     knn_pred = D_p.topk(k_check + 1, largest=False).indices[:, 1:]  # (n_valid, k)
