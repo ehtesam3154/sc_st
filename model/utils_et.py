@@ -3952,3 +3952,176 @@ class ContextCORAL(torch.nn.Module):
         coral.register_buffer("B", data['B'])
         
         return coral
+    
+def edge_log_ratio_loss(V_pred, V_tgt, knn_idx, mask, eps=1e-8):
+    """
+    PATCH 5: Penalize multiplicative edge length error: (log d_pred - log d_tgt)^2.
+    This directly targets the "2.3x too large" symptom.
+    
+    V_pred, V_tgt: (B,N,D)
+    knn_idx: (B,N,K) long
+    mask: (B,N) bool
+    
+    Returns: (B,) per-sample losses
+    """
+    B, N, D = V_pred.shape
+    K = knn_idx.shape[-1]
+    device = V_pred.device
+    
+    losses = torch.zeros(B, device=device)
+    
+    for b in range(B):
+        m_b = mask[b]
+        n_valid = int(m_b.sum().item())
+        
+        if n_valid < 2:
+            continue
+        
+        V_pred_b = V_pred[b, m_b]      # (n_valid, D)
+        V_tgt_b = V_tgt[b, m_b]        # (n_valid, D)
+        knn_b = knn_idx[b, m_b]        # (n_valid, K)
+        
+        # Filter valid neighbors
+        valid_neighbors = (knn_b >= 0) & (knn_b < n_valid)
+        
+        if not valid_neighbors.any():
+            continue
+        
+        # Create edge indices
+        i_local = torch.arange(n_valid, device=device).unsqueeze(1).expand(n_valid, K)
+        
+        edge_mask = valid_neighbors & (i_local != knn_b)  # exclude self-loops
+        i_edges = i_local[edge_mask]
+        j_edges = knn_b[edge_mask]
+        
+        # Additional bounds check
+        valid_j = (j_edges >= 0) & (j_edges < n_valid)
+        i_edges = i_edges[valid_j]
+        j_edges = j_edges[valid_j]
+        
+        if i_edges.numel() == 0:
+            continue
+        
+        # Compute edge lengths
+        d2_pred = (V_pred_b[i_edges] - V_pred_b[j_edges]).pow(2).sum(dim=-1)
+        d2_tgt = (V_tgt_b[i_edges] - V_tgt_b[j_edges]).pow(2).sum(dim=-1)
+        
+        d_pred = torch.sqrt(d2_pred + eps)
+        d_tgt = torch.sqrt(d2_tgt + eps)
+        
+        # Skip degenerate target edges
+        valid_edges = (d_tgt > 1e-6)
+        if not valid_edges.any():
+            continue
+        
+        d_pred = d_pred[valid_edges]
+        d_tgt = d_tgt[valid_edges]
+        
+        # Log-ratio loss (multiplicative error)
+        log_diff = torch.log(d_pred) - torch.log(d_tgt)
+        losses[b] = log_diff.pow(2).mean()
+    
+    return losses
+
+
+def variance_outside_topk(V, mask, k=2, eps=1e-8):
+    """
+    PATCH 7: Fraction of variance outside top-k principal components.
+    This stops the 32D "orthogonalization" mode that inflates distances.
+    
+    V: (B,N,D) float
+    mask: (B,N) bool
+    
+    Returns: scalar loss
+    """
+    B, N, D = V.shape
+    out = V.new_zeros(())
+    cnt = 0
+    
+    for b in range(B):
+        mb = mask[b]
+        n = int(mb.sum().item())
+        if n <= k:
+            continue
+        X = V[b, mb].float()  # (n,D)
+        
+        # Covariance in feature space: (D,D)
+        X_centered = X - X.mean(dim=0, keepdim=True)
+        C = (X_centered.T @ X_centered) / float(n)
+        
+        # Eigenvalue decomposition
+        try:
+            evals = torch.linalg.eigvalsh(C)  # ascending
+        except:
+            continue
+            
+        total = evals.sum().clamp_min(eps)
+        outside = evals[:-k].sum()  # all but top-k
+        out = out + (outside / total)
+        cnt += 1
+    
+    if cnt == 0:
+        return V.new_tensor(0.0)
+    return out / float(cnt)
+
+
+def rigid_align_mse_no_scale(V_pred, V_tgt, mask, eps=1e-8):
+    """
+    PATCH 8A: Rotation/reflection alignment only (no scaling), then MSE.
+    Both sets assumed centered already.
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    loss = V_pred.new_zeros(())
+    cnt = 0
+    
+    for b in range(B):
+        mb = mask[b]
+        n = int(mb.sum().item())
+        if n < 2:
+            continue
+        X = V_pred[b, mb].float()  # (n,D)
+        Y = V_tgt[b, mb].float()   # (n,D)
+        
+        # SVD for optimal rotation
+        M = X.T @ Y                # (D,D)
+        try:
+            U, _, Vh = torch.linalg.svd(M, full_matrices=False)
+            R = U @ Vh             # (D,D)
+        except:
+            continue
+        
+        Xr = X @ R
+        loss = loss + (Xr - Y).pow(2).mean()
+        cnt += 1
+    
+    if cnt == 0:
+        return V_pred.new_tensor(0.0)
+    return loss / float(cnt)
+
+
+def rms_log_loss(V_pred, V_tgt, mask, eps=1e-8):
+    """
+    PATCH 8A: Penalize RMS scale mismatch: (log rms_pred - log rms_tgt)^2.
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    loss = V_pred.new_zeros(())
+    cnt = 0
+    
+    for b in range(B):
+        mb = mask[b]
+        n = int(mb.sum().item())
+        if n < 2:
+            continue
+        X = V_pred[b, mb].float()
+        Y = V_tgt[b, mb].float()
+        
+        rms_x = torch.sqrt((X.pow(2).mean()) + eps)
+        rms_y = torch.sqrt((Y.pow(2).mean()) + eps)
+        loss = loss + (torch.log(rms_x) - torch.log(rms_y)).pow(2)
+        cnt += 1
+    
+    if cnt == 0:
+        return V_pred.new_tensor(0.0)
+    return loss / float(cnt)

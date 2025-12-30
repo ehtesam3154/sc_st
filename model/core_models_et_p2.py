@@ -719,6 +719,22 @@ class DiffusionScoreNet(nn.Module):
                     bin_edges=  self.st_dist_bin_edges
                 )
 
+                # --- PATCH 1: Gate distance bias off when coordinates are very noisy ---
+                # In EDM mode, t == c_noise == log(sigma)/4, so sigma = exp(4*t).
+                # When sigma is large, dist2(V_in) is random -> bias hurts. We smoothly disable it.
+                with torch.no_grad():
+                    # Detect EDM-style t (will include negatives); avoid breaking non-EDM path.
+                    t_squeezed = t.squeeze()  # (B,) or scalar
+                    t_min = float(t_squeezed.min().detach().cpu()) if t_squeezed.numel() > 0 else 0.0
+                if t_min < 0.0:  # EDM mode: t = log(sigma)/4
+                    # t is (B, 1), need sigma_est as (B, 1, 1, 1) to broadcast with (B, 1, N, N)
+                    sigma_est = torch.exp(4.0 * t.squeeze(-1)).view(-1, 1, 1, 1)  # (B, 1, 1, 1)
+                    sigma0 = 0.30  # matches your observed Jaccard cliff at ~0.3
+                    bias_gate = (sigma0 / (sigma0 + sigma_est)).to(attn_bias.dtype)  # (B, 1, 1, 1)
+                    attn_bias = attn_bias * bias_gate  # broadcasts correctly with (B, 1, N, N)
+                # ---------------------------------------------------------------
+
+
                 #get bin embeddings for distogram head
                 if self.use_st_dist_head:
                     bin_embeddings = self.E_bin[bin_ids]
@@ -750,14 +766,6 @@ class DiffusionScoreNet(nn.Module):
             gamma, beta = gamma_beta.chunk(2, dim=-1)    # each (B, N, c_dim)
             X = X * (1.0 + gamma) + beta
             X = X * mask.unsqueeze(-1).float()
-
-            # --- [DEBUG SNIPPET 2] START ---
-            # Check FiLM values approx every 100 steps (random check since global_step isn't available here)
-            # if self.training and torch.rand(1).item() < 0.01:
-            #      print(f"[FILM block {i}] gamma: min={gamma.min():.3f} max={gamma.max():.3f} mean={gamma.mean():.3f}")
-            #      print(f"[FILM block {i}] beta: min={beta.min():.3f} max={beta.max():.3f}")
-            #      print(f"[FILM block {i}] X after FiLM: std={X.std():.6f}")
-            # --- [DEBUG SNIPPET 2] END ---
         
         # Step 5: Output head
         eps_hat = self.output_head(X)  # (B, N, D_latent)
@@ -804,7 +812,13 @@ class DiffusionScoreNet(nn.Module):
                 debug_dict['c_noise'] = c_noise[:2].detach().cpu()
             
             # Scale input
-            x_in = c_in * x  # (B, N, D)
+            # x_in = c_in * x  # (B, N, D)
+
+            # --- PATCH 2: make EDM operate in centered coordinate space consistently ---
+            # Your forward() centers x_in internally, but the skip path used raw x.
+            # This makes score-loss and geometry-loss operate in slightly different spaces.
+            x_c, _ = uet.center_only(x, mask)  # (B,N,D), same dtype as x
+            x_in = c_in * x_c
             
             if return_debug:
                 # 4.2 Log internal input scale
@@ -822,8 +836,8 @@ class DiffusionScoreNet(nn.Module):
                 # 4.3 Log raw network output scale
                 debug_dict['F_x_stats'] = masked_stats(F_x, mask)
             
-            # EDM denoiser output
-            x0_pred = c_skip * x + c_out * F_x
+            # EDM denoiser output - use centered x_c for skip path
+            x0_pred = c_skip * x_c + c_out * F_x
             x0_pred = x0_pred * mask.unsqueeze(-1).float()
             
             if return_debug:
@@ -1046,7 +1060,15 @@ def train_stageC_diffusion_generator(
         list(generator.parameters()) +
         list(score_net.parameters())
     )
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+    # optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
+
+    # PATCH 8C: Separate LR for generator (needs bigger LR due to small gradients)
+    optimizer = torch.optim.AdamW([
+        {"params": context_encoder.parameters(), "lr": lr},
+        {"params": score_net.parameters(),       "lr": lr},
+        {"params": generator.parameters(),       "lr": lr * 5.0},  # generator needs bigger LR
+    ], weight_decay=1e-4)
+
 
     # --- NEW: wrap models + optimizer for DDP ---    
     if fabric is not None:
@@ -1375,10 +1397,33 @@ def train_stageC_diffusion_generator(
     #     'shape_spec': 0.3,      # Shape spectrum (anisotropy matching)
     # }
 
+    # WEIGHTS = {
+    #     'score': 1.0,
+    #     'gram': 1.0,
+    #     'gram_scale': 1.0,
+    #     'heat': 0.0,
+    #     'sw_st': 0.0,
+    #     'sw_sc': 0.0,
+    #     'overlap': 0.0,
+    #     'ordinal_sc': 0.0,
+    #     'st_dist': 0.0,
+    #     'edm_tail': 0.0,
+    #     'gen_align': 0.5,
+    #     'dim': 0.0,
+    #     'triangle': 0.0,
+    #     'radial': 0.0,
+    #     'knn_nca': 0.0,
+    #     'repel': 0.0,
+    #     'shape': 0.0,
+    #     'edge': 2.0,       # Can re-enable later at 0.02-0.1 for low-sigma only
+    #     'topo': 0.0,
+    #     'shape_spec': 0.0,
+    # }
+
     WEIGHTS = {
-        'score': 1.0,
-        'gram': 1.0,
-        'gram_scale': 1.0,
+        'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
+        'gram': 2.0,           # was 1.0
+        'gram_scale': 2.0,     # was 1.0
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -1386,16 +1431,18 @@ def train_stageC_diffusion_generator(
         'ordinal_sc': 0.0,
         'st_dist': 0.0,
         'edm_tail': 0.0,
-        'gen_align': 0.5,
+        'gen_align': 10.0,     # was 0.5 - will use new gen losses in Patch 8
+        'gen_scale': 10.0,     # NEW: add this key for Patch 8
         'dim': 0.0,
         'triangle': 0.0,
         'radial': 0.0,
         'knn_nca': 0.0,
         'repel': 0.0,
         'shape': 0.0,
-        'edge': 2.0,       # Can re-enable later at 0.02-0.1 for low-sigma only
+        'edge': 4.0,           # was 2.0
         'topo': 0.0,
         'shape_spec': 0.0,
+        'subspace': 0.5,       # NEW: add this key for Patch 7
     }
 
 
@@ -1421,7 +1468,14 @@ def train_stageC_diffusion_generator(
     
     # CFG config
     p_uncond = 0.10
+    # sigma_gate = 5.0
+
+    # CFG config - PATCH 9: schedule p_uncond to avoid blocking early learning
+    p_uncond_max = 0.10
+    cfg_warmup_start = 20   # Don't use CFG dropout for first N epochs
+    cfg_warmup_len = 20     # Ramp up over this many epochs
     sigma_gate = 5.0
+
 
     # FiLM/CFG Debug config
     DEBUG_FILM_EVERY = 100   # Check FiLM effect every N steps
@@ -1434,13 +1488,12 @@ def train_stageC_diffusion_generator(
         'epoch_avg': {
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'dim': [], 'triangle': [], 'radial': [], 'knn_nca': [], 
-            'repel': [], 'shape': [],  # NEW: ST shape constraints
-            'edge': [],     # NEW
-            'topo': [],     # NEW
-            'shape_spec': []
+            'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],  # ADD THESE
+            'dim': [], 'triangle': [], 'radial': [],
+            'knn_nca': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': []
         }
     }
+
 
 
     # ========== EDM DEBUG STATE INITIALIZATION ==========
@@ -1818,12 +1871,25 @@ def train_stageC_diffusion_generator(
 
                 if not is_sc:
                     # ST batch: Ground truth from Gram matrix
-                    V_target = batch['V_target'].to(device)
+                    V_target_raw = batch['V_target'].to(device)
                     G_target = batch['G_target'].to(device)  # For geometry losses
+                    D_latent = score_net.D_latent
 
                     # CRITICAL CHECK: Dimension compatibility
-                    assert V_target.shape[-1] == score_net.D_latent, \
-                        f"V_target dim {V_target.shape[-1]} != D_latent {score_net.D_latent}"
+                    assert V_target_raw.shape[-1] == D_latent, \
+                        f"V_target dim {V_target_raw.shape[-1]} != D_latent {D_latent}"
+                    
+                    # --- PATCH 3: Canonicalize ST target coordinates from Gram ---
+                    # This ensures the target is centered and exactly consistent with G_target.
+                    V_target = torch.zeros_like(V_target_raw)
+                    for i in range(batch_size_real):
+                        n_valid = int(mask[i].sum().item())
+                        if n_valid <= 1:
+                            continue
+                        G_i = G_target[i, :n_valid, :n_valid].float()
+                        V_i = uet.factor_from_gram(G_i, D_latent).to(V_target_raw.dtype)
+                        V_target[i, :n_valid] = V_i
+                    # --------------------------------------------------------
                     
                     # Optional: Compute generator output for alignment training
                     if WEIGHTS['gen_align'] > 0:
@@ -1902,8 +1968,21 @@ def train_stageC_diffusion_generator(
                         print(f"[GEN SCALE] RMS={rms_gen:.4f} (target ~{rms_tgt:.4f}) ratio={rms_gen/rms_tgt:.4f}")
 
                 # ===== CFG: Drop context ONLY for score network =====
+                # drop_probs = torch.rand(batch_size_real, device=device)
+                # drop_bool = (drop_probs < p_uncond).float()
+
+                # ===== CFG: Drop context ONLY for score network =====
+                # PATCH 9: Schedule p_uncond to avoid blocking early learning
+                if epoch < cfg_warmup_start:
+                    p_uncond_curr = 0.0
+                else:
+                    t_warmup = (epoch - cfg_warmup_start) / float(max(cfg_warmup_len, 1))
+                    t_warmup = max(0.0, min(1.0, t_warmup))
+                    p_uncond_curr = p_uncond_max * t_warmup
+                
                 drop_probs = torch.rand(batch_size_real, device=device)
-                drop_bool = (drop_probs < p_uncond).float()
+                drop_bool = (drop_probs < p_uncond_curr).float()
+
                 
                 # Dynamically reshape drop_mask to match H's dimensions
                 # If H is (B, C), makes (B, 1). If H is (B, N, C), makes (B, 1, 1)
@@ -2322,9 +2401,9 @@ def train_stageC_diffusion_generator(
                     target_fp32 = target_x0.float()
                     
                     # Masked MSE per sample
-                    err2 = (x0_pred_fp32 - target_fp32).pow(2).sum(dim=-1)  # (B, N)
-                    L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum()
-
+                    # PATCH 4: Masked MSE per sample - mean over D_latent for scale consistency
+                    err2 = (x0_pred_fp32 - target_fp32).pow(2).mean(dim=-1)  # (B, N) - mean over D
+                    L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum().clamp_min(1.0)
 
                     # ========== PHASE 6: EDM LOSS WEIGHTING SANITY ==========
                     # if global_step % 20 == 0 and (fabric is None or fabric.is_global_zero):
@@ -2539,6 +2618,8 @@ def train_stageC_diffusion_generator(
             L_edge = torch.tensor(0.0, device=device)   # NEW: Edge-length loss
             L_topo = torch.tensor(0.0, device=device)   # NEW: Topology loss  
             L_shape_spec = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
+            L_subspace = torch.tensor(0.0, device=device)
+            L_gen_scale = torch.tensor(0.0, device=device)
 
       
             # Denoise to get V_hat
@@ -2559,6 +2640,12 @@ def train_stageC_diffusion_generator(
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                 V_geom = (V_hat_f32 - mean) * m_float  # (B,N,D), centered
 
+            # --- PATCH 7: Low-rank subspace penalty ---
+            if not is_sc and WEIGHTS.get('subspace', 0) > 0:
+                L_subspace = uet.variance_outside_topk(V_geom, mask, k=2)
+            else:
+                L_subspace = torch.tensor(0.0, device=device)
+
 
             if not is_sc:
                 # ==================== COMPUTE V_TARGET_BATCH ONCE ====================
@@ -2570,14 +2657,8 @@ def train_stageC_diffusion_generator(
                 
                 if need_v_target:
                     with torch.autocast(device_type='cuda', enabled=False):
-                        V_target_batch = torch.zeros_like(V_geom)
-                        for i in range(batch_size_real):
-                            n_valid = int(n_list[i].item())
-                            if n_valid < 3:
-                                continue
-                            G_i = G_target[i, :n_valid, :n_valid].float()
-                            V_tgt_i = uet.factor_from_gram(G_i, D_latent)
-                            V_target_batch[i, :n_valid] = V_tgt_i
+                        # PATCH 3 CONTINUED: V_target is already canonicalized above, just reuse it
+                        V_target_batch = V_target.float()
 
                 # ==================== UNIFIED SNR-BASED GATING (COMPUTE ONCE) ====================
                 if not is_sc and 'knn_spatial' in batch:
@@ -2678,6 +2759,16 @@ def train_stageC_diffusion_generator(
                     
                     # Build predicted Gram *with* true scale
                     Gp_raw = V_geom @ V_geom.transpose(1, 2)          # (B,N,N)
+                    
+                    # --- PATCH 6: Diagonal distribution loss (per-point norm matching) ---
+                    diag_p = torch.diagonal(Gp_raw, dim1=-2, dim2=-1)  # (B,N)
+                    diag_t = torch.diagonal(Gt, dim1=-2, dim2=-1)      # (B,N)
+                    
+                    m_float_1d = m_bool.float()  # (B,N)
+                    den_diag = (diag_t.pow(2) * m_float_1d).sum(dim=-1).clamp_min(1e-8)  # (B,)
+                    diag_rel = ((diag_p - diag_t).pow(2) * m_float_1d).sum(dim=-1) / den_diag  # (B,)
+                    # ---------------------------------------------------------------
+
                     
                     # Build masks
                     # MM = (m.unsqueeze(-1) & m.unsqueeze(-2)).float()  # (B,N,N) valid pairs
@@ -2791,7 +2882,12 @@ def train_stageC_diffusion_generator(
 
                     # Always compute, weight by gate (ensures same graph across ranks)
                     gate_sum = geo_gate.sum().clamp(min=1.0)
-                    L_gram = (per_set_relative_loss * geo_gate).sum() / gate_sum
+                    # L_gram = (per_set_relative_loss * geo_gate).sum() / gate_sum
+                    # PATCH 6: Include diagonal distribution loss
+                    L_gram_offdiag = (per_set_relative_loss * geo_gate).sum() / gate_sum
+                    L_gram_diag = (diag_rel * geo_gate).sum() / gate_sum
+                    L_gram = L_gram_offdiag + 0.5 * L_gram_diag
+
 
                     # --- [DEBUG] Log Gram Gate Hit-Rate ---
                     if global_step % 10 == 0:
@@ -2909,12 +3005,21 @@ def train_stageC_diffusion_generator(
                                  print(f"   ⚠️ WARNING: Edge gate is killing >90% of samples! Relax rho or check sampling.")
                         
                         # FIXED: loss_edge now returns (B,) per-sample losses
-                        L_edge_per = loss_edge(
+                        # L_edge_per = loss_edge(
+                        #     V_pred=V_geom,
+                        #     V_target=V_target_batch,
+                        #     knn_indices=knn_indices_batch,
+                        #     mask=mask
+                        # )
+
+                        # PATCH 5: Use log-ratio edge loss for multiplicative error
+                        L_edge_per = uet.edge_log_ratio_loss(
                             V_pred=V_geom,
-                            V_target=V_target_batch,
-                            knn_indices=knn_indices_batch,
+                            V_tgt=V_target_batch,
+                            knn_idx=knn_indices_batch,
                             mask=mask
                         )
+
                         
                         # Proper per-sample gating
                         L_edge = (L_edge_per * geo_gate_edge).sum() / gate_sum_edge
@@ -3551,7 +3656,9 @@ def train_stageC_diffusion_generator(
                     L_edm_tail = torch.tensor(0.0, device=device)
                 
                 # ==================== NEW: GENERATOR ALIGNMENT LOSS ====================
-                # Align generator output V_0 to target geometry via Procrustes
+                # PATCH 8: Scale-aware generator alignment losses
+                L_gen_scale = torch.tensor(0.0, device=device)
+                
                 if WEIGHTS['gen_align'] > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Center V_gen
@@ -3561,14 +3668,30 @@ def train_stageC_diffusion_generator(
                         mean_Vgen = (V_gen_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                         V_gen_centered = (V_gen_f32 - mean_Vgen) * m_float
                         
-                        # V_target_batch already computed above for EDM tail loss
-                        L_gen_align = uet.procrustes_alignment_loss(
-                            V_pred=V_gen_centered,  # ← FIX: Use V_gen
-                            V_target=V_target_batch,
-                            mask=mask
-                        )
+                        # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
+                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_centered, V_target_batch, mask)
+                        L_gen_scale = uet.rms_log_loss(V_gen_centered, V_target_batch, mask)
                 else:
                     L_gen_align = torch.tensor(0.0, device=device)
+
+                # # Align generator output V_0 to target geometry via Procrustes
+                # if WEIGHTS['gen_align'] > 0 and (not is_sc):
+                #     with torch.autocast(device_type='cuda', enabled=False):
+                #         # Center V_gen
+                #         V_gen_f32 = V_gen.float()
+                #         m_float = mask.float().unsqueeze(-1)
+                #         valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
+                #         mean_Vgen = (V_gen_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
+                #         V_gen_centered = (V_gen_f32 - mean_Vgen) * m_float
+                        
+                #         # V_target_batch already computed above for EDM tail loss
+                #         L_gen_align = uet.procrustes_alignment_loss(
+                #             V_pred=V_gen_centered,  # ← FIX: Use V_gen
+                #             V_target=V_target_batch,
+                #             mask=mask
+                #         )
+                # else:
+                #     L_gen_align = torch.tensor(0.0, device=device)
 
                 # ==================== NEW MANIFOLD-AWARE REGULARIZERS ====================
                 # B1: Intrinsic dimension regularizer
@@ -4150,25 +4273,49 @@ def train_stageC_diffusion_generator(
             # ==================== END GEOMETRY SCALE DIAGNOSTICS ====================
 
             L_total = (WEIGHTS['score'] * score_multiplier * L_score +
-                                WEIGHTS['gram'] * L_gram +
-                                WEIGHTS['gram_scale'] * L_gram_scale +
-                                WEIGHTS['heat'] * L_heat +
-                                WEIGHTS['sw_st'] * L_sw_st +
-                                WEIGHTS['sw_sc'] * L_sw_sc +
-                                WEIGHTS['overlap'] * L_overlap +
-                                WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
-                                WEIGHTS['st_dist'] * L_st_dist +
-                                WEIGHTS['edm_tail'] * L_edm_tail +      
-                                WEIGHTS['gen_align'] * L_gen_align +
-                                WEIGHTS['dim'] * L_dim +
-                                WEIGHTS['triangle'] * L_triangle +
-                                WEIGHTS['knn_nca'] * L_knn_nca +
-                                WEIGHTS['radial'] * L_radial +
-                                WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
-                                WEIGHTS['shape'] * L_shape + 
-                                WEIGHTS['edge'] * L_edge +           # NEW
-                                WEIGHTS['topo'] * L_topo +           # NEW
-                                WEIGHTS['shape_spec'] * L_shape_spec )       # NEW: ST shape/anisotropy
+                    WEIGHTS['gram'] * L_gram +
+                    WEIGHTS['gram_scale'] * L_gram_scale +
+                    WEIGHTS['heat'] * L_heat +
+                    WEIGHTS['sw_st'] * L_sw_st +
+                    WEIGHTS['sw_sc'] * L_sw_sc +
+                    WEIGHTS['overlap'] * L_overlap +
+                    WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
+                    WEIGHTS['st_dist'] * L_st_dist +
+                    WEIGHTS['edm_tail'] * L_edm_tail +      
+                    WEIGHTS['gen_align'] * L_gen_align +
+                    WEIGHTS.get('gen_scale', 0) * L_gen_scale +  # PATCH 8
+                    WEIGHTS['dim'] * L_dim +
+                    WEIGHTS['triangle'] * L_triangle +
+                    WEIGHTS['knn_nca'] * L_knn_nca +
+                    WEIGHTS['radial'] * L_radial +
+                    WEIGHTS['repel'] * L_repel +
+                    WEIGHTS['shape'] * L_shape + 
+                    WEIGHTS['edge'] * L_edge +
+                    WEIGHTS['topo'] * L_topo +
+                    WEIGHTS['shape_spec'] * L_shape_spec +
+                    WEIGHTS.get('subspace', 0) * L_subspace)  # PATCH 7
+
+
+            # L_total = (WEIGHTS['score'] * score_multiplier * L_score +
+            #                     WEIGHTS['gram'] * L_gram +
+            #                     WEIGHTS['gram_scale'] * L_gram_scale +
+            #                     WEIGHTS['heat'] * L_heat +
+            #                     WEIGHTS['sw_st'] * L_sw_st +
+            #                     WEIGHTS['sw_sc'] * L_sw_sc +
+            #                     WEIGHTS['overlap'] * L_overlap +
+            #                     WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
+            #                     WEIGHTS['st_dist'] * L_st_dist +
+            #                     WEIGHTS['edm_tail'] * L_edm_tail +      
+            #                     WEIGHTS['gen_align'] * L_gen_align +
+            #                     WEIGHTS['dim'] * L_dim +
+            #                     WEIGHTS['triangle'] * L_triangle +
+            #                     WEIGHTS['knn_nca'] * L_knn_nca +
+            #                     WEIGHTS['radial'] * L_radial +
+            #                     WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
+            #                     WEIGHTS['shape'] * L_shape + 
+            #                     WEIGHTS['edge'] * L_edge +           # NEW
+            #                     WEIGHTS['topo'] * L_topo +           # NEW
+            #                     WEIGHTS['shape_spec'] * L_shape_spec )       # NEW: ST shape/anisotropy
 
             
             # Add SC dimension prior if this is an SC batch
@@ -4558,6 +4705,8 @@ def train_stageC_diffusion_generator(
             epoch_losses['edge'] += L_edge.item()
             epoch_losses['topo'] += L_topo.item()
             epoch_losses['shape_spec'] += L_shape_spec.item()
+            epoch_losses['gen_scale'] += L_gen_scale.item()
+            epoch_losses['subspace'] += L_subspace.item()
 
 
             def _is_rank0():
@@ -4721,6 +4870,8 @@ def train_stageC_diffusion_generator(
                 avg_edge = epoch_losses['edge'] / max(n_batches, 1)
                 avg_topo = epoch_losses['topo'] / max(n_batches, 1)
                 avg_shape_spec = epoch_losses['shape_spec'] / max(n_batches, 1)
+                avg_gen_scale = epoch_losses['gen_scale'] / max(n_batches, 1)
+                avg_subspace = epoch_losses['subspace'] / max(n_batches, 1)
 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
@@ -4729,6 +4880,8 @@ def train_stageC_diffusion_generator(
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
                 print(f"  dim={avg_dim:.4f} | triangle={avg_triangle:.4f} | radial={avg_radial:.4f}")
                 print(f"  edge={avg_edge:.4f} | topo={avg_topo:.4f} | shape_spec={avg_shape_spec:.4f}")
+                print(f"  gen_scale={avg_gen_scale:.4f} subspace={avg_subspace:.4f}")
+
 
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
@@ -4766,57 +4919,6 @@ def train_stageC_diffusion_generator(
                 if val_metric < early_stop_best:
                     early_stop_best = val_metric
         
-
-
-            # ==================== PERIODIC FiLM EVALUATION ====================
-            EVAL_FILM_EVERY_EPOCHS = 5
-            
-            if DEBUG_FILM and ((epoch + 1) % EVAL_FILM_EVERY_EPOCHS == 0) and use_st:
-                print(f"\n[FiLM EVAL] Running detailed local metrics evaluation...")
-                
-                # 1) Single-step evaluation (fast)
-                eval_metrics_single = evaluate_local_metrics_for_film(
-                    score_net=score_net,
-                    context_encoder=context_encoder,
-                    st_loader=st_loader,
-                    sigma_data=sigma_data,
-                    device=device,
-                    n_batches=20,
-                    k_neighbors=12,
-                    sigma_eval=0.1,
-                )
-                print_film_evaluation_report(eval_metrics_single, epoch=epoch, step=global_step)
-                
-                # 2) Multi-step evaluation (BOTH modes, with high guidance like inference)
-                EVAL_GUIDANCE_SCALE = 8.0  # Match your actual inference!
-                print(f"\n[FiLM EVAL] Running MULTI-STEP evaluation (32 steps, CFG={EVAL_GUIDANCE_SCALE})...")
-                eval_metrics_multi = evaluate_local_metrics_multistep(
-                    score_net=score_net,
-                    context_encoder=context_encoder,
-                    st_loader=st_loader,
-                    sigma_data=sigma_data,
-                    device=device,
-                    n_batches=10,
-                    k_neighbors=12,
-                    n_steps=32,
-                    sigma_max=3.0,
-                    sigma_min=0.01,
-                    guidance_scale=EVAL_GUIDANCE_SCALE,  # High guidance!
-                )
-                print_multistep_evaluation_report(eval_metrics_multi, epoch=epoch, step=global_step,
-                                                   n_steps=32, guidance_scale=EVAL_GUIDANCE_SCALE)
-                
-                # Log to history
-                if 'film_eval' not in history:
-                    history['film_eval'] = []
-                history['film_eval'].append({
-                    'epoch': epoch,
-                    'step': global_step,
-                    'single_step': eval_metrics_single,
-                    'multi_step': eval_metrics_multi,
-                })
-
-
 
         # Broadcast stop decision to ALL ranks
         if fabric is not None:
@@ -4891,7 +4993,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
@@ -4933,7 +5035,9 @@ def train_stageC_diffusion_generator(
             WEIGHTS['shape']    * epoch_losses['shape']     +
             WEIGHTS['shape_spec'] * epoch_losses['shape_spec'] +
             WEIGHTS['edge'] * epoch_losses['edge'] +
-            WEIGHTS['topo'] * epoch_losses['topo']
+            WEIGHTS['topo'] * epoch_losses['topo'] +
+            + WEIGHTS['gen_scale'] * epoch_losses['gen_scale']
+            + WEIGHTS['subspace'] * epoch_losses['subspace']
         )
 
         # Override the history['epoch_avg']['total'] with correct value
