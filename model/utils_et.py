@@ -676,31 +676,6 @@ import torch
 import torch.nn.functional as F
 from functools import lru_cache
 
-# def compute_distance_hist(D: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
-#     """
-#     CUDA histogram over the upper triangle.
-#     D: (n, n) or (B, n, n) distances; bins: (nb+1,)
-#     Returns: (nb,) or (B, nb) normalized.
-#     """
-#     assert D.is_cuda and bins.is_cuda, "Put D and bins on CUDA"
-#     if D.dim() == 2:
-#         n = D.size(0)
-#         iu, ju = torch.triu_indices(n, n, 1, device=D.device)
-#         d = D[iu, ju]
-#         hist, _ = torch.histogram(d, bins=bins)
-#         return hist.float() / hist.sum().clamp_min(1)
-#     else:
-#         B, n, _ = D.shape
-#         iu, ju = torch.triu_indices(n, n, 1, device=D.device)
-#         d = D[:, iu, ju]                           # (B, M)
-#         nb = bins.numel() - 1
-#         ids = torch.bucketize(d, bins) - 1
-#         ids = ids.clamp(0, nb - 1)
-#         offs = torch.arange(B, device=D.device).unsqueeze(1) * nb
-#         flat = (ids + offs).reshape(-1)
-#         counts = torch.bincount(flat, minlength=B * nb).view(B, nb).float()
-#         return counts / counts.sum(dim=1, keepdim=True).clamp_min(1)
-
 import torch
 
 @torch.no_grad()
@@ -3229,219 +3204,8 @@ class EdgeLengthLoss(nn.Module):
             # Log-ratio loss
             log_diff = torch.log(d_pred_c) - torch.log(d_target_c)
             losses[b] = (log_diff ** 2).mean()
-            
-            # d_pred = (x_i_pred - x_j_pred).norm(dim=-1)      # (num_edges,)
-            # d_target = (x_i_target - x_j_target).norm(dim=-1)
-            
-            # # Log-ratio loss (ratio-preserving)
-            # log_diff = torch.log(d_pred + self.eps) - torch.log(d_target + self.eps)
-            # losses[b] = (log_diff ** 2).mean()
-        
+                    
         return losses  # (B,) - per-sample, NOT scalar
-
-
-# class EdgeLengthLoss(nn.Module):
-#     """
-#     Local edge-length loss (replaces KNN NCA).
-#     Preserves actual edge lengths instead of just rank ordering.
-#     Uses log-ratio to fight gram_scale naturally.
-#     """
-    
-#     def __init__(self, eps: float = 1e-4):
-#         super().__init__()
-#         self.eps = eps
-    
-#     def forward(
-#         self,
-#         V_pred: torch.Tensor,
-#         V_target: torch.Tensor,
-#         knn_indices: torch.Tensor,
-#         mask: torch.Tensor
-#     ) -> torch.Tensor:
-#         """
-#         Args:
-#             V_pred: (B, N, D) predicted coordinates
-#             V_target: (B, N, D) target coordinates  
-#             knn_indices: (B, N, k) neighbor indices from ST GT
-#             mask: (B, N) boolean mask
-            
-#         Returns:
-#             loss: scalar edge length loss
-#         """
-#         B, N, k = knn_indices.shape
-#         device = V_pred.device
-        
-#         # Create row indices (i)
-#         i = torch.arange(N, device=device).unsqueeze(1).expand(N, k)  # (N, k)
-#         j = knn_indices  # (B, N, k)
-        
-#         loss_per_batch = []
-        
-#         for b in range(B):
-#             m_b = mask[b]
-#             n_valid = m_b.sum().item()
-            
-#             if n_valid < 2:
-#                 continue
-            
-#             # Get valid nodes
-#             V_pred_b = V_pred[b, m_b]  # (n_valid, D)
-#             V_target_b = V_target[b, m_b]  # (n_valid, D)
-#             knn_b = knn_indices[b, m_b]  # (n_valid, k)
-
-#             # knn_b is already in local indices [0..n_valid-1] with -1 for invalid
-#             # DO NOT remap - just use directly
-#             knn_local = knn_b
-            
-#             # Filter out invalid neighbors (-1)
-#             valid_neighbors = (knn_local >= 0)  # (n_valid, k)
-            
-#             if not valid_neighbors.any():
-#                 continue
-            
-#             # Gather coordinates
-#             i_local = torch.arange(n_valid, device=device).unsqueeze(1).expand(n_valid, k)
-            
-#             # Only compute for valid edges
-#             edge_mask = valid_neighbors
-#             i_edges = i_local[edge_mask]  # (num_edges,)
-#             j_edges = knn_local[edge_mask]  # (num_edges,)
-            
-#             # Drop self-edges and validate bounds
-#             not_self = (i_edges != j_edges)
-#             i_edges = i_edges[not_self]
-#             j_edges = j_edges[not_self]
-            
-#             # Bounds check: ensure j_edges are valid indices
-#             valid_j = (j_edges >= 0) & (j_edges < n_valid)
-#             i_edges = i_edges[valid_j]
-#             j_edges = j_edges[valid_j]
-            
-#             if i_edges.numel() == 0:
-#                 continue
-                        
-#             # Compute edge lengths
-#             x_i_pred = V_pred_b[i_edges]  # (num_edges, D)
-#             x_j_pred = V_pred_b[j_edges]
-#             x_i_target = V_target_b[i_edges]
-#             x_j_target = V_target_b[j_edges]
-            
-#             d_pred = (x_i_pred - x_j_pred).norm(dim=-1)  # (num_edges,)
-#             d_target = (x_i_target - x_j_target).norm(dim=-1)
-            
-#             # Log-ratio loss (ratio-preserving)
-#             log_diff = torch.log(d_pred + self.eps) - torch.log(d_target + self.eps)
-#             loss_b = (log_diff ** 2).mean()
-#             loss_per_batch.append(loss_b)
-        
-#         if len(loss_per_batch) == 0:
-#             return torch.tensor(0.0, device=device)
-        
-#         return torch.stack(loss_per_batch).mean()
-       
-
-# ==============================================================================
-# PERSISTENT HOMOLOGY PREPROCESSING (OFFLINE)
-# ==============================================================================
-
-# def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pairs_1d: int = 5):
-#     """
-#     Compute persistent homology pairs for a single miniset.
-#     Uses Vietoris-Rips filtration.
-    
-#     Args:
-#         coords: (n, 2) numpy array of ST coordinates
-#         max_pairs_0d: max number of 0D pairs to keep (connected components)
-#         max_pairs_1d: max number of 1D pairs to keep (loops/holes)
-    
-#     Returns:
-#         dict with:
-#             'pairs_0': (m0, 2) index pairs for 0D features
-#             'dists_0': (m0,) birth distances for 0D features
-#             'pairs_1': (m1, 2) index pairs for 1D features
-#             'dists_1': (m1,) birth distances for 1D features
-#     """
-#     from ripser import ripser
-#     from scipy.spatial.distance import squareform, pdist
-    
-#     n = coords.shape[0]
-    
-#     if n < 3:
-#         # Too few points, return empty
-#         return {
-#             'pairs_0': np.zeros((0, 2), dtype=np.int64),
-#             'dists_0': np.zeros(0, dtype=np.float32),
-#             'pairs_1': np.zeros((0, 2), dtype=np.int64),
-#             'dists_1': np.zeros(0, dtype=np.float32),
-#         }
-    
-#     # Compute distance matrix
-#     D = squareform(pdist(coords, metric='euclidean'))
-    
-#     # Compute persistent homology (up to dimension 1)
-#     result = ripser(D, maxdim=1, distance_matrix=True)
-#     diagrams = result['dgms']  # List of (birth, death) arrays
-    
-#     # Extract 0D and 1D persistence diagrams
-#     dgm0 = diagrams[0]  # 0D: connected components
-#     dgm1 = diagrams[1] if len(diagrams) > 1 else np.zeros((0, 2))  # 1D: loops
-    
-#     def extract_top_pairs(dgm, max_pairs, dimension):
-#         """Extract top-m most persistent features from diagram"""
-#         if len(dgm) == 0:
-#             return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
-        
-#         # Filter out infinite death times
-#         finite_mask = np.isfinite(dgm[:, 1])
-#         dgm_finite = dgm[finite_mask]
-        
-#         if len(dgm_finite) == 0:
-#             return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float32)
-        
-#         # Compute persistence (death - birth)
-#         persistence = dgm_finite[:, 1] - dgm_finite[:, 0]
-        
-#         # Sort by persistence (descending)
-#         sorted_idx = np.argsort(-persistence)
-#         top_k = min(max_pairs, len(sorted_idx))
-#         top_idx = sorted_idx[:top_k]
-        
-#         # Get birth/death distances
-#         births = dgm_finite[top_idx, 0]
-#         deaths = dgm_finite[top_idx, 1]
-        
-#         # For each persistent feature, find representative point pairs
-#         # Simplified: use birth distance to find closest point pairs
-#         pairs = []
-#         dists = []
-        
-#         for birth, death in zip(births, deaths):
-#             # Find pair of points whose distance ≈ birth
-#             # Simple heuristic: find closest pair in D that matches birth distance
-#             diff = np.abs(D - birth)
-#             np.fill_diagonal(diff, np.inf)  # Exclude diagonal
-#             i, j = np.unravel_index(np.argmin(diff), D.shape)
-            
-#             if i > j:
-#                 i, j = j, i  # Ensure i < j
-            
-#             pairs.append([i, j])
-#             dists.append(D[i, j])
-        
-#         return np.array(pairs, dtype=np.int64), np.array(dists, dtype=np.float32)
-    
-#     # Extract 0D pairs (connected components)
-#     pairs_0, dists_0 = extract_top_pairs(dgm0, max_pairs_0d, 0)
-    
-#     # Extract 1D pairs (loops)
-#     pairs_1, dists_1 = extract_top_pairs(dgm1, max_pairs_1d, 1)
-    
-#     return {
-#         'pairs_0': pairs_0,
-#         'dists_0': dists_0,
-#         'pairs_1': pairs_1,
-#         'dists_1': dists_1,
-#     }
 
 
 def compute_persistent_pairs(coords: np.ndarray, max_pairs_0d: int = 10, max_pairs_1d: int = 5):
@@ -3675,33 +3439,7 @@ class TopologyLoss(nn.Module):
                     
                     l1 = ((torch.log(d1_pred + self.eps) - torch.log(dists_1_t + self.eps)) ** 2).mean()
                     losses_b.append(l1)
-            
-            # # 0D features (connected components)
-            # if pairs_0 is not None and len(pairs_0) > 0:
-            #     pairs_0_t = torch.from_numpy(pairs_0).long().to(device) if isinstance(pairs_0, np.ndarray) else pairs_0
-            #     dists_0_t = torch.from_numpy(dists_0).float().to(device) if isinstance(dists_0, np.ndarray) else dists_0
-                
-            #     # Compute predicted distances
-            #     x0_i = V_pred_b[pairs_0_t[:, 0]]  # (m0, D)
-            #     x0_j = V_pred_b[pairs_0_t[:, 1]]
-            #     d0_pred = (x0_i - x0_j).norm(dim=-1)  # (m0,)
-                
-            #     # Log-ratio loss (as ChatGPT specified)
-            #     l0 = ((torch.log(d0_pred + self.eps) - torch.log(dists_0_t + self.eps)) ** 2).mean()
-            #     losses_b.append(l0)
-            
-            # # 1D features (loops/holes)
-            # if pairs_1 is not None and len(pairs_1) > 0:
-            #     pairs_1_t = torch.from_numpy(pairs_1).long().to(device) if isinstance(pairs_1, np.ndarray) else pairs_1
-            #     dists_1_t = torch.from_numpy(dists_1).float().to(device) if isinstance(dists_1, np.ndarray) else dists_1
-                
-            #     x1_i = V_pred_b[pairs_1_t[:, 0]]
-            #     x1_j = V_pred_b[pairs_1_t[:, 1]]
-            #     d1_pred = (x1_i - x1_j).norm(dim=-1)
-                
-            #     l1 = ((torch.log(d1_pred + self.eps) - torch.log(dists_1_t + self.eps)) ** 2).mean()
-            #     losses_b.append(l1)
-            
+                        
             # Average 0D and 1D losses (ChatGPT's formula: 0.5 * (l0.mean() + l1.mean()))
             if len(losses_b) > 0:
                 loss_per_batch.append(torch.stack(losses_b).mean())
@@ -4125,3 +3863,135 @@ def rms_log_loss(V_pred, V_tgt, mask, eps=1e-8):
     if cnt == 0:
         return V_pred.new_tensor(0.0)
     return loss / float(cnt)
+
+
+def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor,
+                 k: int = 15, temperature: float = 0.1, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Differentiable k-NN Neighborhood Preservation Loss using NCA-style soft retrieval.
+    
+    FIXED VERSION: Properly handles masking to avoid plateau issues.
+    
+    Args:
+        V_pred: (B, N, D) predicted coordinates
+        V_target: (B, N, D) target coordinates  
+        mask: (B, N) validity mask
+        k: number of neighbors
+        temperature: softmax temperature (lower = sharper)
+        eps: numerical stability
+    
+    Returns:
+        Scalar loss (lower = better neighborhood preservation)
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+
+    mask_f = mask.float()                          # (B, N)
+    valid_counts = mask_f.sum(dim=1).clamp(min=1)  # (B,)
+
+    # Pairwise squared distances
+    diff_pred = V_pred.unsqueeze(2) - V_pred.unsqueeze(1)      # (B, N, N, D)
+    D2_pred = (diff_pred ** 2).sum(dim=-1)                     # (B, N, N)
+
+    diff_tgt = V_target.unsqueeze(2) - V_target.unsqueeze(1)
+    D2_tgt = (diff_tgt ** 2).sum(dim=-1)
+
+    # Invalid pairs and self-connections
+    mask_2d = (mask_f.unsqueeze(2) * mask_f.unsqueeze(1)).bool()           # (B, N, N)
+    eye = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)       # (1, N, N)
+    invalid_pair = (~mask_2d) | eye                                        # (B, N, N)
+
+    D2_tgt_masked = D2_tgt.masked_fill(invalid_pair, 1e9)
+    D2_pred_masked = D2_pred.masked_fill(invalid_pair, 1e9)
+
+    # kNN indices in target space
+    _, knn_idx_tgt = D2_tgt_masked.topk(k, dim=-1, largest=False)          # (B, N, k)
+
+    # Log-prob over neighbors in pred space (log_softmax for stability)
+    logits = -D2_pred_masked / (temperature + eps)                         # (B, N, N)
+    logits = logits.masked_fill(invalid_pair, -1e9)
+    logP = torch.log_softmax(logits, dim=-1)                               # (B, N, N)
+
+    # Gather log-prob for true neighbors
+    logP_true = torch.gather(logP, dim=2, index=knn_idx_tgt)               # (B, N, k)
+
+    # Neighbor validity (handles n_valid < k+1)
+    mask_j = mask_f.unsqueeze(1).expand(-1, N, -1)                         # (B, N, N)
+    neigh_valid = torch.gather(mask_j, dim=2, index=knn_idx_tgt)           # (B, N, k)
+
+    # Only count valid query points i, and valid gathered neighbors
+    query_valid = mask_f.unsqueeze(-1)                                     # (B, N, 1)
+    w = query_valid * neigh_valid                                          # (B, N, k)
+
+    # Average log-prob over valid neighbors per point
+    denom = w.sum(dim=-1).clamp(min=1.0)                                   # (B, N)
+    loss_per_point = -(logP_true * w).sum(dim=-1) / denom                  # (B, N)
+
+    # Average over valid query points per sample
+    loss_per_sample = (loss_per_point * mask_f).sum(dim=-1) / valid_counts # (B,)
+    return loss_per_sample.mean()
+
+
+
+def knn_jaccard_soft(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor, 
+                     k: int = 15, return_per_sample: bool = False) -> torch.Tensor:
+    """
+    Compute soft (differentiable approximation of) k-NN Jaccard overlap.
+    
+    Uses the same NCA-style probability matching but returns a Jaccard-like metric
+    in [0, 1] range where 1 = perfect overlap.
+    
+    Args:
+        V_pred, V_target: (B, N, D)
+        mask: (B, N)
+        k: number of neighbors
+        return_per_sample: if True, return (B,) instead of scalar
+    
+    Returns:
+        Soft Jaccard score (higher = better)
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    
+    mask_f = mask.float()
+    mask_2d = mask_f.unsqueeze(2) * mask_f.unsqueeze(1)
+    
+    # Pairwise distances
+    diff_pred = V_pred.unsqueeze(2) - V_pred.unsqueeze(1)
+    D2_pred = (diff_pred ** 2).sum(dim=-1)
+    
+    diff_target = V_target.unsqueeze(2) - V_target.unsqueeze(1)
+    D2_target = (diff_target ** 2).sum(dim=-1)
+    
+    # Mask invalid
+    large_val = 1e9
+    eye_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
+    invalid_mask = (~mask_2d.bool()) | eye_mask
+    
+    D2_pred_masked = D2_pred.masked_fill(invalid_mask, large_val)
+    D2_target_masked = D2_target.masked_fill(invalid_mask, large_val)
+    
+    # Get hard k-NN in both spaces
+    _, knn_pred = D2_pred_masked.topk(k, dim=-1, largest=False)  # (B, N, k)
+    _, knn_target = D2_target_masked.topk(k, dim=-1, largest=False)  # (B, N, k)
+    
+    # Create one-hot neighbor indicators
+    neighbor_pred = torch.zeros(B, N, N, device=device)
+    neighbor_pred.scatter_(2, knn_pred, 1.0)  # (B, N, N)
+    
+    neighbor_target = torch.zeros(B, N, N, device=device)
+    neighbor_target.scatter_(2, knn_target, 1.0)  # (B, N, N)
+    
+    # Intersection and union
+    intersection = (neighbor_pred * neighbor_target).sum(dim=-1)  # (B, N)
+    union = ((neighbor_pred + neighbor_target) > 0).float().sum(dim=-1)  # (B, N)
+    
+    jaccard_per_point = intersection / union.clamp(min=1)  # (B, N)
+    
+    # Average over valid points
+    valid_counts = mask_f.sum(dim=1, keepdim=True).clamp(min=1)
+    jaccard_per_sample = (jaccard_per_point * mask_f).sum(dim=1) / valid_counts.squeeze()  # (B,)
+    
+    if return_per_sample:
+        return jaccard_per_sample
+    return jaccard_per_sample.mean()

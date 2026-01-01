@@ -635,7 +635,8 @@ class DiffusionScoreNet(nn.Module):
 
     def forward(self, V_t: torch.Tensor, t: torch.Tensor, H: torch.Tensor, 
            mask: torch.Tensor, self_cond: torch.Tensor = None, 
-           attn_cached: dict = None, return_dist_aux: bool = False) -> torch.Tensor:
+           attn_cached: dict = None, return_dist_aux: bool = False,
+           sigma_raw: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             V_t: (B, N, D_latent) noisy coords at time t
@@ -659,7 +660,52 @@ class DiffusionScoreNet(nn.Module):
         else:
             V_in = V_t
             self_cond_canon = self_cond
+
+        # --- Compute sigma for gating decisions ---
+        # Prefer sigma_raw if provided (true sigma from EDM)
+        # Otherwise fall back to t (but this only works if t is c_noise = 0.25*ln(σ))
+        if sigma_raw is not None:
+            sigma_for_gating = sigma_raw.detach().view(-1).float()  # (B,)
+        else:
+            # Fallback: assume t is c_noise from EDM
+            sigma_for_gating = torch.exp(4.0 * t.squeeze(-1)).detach().view(-1).float()
         
+        # --- DEBUG 1 (FIXED): Log geometry source usage truthfully ---
+        if self.training and (torch.rand(()).item() < 0.01):
+            with torch.no_grad():
+                has_sc = (self_cond_canon is not None)
+                high = (sigma_for_gating > 0.30)
+                n_high = int(high.sum().item())
+                B_dbg = int(sigma_for_gating.numel())
+
+                if has_sc:
+                    print(f"[DEBUG-GEOM-SRC] B={B_dbg} σ_mean={sigma_for_gating.mean():.3f} "
+                          f"self_cond=YES highσ={n_high}/{B_dbg} "
+                          f"V_geom=blend(self_cond for highσ, V_in for lowσ)")
+                else:
+                    print(f"[DEBUG-GEOM-SRC] B={B_dbg} σ_mean={sigma_for_gating.mean():.3f} "
+                          f"self_cond=NO V_geom=V_in")
+
+        # --- GEOM_OK: Geometry is trustworthy if low σ OR we have self_cond ---
+        # At high σ, V_in is noise. But if we have self_cond, it provides good geometry.
+        low_sigma = (sigma_for_gating < 0.30)
+        if self_cond_canon is not None:
+            # Geometry is OK for ALL samples when we have self_cond
+            # (because V_geom will use self_cond for high-σ samples)
+            geom_ok = torch.ones_like(low_sigma)  # All True
+        else:
+            # Without self_cond, geometry is only OK for low σ
+            geom_ok = low_sigma
+        
+        # --- V_geom: Geometry source for distance bias and angle features ---
+        # At high σ with self_cond: use self_cond as geometry source
+        # At low σ or without self_cond: use V_in
+        if self_cond_canon is not None:
+            high_sigma_blend = (~low_sigma).float().view(-1, 1, 1)  # (B, 1, 1)
+            V_geom = high_sigma_blend * self_cond_canon + (1 - high_sigma_blend) * V_in
+        else:
+            V_geom = V_in
+
         # Step 2: Compose node features
         features = [H]  # Start with context
         
@@ -684,12 +730,27 @@ class DiffusionScoreNet(nn.Module):
             features.append(sc_feat)
         
         # Add angle features
+        # Add angle features (gated by geom_ok)
         if self.use_angle_features:
-            idx = uet.knn_graph(V_in, mask, k=self.knn_k)
-            angle_feat = uet.angle_features(V_in, mask, idx, n_angle_bins=self.angle_bins)
-            features.append(angle_feat)
-        
-        features.append(V_in)
+            if geom_ok.any():
+                # Compute angle features from V_geom (trustworthy geometry source)
+                idx = uet.knn_graph(V_geom, mask, k=self.knn_k)
+                angle_feat = uet.angle_features(V_geom, mask, idx, n_angle_bins=self.angle_bins)
+                # Gate: zero out for samples where geometry is not trustworthy
+                gate_angle = geom_ok.float().view(-1, 1, 1)  # (B, 1, 1)
+                angle_feat = angle_feat * gate_angle
+                features.append(angle_feat)
+            else:
+                # No trustworthy geometry: use zeros
+                angle_feat = torch.zeros(B, N, self.angle_bins, device=V_t.device)
+                features.append(angle_feat)
+
+        # Append geometry features (gated by geom_ok)
+        # At high σ without self_cond, this becomes zeros
+        V_geom_gated = V_geom * geom_ok.float().view(-1, 1, 1)
+        features.append(V_geom_gated)
+
+
 
         # Concatenate all features
         X = torch.cat(features, dim=-1)  # (B, N, c_dim + 128 + extras)
@@ -705,8 +766,9 @@ class DiffusionScoreNet(nn.Module):
                 attn_bias = attn_cached['bias']
                 bin_ids = attn_cached.get('bin_ids', None)
                 bin_embeddings = attn_cached.get('bin_embeddings', None)
-            else:
-                D2 = uet.pairwise_dist2(V_in, mask)
+            elif geom_ok.any():
+                # Compute distance bias from V_geom (trustworthy geometry source)
+                D2 = uet.pairwise_dist2(V_geom, mask)
                 attn_bias, _, bin_ids = uet.make_distance_bias(
                     D2, mask, 
                     n_bins=self.dist_bins,
@@ -716,26 +778,27 @@ class DiffusionScoreNet(nn.Module):
                     W=self.W_bias,
                     alpha_bias=self.alpha_bias,
                     device=V_t.device,
-                    bin_edges=  self.st_dist_bin_edges
+                    bin_edges=self.st_dist_bin_edges
                 )
 
-                # --- PATCH 1: Gate distance bias off when coordinates are very noisy ---
-                # In EDM mode, t == c_noise == log(sigma)/4, so sigma = exp(4*t).
-                # When sigma is large, dist2(V_in) is random -> bias hurts. We smoothly disable it.
-                with torch.no_grad():
-                    # Detect EDM-style t (will include negatives); avoid breaking non-EDM path.
-                    t_squeezed = t.squeeze()  # (B,) or scalar
-                    t_min = float(t_squeezed.min().detach().cpu()) if t_squeezed.numel() > 0 else 0.0
-                if t_min < 0.0:  # EDM mode: t = log(sigma)/4
-                    # t is (B, 1), need sigma_est as (B, 1, 1, 1) to broadcast with (B, 1, N, N)
-                    sigma_est = torch.exp(4.0 * t.squeeze(-1)).view(-1, 1, 1, 1)  # (B, 1, 1, 1)
-                    sigma0 = 0.30  # matches your observed Jaccard cliff at ~0.3
-                    bias_gate = (sigma0 / (sigma0 + sigma_est)).to(attn_bias.dtype)  # (B, 1, 1, 1)
-                    attn_bias = attn_bias * bias_gate  # broadcasts correctly with (B, 1, N, N)
-                # ---------------------------------------------------------------
+                # --- DEBUG 2: Distance bias magnitude per sigma bin ---
+                if self.training and torch.rand(1).item() < 0.02:
+                    with torch.no_grad():
+                        sigma_bins = [0.0, 0.1, 0.3, 0.5, 1.0, float('inf')]
+                        for i in range(len(sigma_bins) - 1):
+                            lo, hi = sigma_bins[i], sigma_bins[i+1]
+                            in_bin = (sigma_for_gating >= lo) & (sigma_for_gating < hi)
+                            if in_bin.any():
+                                bias_in_bin = attn_bias[in_bin]
+                                pre_gate_mag = bias_in_bin.abs().mean().item()
+                                post_gate_mag = (bias_in_bin * geom_ok[in_bin].float().view(-1, 1, 1, 1)).abs().mean().item()
+                                print(f"[DEBUG-BIAS] σ∈[{lo:.1f},{hi:.1f}): n={in_bin.sum().item()}, "
+                                      f"pre_gate={pre_gate_mag:.4f}, post_gate={post_gate_mag:.4f}")
+                
+                # Gate by geom_ok (NOT just low_sigma!)
+                gate = geom_ok.float().view(-1, 1, 1, 1)  # (B, 1, 1, 1)
+                attn_bias = attn_bias * gate
 
-
-                #get bin embeddings for distogram head
                 if self.use_st_dist_head:
                     bin_embeddings = self.E_bin[bin_ids]
 
@@ -743,6 +806,13 @@ class DiffusionScoreNet(nn.Module):
                     attn_cached['bias'] = attn_bias
                     attn_cached['bin_ids'] = bin_ids
                     attn_cached['bin_embeddings'] = bin_embeddings
+            else:
+                # No trustworthy geometry: skip distance bias
+                attn_bias = None
+                bin_ids = None
+                bin_embeddings = None
+
+
 
         # Apply X↔X distance-biased attention exactly once
         if self.use_dist_bias and attn_bias is not None:
@@ -826,7 +896,12 @@ class DiffusionScoreNet(nn.Module):
                 debug_dict['H_stats'] = masked_stats(H, mask)
             
             # Call underlying network with c_noise as time embedding
-            F_x = self.forward(x_in, c_noise, H, mask, self_cond=self_cond)
+            # F_x = self.forward(x_in, c_noise, H, mask, self_cond=self_cond)
+            # --- PATCH 13B: Pass sigma to forward for geometry source decisions ---
+            # Call underlying network with c_noise as time embedding
+            # Also pass the original sigma for σ-based gating decisions in forward()
+            F_x = self.forward(x_in, c_noise, H, mask, self_cond=self_cond, sigma_raw=sigma)
+
             
             # If forward returns tuple (for dist_aux), extract just the prediction
             if isinstance(F_x, tuple):
@@ -1436,7 +1511,7 @@ def train_stageC_diffusion_generator(
         'dim': 0.0,
         'triangle': 0.0,
         'radial': 0.0,
-        'knn_nca': 0.0,
+        'knn_nca': 2.0,
         'repel': 0.0,
         'shape': 0.0,
         'edge': 4.0,           # was 2.0
@@ -1728,6 +1803,49 @@ def train_stageC_diffusion_generator(
     early_stop_no_improve = 0
     early_stopped = False
     early_stop_epoch = -1
+
+
+    # --- DEBUG 5: Sigma-stratified sample selection helper ---
+    def get_debug_samples_by_sigma(sigma_batch, n_per_bin=1):
+        """
+        Return dict of sample indices stratified by sigma bins.
+        
+        Args:
+            sigma_batch: (B,) tensor of sigma values
+            n_per_bin: how many samples to return per bin
+            
+        Returns:
+            dict like {'very_low': [0, 3], 'low': [1], 'mid': [5], ...}
+        """
+        indices = {}
+        bins = [
+            (0.0, 0.1, 'very_low'),   # σ < 0.1: nearly clean
+            (0.1, 0.3, 'low'),         # σ ∈ [0.1, 0.3): geometry still useful
+            (0.3, 0.5, 'mid'),         # σ ∈ [0.3, 0.5): geometry questionable
+            (0.5, 1.0, 'high'),        # σ ∈ [0.5, 1.0): mostly noise
+            (1.0, float('inf'), 'very_high')  # σ > 1.0: pure noise
+        ]
+        
+        for lo, hi, name in bins:
+            in_bin = (sigma_batch >= lo) & (sigma_batch < hi)
+            if in_bin.any():
+                bin_indices = in_bin.nonzero(as_tuple=True)[0]
+                indices[name] = bin_indices[:n_per_bin].tolist()
+            else:
+                indices[name] = []
+        
+        return indices
+    
+    def get_one_sample_per_sigma_bin(sigma_batch):
+        """Convenience: get exactly one sample index per available sigma bin."""
+        samples = get_debug_samples_by_sigma(sigma_batch, n_per_bin=1)
+        # Flatten to list of (bin_name, idx) tuples
+        result = []
+        for bin_name, idx_list in samples.items():
+            if idx_list:
+                result.append((bin_name, idx_list[0]))
+        return result
+
     
     for epoch in range(n_epochs):
 
@@ -1967,9 +2085,6 @@ def train_stageC_diffusion_generator(
                         rms_tgt = (V_target.pow(2) * mask_f).sum().div(valid_count).sqrt()
                         print(f"[GEN SCALE] RMS={rms_gen:.4f} (target ~{rms_tgt:.4f}) ratio={rms_gen/rms_tgt:.4f}")
 
-                # ===== CFG: Drop context ONLY for score network =====
-                # drop_probs = torch.rand(batch_size_real, device=device)
-                # drop_bool = (drop_probs < p_uncond).float()
 
                 # ===== CFG: Drop context ONLY for score network =====
                 # PATCH 9: Schedule p_uncond to avoid blocking early learning
@@ -1995,10 +2110,6 @@ def train_stageC_diffusion_generator(
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
                 
-                # Add noise around the GENERATOR output (not V_target!)
-                # eps = torch.randn_like(V_anchor)
-                # V_t = V_anchor + sigma_t * eps  # Noise around generator proposal
-                # V_t = V_t * mask.unsqueeze(-1).float()
                 # ===== NOISE AROUND GROUND TRUTH (not generator!) =====
                 eps = torch.randn_like(V_target)
                 # eps = eps * mask.unsqueeze(-1).float()
@@ -2013,33 +2124,40 @@ def train_stageC_diffusion_generator(
 
                 if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
                     with torch.no_grad():
-                        b_idx = 0
-                        m_b = mask_orig[b_idx].bool()
-                        if m_b.sum() > 5:
-                            noise_actual = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
-                            noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
-                            diff = (noise_actual - noise_expected).abs().max().item()
-                            
-                            noise_b = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
-                            noise_std = noise_b.std(dim=0).mean().item()
-                            noise_mean_norm = noise_b.mean(dim=0).norm().item()
-                            sig_b = float(sigma_t_orig[b_idx].view(-1)[0])
-                            
-                            print(f"\n[NOISE] step={global_step}")
-                            print(f"  equation_diff: {diff:.6f}")
-                            print(f"  sigma: {sig_b:.4f}")
-                            print(f"  noise_std: {noise_std:.4f}")
-                            print(f"  noise_mean: {noise_mean_norm:.4f}")
-                            print(f"  ratio: {noise_std/sig_b:.3f}")
-                            
-                            if diff > 1e-4:
-                                print(f"  🔴 EQUATION FAIL")
-                            elif noise_std < 0.7 * sig_b:
-                                print(f"  🔴 TRANSLATION NOISE")
-                            elif noise_mean_norm > 0.5 * sig_b:
-                                print(f"  🔴 MEAN SHIFT")
-                            else:
-                                print(f"  ✅ PASS")
+                        # --- DEBUG 5: Check noise across sigma bins ---
+                        sigma_for_debug = sigma_t.view(-1) if use_edm else torch.exp(4.0 * t_norm)
+                        debug_samples = get_one_sample_per_sigma_bin(sigma_for_debug)
+                        
+                        for bin_name, b_idx in debug_samples[:2]:  # Check 2 bins max
+                            m_b = mask_orig[b_idx].bool()
+                            if m_b.sum() > 5:
+                                noise_actual = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
+                                sigma_val = sigma_for_debug[b_idx].item()
+                                noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
+                                diff = (noise_actual - noise_expected).abs().max().item()
+                                
+                                noise_b = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
+                                noise_std = noise_b.std(dim=0).mean().item()
+                                noise_mean_norm = noise_b.mean(dim=0).norm().item()
+                                sig_b = float(sigma_t_orig[b_idx].view(-1)[0])
+
+                                print(f"[NOISE CHECK] bin={bin_name}, σ={sigma_val:.3f}, sample={b_idx}")
+                                
+                                print(f"\n[NOISE] step={global_step}")
+                                print(f"  equation_diff: {diff:.6f}")
+                                print(f"  sigma: {sig_b:.4f}")
+                                print(f"  noise_std: {noise_std:.4f}")
+                                print(f"  noise_mean: {noise_mean_norm:.4f}")
+                                print(f"  ratio: {noise_std/sig_b:.3f}")
+                                
+                                if diff > 1e-4:
+                                    print(f"  🔴 EQUATION FAIL")
+                                elif noise_std < 0.7 * sig_b:
+                                    print(f"  🔴 TRANSLATION NOISE")
+                                elif noise_mean_norm > 0.5 * sig_b:
+                                    print(f"  🔴 MEAN SHIFT")
+                                else:
+                                    print(f"  ✅ PASS")
 
                 if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                     check_target_scale_consistency(V_target, G_target, mask)
@@ -2060,51 +2178,6 @@ def train_stageC_diffusion_generator(
 
 
                 # ========== PHASE 3: NOISE INJECTION SANITY ==========
-                # ========== PHASE 3: NOISE INJECTION SANITY (ENHANCED) ==========
-                # if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
-                #     print(f"\n{'='*70}")
-                #     print(f"[PHASE 3] NOISE INJECTION DIAGNOSTIC (step {global_step})")
-                #     print(f"{'='*70}")
-                    
-                #     # === A. SHAPE VERIFICATION (catch broadcasting bugs) ===
-                #     print(f"\n[3A] Shape Check:")
-                #     print(f"  V_target: {V_target.shape}")
-                #     print(f"  eps:      {eps.shape}")
-                #     print(f"  sigma_t:  {sigma_t.shape}")
-                #     print(f"  V_t:      {V_t.shape}")
-                    
-                #     if eps.shape != V_target.shape:
-                #         print(f"  🔴 FAIL: eps shape mismatch! Broadcasting detected!")
-                #     else:
-                #         print(f"  ✓ PASS: Shapes match")
-                    
-                    # # === B. PER-POINT VARIABILITY OF EPS (should be ~N(0,1)) ===
-                    # print(f"\n[3B] EPS Per-Point Variability:")
-                    # eps_stats = []
-                    # # for b_idx in range(min(2, eps.shape[0])):  # Check first 2 samples
-                    # for b_idx in range(eps.shape[0]):  # Check first 2 samples
-                    #     m_b = mask[b_idx].bool()
-                    #     n_valid = m_b.sum().item()
-                    #     if n_valid > 1:
-                    #         eps_b = eps[b_idx][m_b]  # shape: (n_valid, D)
-                            
-                    #         eps_point_std = eps_b.std(dim=0).mean().item()  # Avg std per coordinate
-                    #         eps_mean_norm = eps_b.mean(dim=0).norm().item()  # Magnitude of mean vector
-                    #         eps_stats.append((eps_point_std, eps_mean_norm, n_valid))
-                    
-                    # if eps_stats:
-                    #     for i, (std, mean_norm, n) in enumerate(eps_stats):
-                    #         expected_mean_norm = (eps.shape[-1] ** 0.5) / (n ** 0.5)  # sqrt(D)/sqrt(n)
-                    #         print(f"  Sample {i}: n_valid={n}")
-                    #         print(f"    eps_point_std:  {std:.4f} (should be ~1.0)")
-                    #         print(f"    eps_mean_norm:  {mean_norm:.4f} (should be ~{expected_mean_norm:.4f})")
-                            
-                    #         if std < 0.7 or std > 1.3:
-                    #             print(f"    🔴 FAIL: eps_point_std out of range [0.7, 1.3]")
-                    #         elif mean_norm > 3.0 * expected_mean_norm:
-                    #             print(f"    ⚠️ WARNING: eps has unexpectedly large mean")
-                    #         else:
-                    #             print(f"    ✓ PASS: eps appears to be proper N(0,1)")
                     
                     # === C. REALIZED NOISE vs SIGMA (after multiplication) ===
                     print(f"\n[3C] Realized Noise vs Sigma:")
@@ -2124,38 +2197,7 @@ def train_stageC_diffusion_generator(
                             noise_over_sigma_std = (noise_b / (sig + 1e-8)).std(dim=0).mean().item()
                             
                             noise_stats.append((noise_point_std, noise_mean_norm, noise_over_sigma_std, sig))
-                    
-                    # if noise_stats:
-                    #     for i, (std, mean_norm, norm_std, sig) in enumerate(noise_stats):
-                    #         print(f"  Sample {i}:")
-                    #         print(f"    sigma:              {sig:.4f}")
-                    #         print(f"    noise_point_std:    {std:.4f} (should be ~{sig:.4f})")
-                    #         print(f"    noise_mean_norm:    {mean_norm:.4f} (should be ~0)")
-                    #         print(f"    noise/sigma_std:    {norm_std:.4f} (should be ~1.0)")
-                            
-                    #         # Diagnosis
-                    #         if std < 0.1 * sig:
-                    #             print(f"    🔴 FAIL: Noise is TRANSLATION-LIKE (std << sigma)")
-                    #         elif mean_norm > 0.5 * sig:
-                    #             print(f"    🔴 FAIL: Noise has LARGE MEAN SHIFT")
-                    #         elif abs(norm_std - 1.0) > 0.3:
-                    #             print(f"    ⚠️ WARNING: Noise/sigma ratio off by >{30}%")
-                    #         else:
-                    #             print(f"    ✓ PASS: Noise structure looks correct")
-                    
-                    # === D. MASK CORRECTNESS (original check) ===
-                    # print(f"\n[3D] Mask Correctness:")
-                    # invalid_mask = (~mask.bool()).unsqueeze(-1)
-                    # if invalid_mask.any():
-                    #     inv_max = V_t.masked_select(invalid_mask).abs().max().item()
-                    #     print(f"  invalid_absmax: {inv_max:.6e} (should be ~0)")
-                    #     if inv_max > 1e-6:
-                    #         print(f"  ⚠️ WARNING: Padding leak detected!")
-                    #     else:
-                    #         print(f"  ✓ PASS: Masked positions are zero")
-                    # else:
-                    #     print(f"  ✓ PASS: No padded positions (all valid)")
-                    
+                                        
                     # === E. EXPECTED VARIANCE CHECK (original check) ===
                     # print(f"\n[3E] Global Variance Check:")
                     valid_mask = mask.bool().unsqueeze(-1)
@@ -2205,12 +2247,6 @@ def train_stageC_diffusion_generator(
                         
                         # Expected = sqrt(Var(Data) + E[Sigma^2])
                         expected_rms = (vtar_std**2 + sigma_rms**2)**0.5
-                        
-                        # print(f"[V_T CHECK] sigma_mean={sigma_mean:.3f} sigma_rms={sigma_rms:.3f}")
-                        # print(f"   V_t_std_valid={vt_std:.3f}")
-                        # print(f"   Expected(rms)={expected_rms:.3f} -> Ratio={vt_std/expected_rms:.3f}")
-                        # Ratio should now be close to 1.0
-                    # -------------------------------------------------
                     # -------------------------------------------------
 
                 # After computing H in training loop
@@ -2257,88 +2293,104 @@ def train_stageC_diffusion_generator(
                     
                     if use_self_cond and score_net.self_conditioning:
                         with torch.no_grad():
+                            # --- PATCH 13A: Use generator as prior for high-σ samples ---
+                            high_sigma_mask = (sigma_flat > 0.30)  # (B,) boolean
+                            
+                            if high_sigma_mask.any():
+                                # Get generator output for high-σ samples as geometric prior
+                                V_gen_prior = generator(H_train, mask)
+                                V_gen_prior = V_gen_prior.detach()
+                            else:
+                                V_gen_prior = None
+                            
+                            # First pass: standard self-cond prediction
                             x0_pred_0_result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
                                                                      self_cond=None, return_debug=False)
                             if isinstance(x0_pred_0_result, tuple):
                                 x0_pred_0 = x0_pred_0_result[0]
                             else:
                                 x0_pred_0 = x0_pred_0_result
+                            
+                            # For high-σ samples, use generator instead of diffusion self-cond
+                            if V_gen_prior is not None:
+                                # Blend: high σ → generator, low σ → diffusion prediction
+                                blend_weight = high_sigma_mask.float().view(-1, 1, 1)  # (B, 1, 1)
+                                x0_pred_0 = blend_weight * V_gen_prior + (1 - blend_weight) * x0_pred_0
                         
                         result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
                                                       self_cond=x0_pred_0, return_debug=return_debug)
                     else:
                         result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
                                                       self_cond=None, return_debug=return_debug)
+
                     
                     if isinstance(result, tuple):
                         x0_pred, debug_dict = result
                     else:
                         x0_pred = result
                         debug_dict = None
+
+                    # --- DEBUG 3: Per-sigma edge analysis ---
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc:
+                        with torch.no_grad():
+                            sigma_bins_debug = [(0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, float('inf'))]
+                            print(f"\n[DEBUG-EDGE] Step {global_step} - Per-sigma edge analysis:")
+                            
+                            for lo, hi in sigma_bins_debug:
+                                in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
+                                if in_bin.any():
+                                    # Get samples in this bin
+                                    pred_bin = x0_pred[in_bin]
+                                    tgt_bin = V_target[in_bin]
+                                    mask_bin = mask[in_bin]
+                                    
+                                    # Compute edge distances
+                                    D_pred = torch.cdist(pred_bin, pred_bin)
+                                    D_tgt = torch.cdist(tgt_bin, tgt_bin)
+                                    
+                                    # Average over valid pairs
+                                    mask_2d = mask_bin.unsqueeze(2) * mask_bin.unsqueeze(1)
+                                    mask_2d = mask_2d.float()
+                                    
+                                    valid_pairs = mask_2d.sum()
+                                    if valid_pairs > 0:
+                                        mean_pred = (D_pred * mask_2d).sum() / valid_pairs
+                                        mean_tgt = (D_tgt * mask_2d).sum() / valid_pairs
+                                        ratio = (mean_pred / mean_tgt.clamp(min=1e-6)).item()
+                                        print(f"  σ∈[{lo:.1f},{hi:.1f}): n={in_bin.sum().item()}, "
+                                              f"D_pred={mean_pred.item():.4f}, D_tgt={mean_tgt.item():.4f}, "
+                                              f"ratio={ratio:.3f}")
+
                     
-                    # ========== PHASE 4: EDM PRECONDITIONING INTROSPECTION ==========
-                    # if debug_dict is not None:
-                    #     print(f"\n[PHASE 4] EDM Preconditioning (step {global_step}):")
-                    #     print(f"  c_skip: {debug_dict['c_skip']}")
-                    #     print(f"  c_out:  {debug_dict['c_out']}")
-                    #     print(f"  c_in:   {debug_dict['c_in']}")
-                    #     print(f"  c_noise: {debug_dict['c_noise']}")
-                        
-                    #     print(f"  x_in stats: {debug_dict['x_in_stats']}")
-                    #     print(f"  H stats: {debug_dict['H_stats']}")
-                    #     print(f"  F(x) stats: {debug_dict['F_x_stats']}")
-                        
-                    #     print(f"  skip_term stats: {debug_dict['skip_term_stats']}")
-                    #     print(f"  out_term stats: {debug_dict['out_term_stats']}")
-                    #     print(f"  x0_pred stats: {debug_dict['x0_pred_stats']}")
-                    #     print(f"  out/skip ratio: {debug_dict['out_skip_ratio']:.6f} (should grow during training)")
-                        
-                    #     if debug_dict['out_skip_ratio'] < 0.01:
-                    #         print(f"    ⚠️ WARNING: Network contribution is negligible!")
+                    # --- DEBUG 6: Self-conditioning effectiveness check ---
+                    if global_step % 200 == 0 and use_self_cond and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            print(f"\n[DEBUG-SELFCOND] Step {global_step} - Self-cond effectiveness:")
+                            
+                            # Compare x0_pred with and without self-cond for same input
+                            x0_no_sc = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
+                                                             self_cond=None)
+                            if isinstance(x0_no_sc, tuple):
+                                x0_no_sc = x0_no_sc[0]
+                            
+                            # Difference caused by self-conditioning
+                            diff = (x0_pred - x0_no_sc).abs()
+                            mask_f = mask.unsqueeze(-1).float()
+                            diff_mean = (diff * mask_f).sum() / mask_f.sum()
+                            x0_scale = (x0_pred.abs() * mask_f).sum() / mask_f.sum()
+                            rel_diff = diff_mean / x0_scale.clamp(min=1e-6)
+                            
+                            print(f"  Self-cond relative effect: {rel_diff.item()*100:.2f}%")
+                            
+                            # Per-sigma breakdown
+                            for lo, hi in [(0.0, 0.3), (0.3, 1.0)]:
+                                in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
+                                if in_bin.any():
+                                    diff_bin = diff[in_bin]
+                                    mask_bin = mask[in_bin].unsqueeze(-1).float()
+                                    diff_bin_mean = (diff_bin * mask_bin).sum() / mask_bin.sum()
+                                    print(f"  σ∈[{lo:.1f},{hi:.1f}): self-cond effect={diff_bin_mean.item():.4f}")
                     
-                    # ========== PHASE 5: CONDITIONING EFFECT VERIFICATION ==========
-                    # if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
-                    #     with torch.no_grad():
-                    #         print(f"\n[PHASE 5] Conditioning Effect (step {global_step}):")
-                            
-                    #         # 5.1 Conditional vs unconditional difference
-                    #         x0_cond = score_net.forward_edm(V_t, sigma_flat, H, mask, sigma_data, self_cond=None)
-                    #         if isinstance(x0_cond, tuple):
-                    #             x0_cond = x0_cond[0]
-                            
-                    #         H_zero = torch.zeros_like(H)
-                    #         x0_uncond = score_net.forward_edm(V_t, sigma_flat, H_zero, mask, sigma_data, self_cond=None)
-                    #         if isinstance(x0_uncond, tuple):
-                    #             x0_uncond = x0_uncond[0]
-                            
-                    #         mask_exp = mask.unsqueeze(-1).float()
-                    #         n_valid = mask_exp.sum()
-                            
-                    #         diff_abs = ((x0_cond - x0_uncond).abs() * mask_exp).sum() / n_valid.clamp(min=1)
-                    #         cond_abs_mean = (x0_cond.abs() * mask_exp).sum() / n_valid.clamp(min=1)
-                    #         rel_diff = diff_abs / (cond_abs_mean + 1e-8)
-                            
-                    #         print(f"  diff_absmean: {diff_abs.item():.6f}")
-                    #         print(f"  rel_diff: {rel_diff.item()*100:.2f}%")
-                            
-                    #         if rel_diff < 0.01:
-                    #             print(f"    ⚠️ WARNING: Conditioning has no effect!")
-                    #         elif rel_diff > 0.05:
-                    #             print(f"    ✓ Good: Conditioning is active")
-                            
-                    #         # 5.2 Drop-mask correctness
-                    #         n_dropped = drop_mask.sum().item()
-                    #         pct_dropped = n_dropped / batch_size_real * 100
-                    #         print(f"  CFG: {n_dropped}/{batch_size_real} ({pct_dropped:.1f}%) contexts dropped")
-                            
-                    #         # Check H_train for dropped samples
-                    #         if n_dropped > 0:
-                    #             dropped_samples = drop_mask.squeeze() > 0.5
-                    #             H_dropped = H_train[dropped_samples]
-                    #             h_drop_stats = masked_stats(H_dropped, torch.ones_like(H_dropped[:, :, 0]).bool())
-                    #             print(f"  H_train (dropped): {h_drop_stats}")
-                    #             if h_drop_stats['absmean'] > 0.01:
-                    #                 print(f"    ⚠️ WARNING: Dropped H_train is not near zero!")
                     
                     # for geom losses, V_hat is x0_pred
                     V_hat = x0_pred
@@ -2405,29 +2457,6 @@ def train_stageC_diffusion_generator(
                     err2 = (x0_pred_fp32 - target_fp32).pow(2).mean(dim=-1)  # (B, N) - mean over D
                     L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum().clamp_min(1.0)
 
-                    # ========== PHASE 6: EDM LOSS WEIGHTING SANITY ==========
-                    # if global_step % 20 == 0 and (fabric is None or fabric.is_global_zero):
-                    #     print(f"\n[PHASE 6] EDM Loss Weighting (step {global_step}):")
-                        
-                    #     w_squeezed = w.squeeze()
-                    #     print(f"  w: min={w_squeezed.min():.4f} median={w_squeezed.median():.4f} max={w_squeezed.max():.4f}")
-                    #     print(f"  w quantiles: p05={w_squeezed.quantile(0.05):.4f} "
-                    #           f"p50={w_squeezed.quantile(0.50):.4f} p95={w_squeezed.quantile(0.95):.4f}")
-                        
-                    #     clamp_hits = (w_squeezed >= 999.0).float().mean().item()
-                    #     print(f"  Clamp hit rate: {clamp_hits*100:.1f}%")
-                        
-                    #     if clamp_hits > 0.5:
-                    #         print(f"    ⚠️ WARNING: >50% weights hit clamp!")
-                        
-                    #     # Correlation between sigma and w
-                    #     sigma_log = sigma_flat.log()
-                    #     w_log = w_squeezed.log()
-                    #     if len(sigma_log) > 1:
-                    #         corr_num = ((sigma_log - sigma_log.mean()) * (w_log - w_log.mean())).mean()
-                    #         corr_denom = sigma_log.std() * w_log.std()
-                    #         corr = corr_num / (corr_denom + 1e-8)
-                    #         print(f"  corr(log(sigma), log(w)): {corr:.4f} (should be strongly negative)")
                     
                     # ========== PHASE 6: PER-SIGMA BIN ACCUMULATION ==========
                     # Initialize bins on first step (data-driven edges)
@@ -2444,10 +2473,6 @@ def train_stageC_diffusion_generator(
                         edm_debug_state['sigma_bin_sum_werr2'] = torch.zeros(n_bins)
                         edm_debug_state['sigma_bin_count'] = torch.zeros(n_bins)
                         
-                        # if fabric is None or fabric.is_global_zero:
-                        #     print(f"\n[PHASE 6] Initialized {n_bins} sigma bins (log-space):")
-                        #     print(f"  Edges (log): {bin_edges}")
-                        #     print(f"  Edges (linear): {bin_edges.exp()}")
                     
                     # Accumulate per bin
                     log_sigma_batch = sigma_flat.log().detach().cpu()
@@ -2477,21 +2502,6 @@ def train_stageC_diffusion_generator(
                     if sigma_t_squeezed.dim() == 1:
                         sigma_t_squeezed = sigma_t_squeezed.unsqueeze(-1)  # (B, 1)
 
-                    # Simple EDM weight for noise prediction
-                    # w(σ) = (σ² + σ_d²) / σ_d², with σ_d = 1
-                    # w = (sigma_t_squeezed**2 + sigma_data**2) / (sigma_data**2)  # here sigma_data=1
-                    # w = (sigma_t_squeezed**2 + sigma_data**2) / ((sigma_t_squeezed * sigma_data)**2)
-                    # w = 1.0 / (sigma_t_squeezed**2).clamp(min=0.1, max=10.0)
-
-                    # # Just cap very large weights; no SNR magic
-                    # w = w.clamp(max=100.0)
-
-                    # Standard DDPM objective: || eps_pred - eps ||^2
-                    # w = torch.ones_like(sigma_t.squeeze()).view(-1, 1)
-
-                    # =========================================================
-                    #  Weight toward low sigma (1/σ²) with Safety Floor
-                    # =========================================================
                     
                     # 1. Compute a data-driven floor from the current batch
                     # This prevents weight explosion at very small sigmas (e.g. 0.002)
@@ -2621,12 +2631,6 @@ def train_stageC_diffusion_generator(
             L_subspace = torch.tensor(0.0, device=device)
             L_gen_scale = torch.tensor(0.0, device=device)
 
-      
-            # Denoise to get V_hat
-            # if not use_edm:
-            #     with torch.autocast(device_type='cuda', dtype=amp_dtype):
-            #         V_hat = V_t - sigma_t * eps_pred
-            #         V_hat = V_hat * mask.unsqueeze(-1).float()
 
             # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
             # 1. Canonicalize V_hat (Center per set) - NOW GLOBAL for ST and SC
@@ -2744,15 +2748,6 @@ def train_stageC_diffusion_generator(
                     L_st_dist = torch.tensor(0.0, device=device)
 
                 with torch.autocast(device_type='cuda', enabled=False):
-                    # V_hat_f32 = V_hat.float()
-                    # m_bool = mask.bool()
-                    # m_float = mask.float().unsqueeze(-1)              # (B,N,1)
-
-                    # # center per set over valid nodes
-                    # valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1)
-                    # mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
-                    # V_geom = (V_hat_f32 - mean) * m_float             # (B,N,D), centered, scale-preserving
-
                     Gt = G_target.float()
                     B, N, _ = V_geom.shape
 
@@ -2923,9 +2918,6 @@ def train_stageC_diffusion_generator(
                             n_gated = geo_gate.sum().item()
                             if n_gated > 0:
                                 sigma_gated = sigma_vec[geo_gate.bool()]
-                                # print(f"[GEO GATE] {n_gated}/{len(geo_gate)} samples | "
-                                #     f"σ range: [{sigma_gated.min():.3f}, {sigma_gated.max():.3f}] "
-                                #     f"mean={sigma_gated.mean():.3f}")
                     
                     # --- DEBUG 5: Loss statistics ---
                     if DEBUG and (global_step % LOG_EVERY == 0):
@@ -2981,6 +2973,28 @@ def train_stageC_diffusion_generator(
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
 
 
+                # --- kNN NCA Loss (with float32 + autocast disabled) ---
+                if WEIGHTS['knn_nca'] > 0 and (not is_sc):
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        L_knn_nca = uet.knn_nca_loss(
+                            x0_pred.float() if use_edm else V_hat.float(), 
+                            V_target.float(), 
+                            mask, 
+                            k=15, 
+                            temperature=0.1
+                        )
+                else:
+                    L_knn_nca = torch.tensor(0.0, device=device)
+                
+                # --- NCA sanity debug ---
+                if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc and WEIGHTS['knn_nca'] > 0:
+                    with torch.no_grad():
+                        n_valid = mask.sum(dim=1).float()
+                        baseline = torch.log((n_valid - 1).clamp(min=1)).mean().item()
+                        print(f"[NCA] n_valid_mean={n_valid.mean().item():.1f} "
+                              f"uniform_baseline≈{baseline:.3f} L_knn_nca={L_knn_nca.item():.3f}")
+
+
                 # Low-noise gating - use actual drop_mask for consistency with CFG
                 if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
                     with torch.autocast(device_type='cuda', enabled=False):
@@ -2999,18 +3013,9 @@ def train_stageC_diffusion_generator(
                         # --- [DEBUG] Log Edge Gate Hit-Rate ---
                         if global_step % 10 == 0 and (fabric is None or fabric.is_global_zero):
                              hit_rate_edge = geo_gate_edge.float().mean().item()
-                            #  print(f"[GATE-EDGE] step={global_step} hit_rate={hit_rate_edge:.2%} "
-                            #        f"({int(geo_gate_edge.sum().item())}/{len(geo_gate_edge)} samples)")
                              if hit_rate_edge < 0.1:
                                  print(f"   ⚠️ WARNING: Edge gate is killing >90% of samples! Relax rho or check sampling.")
-                        
-                        # FIXED: loss_edge now returns (B,) per-sample losses
-                        # L_edge_per = loss_edge(
-                        #     V_pred=V_geom,
-                        #     V_target=V_target_batch,
-                        #     knn_indices=knn_indices_batch,
-                        #     mask=mask
-                        # )
+
 
                         # PATCH 5: Use log-ratio edge loss for multiplicative error
                         L_edge_per = uet.edge_log_ratio_loss(
@@ -3037,21 +3042,26 @@ def train_stageC_diffusion_generator(
                                 print(f"  Tgt id: {id(Tgt)}")
                                 
                                 # Verify the noise equation holds
-                                b_idx = 0
-                                m_b = mask_orig[b_idx].bool()
-                                if m_b.sum() > 5:
-                                    noise_computed = (V_t[b_idx] - Tgt[b_idx])[m_b]
-                                    noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
-                                    
-                                    diff = (noise_computed - noise_expected).abs().max().item()
-                                    print(f"  Max diff between (V_t - Tgt) and (sigma*eps): {diff:.6f} (should be ~0)")
-                                    
-                                    if diff > 1e-4:
-                                        print(f"  🔴 FAIL: Tgt is NOT the same V_target used to create V_t!")
-                                        print(f"  V_target_clean mean: {V_target_orig[b_idx][m_b].mean(dim=0).norm().item():.6f}")
-                                        print(f"  Tgt mean: {Tgt[b_idx][m_b].mean(dim=0).norm().item():.6f}")
-                                    else:
-                                        print(f"  ✅ PASS: Noise equation verified!")
+                                # --- DEBUG 5: Check across sigma bins ---
+                                sigma_for_verify = sigma_flat if use_edm else sigma_t.view(-1)
+                                debug_samples = get_one_sample_per_sigma_bin(sigma_for_verify)
+                                
+                                for bin_name, b_idx in debug_samples[:1]:  # Just check 1
+                                    m_b = mask_orig[b_idx].bool()
+                                    if m_b.sum() > 5:
+                                        noise_computed = (V_t[b_idx] - Tgt[b_idx])[m_b]
+                                        sigma_val = sigma_for_verify[b_idx].item()
+                                        noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
+                                        
+                                        diff = (noise_computed - noise_expected).abs().max().item()
+                                        print(f"  bin={bin_name} Max diff between (V_t - Tgt) and (sigma*eps): {diff:.6f} (should be ~0)")
+                                        
+                                        if diff > 1e-4:
+                                            print(f"  bin={bin_name} 🔴 FAIL: Tgt is NOT the same V_target used to create V_t!")
+                                            print(f"  V_target_clean mean: {V_target_orig[b_idx][m_b].mean(dim=0).norm().item():.6f}")
+                                            print(f"  Tgt mean: {Tgt[b_idx][m_b].mean(dim=0).norm().item():.6f}")
+                                        else:
+                                            print(f"  bin={bin_name} ✅ PASS: Noise equation verified!")
 
 
                         # k-NN preservation check (identity, not just distance)
@@ -3287,11 +3297,41 @@ def train_stageC_diffusion_generator(
                                 
                                 if jaccard_scores:
                                     jaccard_arr = torch.tensor(jaccard_scores)
-                                    # print(f"[KNN PRESERVE] k={k_check} | "
-                                    #     f"jaccard: mean={jaccard_arr.mean():.3f} "
-                                    #     f"p10={jaccard_arr.quantile(0.1):.3f} "
-                                    #     f"p50={jaccard_arr.quantile(0.5):.3f} "
-                                    #     f"p90={jaccard_arr.quantile(0.9):.3f}")
+                    
+                        # --- DEBUG 4: Generator vs diffusion neighbor comparison ---
+                        if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc:
+                            with torch.no_grad():
+                                print(f"\n[DEBUG-GEN-VS-DIFF] Step {global_step} - Generator vs Diffusion neighbor structure:")
+                                
+                                # Get generator output
+                                V_gen_debug = generator(H_train, mask)
+                                
+                                # Compute k-NN Jaccard for both
+                                k = 15
+                                for name, V_test in [("Generator", V_gen_debug), ("Diffusion", x0_pred)]:
+                                    # Sample a few points from batch
+                                    b_idx = 0
+                                    m = mask[b_idx]
+                                    valid_idx = m.nonzero(as_tuple=True)[0]
+                                    
+                                    if len(valid_idx) > 20:
+                                        v_test = V_test[b_idx:b_idx+1]
+                                        v_tgt = V_target[b_idx:b_idx+1]
+                                        m_batch = mask[b_idx:b_idx+1]
+                                        
+                                        jaccard = uet.knn_jaccard_soft(v_test, v_tgt, m_batch, k=k)
+                                        print(f"  {name}: k={k} Jaccard={jaccard.item():.4f}")
+                                
+                                # Per-sigma breakdown for diffusion
+                                for lo, hi in [(0.0, 0.3), (0.3, 1.0), (1.0, float('inf'))]:
+                                    in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
+                                    if in_bin.any() and in_bin.sum() >= 2:
+                                        jaccard_bin = uet.knn_jaccard_soft(
+                                            x0_pred[in_bin][:2], V_target[in_bin][:2], 
+                                            mask[in_bin][:2], k=k
+                                        )
+                                        print(f"  Diffusion σ∈[{lo:.1f},{hi:.1f}): Jaccard={jaccard_bin.item():.4f}")
+
 
                         # ========== COMPREHENSIVE GEOMETRY DIAGNOSTICS ==========
                         if (global_step % 25 == 0) and (not is_sc) and (fabric is None or fabric.is_global_zero):
@@ -3313,139 +3353,170 @@ def train_stageC_diffusion_generator(
                                     print(f"  batch['V_target'] (raw): shape={V_raw.shape}")
                                     
                                     # Compare V_target_batch vs batch['V_target']
-                                    b_idx = 0
-                                    m_b = mask[b_idx].bool()
-                                    n_valid = m_b.sum().item()
-                                    if n_valid > 5:
-                                        v_from_gram = V_target_batch[b_idx, m_b]
-                                        v_raw = V_raw[b_idx, m_b]
-                                        
-                                        # Center both for fair comparison
-                                        v_from_gram_c = v_from_gram - v_from_gram.mean(dim=0)
-                                        v_raw_c = v_raw - v_raw.mean(dim=0)
-                                        
-                                        diff_rms = (v_from_gram_c - v_raw_c).pow(2).mean().sqrt().item()
-                                        scale_ratio = v_from_gram_c.pow(2).mean().sqrt() / v_raw_c.pow(2).mean().sqrt().clamp_min(1e-8)
-                                        
-                                        print(f"  V_target_batch vs batch['V_target'] (sample 0):")
-                                        print(f"    RMS diff: {diff_rms:.6f}")
-                                        print(f"    Scale ratio: {scale_ratio.item():.6f} (should be ~1.0)")
-                                        
-                                        if abs(scale_ratio.item() - 1.0) > 0.1:
-                                            print(f"    ⚠️ WARNING: V_target sources differ by {abs(scale_ratio.item()-1.0)*100:.1f}%!")
+                                    # --- DEBUG 5: Check multiple sigma bins ---
+                                    sigma_for_track = sigma_flat if use_edm else sigma_t.view(-1)
+                                    debug_samples = get_one_sample_per_sigma_bin(sigma_for_track)
+                                    
+                                    for bin_name, b_idx in debug_samples[:2]:
+                                        m_b = mask[b_idx].bool()
+                                        n_valid = m_b.sum().item()
+                                        sigma_val = sigma_for_track[b_idx].item()
+                                        if n_valid > 5:
+                                            print(f"  [{bin_name}] σ={sigma_val:.3f} sample={b_idx}:")
+                                            v_from_gram = V_target_batch[b_idx, m_b]
+                                            v_raw = V_raw[b_idx, m_b]
+                                            
+                                            # Center both for fair comparison
+                                            v_from_gram_c = v_from_gram - v_from_gram.mean(dim=0)
+                                            v_raw_c = v_raw - v_raw.mean(dim=0)
+                                            
+                                            diff_rms = (v_from_gram_c - v_raw_c).pow(2).mean().sqrt().item()
+                                            scale_ratio = v_from_gram_c.pow(2).mean().sqrt() / v_raw_c.pow(2).mean().sqrt().clamp_min(1e-8)
+                                            
+                                            print(f"  V_target_batch vs batch['V_target'] (sample 0):")
+                                            print(f"    RMS diff: {diff_rms:.6f}")
+                                            print(f"    Scale ratio: {scale_ratio.item():.6f} (should be ~1.0)")
+                                            
+                                            if abs(scale_ratio.item() - 1.0) > 0.1:
+                                                print(f"    ⚠️ WARNING: V_target sources differ by {abs(scale_ratio.item()-1.0)*100:.1f}%!")
                                 
                                 # === 2. GRAM MATRIX RECONSTRUCTION CHECK ===
                                 print(f"\n[2] GRAM RECONSTRUCTION:")
-                                b_idx = 0
-                                m_b = mask[b_idx].bool()
-                                n_valid = m_b.sum().item()
+                                # --- DEBUG 5: Check across sigma bins ---
+                                sigma_for_gram = sigma_flat if use_edm else sigma_t.view(-1)
+                                debug_samples = get_one_sample_per_sigma_bin(sigma_for_gram)
                                 
-                                if n_valid > 5:
-                                    # Reconstruct Gram from V_target_batch
-                                    v_tgt = V_target_batch[b_idx, m_b]
-                                    G_reconstructed = v_tgt @ v_tgt.T
-                                    G_true = G_target[b_idx, :n_valid, :n_valid].float()
+                                for bin_name, b_idx in debug_samples[:2]:
+                                    m_b = mask[b_idx].bool()
+                                    sigma_val = sigma_for_gram[b_idx].item()
+                                    print(f"  [{bin_name}] σ={sigma_val:.3f}:")
+                                    n_valid = m_b.sum().item()
                                     
-                                    # Compare traces
-                                    tr_recon = G_reconstructed.diag().sum().item()
-                                    tr_true = G_true.diag().sum().item()
-                                    tr_ratio = tr_recon / max(tr_true, 1e-8)
-                                    
-                                    # Compare off-diagonal
-                                    eye_mask = ~torch.eye(n_valid, device=device).bool()
-                                    g_recon_off = G_reconstructed[eye_mask]
-                                    g_true_off = G_true[eye_mask]
-                                    frob_err = (g_recon_off - g_true_off).norm() / g_true_off.norm().clamp_min(1e-8)
-                                    
-                                    print(f"  Sample 0 (n={n_valid}):")
-                                    print(f"    Gram trace: recon={tr_recon:.3f} vs true={tr_true:.3f} ratio={tr_ratio:.6f}")
-                                    print(f"    Offdiag Frob: {frob_err.item():.6f} (should be <0.01)")
-                                    
-                                    if abs(tr_ratio - 1.0) > 0.05:
-                                        print(f"    🔴 FAIL: factor_from_gram scale mismatch!")
+                                    if n_valid > 5:
+                                        # Reconstruct Gram from V_target_batch
+                                        v_tgt = V_target_batch[b_idx, m_b]
+                                        G_reconstructed = v_tgt @ v_tgt.T
+                                        G_true = G_target[b_idx, :n_valid, :n_valid].float()
+                                        
+                                        # Compare traces
+                                        tr_recon = G_reconstructed.diag().sum().item()
+                                        tr_true = G_true.diag().sum().item()
+                                        tr_ratio = tr_recon / max(tr_true, 1e-8)
+                                        
+                                        # Compare off-diagonal
+                                        eye_mask = ~torch.eye(n_valid, device=device).bool()
+                                        g_recon_off = G_reconstructed[eye_mask]
+                                        g_true_off = G_true[eye_mask]
+                                        frob_err = (g_recon_off - g_true_off).norm() / g_true_off.norm().clamp_min(1e-8)
+                                        
+                                        print(f"  Sample 0 (n={n_valid}):")
+                                        print(f"    Gram trace: recon={tr_recon:.3f} vs true={tr_true:.3f} ratio={tr_ratio:.6f}")
+                                        print(f"    Offdiag Frob: {frob_err.item():.6f} (should be <0.01)")
+                                        
+                                        if abs(tr_ratio - 1.0) > 0.05:
+                                            print(f"    🔴 FAIL: factor_from_gram scale mismatch!")
                                 
                                 # === 3. LOSS INPUT VERIFICATION ===
                                 print(f"\n[3] LOSS INPUTS:")
                                 
                                 # Gram loss
                                 if WEIGHTS['gram'] > 0:
-                                    b_idx = 0
-                                    m_b = mask[b_idx].bool()
-                                    n_valid = m_b.sum().item()
-                                    if n_valid > 5:
-                                        v_hat_b = V_geom[b_idx, m_b]
-                                        G_pred_b = v_hat_b @ v_hat_b.T
-                                        G_tgt_b = G_target[b_idx, :n_valid, :n_valid].float()
-                                        
-                                        print(f"  GRAM LOSS (sample 0):")
-                                        print(f"    Input: V_geom[{b_idx}, valid] -> Gp_raw")
-                                        print(f"    Target: G_target[{b_idx}, :n, :n]")
-                                        print(f"    Gram_pred trace: {G_pred_b.diag().sum().item():.3f}")
-                                        print(f"    Gram_tgt trace:  {G_tgt_b.diag().sum().item():.3f}")
-                                        print(f"    Ratio: {(G_pred_b.diag().sum() / G_tgt_b.diag().sum().clamp_min(1e-8)).item():.6f}")
+                                    # --- DEBUG 5: Show gram loss for different sigma bins ---
+                                    sigma_for_gram_loss = sigma_flat if use_edm else sigma_t.view(-1)
+                                    debug_samples = get_one_sample_per_sigma_bin(sigma_for_gram_loss)
+                                    
+                                    for bin_name, b_idx in debug_samples[:2]:
+                                        m_b = mask[b_idx].bool()
+                                        sigma_val = sigma_for_gram_loss[b_idx].item()
+                                        n_valid = m_b.sum().item()
+                                        if n_valid > 5:
+                                            v_hat_b = V_geom[b_idx, m_b]
+                                            G_pred_b = v_hat_b @ v_hat_b.T
+                                            G_tgt_b = G_target[b_idx, :n_valid, :n_valid].float()
+                                            
+                                            print(f"  GRAM LOSS (sample 0):")
+                                            print(f"  GRAM LOSS [{bin_name}] σ={sigma_val:.3f} sample={b_idx}:")
+                                            print(f"    Input: V_geom[{b_idx}, valid] -> Gp_raw")
+                                            print(f"    Target: G_target[{b_idx}, :n, :n]")
+                                            print(f"    Gram_pred trace: {G_pred_b.diag().sum().item():.3f}")
+                                            print(f"    Gram_tgt trace:  {G_tgt_b.diag().sum().item():.3f}")
+                                            print(f"    Ratio: {(G_pred_b.diag().sum() / G_tgt_b.diag().sum().clamp_min(1e-8)).item():.6f}")
                                 
                                 # Edge loss
                                 if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
                                     knn_idx = batch['knn_spatial'].to(device)
-                                    b_idx = 0
-                                    m_b = mask[b_idx].bool()
-                                    n_valid = m_b.sum().item()
+                                    # --- DEBUG 5: Check edge loss across sigma bins ---
+                                    sigma_for_edge = sigma_flat if use_edm else sigma_t.view(-1)
+                                    debug_samples = get_one_sample_per_sigma_bin(sigma_for_edge)
                                     
-                                    if n_valid > 10:
-                                        v_pred_b = V_geom[b_idx, m_b]
-                                        v_tgt_b = V_target_batch[b_idx, m_b]
-                                        knn_b = knn_idx[b_idx, m_b]
+                                    for bin_name, b_idx in debug_samples[:2]:
+                                        m_b = mask[b_idx].bool()
+                                        sigma_val = sigma_for_edge[b_idx].item()
+                                        n_valid = m_b.sum().item()
                                         
-                                        # Compute sample edge lengths
-                                        valid_edges = (knn_b >= 0) & (knn_b < n_valid)
-                                        if valid_edges.sum() > 0:
-                                            i_idx = torch.arange(n_valid, device=device).unsqueeze(1).expand_as(knn_b)
-                                            i_valid = i_idx[valid_edges]
-                                            j_valid = knn_b[valid_edges]
+                                        if n_valid > 10:
+                                            v_pred_b = V_geom[b_idx, m_b]
+                                            v_tgt_b = V_target_batch[b_idx, m_b]
+                                            knn_b = knn_idx[b_idx, m_b]
                                             
-                                            d_pred = (v_pred_b[i_valid] - v_pred_b[j_valid]).norm(dim=-1)
-                                            d_tgt = (v_tgt_b[i_valid] - v_tgt_b[j_valid]).norm(dim=-1)
-                                            
-                                            print(f"  EDGE LOSS (sample 0, {i_valid.shape[0]} edges):")
-                                            print(f"    Input: V_geom[{b_idx}, valid]")
-                                            print(f"    Target: V_target_batch[{b_idx}, valid]")
-                                            print(f"    d_pred: min={d_pred.min():.4f} med={d_pred.median():.4f} max={d_pred.max():.4f}")
-                                            print(f"    d_tgt:  min={d_tgt.min():.4f} med={d_tgt.median():.4f} max={d_tgt.max():.4f}")
-                                            print(f"    Ratio (pred/tgt): {(d_pred.median() / d_tgt.median().clamp_min(1e-8)).item():.6f}")
+                                            # Compute sample edge lengths
+                                            valid_edges = (knn_b >= 0) & (knn_b < n_valid)
+                                            if valid_edges.sum() > 0:
+                                                i_idx = torch.arange(n_valid, device=device).unsqueeze(1).expand_as(knn_b)
+                                                i_valid = i_idx[valid_edges]
+                                                j_valid = knn_b[valid_edges]
+                                                
+                                                d_pred = (v_pred_b[i_valid] - v_pred_b[j_valid]).norm(dim=-1)
+                                                d_tgt = (v_tgt_b[i_valid] - v_tgt_b[j_valid]).norm(dim=-1)
+                                                
+                                                print(f"  EDGE LOSS (sample 0, {i_valid.shape[0]} edges):")
+                                                print(f"  EDGE LOSS [{bin_name}] σ={sigma_val:.3f} sample={b_idx}:")
+                                                print(f"    Input: V_geom[{b_idx}, valid]")
+                                                print(f"    Target: V_target_batch[{b_idx}, valid]")
+                                                print(f"    d_pred: min={d_pred.min():.4f} med={d_pred.median():.4f} max={d_pred.max():.4f}")
+                                                print(f"    d_tgt:  min={d_tgt.min():.4f} med={d_tgt.median():.4f} max={d_tgt.max():.4f}")
+                                                print(f"    Ratio (pred/tgt): {(d_pred.median() / d_tgt.median().clamp_min(1e-8)).item():.6f}")
                                 
                                 # === 4. GLOBAL SCALE CONSISTENCY ===
                                 print(f"\n[4] GLOBAL SCALE:")
-                                b_idx = 0
-                                m_b = mask[b_idx].bool()
-                                n_valid = m_b.sum().item()
+                                # --- DEBUG 5: Check scale across sigma bins ---
+                                sigma_for_scale = sigma_flat if use_edm else sigma_t.view(-1)
+                                debug_samples = get_one_sample_per_sigma_bin(sigma_for_scale)
                                 
-                                if n_valid > 5:
-                                    v_hat_b = V_geom[b_idx, m_b]
-                                    v_tgt_b = V_target_batch[b_idx, m_b]
+                                for bin_name, b_idx in debug_samples:
+                                    m_b = mask[b_idx].bool()
+                                    sigma_val = sigma_for_scale[b_idx].item()
+                                    n_valid = m_b.sum().item()
+                                    print(f"  [{bin_name}] σ={sigma_val:.3f} sample={b_idx}:")
+                                    n_valid = m_b.sum().item()
                                     
-                                    # RMS
-                                    rms_hat = v_hat_b.pow(2).mean().sqrt().item()
-                                    rms_tgt = v_tgt_b.pow(2).mean().sqrt().item()
-                                    
-                                    # Median pairwise distance
-                                    D_hat = torch.cdist(v_hat_b, v_hat_b)
-                                    D_tgt = torch.cdist(v_tgt_b, v_tgt_b)
-                                    triu_mask = torch.triu(torch.ones_like(D_hat, dtype=torch.bool), diagonal=1)
-                                    med_d_hat = D_hat[triu_mask].median().item()
-                                    med_d_tgt = D_tgt[triu_mask].median().item()
-                                    
-                                    print(f"  Sample 0 (n={n_valid}):")
-                                    print(f"    RMS: pred={rms_hat:.4f} tgt={rms_tgt:.4f} ratio={rms_hat/max(rms_tgt,1e-8):.6f}")
-                                    print(f"    Median dist: pred={med_d_hat:.4f} tgt={med_d_tgt:.4f} ratio={med_d_hat/max(med_d_tgt,1e-8):.6f}")
-                                    
-                                    # These should match if losses are working
-                                    gram_ratio = (rms_hat**2) / max(rms_tgt**2, 1e-8)
-                                    dist_ratio = med_d_hat / max(med_d_tgt, 1e-8)
-                                    expected_dist_from_gram = gram_ratio ** 0.5
-                                    
-                                    print(f"    Consistency: gram_ratio={gram_ratio:.6f} dist_ratio={dist_ratio:.6f}")
-                                    print(f"    Expected dist from gram: {expected_dist_from_gram:.6f}")
-                                    print(f"    Error: {abs(dist_ratio - expected_dist_from_gram):.6f} (should be <0.05)")
+                                    if n_valid > 5:
+                                        v_hat_b = V_geom[b_idx, m_b]
+                                        v_tgt_b = V_target_batch[b_idx, m_b]
+                                        
+                                        # RMS
+                                        rms_hat = v_hat_b.pow(2).mean().sqrt().item()
+                                        rms_tgt = v_tgt_b.pow(2).mean().sqrt().item()
+                                        
+                                        # Median pairwise distance
+                                        D_hat = torch.cdist(v_hat_b, v_hat_b)
+                                        D_tgt = torch.cdist(v_tgt_b, v_tgt_b)
+                                        triu_mask = torch.triu(torch.ones_like(D_hat, dtype=torch.bool), diagonal=1)
+                                        med_d_hat = D_hat[triu_mask].median().item()
+                                        med_d_tgt = D_tgt[triu_mask].median().item()
+                                        
+                                        print(f"  Sample 0 (n={n_valid}):")
+                                        print(f"    RMS: pred={rms_hat:.4f} tgt={rms_tgt:.4f} ratio={rms_hat/max(rms_tgt,1e-8):.6f}")
+                                        print(f"    Median dist: pred={med_d_hat:.4f} tgt={med_d_tgt:.4f} ratio={med_d_hat/max(med_d_tgt,1e-8):.6f}")
+                                        
+                                        # These should match if losses are working
+                                        gram_ratio = (rms_hat**2) / max(rms_tgt**2, 1e-8)
+                                        dist_ratio = med_d_hat / max(med_d_tgt, 1e-8)
+                                        expected_dist_from_gram = gram_ratio ** 0.5
+                                        
+                                        print(f"    Consistency: gram_ratio={gram_ratio:.6f} dist_ratio={dist_ratio:.6f}")
+                                        print(f"    Expected dist from gram: {expected_dist_from_gram:.6f}")
+                                        print(f"    Error: {abs(dist_ratio - expected_dist_from_gram):.6f} (should be <0.05)")
                                 
                                 print(f"{'='*80}\n")
 
@@ -3674,25 +3745,6 @@ def train_stageC_diffusion_generator(
                 else:
                     L_gen_align = torch.tensor(0.0, device=device)
 
-                # # Align generator output V_0 to target geometry via Procrustes
-                # if WEIGHTS['gen_align'] > 0 and (not is_sc):
-                #     with torch.autocast(device_type='cuda', enabled=False):
-                #         # Center V_gen
-                #         V_gen_f32 = V_gen.float()
-                #         m_float = mask.float().unsqueeze(-1)
-                #         valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
-                #         mean_Vgen = (V_gen_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
-                #         V_gen_centered = (V_gen_f32 - mean_Vgen) * m_float
-                        
-                #         # V_target_batch already computed above for EDM tail loss
-                #         L_gen_align = uet.procrustes_alignment_loss(
-                #             V_pred=V_gen_centered,  # ← FIX: Use V_gen
-                #             V_target=V_target_batch,
-                #             mask=mask
-                #         )
-                # else:
-                #     L_gen_align = torch.tensor(0.0, device=device)
-
                 # ==================== NEW MANIFOLD-AWARE REGULARIZERS ====================
                 # B1: Intrinsic dimension regularizer
                 if WEIGHTS['dim'] > 0:
@@ -3734,140 +3786,6 @@ def train_stageC_diffusion_generator(
 
                 if DEBUG and (global_step % LOG_EVERY == 0):
                     print(f"[sw_st] step={global_step} val={float(L_sw_st.item()):.6f} K=64 cap=512 pairs={int(pairA.numel())}")
-
-
-                # ==================== NEW: REPULSION LOSS (ST ONLY) ====================
-                # Penalize very small predicted pairwise distances (avoid local overlaps)
-                if False:
-                    if DEBUG and (global_step % LOG_EVERY == 0):
-                        print(f"\n[REPEL] Computing repulsion loss for ST batch...")
-
-                    B_rep, N_rep, D_rep = V_geom.shape
-                    repel_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
-                    repel_debug = {"total_pairs": 0, "violating_pairs": 0, "min_dist": float('inf'), "samples_checked": 0}
-
-                    for b in range(B_rep):
-                        m_b = mask[b]
-                        n_valid = m_b.sum().item()
-                        if n_valid < 2:
-                            continue
-                        
-                        V_b = V_geom[b, m_b]  # (n_valid, D)
-                        
-                        # ROTATION-INVARIANT 2D PROJECTION (PCA)
-                        V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
-                        Cov_b = V_b_c.T @ V_b_c / n_valid  # (D, D) covariance
-                        eigvals, eigvecs = torch.linalg.eigh(Cov_b)  # ascending order
-                        U2 = eigvecs[:, -2:]  # top-2 eigenvectors (last 2 columns)
-                        V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
-                        
-                        D_pred_b = torch.cdist(V_b_2d, V_b_2d)  # (n_valid, n_valid)
-                        
-                        # Mask out diagonal
-                        eye_b = torch.eye(n_valid, device=device, dtype=torch.bool)
-                        D_pred_b_nodiag = D_pred_b.masked_fill(eye_b, 1e6)
-                        
-                        # DEBUG: Track statistics
-                        repel_debug["samples_checked"] += 1
-                        min_dist_sample = D_pred_b_nodiag.min().item()
-                        repel_debug["min_dist"] = min(repel_debug["min_dist"], min_dist_sample)
-                        repel_debug["total_pairs"] += (n_valid * (n_valid - 1)) // 2
-                        
-                        # Find pairs with distance < repel_epsilon_st
-                        violating_mask = (D_pred_b_nodiag < repel_epsilon_st) & (~eye_b)
-                        n_violations = violating_mask.sum().item() // 2  # Divide by 2 (symmetric)
-                        repel_debug["violating_pairs"] += n_violations
-                        
-                        if violating_mask.any():
-                            # Penalty: (epsilon - D_ij)^2 for violating pairs
-                            violations = D_pred_b_nodiag[violating_mask]
-                            penalty = (repel_epsilon_st - violations).pow(2).mean()
-                            repel_per_set[b] = penalty  # ← STORE IN TENSOR
-                        # else: repel_per_set[b] stays 0.0 (already initialized)
-
-                    # Gate by low-noise + conditional (same as Gram)
-                    # geo_gate is already computed above in Gram loss section
-                    gate_sum = geo_gate.sum().clamp_min(1.0)
-                    L_repel = (repel_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
-
-                # if DEBUG and (global_step % LOG_EVERY == 0):
-                if False:
-                    print(f"[REPEL] L_repel={L_repel.item():.6f} | epsilon={repel_epsilon_st:.6f}")
-                    print(f"[REPEL] Samples checked: {repel_debug['samples_checked']}, Total pairs: {repel_debug['total_pairs']}, Violating: {repel_debug['violating_pairs']}")
-                    print(f"[REPEL] Min predicted distance across all samples: {repel_debug['min_dist']:.6f}")
-                
-                # ==================== NEW: SHAPE/ANISOTROPY LOSS (ST ONLY) ====================
-                # Match eigenvalue ratio of predicted Gram to target Gram
-                if False:
-                    if DEBUG and (global_step % LOG_EVERY == 0):
-                        print(f"\n[SHAPE] Computing anisotropy/shape loss for ST batch...")
-
-                    shape_per_set = torch.zeros(B_rep, device=device)  # ← INITIALIZE HERE
-                    shape_debug = {"skipped_too_few": 0, "skipped_exception": 0, "computed": 0}
-
-                    for b in range(B_rep):
-                        m_b = mask[b].bool()
-                        n_valid = m_b.sum().item()
-                        if n_valid < 3:  # Need at least 3 points for meaningful eigenvalues
-                            shape_debug["skipped_too_few"] += 1
-                            continue
-                        
-                        # ROTATION-INVARIANT 2D PROJECTION (PCA)
-                        V_b = V_geom[b, m_b]  # (n_valid, 32)
-                        V_b_c = V_b - V_b.mean(0, keepdim=True)  # center
-                        Cov_b = V_b_c.T @ V_b_c / n_valid  # (32, 32) covariance
-                        eigvals_cov, eigvecs_cov = torch.linalg.eigh(Cov_b)  # ascending order
-                        U2 = eigvecs_cov[:, -2:]  # top-2 eigenvectors
-                        V_b_2d = V_b_c @ U2  # project to principal 2D plane (n_valid, 2)
-                        
-                        Gp_b = V_b_2d @ V_b_2d.T  # Recompute Gram in 2D space
-                        
-                        Gt_b = Gt[b][m_b][:, m_b]   
-
-                        # Compute eigenvalues (symmetric, so use eigvalsh)
-                        try:
-                            eig_pred = torch.linalg.eigvalsh(Gp_b)  # (n_valid,), ascending order
-                            eig_targ = torch.linalg.eigvalsh(Gt_b)  # (n_valid,), ascending order
-                            
-                            # Clamp from below to avoid log(0)
-                            eig_pred = eig_pred.clamp_min(1e-8)
-                            eig_targ = eig_targ.clamp_min(1e-8)
-                            
-                            # Take top 2 eigenvalues (largest)
-                            lambda1_pred = eig_pred[-1]
-                            lambda2_pred = eig_pred[-2]
-                            lambda1_targ = eig_targ[-1]
-                            lambda2_targ = eig_targ[-2]
-                            
-                            # Anisotropy ratio (how elongated vs round)
-                            r_pred = lambda1_pred / lambda2_pred.clamp_min(1e-8)
-                            r_targ = lambda1_targ / lambda2_targ.clamp_min(1e-8)
-                            
-                            # Log-ratio penalty (scale-invariant)
-                            log_ratio_loss = (torch.log(r_pred) - torch.log(r_targ)).pow(2)
-                            shape_per_set[b] = log_ratio_loss  # ← STORE IN TENSOR
-                            shape_debug["computed"] += 1
-                            
-                            # DEBUG: Print first few samples
-                            if DEBUG and (global_step % LOG_EVERY == 0) and shape_debug["computed"] <= 3:
-                                print(f"  [SHAPE sample {b}] n_valid={n_valid}")
-                                print(f"    λ_pred: {lambda1_pred:.4f}, {lambda2_pred:.4f} → ratio: {r_pred:.4f}")
-                                print(f"    λ_targ: {lambda1_targ:.4f}, {lambda2_targ:.4f} → ratio: {r_targ:.4f}")
-                                print(f"    log_ratio_loss: {log_ratio_loss:.6f}")
-                            
-                        except Exception as e:
-                            shape_debug["skipped_exception"] += 1
-                            if DEBUG and (global_step % LOG_EVERY == 0):
-                                print(f"[SHAPE] Warning: eigendecomp failed for sample {b}: {e}")
-                            continue
-
-                    # Gate by low-noise + conditional (same as Gram)
-                    gate_sum = geo_gate.sum().clamp_min(1.0)
-                    L_shape = (shape_per_set * geo_gate).sum() / gate_sum  # ← GATED AGGREGATION
-
-                    if DEBUG and (global_step % LOG_EVERY == 0):
-                        print(f"[SHAPE] L_shape={L_shape.item():.6f} | computed={shape_debug['computed']}, skipped_few={shape_debug['skipped_too_few']}, skipped_exc={shape_debug['skipped_exception']}")
-                    # ==============================================================================
 
 
                 # ============================================================================
@@ -4149,39 +4067,6 @@ def train_stageC_diffusion_generator(
             # Total loss with optional score deprioritization on geometry-heavy batches
             score_multiplier = 1.0
 
-            # After computing all losses, BEFORE L_total
-            if False:
-                test_losses = {
-                    "score": L_score,
-                    "gram": L_gram if (not is_sc) else None,
-                    "edge": L_edge if ((not is_sc) and (WEIGHTS["edge"] > 0)) else None,
-                }
-
-                fabric.print(f"\n[GRAD SOURCE] step={global_step}")  # only prints on rank 0
-
-                for name, loss in test_losses.items():
-                    if loss is None or (not isinstance(loss, torch.Tensor)) or (not loss.requires_grad):
-                        continue
-
-                    optimizer.zero_grad(set_to_none=True)
-
-                    # IMPORTANT: use Fabric backward (not loss.backward)
-                    fabric.backward(loss, retain_graph=True)
-
-                    # Option A: manual grad norm (works, but in mixed precision it may be scaled)
-                    sq = 0.0
-                    for p in params:
-                        if p.grad is not None:
-                            sq += p.grad.detach().norm().item() ** 2
-                    norm = sq ** 0.5
-
-                    fabric.print(f"  {name}: loss={loss.item():.3f}, grad_norm={norm:.1f}")
-
-                    optimizer.zero_grad(set_to_none=True)
-
-                optimizer.zero_grad(set_to_none=True)
-
-
             # ==================== GEOMETRY SCALE DIAGNOSTICS ====================
             if (not is_sc) and (global_step % 50 == 0) and global_step < 2000:
                 with torch.no_grad():
@@ -4294,28 +4179,6 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['topo'] * L_topo +
                     WEIGHTS['shape_spec'] * L_shape_spec +
                     WEIGHTS.get('subspace', 0) * L_subspace)  # PATCH 7
-
-
-            # L_total = (WEIGHTS['score'] * score_multiplier * L_score +
-            #                     WEIGHTS['gram'] * L_gram +
-            #                     WEIGHTS['gram_scale'] * L_gram_scale +
-            #                     WEIGHTS['heat'] * L_heat +
-            #                     WEIGHTS['sw_st'] * L_sw_st +
-            #                     WEIGHTS['sw_sc'] * L_sw_sc +
-            #                     WEIGHTS['overlap'] * L_overlap +
-            #                     WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
-            #                     WEIGHTS['st_dist'] * L_st_dist +
-            #                     WEIGHTS['edm_tail'] * L_edm_tail +      
-            #                     WEIGHTS['gen_align'] * L_gen_align +
-            #                     WEIGHTS['dim'] * L_dim +
-            #                     WEIGHTS['triangle'] * L_triangle +
-            #                     WEIGHTS['knn_nca'] * L_knn_nca +
-            #                     WEIGHTS['radial'] * L_radial +
-            #                     WEIGHTS['repel'] * L_repel +      # NEW: ST repulsion
-            #                     WEIGHTS['shape'] * L_shape + 
-            #                     WEIGHTS['edge'] * L_edge +           # NEW
-            #                     WEIGHTS['topo'] * L_topo +           # NEW
-            #                     WEIGHTS['shape_spec'] * L_shape_spec )       # NEW: ST shape/anisotropy
 
             
             # Add SC dimension prior if this is an SC batch
@@ -4480,20 +4343,6 @@ def train_stageC_diffusion_generator(
                 if (not is_sc) and (global_step >= AUTOBALANCE_START) and (global_step % AUTOBALANCE_EVERY == 0):
                     # Define bounds for each loss (min_weight, max_weight)
                     # Conservative bounds prevent any single loss from dominating
-                    # bounds = {
-                    #     'gram': (6.0, 20.0),          # Original range
-                    #     'gram_scale': (0.05, 0.8),    # Scale regularizer - keep modest
-                    #     'heat': (0.6, 3.0),           # Original range
-                    #     'sw_st': (0.8, 3.0),          # Original range
-                    #     'st_dist': (0.01, 0.5),       # Distance classification - moderate
-                    #     'edm_tail': (0.05, 0.8),      # EDM tail - moderate
-                    #     'gen_align': (0.05, 0.6),     # Procrustes alignment - moderate
-                    #     'radial': (0.2, 2.0),         # Radial histogram - moderate
-                    #     'edge': (0.3, 1.5),           # Keep edge consistency moderate
-                    #     'topo': (0.2, 1.0),           # Topology can be expensive, keep check
-                    #     'shape_spec': (0.2, 1.0), # Shape spectrum bounds
-                    # }
-
                     bounds = {
                         # Global losses - TIGHTER upper bounds (don't let them dominate)
                         'gram': (0.3, 3.0),         # was (6.0, 20.0) - much lower ceiling
@@ -4681,6 +4530,42 @@ def train_stageC_diffusion_generator(
             ema_update(score_net_ema, score_net, ema_decay)
             ema_update(context_encoder_ema, context_encoder, ema_decay)
             # ====================================================
+
+            # --- DEBUG 7: Gradient health check ---
+            if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                print(f"\n[DEBUG-GRAD] Step {global_step} - Gradient health:")
+                dead_grads = []
+                exploding_grads = []
+                for name, param in score_net.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        if grad_norm < 1e-8:
+                            dead_grads.append((name, grad_norm))
+                        elif grad_norm > 100:
+                            exploding_grads.append((name, grad_norm))
+                
+                if dead_grads:
+                    print(f"  ⚠️ DEAD GRADS ({len(dead_grads)}):")
+                    for name, gn in dead_grads[:5]:  # Show first 5
+                        print(f"    {name}: {gn:.2e}")
+                
+                if exploding_grads:
+                    print(f"  ⚠️ EXPLODING GRADS ({len(exploding_grads)}):")
+                    for name, gn in exploding_grads[:5]:
+                        print(f"    {name}: {gn:.2e}")
+                
+                if not dead_grads and not exploding_grads:
+                    print(f"  ✓ All gradients healthy")
+                
+                # Check generator gradients specifically
+                gen_grad_norm = 0.0
+                gen_param_count = 0
+                for param in generator.parameters():
+                    if param.grad is not None:
+                        gen_grad_norm += param.grad.norm().item() ** 2
+                        gen_param_count += 1
+                gen_grad_norm = (gen_grad_norm ** 0.5) if gen_param_count > 0 else 0
+                print(f"  Generator total grad norm: {gen_grad_norm:.4f}")
 
             
             # Log
@@ -5617,16 +5502,6 @@ def sample_sc_edm_patchwise(
         )
         print("[DEBUG] Saved patch graph to debug patch graph")
 
-    # ------------------------------------------------------------------
-    # 4) For each patch: run diffusion sampling (all points free),
-    #    then canonicalize to match training.
-    # ------------------------------------------------------------------
-    # sigmas = torch.exp(torch.linspace(
-    #     torch.log(torch.tensor(sigma_max, device=device)),
-    #     torch.log(torch.tensor(sigma_min, device=device)),
-    #     n_timesteps_sample,
-    #     device=device,
-    # ))  # (T,)
 
     # EDM Karras sigma schedule - use refinement sigma range
     # sigma_max should match training sigma_refine_max (typically 1.0 * sigma_data)
@@ -5668,13 +5543,6 @@ def sample_sc_edm_patchwise(
             V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
             V_t = V_t * mask_k.unsqueeze(-1).float()  # Mask out invalid positions
 
-
-            # for t_idx in range(n_timesteps_sample):
-            #     sigma_t = sigmas[t_idx]
-            #     t_norm = torch.tensor([[t_idx / float(n_timesteps_sample - 1)]],
-            #                           device=device)
-
-            # sigma_data = 1.0  # Use stored or estimated value
             
             # EDM Euler + Heun sampler
             for i in range(len(sigmas) - 1):
@@ -5728,64 +5596,6 @@ def sample_sc_edm_patchwise(
                     noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma**2, min=0))
                     V_t = V_t + noise_scale * torch.randn_like(V_t)
 
-            # for i in range(n_timesteps_sample):
-            #     sigma_cur = sigmas[i]
-            #     sigma_next = sigmas[i + 1] if i < n_timesteps_sample - 1 else torch.tensor(0.0, device=device)
-                
-            #     # EDM denoised prediction with CFG
-            #     H_null = torch.zeros_like(H_k)
-            #     x0_uncond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_null, mask_k, sigma_data)
-            #     x0_cond = score_net.forward_edm(V_t, sigma_cur.expand(1), H_k, mask_k, sigma_data)
-            #     x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
-                
-            #     # Debug on first patch
-            #     if DEBUG_FLAG and k == 0 and i < 3:
-            #         du = x0_uncond.norm(dim=[1, 2]).mean().item()
-            #         dc = x0_cond.norm(dim=[1, 2]).mean().item()
-            #         diff = (x0_cond - x0_uncond).norm(dim=[1, 2]).mean().item()
-            #         print(f"  [PATCH0] i={i:3d} sigma={float(sigma_cur):.4f} "
-            #               f"||x0_u||={du:.3f} ||x0_c||={dc:.3f} ||diff||={diff:.3f}")
-                
-            #     # EDM update
-            #     if sigma_next > 0:
-            #         d_cur = (V_t - x0_pred) / sigma_cur
-            #         V_t = V_t + (sigma_next - sigma_cur) * d_cur
-                    
-            #         if eta > 0:
-            #             noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_cur**2, min=0))
-            #             V_t = V_t + noise_scale * torch.randn_like(V_t)
-            #     else:
-            #         V_t = x0_pred
-                
-            # for t_idx in range(n_timesteps_sample):
-            #     sigma_t = sigmas[t_idx]
-            #     t_norm = torch.tensor([[1.0 - t_idx / float(n_timesteps_sample - 1)]], device=device)
-
-            #     H_null = torch.zeros_like(H_k)
-            #     eps_uncond = score_net(V_t, t_norm, H_null, mask_k)
-            #     eps_cond   = score_net(V_t, t_norm, H_k,    mask_k)
-            #     eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
-            #     # Extra debug on first patch
-            #     if DEBUG_FLAG and k == 0 and t_idx < 3:
-            #         du = eps_uncond.norm(dim=[1, 2]).mean().item()
-            #         dc = eps_cond.norm(dim=[1, 2]).mean().item()
-            #         diff = (eps_cond - eps_uncond).norm(dim=[1, 2]).mean().item()
-            #         ratio = diff / (du + 1e-8)
-            #         print(f"  [PATCH0] t={t_idx:3d} sigma={float(sigma_t):.4f} "
-            #               f"||eps_u||={du:.3f} ||eps_c||={dc:.3f} "
-            #               f"||diff||={diff:.3f} CFG_ratio={ratio:.3f}")
-
-            #     if t_idx < n_timesteps_sample - 1:
-            #         sigma_next = sigmas[t_idx + 1]
-            #         V_0_pred = V_t - sigma_t * eps
-            #         V_t = V_0_pred + (sigma_next / sigma_t) * (V_t - V_0_pred)
-            #         if eta > 0:
-            #             noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_t**2, min=0))
-            #             V_t = V_t + noise_scale * torch.randn_like(V_t)
-            #     else:
-            #         V_t = V_t - sigma_t * eps
-    
 
             # if DEBUG_FLAG and (k % max(1, K // 5) == 0):
             #     rms = V_canon.pow(2).mean().sqrt().item()
