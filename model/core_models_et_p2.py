@@ -634,9 +634,12 @@ class DiffusionScoreNet(nn.Module):
         return emb
 
     def forward(self, V_t: torch.Tensor, t: torch.Tensor, H: torch.Tensor, 
-           mask: torch.Tensor, self_cond: torch.Tensor = None, 
-           attn_cached: dict = None, return_dist_aux: bool = False,
-           sigma_raw: torch.Tensor = None) -> torch.Tensor:
+        mask: torch.Tensor, self_cond: torch.Tensor = None, 
+        attn_cached: dict = None, return_dist_aux: bool = False,
+        sigma_raw: torch.Tensor = None,
+        x_raw: torch.Tensor = None,     # NEW: raw centered geometry (Fix #1)
+        c_in: torch.Tensor = None       # NEW: for self-cond feature scaling (Fix #3)
+        ) -> torch.Tensor:
         """
         Args:
             V_t: (B, N, D_latent) noisy coords at time t
@@ -645,6 +648,9 @@ class DiffusionScoreNet(nn.Module):
             mask: (B, N)
             self_cond: optional (B, N, D_latent) predicted V_0 from previous step
             attn_cached: optional dict to reuse distance bias
+            sigma_raw: optional (B,) raw sigma values from EDM
+            x_raw: optional (B, N, D_latent) raw centered geometry for distance bias (Fix #1)
+            c_in: optional (B, 1, 1) preconditioning scalar for self_cond scaling (Fix #3)
         
         Returns:
             eps_hat: (B, N, D_latent)
@@ -662,49 +668,50 @@ class DiffusionScoreNet(nn.Module):
             self_cond_canon = self_cond
 
         # --- Compute sigma for gating decisions ---
-        # Prefer sigma_raw if provided (true sigma from EDM)
-        # Otherwise fall back to t (but this only works if t is c_noise = 0.25*ln(σ))
         if sigma_raw is not None:
             sigma_for_gating = sigma_raw.detach().view(-1).float()  # (B,)
         else:
             # Fallback: assume t is c_noise from EDM
             sigma_for_gating = torch.exp(4.0 * t.squeeze(-1)).detach().view(-1).float()
         
-        # --- DEBUG 1 (FIXED): Log geometry source usage truthfully ---
+        # --- FIX #2: Smooth σ gating instead of hard threshold ---
+        # geom_gate: 1 at low σ, 0 at high σ (smooth transition around 0.30)
+        sigma_cut = 0.30
+        sigma_k = 20.0  # Steepness of transition
+        geom_gate = torch.sigmoid((sigma_cut - sigma_for_gating) * sigma_k)  # (B,)
+        
+        # --- FIX #1: Raw-space geometry source for distance bias ---
+        # Use x_raw if provided (from forward_edm), otherwise fallback to V_in
+        if x_raw is not None:
+            V_geom_for_bias = x_raw  # Raw centered x_t (units match st_dist_bin_edges)
+        else:
+            V_geom_for_bias = V_in  # Fallback for backward compatibility
+        
+        # --- FIX #2 CONTINUED: Blend geometry source smoothly ---
+        if self_cond_canon is not None:
+            # For high σ, use self_cond as geometry source
+            # For low σ, use V_geom_for_bias (raw or V_in)
+            g = geom_gate.view(-1, 1, 1)  # (B, 1, 1)
+            V_geom = g * V_geom_for_bias + (1.0 - g) * self_cond_canon
+        else:
+            V_geom = V_geom_for_bias
+
+        # geom_ok: for gating - when we have self_cond, geometry is always usable
+        if self_cond_canon is not None:
+            geom_ok = torch.ones_like(geom_gate).bool()
+        else:
+            geom_ok = (geom_gate > 0.5)  # Binary for compatibility
+
+        # DEBUG: Log geometry source usage
         if self.training and (torch.rand(()).item() < 0.01):
             with torch.no_grad():
                 has_sc = (self_cond_canon is not None)
-                high = (sigma_for_gating > 0.30)
-                n_high = int(high.sum().item())
+                n_low = int((geom_gate > 0.5).sum().item())
                 B_dbg = int(sigma_for_gating.numel())
-
-                if has_sc:
-                    print(f"[DEBUG-GEOM-SRC] B={B_dbg} σ_mean={sigma_for_gating.mean():.3f} "
-                          f"self_cond=YES highσ={n_high}/{B_dbg} "
-                          f"V_geom=blend(self_cond for highσ, V_in for lowσ)")
-                else:
-                    print(f"[DEBUG-GEOM-SRC] B={B_dbg} σ_mean={sigma_for_gating.mean():.3f} "
-                          f"self_cond=NO V_geom=V_in")
-
-        # --- GEOM_OK: Geometry is trustworthy if low σ OR we have self_cond ---
-        # At high σ, V_in is noise. But if we have self_cond, it provides good geometry.
-        low_sigma = (sigma_for_gating < 0.30)
-        if self_cond_canon is not None:
-            # Geometry is OK for ALL samples when we have self_cond
-            # (because V_geom will use self_cond for high-σ samples)
-            geom_ok = torch.ones_like(low_sigma)  # All True
-        else:
-            # Without self_cond, geometry is only OK for low σ
-            geom_ok = low_sigma
-        
-        # --- V_geom: Geometry source for distance bias and angle features ---
-        # At high σ with self_cond: use self_cond as geometry source
-        # At low σ or without self_cond: use V_in
-        if self_cond_canon is not None:
-            high_sigma_blend = (~low_sigma).float().view(-1, 1, 1)  # (B, 1, 1)
-            V_geom = high_sigma_blend * self_cond_canon + (1 - high_sigma_blend) * V_in
-        else:
-            V_geom = V_in
+                geom_gate_mean = geom_gate.mean().item()
+                print(f"[DEBUG-GEOM-SRC] B={B_dbg} σ_mean={sigma_for_gating.mean():.3f} "
+                    f"self_cond={'YES' if has_sc else 'NO'} "
+                    f"geom_gate_mean={geom_gate_mean:.3f} n_lowσ={n_low}/{B_dbg}")
 
         # Step 2: Compose node features
         features = [H]  # Start with context
@@ -712,49 +719,100 @@ class DiffusionScoreNet(nn.Module):
         # Add time embedding (expanded to all nodes)
         if t.dim() == 1:
             t = t.unsqueeze(1)
-        t_emb = self.get_time_embedding(t)  #First get Fourier features
-        t_emb = self.time_mlp(t_emb)  # then pass through MLP
-        # t_emb_expanded = t_emb.expand(-1, N, -1)  # (B, N, c_dim)
+        t_emb = self.get_time_embedding(t)
+        t_emb = self.time_mlp(t_emb)
         t_emb_expanded = t_emb.unsqueeze(1).expand(-1, N, -1) 
         features.append(t_emb_expanded)
         
-        # Add self-conditioning
+        # --- FIX #3 CORRECTED: Consistent self-conditioning feature scaling for ALL modes ---
         if self.self_conditioning and self_cond_canon is not None:
+            # FIRST: Scale self_cond to match preconditioned V_in scale
+            # This ensures consistent units regardless of sc_feat_mode
+            if c_in is not None:
+                self_cond_feat_input = self_cond_canon * c_in  # (B, 1, 1) broadcasts
+            else:
+                self_cond_feat_input = self_cond_canon  # Fallback
+            
+            # THEN: Apply mode-specific processing to the SCALED input
             if self.sc_feat_mode == "mlp":
-                sc_feat = self.sc_mlp(self_cond_canon)
+                sc_feat = self.sc_mlp(self_cond_feat_input)  # MLP sees scaled input
             else:  # concat
-                sc_feat = self_cond_canon
+                sc_feat = self_cond_feat_input  # Already scaled
+            
             features.append(sc_feat)
         elif self.self_conditioning:  # No self_cond provided, use zeros
             sc_feat = torch.zeros(B, N, self.D_latent, device=V_t.device)
             features.append(sc_feat)
+
+        # --- DEBUG: Verify self-cond feature scaling ---
+        if self.training and self_cond_canon is not None and (torch.rand(()).item() < 0.005):
+            with torch.no_grad():
+                mask_f = mask.unsqueeze(-1).float()
+                valid_count = mask_f.sum()
+                
+                rms_vin = (V_in.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                rms_sc_raw = (self_cond_canon.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                rms_sc_scaled = (self_cond_feat_input.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                
+                print(f"\n[DEBUG-SC-SCALE] Self-cond feature scaling:")
+                print(f"  rms(V_in)={rms_vin:.4f} (preconditioned input)")
+                print(f"  rms(self_cond_raw)={rms_sc_raw:.4f}")
+                print(f"  rms(self_cond_scaled)={rms_sc_scaled:.4f}")
+                print(f"  scaled/V_in ratio={rms_sc_scaled/max(rms_vin, 1e-8):.3f} (should be ~1.0)")
+
+
         
-        # Add angle features
-        # Add angle features (gated by geom_ok)
+        # Add angle features (use V_geom which is already blended)
         if self.use_angle_features:
             if geom_ok.any():
-                # Compute angle features from V_geom (trustworthy geometry source)
                 idx = uet.knn_graph(V_geom, mask, k=self.knn_k)
                 angle_feat = uet.angle_features(V_geom, mask, idx, n_angle_bins=self.angle_bins)
-                # Gate: zero out for samples where geometry is not trustworthy
-                gate_angle = geom_ok.float().view(-1, 1, 1)  # (B, 1, 1)
+                # Gate by smooth geom_gate (not binary geom_ok)
+                gate_angle = geom_gate.view(-1, 1, 1)
                 angle_feat = angle_feat * gate_angle
                 features.append(angle_feat)
             else:
-                # No trustworthy geometry: use zeros
                 angle_feat = torch.zeros(B, N, self.angle_bins, device=V_t.device)
                 features.append(angle_feat)
 
-        # Append geometry features (gated by geom_ok)
-        # At high σ without self_cond, this becomes zeros
-        V_geom_gated = V_geom * geom_ok.float().view(-1, 1, 1)
-        features.append(V_geom_gated)
+        # --- CORRECTED: Coordinate features are NEVER gated ---
+        # The network must always see the noisy coordinates V_in for denoising.
+        # Only gate AUXILIARY geometry features (distance bias, angles), not the core coordinates.
+        V_coord_feat = V_in  # NO GATING - always pass coordinates
+        features.append(V_coord_feat)
+
+
+        # --- DEBUG: Verify coordinate features are not gated ---
+        if self.training and (torch.rand(()).item() < 0.005):  # ~0.5% of steps
+            with torch.no_grad():
+                sigma_for_dbg = sigma_for_gating if sigma_raw is not None else torch.zeros(B, device=V_t.device)
+                
+                # Check coordinate feature is same as V_in
+                coord_ratio = V_coord_feat.norm() / V_in.norm().clamp(min=1e-8)
+                
+                # Per-sigma-bin check
+                sigma_bins = [(0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, float('inf'))]
+                print(f"\n[DEBUG-COORD-FEAT] Coordinate feature verification:")
+                for lo, hi in sigma_bins:
+                    in_bin = (sigma_for_dbg >= lo) & (sigma_for_dbg < hi)
+                    if in_bin.any():
+                        v_in_bin = V_in[in_bin]
+                        v_coord_bin = V_coord_feat[in_bin]
+                        mask_bin = mask[in_bin].unsqueeze(-1).float()
+                        
+                        rms_vin = (v_in_bin.pow(2) * mask_bin).sum().div(mask_bin.sum()).sqrt().item()
+                        rms_coord = (v_coord_bin.pow(2) * mask_bin).sum().div(mask_bin.sum()).sqrt().item()
+                        ratio = rms_coord / max(rms_vin, 1e-8)
+                        
+                        status = "✅" if abs(ratio - 1.0) < 0.01 else "❌ GATED!"
+                        print(f"  σ∈[{lo:.1f},{hi:.1f}): rms(V_in)={rms_vin:.4f}, "
+                            f"rms(V_coord)={rms_coord:.4f}, ratio={ratio:.4f} {status}")
 
 
 
         # Concatenate all features
-        X = torch.cat(features, dim=-1)  # (B, N, c_dim + 128 + extras)
-        X = self.input_proj(X)  # (B, N, c_dim)
+        X = torch.cat(features, dim=-1)
+        X = self.input_proj(X)
         
         # Step 3: Distance-bucket attention bias
         attn_bias = None
@@ -767,7 +825,7 @@ class DiffusionScoreNet(nn.Module):
                 bin_ids = attn_cached.get('bin_ids', None)
                 bin_embeddings = attn_cached.get('bin_embeddings', None)
             elif geom_ok.any():
-                # Compute distance bias from V_geom (trustworthy geometry source)
+                # --- FIX #1 CONTINUED: Use V_geom (raw-space blended) for distance bias ---
                 D2 = uet.pairwise_dist2(V_geom, mask)
                 attn_bias, _, bin_ids = uet.make_distance_bias(
                     D2, mask, 
@@ -780,23 +838,14 @@ class DiffusionScoreNet(nn.Module):
                     device=V_t.device,
                     bin_edges=self.st_dist_bin_edges
                 )
-
-                # --- DEBUG 2: Distance bias magnitude per sigma bin ---
-                if self.training and torch.rand(1).item() < 0.02:
-                    with torch.no_grad():
-                        sigma_bins = [0.0, 0.1, 0.3, 0.5, 1.0, float('inf')]
-                        for i in range(len(sigma_bins) - 1):
-                            lo, hi = sigma_bins[i], sigma_bins[i+1]
-                            in_bin = (sigma_for_gating >= lo) & (sigma_for_gating < hi)
-                            if in_bin.any():
-                                bias_in_bin = attn_bias[in_bin]
-                                pre_gate_mag = bias_in_bin.abs().mean().item()
-                                post_gate_mag = (bias_in_bin * geom_ok[in_bin].float().view(-1, 1, 1, 1)).abs().mean().item()
-                                print(f"[DEBUG-BIAS] σ∈[{lo:.1f},{hi:.1f}): n={in_bin.sum().item()}, "
-                                      f"pre_gate={pre_gate_mag:.4f}, post_gate={post_gate_mag:.4f}")
                 
-                # Gate by geom_ok (NOT just low_sigma!)
-                gate = geom_ok.float().view(-1, 1, 1, 1)  # (B, 1, 1, 1)
+                # --- FIX #2 CONTINUED: Gate bias strength by smooth geom_gate ---
+                if self_cond_canon is None:
+                    # Without self_cond, bias strength depends on how much we trust V_in
+                    gate = geom_gate.view(-1, 1, 1, 1)
+                else:
+                    # With self_cond, bias is always reliable (blended geometry)
+                    gate = torch.ones_like(geom_gate).view(-1, 1, 1, 1)
                 attn_bias = attn_bias * gate
 
                 if self.use_st_dist_head:
@@ -807,46 +856,39 @@ class DiffusionScoreNet(nn.Module):
                     attn_cached['bin_ids'] = bin_ids
                     attn_cached['bin_embeddings'] = bin_embeddings
             else:
-                # No trustworthy geometry: skip distance bias
                 attn_bias = None
                 bin_ids = None
                 bin_embeddings = None
-
-
 
         # Apply X↔X distance-biased attention exactly once
         if self.use_dist_bias and attn_bias is not None:
             X = self.bias_sab(X, mask=mask, attn_bias=attn_bias)
         else:
-            # Even without bias, keep a homogeneous pass for depth
             X = self.bias_sab(X, mask=mask, attn_bias=None)
         X = X * mask.unsqueeze(-1).float()
         
-        # Step 4: Apply ISAB blocks with film conditioning
-        # build film conditioning input: concatenate H and time embedding (per-point)
+        # Step 4: Apply ISAB blocks with FiLM conditioning
         film_cond = torch.cat([H, t_emb_expanded], dim=-1)
 
         for i, isab in enumerate(self.denoise_blocks):
-            #apply ISAB block
             X = isab(X, mask=mask, attn_bias=None)
             X = X * mask.unsqueeze(-1).float()
 
-            #apply film modulation: x= x * (1 + gamma) + beta
-            gamma_beta = self.film_layers[i](film_cond)  # (B, N, 2*c_dim)
-            gamma, beta = gamma_beta.chunk(2, dim=-1)    # each (B, N, c_dim)
+            gamma_beta = self.film_layers[i](film_cond)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
             X = X * (1.0 + gamma) + beta
             X = X * mask.unsqueeze(-1).float()
         
         # Step 5: Output head
-        eps_hat = self.output_head(X)  # (B, N, D_latent)
+        eps_hat = self.output_head(X)
         eps_hat = eps_hat * mask.unsqueeze(-1).float()
 
-        #return distogram auxiliary outputs if requested
         if return_dist_aux and self.st_dist_head and bin_embeddings is not None:
             dist_logits = self.st_dist_head(bin_embeddings)
             return eps_hat, {'dist_logits': dist_logits, 'bin_ids': bin_ids}
         
         return eps_hat
+
     
     def forward_edm(
             self,
@@ -856,7 +898,7 @@ class DiffusionScoreNet(nn.Module):
             mask: torch.Tensor,        # (B, N)
             sigma_data: float,         # data std
             self_cond: torch.Tensor = None,
-            return_debug: bool = False,  # NEW
+            return_debug: bool = False,
         ) -> torch.Tensor:
             """
             EDM-preconditioned forward pass.
@@ -875,40 +917,40 @@ class DiffusionScoreNet(nn.Module):
             debug_dict = {} if return_debug else None
             
             if return_debug:
-                # 4.1 Log preconditioning scalars (first 2 samples)
                 debug_dict['c_skip'] = c_skip[:2].detach().cpu()
                 debug_dict['c_out'] = c_out[:2].detach().cpu()
                 debug_dict['c_in'] = c_in[:2].detach().cpu()
                 debug_dict['c_noise'] = c_noise[:2].detach().cpu()
             
-            # Scale input
-            # x_in = c_in * x  # (B, N, D)
-
-            # --- PATCH 2: make EDM operate in centered coordinate space consistently ---
-            # Your forward() centers x_in internally, but the skip path used raw x.
-            # This makes score-loss and geometry-loss operate in slightly different spaces.
-            x_c, _ = uet.center_only(x, mask)  # (B,N,D), same dtype as x
+            # --- FIX #1: Center in raw space BEFORE preconditioning ---
+            # x_c is the raw centered geometry (units match V_target / st_dist_bin_edges)
+            x_c, mean_shift = uet.center_only(x, mask)  # (B, N, D)
+            
+            # Scale input for network (preconditioned space)
             x_in = c_in * x_c
             
             if return_debug:
-                # 4.2 Log internal input scale
                 debug_dict['x_in_stats'] = masked_stats(x_in, mask)
                 debug_dict['H_stats'] = masked_stats(H, mask)
             
-            # Call underlying network with c_noise as time embedding
-            # F_x = self.forward(x_in, c_noise, H, mask, self_cond=self_cond)
-            # --- PATCH 13B: Pass sigma to forward for geometry source decisions ---
-            # Call underlying network with c_noise as time embedding
-            # Also pass the original sigma for σ-based gating decisions in forward()
-            F_x = self.forward(x_in, c_noise, H, mask, self_cond=self_cond, sigma_raw=sigma)
-
+            # --- FIX #1 CONTINUED: Pass raw centered geometry to forward() ---
+            # This ensures distance bias is computed in raw units (matching st_dist_bin_edges)
+            F_x = self.forward(
+                x_in, 
+                c_noise, 
+                H, 
+                mask, 
+                self_cond=self_cond, 
+                sigma_raw=sigma,
+                x_raw=x_c,      # NEW: raw centered geometry for distance bias
+                c_in=c_in       # NEW: for consistent self-cond feature scaling
+            )
             
             # If forward returns tuple (for dist_aux), extract just the prediction
             if isinstance(F_x, tuple):
                 F_x = F_x[0]
             
             if return_debug:
-                # 4.3 Log raw network output scale
                 debug_dict['F_x_stats'] = masked_stats(F_x, mask)
             
             # EDM denoiser output - use centered x_c for skip path
@@ -916,8 +958,7 @@ class DiffusionScoreNet(nn.Module):
             x0_pred = x0_pred * mask.unsqueeze(-1).float()
             
             if return_debug:
-                # 4.4 Log final x0_pred composition
-                skip_term = c_skip * x * mask.unsqueeze(-1).float()
+                skip_term = c_skip * x_c * mask.unsqueeze(-1).float()
                 out_term = c_out * F_x * mask.unsqueeze(-1).float()
                 debug_dict['skip_term_stats'] = masked_stats(skip_term, mask)
                 debug_dict['out_term_stats'] = masked_stats(out_term, mask)
@@ -930,6 +971,7 @@ class DiffusionScoreNet(nn.Module):
             if return_debug:
                 return x0_pred, debug_dict
             return x0_pred
+
     
 # ==============================================================================
 # STAGE C: TRAINING FUNCTION
@@ -1101,7 +1143,21 @@ def train_stageC_diffusion_generator(
     else:
         r_15_median = 1.0  # fallback
 
+    # --- FIX: Validate and clamp tau_reference ---
+    # tau_reference is in SQUARED-DISTANCE units (raw target space)
+    # This matches the squared distances used in knn_nca_loss
     tau_reference = r_15_median ** 2
+
+    # Safety clamp to prevent numerical issues
+    tau_reference = max(1e-4, min(tau_reference, 1e2))
+
+    # Make it a plain Python float (no gradients)
+    tau_reference = float(tau_reference)
+
+    # Debug logging
+    print(f"[NCA TEMP] r_15_median={r_15_median:.4f}, tau_reference={tau_reference:.6f}")
+    print(f"[NCA TEMP] This represents the squared 15th-NN distance in raw target space")
+
 
     """
     Train diffusion generator with mixed ST/SC regimen.
@@ -2142,20 +2198,26 @@ def train_stageC_diffusion_generator(
                                 sig_b = float(sigma_t_orig[b_idx].view(-1)[0])
 
                                 print(f"[NOISE CHECK] bin={bin_name}, σ={sigma_val:.3f}, sample={b_idx}")
-                                
+
                                 print(f"\n[NOISE] step={global_step}")
                                 print(f"  equation_diff: {diff:.6f}")
                                 print(f"  sigma: {sig_b:.4f}")
                                 print(f"  noise_std: {noise_std:.4f}")
                                 print(f"  noise_mean: {noise_mean_norm:.4f}")
                                 print(f"  ratio: {noise_std/sig_b:.3f}")
-                                
+
+                                # --- FIX #7: Use proper expected value for mean shift threshold ---
+                                # Expected: ||mean(eps)|| ≈ σ * sqrt(D) / sqrt(n_valid)
+                                n_valid = m_b.sum().item()
+                                D_check = noise_b.shape[-1]
+                                expected_mean_norm = sig_b * math.sqrt(D_check) / math.sqrt(max(n_valid, 1))
+
                                 if diff > 1e-4:
                                     print(f"  🔴 EQUATION FAIL")
                                 elif noise_std < 0.7 * sig_b:
                                     print(f"  🔴 TRANSLATION NOISE")
-                                elif noise_mean_norm > 0.5 * sig_b:
-                                    print(f"  🔴 MEAN SHIFT")
+                                elif noise_mean_norm > 3.0 * expected_mean_norm:  # FIX: 3σ rule
+                                    print(f"  🔴 MEAN SHIFT (expected≈{expected_mean_norm:.4f})")
                                 else:
                                     print(f"  ✅ PASS")
 
@@ -2293,32 +2355,36 @@ def train_stageC_diffusion_generator(
                     
                     if use_self_cond and score_net.self_conditioning:
                         with torch.no_grad():
-                            # --- PATCH 13A: Use generator as prior for high-σ samples ---
-                            high_sigma_mask = (sigma_flat > 0.30)  # (B,) boolean
+                            # --- FIX #4: Smooth generator prior blending ---
+                            # Use sigmoid for smooth transition instead of hard mask
+                            sigma_prior_start = 0.30
+                            sigma_prior_k = 15.0
+                            w_gen = torch.sigmoid((sigma_flat - sigma_prior_start) * sigma_prior_k)  # (B,)
                             
-                            if high_sigma_mask.any():
-                                # Get generator output for high-σ samples as geometric prior
-                                V_gen_prior = generator(H_train, mask)
-                                V_gen_prior = V_gen_prior.detach()
-                            else:
-                                V_gen_prior = None
+                            # Optional cap: so diffusion still contributes even at high σ
+                            w_gen = w_gen * 0.8  # Max 80% generator, 20% diffusion
+                            
+                            # Get generator output for blending
+                            V_gen_prior = generator(H_train, mask).detach()
                             
                             # First pass: standard self-cond prediction
                             x0_pred_0_result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
-                                                                     self_cond=None, return_debug=False)
+                                                                    self_cond=None, return_debug=False)
                             if isinstance(x0_pred_0_result, tuple):
                                 x0_pred_0 = x0_pred_0_result[0]
                             else:
                                 x0_pred_0 = x0_pred_0_result
                             
-                            # For high-σ samples, use generator instead of diffusion self-cond
-                            if V_gen_prior is not None:
-                                # Blend: high σ → generator, low σ → diffusion prediction
-                                blend_weight = high_sigma_mask.float().view(-1, 1, 1)  # (B, 1, 1)
-                                x0_pred_0 = blend_weight * V_gen_prior + (1 - blend_weight) * x0_pred_0
+                            # Smooth blend: low σ → diffusion, high σ → generator
+                            w_gen_3d = w_gen.view(-1, 1, 1)  # (B, 1, 1)
+                            x0_pred_0 = (1.0 - w_gen_3d) * x0_pred_0 + w_gen_3d * V_gen_prior
+                            
+                            # Debug logging
+                            if torch.rand(1).item() < 0.01:
+                                print(f"[DEBUG-PRIOR] w_gen: min={w_gen.min():.3f} mean={w_gen.mean():.3f} max={w_gen.max():.3f}")
                         
                         result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
-                                                      self_cond=x0_pred_0, return_debug=return_debug)
+                                                    self_cond=x0_pred_0, return_debug=return_debug)
                     else:
                         result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
                                                       self_cond=None, return_debug=return_debug)
@@ -2329,6 +2395,32 @@ def train_stageC_diffusion_generator(
                     else:
                         x0_pred = result
                         debug_dict = None
+
+                    # --- DEBUG: Per-sigma scale analysis ---
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc:
+                        with torch.no_grad():
+                            sigma_bins_debug = [(0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, float('inf'))]
+                            
+                            print(f"\n[DEBUG-PRECOND] Step {global_step} - Per-sigma preconditioning analysis:")
+                            for lo, hi in sigma_bins_debug:
+                                in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
+                                if in_bin.any():
+                                    # RMS of predictions and targets
+                                    pred_bin = x0_pred[in_bin]
+                                    tgt_bin = V_target[in_bin]
+                                    mask_bin = mask[in_bin]
+                                    
+                                    mask_f = mask_bin.unsqueeze(-1).float()
+                                    valid_count = mask_f.sum()
+                                    
+                                    rms_pred = (pred_bin.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                                    rms_tgt = (tgt_bin.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                                    scale_ratio = rms_pred / max(rms_tgt, 1e-8)
+                                    
+                                    print(f"  σ∈[{lo:.1f},{hi:.1f}): n={in_bin.sum().item()}, "
+                                        f"rms_pred={rms_pred:.4f}, rms_tgt={rms_tgt:.4f}, "
+                                        f"scale_ratio={scale_ratio:.3f}")
+
 
                     # --- DEBUG 3: Per-sigma edge analysis ---
                     if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc:
@@ -2428,68 +2520,88 @@ def train_stageC_diffusion_generator(
                 mask_fp32 = mask.float()
                 if use_edm:
                     # EDM: Loss on denoised prediction
+                    # EDM: Loss on denoised prediction
                     x0_pred_fp32 = x0_pred.float()
-                    sigma_flat = sigma_t.view(-1).float()
-                    
-                    # EDM weight: (σ² + σ_d²) / (σ · σ_d)²
-                    w = uet.edm_loss_weight(sigma_flat, sigma_data)  # (B,)
-                    w = w.view(-1, 1)  # (B, 1)
-                    # w = w.clamp(max=10.0)  # Prevent extreme weights
+                    sigma_flat = sigma_t.view(-1).float()  # (B,)
 
-                    # 2. [ACTION 1] Relax the clamp! 
-                    # Standard EDM weights can go up to 1000+. 10.0 is too low.
-                    w = w.clamp(max=50.0) 
+                    # EDM weight: (σ² + σ_d²) / (σ · σ_d)²  (returns (B,))
+                    w_raw = uet.edm_loss_weight(sigma_flat, sigma_data).float()
 
-                    # 3. [ACTION 2] Add the "Finisher" Bias
-                    # If sigma is very low (< 0.1), multiply the weight by 5x.
-                    # This forces the model to obsession over the tiny details (KNN Jaccard).
-                    is_low_noise = (sigma_flat < 0.1).float().view(-1, 1)
-                    finisher_boost = 1.0 + (4.0 * is_low_noise) 
-                    w = w * finisher_boost
-                    
-                    # Choose target: V_target for ST, V_0 for SC
-                    # target_x0 = V_target if (not is_sc) else V_0
-                    target_x0 = V_target  # Both ST and SC use V_target now
+                    # --- Adaptive soft-cap (data-driven) instead of fixed 50 ---
+                    # This prevents low-σ explosion while avoiding a hard plateau at a fixed constant.
+                    # Use EMA of a high quantile as the cap so it is stable across steps.
+                    q = 0.95
+                    cap_now = torch.quantile(w_raw.detach(), q)
+
+                    # Initialize EMA state if needed
+                    if edm_debug_state.get('w_cap_ema', None) is None:
+                        edm_debug_state['w_cap_ema'] = cap_now
+                    else:
+                        ema = 0.98
+                        edm_debug_state['w_cap_ema'] = ema * edm_debug_state['w_cap_ema'] + (1.0 - ema) * cap_now
+
+                    cap = edm_debug_state['w_cap_ema'].clamp_min(1e-6)
+                    w = cap * torch.tanh(w_raw / cap)  # (B,)
+
+                    # Choose target: ST uses V_target; SC must not require coords.
+                    # If your SC path truly has V_target, keep it; otherwise revert to V_0.
+                    target_x0 = V_target if (not is_sc) else V_0
                     target_fp32 = target_x0.float()
-                    
-                    # Masked MSE per sample
-                    # PATCH 4: Masked MSE per sample - mean over D_latent for scale consistency
-                    err2 = (x0_pred_fp32 - target_fp32).pow(2).mean(dim=-1)  # (B, N) - mean over D
-                    L_score = (w * err2 * mask_fp32).sum() / mask_fp32.sum().clamp_min(1.0)
 
-                    
+                    # Masked MSE (B, N) mean over latent dims
+                    err2_node = (x0_pred_fp32 - target_fp32).pow(2).mean(dim=-1)  # (B, N)
+
+                    # --- IMPORTANT: per-sample normalization (avoid variable-n set size bias) ---
+                    den = mask_fp32.sum(dim=1).clamp_min(1.0)                         # (B,)
+                    err2_sample = (err2_node * mask_fp32).sum(dim=1) / den            # (B,)
+
+                    # Final score loss: mean over batch of (w_b * err2_b)
+                    L_score = (w * err2_sample).mean()
+
                     # ========== PHASE 6: PER-SIGMA BIN ACCUMULATION ==========
-                    # Initialize bins on first step (data-driven edges)
-                    if edm_debug_state['sigma_bins'] is None:
-                        # Create bins based on observed log(sigma) quantiles
+                    # FIX: use sigma_bin_edges key, not sigma_bins (avoid re-init every step)
+                    if edm_debug_state.get('sigma_bin_edges', None) is None:
                         n_bins = 8
-                        log_sigma_all = sigma_flat.log().detach().cpu()
-                        quantiles = torch.linspace(0, 1, n_bins+1)
-                        bin_edges = torch.quantile(log_sigma_all, quantiles)
-                        
-                        edm_debug_state['sigma_bin_edges'] = bin_edges
+
+                        # Build stable edges from a warmup buffer (first few steps), then freeze.
+                        # This avoids computing quantiles from a single batch (too noisy).
+                        edm_debug_state['log_sigma_buffer'] = []
                         edm_debug_state['sigma_bin_sum_err2'] = torch.zeros(n_bins)
                         edm_debug_state['sigma_bin_sum_w'] = torch.zeros(n_bins)
                         edm_debug_state['sigma_bin_sum_werr2'] = torch.zeros(n_bins)
                         edm_debug_state['sigma_bin_count'] = torch.zeros(n_bins)
-                        
-                    
-                    # Accumulate per bin
-                    log_sigma_batch = sigma_flat.log().detach().cpu()
-                    err2_batch = err2.mean(dim=1).detach().cpu()  # (B,) average over nodes
-                    w_batch = w.squeeze().detach().cpu()  # (B,)
-                    werr2_batch = (w_batch * err2_batch)
-                    
-                    bin_edges = edm_debug_state['sigma_bin_edges']
-                    for b_idx in range(len(log_sigma_batch)):
-                        log_s = log_sigma_batch[b_idx]
-                        bin_id = torch.searchsorted(bin_edges, log_s, right=False) - 1
-                        bin_id = torch.clamp(bin_id, 0, len(edm_debug_state['sigma_bin_sum_err2'])-1).item()
-                        
-                        edm_debug_state['sigma_bin_sum_err2'][bin_id] += err2_batch[b_idx]
-                        edm_debug_state['sigma_bin_sum_w'][bin_id] += w_batch[b_idx]
-                        edm_debug_state['sigma_bin_sum_werr2'][bin_id] += werr2_batch[b_idx]
-                        edm_debug_state['sigma_bin_count'][bin_id] += 1
+
+                    # Append to warmup buffer until we have enough, then create edges once
+                    if edm_debug_state.get('sigma_bin_edges', None) is None:
+                        edm_debug_state['log_sigma_buffer'].append(sigma_flat.log().detach().cpu())
+
+                        # Tune this buffer size if needed; 1024 gives stable quantiles.
+                        if sum(x.numel() for x in edm_debug_state['log_sigma_buffer']) >= 1024:
+                            log_sigma_all = torch.cat(edm_debug_state['log_sigma_buffer'], dim=0)
+                            quantiles = torch.linspace(0, 1, n_bins + 1)
+                            bin_edges = torch.quantile(log_sigma_all, quantiles)
+                            edm_debug_state['sigma_bin_edges'] = bin_edges
+                            edm_debug_state.pop('log_sigma_buffer', None)
+
+                    # Accumulate per bin once edges exist
+                    if edm_debug_state.get('sigma_bin_edges', None) is not None:
+                        bin_edges = edm_debug_state['sigma_bin_edges']
+
+                        log_sigma_batch = sigma_flat.log().detach().cpu()          # (B,)
+                        err2_batch = err2_sample.detach().cpu()                    # (B,)
+                        w_batch = w.detach().cpu()                                 # (B,)
+                        werr2_batch = w_batch * err2_batch                         # (B,)
+
+                        for b_idx in range(log_sigma_batch.numel()):
+                            log_s = log_sigma_batch[b_idx]
+                            bin_id = torch.searchsorted(bin_edges, log_s, right=False) - 1
+                            bin_id = torch.clamp(bin_id, 0, n_bins - 1).item()
+
+                            edm_debug_state['sigma_bin_sum_err2'][bin_id] += err2_batch[b_idx]
+                            edm_debug_state['sigma_bin_sum_w'][bin_id] += w_batch[b_idx]
+                            edm_debug_state['sigma_bin_sum_werr2'][bin_id] += werr2_batch[b_idx]
+                            edm_debug_state['sigma_bin_count'][bin_id] += 1
+
 
                 else:
                     sigma_t_fp32 = sigma_t.float()
@@ -2864,9 +2976,20 @@ def train_stageC_diffusion_generator(
                     per_set_relative_loss = numerator / denominator  # (B,)
 
                     # Sigma compensation: geometry gradients scale with sigma
+                    # --- FIX #5: Remove σ-weighting from shape loss ---
+                    # The σ-weighting was causing scale pressure to vary with σ
+                    # Keep it for the shape component but NOT for the scale component
                     sigma_vec = sigma_t.view(-1).float()  # (B,)
-                    w_geom = (1.0 / sigma_vec.clamp_min(0.3)).pow(1.0)
-                    per_set_relative_loss = per_set_relative_loss * w_geom
+
+                    # OPTION A: Remove σ-weighting entirely (pure EDM approach)
+                    # per_set_relative_loss = per_set_relative_loss  # No modification
+
+                    # OPTION B: Keep σ-weighting only for SHAPE, not for SCALE
+                    # This is applied ONLY to per_set_relative_loss (shape/structure)
+                    # L_gram_scale (below) should NOT get this weighting
+                    # w_geom = (1.0 / sigma_vec.clamp_min(0.3)).pow(1.0)
+                    # per_set_relative_loss = per_set_relative_loss * w_geom
+                    # NOTE: L_gram_scale is computed separately and does NOT use w_geom
 
                     # Gate geometry to conditional + low noise samples
                     if rho is not None:
@@ -2918,7 +3041,7 @@ def train_stageC_diffusion_generator(
                             n_gated = geo_gate.sum().item()
                             if n_gated > 0:
                                 sigma_gated = sigma_vec[geo_gate.bool()]
-                    
+                                        
                     # --- DEBUG 5: Loss statistics ---
                     if DEBUG and (global_step % LOG_EVERY == 0):
                         print(f"[gram/loss] L_gram={L_gram.item():.3e} | "
@@ -2973,7 +3096,35 @@ def train_stageC_diffusion_generator(
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
 
 
+                    # --- DEBUG: Per-σ-bin Gram loss verification ---
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            sigma_bins_gram = [(0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, float('inf'))]
+                            print(f"\n[DEBUG-GRAM-BINS] Step {global_step} - Per-σ Gram analysis:")
+                            
+                            for lo, hi in sigma_bins_gram:
+                                in_bin = (sigma_vec >= lo) & (sigma_vec < hi)
+                                if in_bin.any():
+                                    # Per-set loss in this bin
+                                    loss_bin = per_set_relative_loss[in_bin].mean().item()
+                                    
+                                    # Trace ratio for this bin
+                                    tr_p_bin_val = tr_p[in_bin].mean().item()
+                                    tr_t_bin_val = tr_t[in_bin].mean().item()
+                                    tr_ratio_bin = tr_p_bin_val / max(tr_t_bin_val, 1e-8)
+                                    
+                                    # Scale loss for this bin  
+                                    scale_loss_bin = (log_ratio[in_bin] ** 2).mean().item()
+                                    
+                                    print(f"  σ∈[{lo:.1f},{hi:.1f}): n={in_bin.sum().item()}, "
+                                        f"shape_loss={loss_bin:.4f}, "
+                                        f"trace_ratio={tr_ratio_bin:.3f}, "
+                                        f"scale_loss={scale_loss_bin:.4f}")
+
+
+
                 # --- kNN NCA Loss (with float32 + autocast disabled) ---
+                # FIX: Use tau_reference (squared-distance scale) instead of fixed 0.1
                 if WEIGHTS['knn_nca'] > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
                         L_knn_nca = uet.knn_nca_loss(
@@ -2981,18 +3132,62 @@ def train_stageC_diffusion_generator(
                             V_target.float(), 
                             mask, 
                             k=15, 
-                            temperature=0.1
+                            temperature=tau_reference  # FIX: scale-matched temperature
                         )
                 else:
                     L_knn_nca = torch.tensor(0.0, device=device)
                 
                 # --- NCA sanity debug ---
+                # --- NCA sanity debug (ENHANCED) ---
                 if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc and WEIGHTS['knn_nca'] > 0:
                     with torch.no_grad():
                         n_valid = mask.sum(dim=1).float()
                         baseline = torch.log((n_valid - 1).clamp(min=1)).mean().item()
+                        
+                        # --- FIX: Debug NCA scale matching ---
+                        V_pred_nca = x0_pred.float() if use_edm else V_hat.float()
+                        V_tgt_nca = V_target.float()
+                        
+                        # Compute median kNN squared distances for pred and target
+                        D2_pred_list = []
+                        D2_tgt_list = []
+                        for b in range(min(4, V_pred_nca.shape[0])):
+                            m_b = mask[b].bool()
+                            n_b = m_b.sum().item()
+                            if n_b < 16:
+                                continue
+                            
+                            v_p = V_pred_nca[b, m_b]
+                            v_t = V_tgt_nca[b, m_b]
+                            
+                            d2_p = torch.cdist(v_p, v_p).pow(2)
+                            d2_t = torch.cdist(v_t, v_t).pow(2)
+                            
+                            # Get k=15 nearest (exclude self)
+                            d2_p.fill_diagonal_(float('inf'))
+                            d2_t.fill_diagonal_(float('inf'))
+                            
+                            knn_d2_p, _ = d2_p.topk(15, largest=False, dim=1)
+                            knn_d2_t, _ = d2_t.topk(15, largest=False, dim=1)
+                            
+                            D2_pred_list.append(knn_d2_p.median().item())
+                            D2_tgt_list.append(knn_d2_t.median().item())
+                        
+                        if D2_pred_list:
+                            med_D2_pred = np.median(D2_pred_list)
+                            med_D2_tgt = np.median(D2_tgt_list)
+                            ratio = med_D2_pred / max(med_D2_tgt, 1e-8)
+                            
+                            print(f"[DEBUG-NCA-SCALE] tau_reference={tau_reference:.4f}")
+                            print(f"[DEBUG-NCA-SCALE] median(D2_pred_knn)={med_D2_pred:.4f}, "
+                                f"median(D2_tgt_knn)={med_D2_tgt:.4f}, ratio={ratio:.3f}")
+                            
+                            if ratio < 0.5 or ratio > 2.0:
+                                print(f"  ⚠️ WARNING: D2 ratio far from 1.0 - scale mismatch!")
+                        
                         print(f"[NCA] n_valid_mean={n_valid.mean().item():.1f} "
-                              f"uniform_baseline≈{baseline:.3f} L_knn_nca={L_knn_nca.item():.3f}")
+                            f"uniform_baseline≈{baseline:.3f} L_knn_nca={L_knn_nca.item():.3f}")
+
 
 
                 # Low-noise gating - use actual drop_mask for consistency with CFG
