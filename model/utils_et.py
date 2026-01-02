@@ -3837,6 +3837,59 @@ def rigid_align_mse_no_scale(V_pred, V_tgt, mask, eps=1e-8):
         return V_pred.new_tensor(0.0)
     return loss / float(cnt)
 
+def rigid_align_apply_no_scale(V_src, V_tgt, mask, eps=1e-8):
+    """
+    Apply orthogonal Procrustes alignment (rotation/reflection only, NO scale).
+    Aligns V_src to V_tgt and returns the aligned V_src.
+    
+    This is used to align generator prior into diffusion frame before blending.
+    
+    Args:
+        V_src: (B, N, D) source coordinates (e.g., generator prior)
+        V_tgt: (B, N, D) target coordinates (e.g., diffusion x0_pred)
+        mask: (B, N) validity mask
+        eps: numerical stability
+        
+    Returns:
+        V_src_aligned: (B, N, D) source aligned to target frame
+    """
+    B, N, D = V_src.shape
+    device = V_src.device
+    V_aligned = V_src.clone()
+    
+    for b in range(B):
+        mb = mask[b].bool()
+        n_valid = int(mb.sum().item())
+        if n_valid < 2:
+            continue
+        
+        # Extract valid points
+        X = V_src[b, mb].float()   # (n_valid, D) - source
+        Y = V_tgt[b, mb].float()   # (n_valid, D) - target
+        
+        # Center both
+        X_mean = X.mean(dim=0, keepdim=True)
+        Y_mean = Y.mean(dim=0, keepdim=True)
+        X_c = X - X_mean
+        Y_c = Y - Y_mean
+        
+        # Compute optimal rotation via SVD: M = X^T @ Y
+        M = X_c.T @ Y_c  # (D, D)
+        try:
+            U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+            R = U @ Vh  # (D, D) orthogonal rotation matrix
+        except:
+            # SVD failed, skip alignment for this sample
+            continue
+        
+        # Apply rotation and translate to target mean
+        X_aligned = (X_c @ R) + Y_mean  # Rotate centered, then add target mean
+        
+        # Write back aligned coordinates
+        V_aligned[b, mb] = X_aligned.to(V_aligned.dtype)
+    
+    return V_aligned
+
 
 def rms_log_loss(V_pred, V_tgt, mask, eps=1e-8):
     """

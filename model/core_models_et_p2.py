@@ -555,6 +555,9 @@ class DiffusionScoreNet(nn.Module):
         #buffer for data=driven bin edges 
         self.register_buffer('st_dist_bin_edges', None)
 
+        # NEW: Store sigma_data for EDM preconditioning reference
+        self.sigma_data = None  # Will be set during training
+
         #self conditioning MLP if needed
         if self.self_conditioning and sc_feat_mode == 'mlp':
             self.sc_mlp = nn.Sequential(
@@ -687,20 +690,19 @@ class DiffusionScoreNet(nn.Module):
         else:
             V_geom_for_bias = V_in  # Fallback for backward compatibility
         
-        # --- FIX #2 CONTINUED: Blend geometry source smoothly ---
+        # === CHATGPT FIX 3: Pick ONE geometry source, don't blend ===
+        # Policy A: If self_cond exists, use it; else use raw input
+        # This prevents geometry distortions from mixing two different estimates
         if self_cond_canon is not None:
-            # For high σ, use self_cond as geometry source
-            # For low σ, use V_geom_for_bias (raw or V_in)
-            g = geom_gate.view(-1, 1, 1)  # (B, 1, 1)
-            V_geom = g * V_geom_for_bias + (1.0 - g) * self_cond_canon
+            V_geom = self_cond_canon  # Use self-conditioning for geometry bias
         else:
-            V_geom = V_geom_for_bias
-
-        # geom_ok: for gating - when we have self_cond, geometry is always usable
+            V_geom = V_geom_for_bias  # Fallback to raw centered input
+        
+        # geom_ok: geometry is usable when we have self_cond or at low sigma
         if self_cond_canon is not None:
             geom_ok = torch.ones_like(geom_gate).bool()
         else:
-            geom_ok = (geom_gate > 0.5)  # Binary for compatibility
+            geom_ok = (geom_gate > 0.5)
 
         # DEBUG: Log geometry source usage
         if self.training and (torch.rand(()).item() < 0.01):
@@ -744,7 +746,7 @@ class DiffusionScoreNet(nn.Module):
             sc_feat = torch.zeros(B, N, self.D_latent, device=V_t.device)
             features.append(sc_feat)
 
-        # --- DEBUG: Verify self-cond feature scaling ---
+        # === CHATGPT FIX 4: Compare self-cond scaling to sqrt(c_skip), not 1.0 ===
         if self.training and self_cond_canon is not None and (torch.rand(()).item() < 0.005):
             with torch.no_grad():
                 mask_f = mask.unsqueeze(-1).float()
@@ -754,11 +756,26 @@ class DiffusionScoreNet(nn.Module):
                 rms_sc_raw = (self_cond_canon.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
                 rms_sc_scaled = (self_cond_feat_input.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
                 
-                print(f"\n[DEBUG-SC-SCALE] Self-cond feature scaling:")
+                # Compute expected ratio from EDM theory
+                # c_in was passed in, compute c_skip for comparison
+                if sigma_raw is not None and self.sigma_data is not None:
+                    sigma_mean = sigma_raw.mean().item()
+                    sigma_data = self.sigma_data
+                    c_skip_val = sigma_data ** 2 / (sigma_mean ** 2 + sigma_data ** 2)
+                    expected_ratio = (c_skip_val ** 0.5)  # sqrt(c_skip)
+                else:
+                    expected_ratio = 1.0  # Fallback
+                
+                actual_ratio = rms_sc_scaled / max(rms_vin, 1e-8)
+                
+                print(f"\n[DEBUG-SC-SCALE] Self-cond feature scaling (FIXED):")
                 print(f"  rms(V_in)={rms_vin:.4f} (preconditioned input)")
                 print(f"  rms(self_cond_raw)={rms_sc_raw:.4f}")
                 print(f"  rms(self_cond_scaled)={rms_sc_scaled:.4f}")
-                print(f"  scaled/V_in ratio={rms_sc_scaled/max(rms_vin, 1e-8):.3f} (should be ~1.0)")
+                print(f"  scaled/V_in ratio={actual_ratio:.3f}")
+                print(f"  expected ratio (sqrt(c_skip))={expected_ratio:.3f}")
+                print(f"  ratio error: {abs(actual_ratio - expected_ratio):.4f}")
+
 
 
         
@@ -783,7 +800,7 @@ class DiffusionScoreNet(nn.Module):
 
 
         # --- DEBUG: Verify coordinate features are not gated ---
-        if self.training and (torch.rand(()).item() < 0.005):  # ~0.5% of steps
+        if self.training and (torch.rand(()).item() < 0.000000005):  # ~0.5% of steps
             with torch.no_grad():
                 sigma_for_dbg = sigma_for_gating if sigma_raw is not None else torch.zeros(B, device=V_t.device)
                 
@@ -1668,6 +1685,17 @@ def train_stageC_diffusion_generator(
 
     sigma_data = sync_scalar(sigma_data, device)
 
+    # Store sigma_data on score_net for reference in forward pass
+    print(f"[StageC] sigma_data = {sigma_data:.4f}")
+    
+    # Store sigma_data on score_net (handle DDP/Fabric wrapper)
+    if hasattr(score_net, 'module'):
+        score_net.module.sigma_data = sigma_data
+    else:
+        score_net.sigma_data = sigma_data
+
+
+
 
     # ========== PHASE 1: DATA + TARGET SCALE SANITY ==========
     if fabric is None or fabric.is_global_zero:
@@ -2178,7 +2206,7 @@ def train_stageC_diffusion_generator(
                 sigma_t_orig = sigma_t.clone().detach()
                 mask_orig = mask.clone().detach()
 
-                if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
+                if global_step % 2500 == 0 and (fabric is None or fabric.is_global_zero):
                     with torch.no_grad():
                         # --- DEBUG 5: Check noise across sigma bins ---
                         sigma_for_debug = sigma_t.view(-1) if use_edm else torch.exp(4.0 * t_norm)
@@ -2226,7 +2254,7 @@ def train_stageC_diffusion_generator(
 
                 # DEBUG: Check which samples have correct noise
                 # DEBUG: Check which samples have correct noise
-                if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
+                if global_step % 50 == 0 and (fabric is None or fabric.is_global_zero):
                     with torch.no_grad():
                         for b_idx in range(V_t.shape[0]):
                             m_b = mask_orig[b_idx].bool()
@@ -2312,7 +2340,7 @@ def train_stageC_diffusion_generator(
                     # -------------------------------------------------
 
                 # After computing H in training loop
-                if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                if global_step % 2000 == 0 and (fabric is None or fabric.is_global_zero):
                     with torch.no_grad():
                         # Check if H varies meaningfully across batch
                         H_std_per_dim = H.std(dim=0).mean()
@@ -2355,36 +2383,82 @@ def train_stageC_diffusion_generator(
                     
                     if use_self_cond and score_net.self_conditioning:
                         with torch.no_grad():
-                            # --- FIX #4: Smooth generator prior blending ---
-                            # Use sigmoid for smooth transition instead of hard mask
-                            sigma_prior_start = 0.30
-                            sigma_prior_k = 15.0
-                            w_gen = torch.sigmoid((sigma_flat - sigma_prior_start) * sigma_prior_k)  # (B,)
+                            # === FIX 1 & 2: Delayed generator blend + Frame alignment ===
                             
-                            # Optional cap: so diffusion still contributes even at high σ
-                            w_gen = w_gen * 0.8  # Max 80% generator, 20% diffusion
+                            # FIX 2: Start generator blend LATER and with LOWER cap
+                            sigma_prior_start = 0.80  # Was 0.30
+                            sigma_prior_k = 5.0       # Was 15.0
+                            w_gen = torch.sigmoid((sigma_flat - sigma_prior_start) * sigma_prior_k)
+                            w_gen = w_gen * 0.3       # Was 0.8 - now max 30%
                             
-                            # Get generator output for blending
+                            # Get generator output
                             V_gen_prior = generator(H_train, mask).detach()
                             
-                            # First pass: standard self-cond prediction
+                            # First pass: pure diffusion estimate (KEEP SEPARATE for debug)
                             x0_pred_0_result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
                                                                     self_cond=None, return_debug=False)
                             if isinstance(x0_pred_0_result, tuple):
-                                x0_pred_0 = x0_pred_0_result[0]
+                                x0_pred_0_diff = x0_pred_0_result[0]
                             else:
-                                x0_pred_0 = x0_pred_0_result
+                                x0_pred_0_diff = x0_pred_0_result
                             
-                            # Smooth blend: low σ → diffusion, high σ → generator
-                            w_gen_3d = w_gen.view(-1, 1, 1)  # (B, 1, 1)
-                            x0_pred_0 = (1.0 - w_gen_3d) * x0_pred_0 + w_gen_3d * V_gen_prior
+                            # FIX 1: Align generator to diffusion frame BEFORE blending
+                            V_gen_prior_aligned = uet.rigid_align_apply_no_scale(
+                                V_gen_prior, 
+                                x0_pred_0_diff,  # Use pure diffusion, not blended
+                                mask
+                            )
                             
-                            # Debug logging
+                            # Now blend using ALIGNED generator
+                            w_gen_3d = w_gen.view(-1, 1, 1)
+                            self_cond = (1.0 - w_gen_3d) * x0_pred_0_diff + w_gen_3d * V_gen_prior_aligned
+                            
+                            # === DEBUG-PRIOR-ALIGN: Alignment quality on CENTERED coords ===
                             if torch.rand(1).item() < 0.01:
-                                print(f"[DEBUG-PRIOR] w_gen: min={w_gen.min():.3f} mean={w_gen.mean():.3f} max={w_gen.max():.3f}")
+                                # Helper: per-sample centered MSE
+                                def _centered_mse_batch(A, B, m):
+                                    """MSE after centering each sample. A, B: (B,N,D), m: (B,N)"""
+                                    mf = m.unsqueeze(-1).float()
+                                    denom = mf.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1,1)
+                                    A_c = A - (A * mf).sum(dim=1, keepdim=True) / denom
+                                    B_c = B - (B * mf).sum(dim=1, keepdim=True) / denom
+                                    err2 = ((A_c - B_c).pow(2) * mf).sum(dim=(1,2)) / denom.squeeze(-1).squeeze(-1)
+                                    return err2.mean()  # average over batch
+                                
+                                mse_before = _centered_mse_batch(V_gen_prior, x0_pred_0_diff, mask)
+                                mse_after = _centered_mse_batch(V_gen_prior_aligned, x0_pred_0_diff, mask)
+                                
+                                improvement = (1 - mse_after / mse_before.clamp(min=1e-8)) * 100
+                                print(f"\n[DEBUG-PRIOR-ALIGN] Generator→Diffusion alignment:")
+                                print(f"  w_gen: min={w_gen.min():.3f} mean={w_gen.mean():.3f} max={w_gen.max():.3f}")
+                                print(f"  MSE before (centered): {mse_before.item():.6f}")
+                                print(f"  MSE after (centered):  {mse_after.item():.6f}")
+                                print(f"  Alignment improvement: {improvement.item():.1f}%")
+                            
+                            # === DEBUG-FRAME: Track rotation magnitude ===
+                            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                                rot_traces = []
+                                for b in range(min(4, V_gen_prior.shape[0])):
+                                    mb = mask[b].bool()
+                                    n_valid = int(mb.sum().item())
+                                    if n_valid < 2:
+                                        continue
+                                    X = V_gen_prior[b, mb].float()
+                                    Y = x0_pred_0_diff[b, mb].float()  # Use PURE diffusion
+                                    X_c = X - X.mean(dim=0, keepdim=True)
+                                    Y_c = Y - Y.mean(dim=0, keepdim=True)
+                                    M = X_c.T @ Y_c
+                                    try:
+                                        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+                                        R = U @ Vh
+                                        rot_traces.append((R.trace() / R.shape[0]).item())
+                                    except:
+                                        pass
+                                if rot_traces:
+                                    print(f"[DEBUG-FRAME] step={global_step} mean(tr(R)/D)={sum(rot_traces)/len(rot_traces):.4f} (1.0=no rotation needed)")
                         
                         result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
-                                                    self_cond=x0_pred_0, return_debug=return_debug)
+                                                    self_cond=self_cond, return_debug=return_debug)
                     else:
                         result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
                                                       self_cond=None, return_debug=return_debug)
@@ -2455,7 +2529,7 @@ def train_stageC_diffusion_generator(
 
                     
                     # --- DEBUG 6: Self-conditioning effectiveness check ---
-                    if global_step % 200 == 0 and use_self_cond and (fabric is None or fabric.is_global_zero):
+                    if global_step % 100 == 0 and use_self_cond and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             print(f"\n[DEBUG-SELFCOND] Step {global_step} - Self-cond effectiveness:")
                             
@@ -2482,8 +2556,39 @@ def train_stageC_diffusion_generator(
                                     mask_bin = mask[in_bin].unsqueeze(-1).float()
                                     diff_bin_mean = (diff_bin * mask_bin).sum() / mask_bin.sum()
                                     print(f"  σ∈[{lo:.1f},{hi:.1f}): self-cond effect={diff_bin_mean.item():.4f}")
-                    
-                    
+
+                    # === DEBUG-SELFCOND-QUALITY: Per σ-bin quality tracking ===
+                    if global_step % 200 == 0 and use_self_cond and (fabric is None or fabric.is_global_zero) and not is_sc:
+                        with torch.no_grad():
+                            print(f"\n[DEBUG-SELFCOND-QUALITY] Step {global_step}:")
+                            
+                            # Helper: per-sample centered MSE (CORRECTED)
+                            def _batch_centered_mse(A, B, m):
+                                """Compute MSE after centering each sample individually."""
+                                mf = m.unsqueeze(-1).float()  # (Bbin, N, 1)
+                                denom = mf.sum(dim=1, keepdim=True).clamp(min=1)  # (Bbin, 1, 1)
+                                A_c = A - (A * mf).sum(dim=1, keepdim=True) / denom
+                                B_c = B - (B * mf).sum(dim=1, keepdim=True) / denom
+                                # Per-sample MSE, then average
+                                per_sample_mse = ((A_c - B_c).pow(2) * mf).sum(dim=(1,2)) / denom.squeeze(-1).squeeze(-1).clamp(min=1)
+                                return per_sample_mse.mean()
+                            
+                            sigma_bins = [(0.0, 0.3), (0.3, 0.5), (0.5, 0.8), (0.8, 1.5), (1.5, float('inf'))]
+                            
+                            for lo, hi in sigma_bins:
+                                in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
+                                if not in_bin.any():
+                                    continue
+                                
+                                n_in_bin = in_bin.sum().item()
+                                tgt_bin = V_target[in_bin]
+                                pred_bin = x0_pred[in_bin]
+                                mask_bin = mask[in_bin]
+                                
+                                mse_pred = _batch_centered_mse(pred_bin, tgt_bin, mask_bin).item()
+                                
+                                print(f"  σ∈[{lo:.1f},{hi:.1f}): n={n_in_bin}, mse(pred→tgt)={mse_pred:.6f}")
+
                     # for geom losses, V_hat is x0_pred
                     V_hat = x0_pred
                     dist_aux = None
@@ -3029,7 +3134,7 @@ def train_stageC_diffusion_generator(
                                 print(f"[DIST SCALE] global_dist_ratio={dist_scale:.3f} (should be ~1.0)")
 
                     # Sanity check: V_target_batch should be consistent with G_target
-                    if (global_step % 20 == 0) and (fabric is None or fabric.is_global_zero):
+                    if (global_step % 2000 == 0) and (fabric is None or fabric.is_global_zero):
                         G_reconstructed = V_target_batch @ V_target_batch.transpose(1, 2)
                         G_recon_trace = (G_reconstructed.diagonal(dim1=1, dim2=2) * m_bool.float()).sum(dim=1)
                         G_target_trace = (Gt.diagonal(dim1=1, dim2=2) * m_bool.float()).sum(dim=1)
@@ -3226,7 +3331,7 @@ def train_stageC_diffusion_generator(
 
 
                         # === CRITICAL DEBUG: Verify Tgt identity ===
-                        if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
+                        if global_step % 2500 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
                                 print(f"\n[TGT VERIFICATION] step={global_step}")
                                 print(f"  V_target_clean id: {id(V_target_orig)}")
