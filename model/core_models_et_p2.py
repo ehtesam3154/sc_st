@@ -1115,6 +1115,364 @@ def apply_context_augmentation(Z_set, mask, noise_std=0.02, dropout_rate=0.1):
     return Z_aug
 
 
+# ==============================================================================
+# A/B TESTS FOR SIGMA/TIME CONDITIONING DIAGNOSIS
+# ==============================================================================
+
+def run_ab_tests_fixed_batch(
+    score_net,
+    context_encoder,
+    fixed_batch_data,
+    sigma_data: float,
+    fixed_eval_sigmas: list,
+    device: str,
+    epoch: int,
+):
+    """
+    Run A/B tests on fixed batch to diagnose σ/time conditioning issues.
+    
+    Test 1 (A/B 1): Is σ-conditioning actually being used?
+        - A: Normal time/σ signal
+        - B: Constant time (force σ=0.3 for time embedding, but keep true preconditioning)
+        
+    Test 2 (Decomposition): Is shrink coming from the learned branch?
+        - Log RMS of x_skip, x_out, x0_pred separately
+        
+    Test 3 (A/B 6): Does a different time signal change behavior?
+        - A: Current time input (c_noise = log(σ)/4)
+        - B: Alternative: c_noise = log(σ) (unscaled)
+    
+    These tests are EVAL ONLY and do not affect training.
+    """
+    print(f"\n{'='*80}")
+    print(f"A/B TESTS - Epoch {epoch}")
+    print(f"{'='*80}")
+    
+    # Set eval mode
+    was_training_score = score_net.training
+    was_training_ctx = context_encoder.training
+    score_net.eval()
+    context_encoder.eval()
+    
+    # Handle DDP wrapper for score_net.forward
+    if hasattr(score_net, 'module'):
+        score_net_unwrapped = score_net.module
+    else:
+        score_net_unwrapped = score_net
+    
+    with torch.no_grad():
+        Z_fixed = fixed_batch_data['Z_set'].to(device)
+        mask_fixed = fixed_batch_data['mask'].to(device)
+        V_target_fixed = fixed_batch_data['V_target'].to(device)
+        
+        B_fixed = Z_fixed.shape[0]
+        
+        # Get D_latent from score_net (handle DDP wrapper)
+        D_lat = score_net_unwrapped.D_latent
+        
+        H_fixed = context_encoder(Z_fixed, mask_fixed)
+        
+        mask_f = mask_fixed.unsqueeze(-1).float()
+        valid_count = mask_f.sum()
+        
+        # Helper: compute RMS over valid entries
+        def masked_rms(x, mask_f):
+            return (x.pow(2) * mask_f).sum().div(mask_f.sum().clamp(min=1)).sqrt().item()
+        
+        # Helper: compute Jaccard@10
+        def compute_jaccard_at_k(pred, target, mask, k=10):
+            jaccard_sum = 0.0
+            jaccard_count = 0
+            B = pred.shape[0]
+            for b in range(min(4, B)):
+                m_b = mask[b].bool()
+                n_valid = int(m_b.sum().item())
+                if n_valid < k + 5:
+                    continue
+                
+                pred_b = pred[b, m_b]
+                tgt_b = target[b, m_b]
+                
+                D_pred_b = torch.cdist(pred_b, pred_b)
+                D_tgt_b = torch.cdist(tgt_b, tgt_b)
+                
+                k_j = min(k, n_valid - 1)
+                _, knn_pred = D_pred_b.topk(k_j + 1, largest=False)
+                _, knn_tgt = D_tgt_b.topk(k_j + 1, largest=False)
+                
+                knn_pred = knn_pred[:, 1:]  # Exclude self
+                knn_tgt = knn_tgt[:, 1:]
+                
+                for i in range(n_valid):
+                    set_pred = set(knn_pred[i].tolist())
+                    set_tgt = set(knn_tgt[i].tolist())
+                    inter = len(set_pred & set_tgt)
+                    union = len(set_pred | set_tgt)
+                    if union > 0:
+                        jaccard_sum += inter / union
+                        jaccard_count += 1
+            
+            return jaccard_sum / max(jaccard_count, 1)
+        
+        # Fixed seed for reproducible noise
+        rng_state = torch.get_rng_state()
+        
+        # =====================================================================
+        # TEST 1: Is σ-conditioning actually being used?
+        # =====================================================================
+        print(f"\n{'='*70}")
+        print(f"TEST 1 (A/B 1): Is σ-conditioning actually being used?")
+        print(f"{'='*70}")
+        print(f"  A = Normal σ/time signal")
+        print(f"  B = Force constant time (σ=0.30 for time embedding only)")
+        print(f"  EDM preconditioning (c_skip/c_in/c_out) uses TRUE σ in both cases")
+        print()
+        print(f"  {'σ':>8} | {'scale_r_A':>10} | {'scale_r_B':>10} | {'Jacc_A':>8} | {'Jacc_B':>8} | {'mean_diff':>10}")
+        print(f"  {'-'*8} | {'-'*10} | {'-'*10} | {'-'*8} | {'-'*8} | {'-'*10}")
+        
+        CONSTANT_SIGMA_FOR_TIME = 0.30  # The constant σ used for time embedding in test B
+        
+        for sigma_val in fixed_eval_sigmas:
+            torch.manual_seed(42 + int(sigma_val * 1000))
+            
+            sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
+            sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
+            
+            eps_fixed = torch.randn_like(V_target_fixed)
+            V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+            V_t_fixed = V_t_fixed * mask_f
+            
+            # A: Normal forward
+            x0_pred_A = score_net_unwrapped.forward_edm(
+                V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
+                sigma_data, self_cond=None
+            )
+            if isinstance(x0_pred_A, tuple):
+                x0_pred_A = x0_pred_A[0]
+            
+            # B: Force constant time embedding, but use TRUE sigma for preconditioning
+            sigma_const_for_time = torch.full((B_fixed,), CONSTANT_SIGMA_FOR_TIME, device=device)
+            
+            # Manually compute preconditioning with TRUE sigma
+            c_skip, c_out, c_in, _ = uet.edm_precond(sigma_fixed, sigma_data)
+            
+            # Compute c_noise with CONSTANT sigma (this is what goes to time embedding)
+            c_noise_const = sigma_const_for_time.log() / 4  # Same formula as edm_precond
+            c_noise_const = c_noise_const.view(-1, 1)
+            
+            # Center x
+            x_c, _ = uet.center_only(V_t_fixed, mask_fixed)
+            x_in = c_in * x_c
+            
+            # Call forward() with constant c_noise
+            F_x_B = score_net_unwrapped.forward(
+                x_in, 
+                c_noise_const,  # CONSTANT time signal
+                H_fixed, 
+                mask_fixed, 
+                self_cond=None, 
+                sigma_raw=sigma_fixed,  # TRUE sigma for gating
+                x_raw=x_c,
+                c_in=c_in
+            )
+            if isinstance(F_x_B, tuple):
+                F_x_B = F_x_B[0]
+            
+            # Apply EDM denoiser formula with TRUE preconditioning
+            x0_pred_B = c_skip * x_c + c_out * F_x_B
+            x0_pred_B = x0_pred_B * mask_f
+            
+            # Compute metrics
+            V_pred_A_c, _ = uet.center_only(x0_pred_A, mask_fixed)
+            V_pred_B_c, _ = uet.center_only(x0_pred_B, mask_fixed)
+            V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+            
+            rms_pred_A = masked_rms(V_pred_A_c, mask_f)
+            rms_pred_B = masked_rms(V_pred_B_c, mask_f)
+            rms_tgt = masked_rms(V_tgt_c, mask_f)
+            
+            scale_r_A = rms_pred_A / max(rms_tgt, 1e-8)
+            scale_r_B = rms_pred_B / max(rms_tgt, 1e-8)
+            
+            jacc_A = compute_jaccard_at_k(x0_pred_A, V_target_fixed, mask_fixed, k=10)
+            jacc_B = compute_jaccard_at_k(x0_pred_B, V_target_fixed, mask_fixed, k=10)
+            
+            # Mean absolute difference between A and B predictions
+            diff_AB = (x0_pred_A - x0_pred_B).abs()
+            mean_abs_diff = (diff_AB * mask_f).sum() / valid_count
+            mean_abs_diff = mean_abs_diff.item()
+            
+            print(f"  {sigma_val:8.3f} | {scale_r_A:10.4f} | {scale_r_B:10.4f} | {jacc_A:8.4f} | {jacc_B:8.4f} | {mean_abs_diff:10.6f}")
+        
+        print()
+        print(f"  INTERPRETATION:")
+        print(f"    If mean_diff is SMALL (< 0.01) across all σ:")
+        print(f"      → Time conditioning is NOT being used effectively (or broken)")
+        print(f"    If mean_diff is LARGE (> 0.05) especially at mid/high σ:")
+        print(f"      → Time conditioning IS alive and affecting predictions")
+        
+        # =====================================================================
+        # TEST 2: Decomposition - Is shrink coming from learned branch?
+        # =====================================================================
+        print(f"\n{'='*70}")
+        print(f"TEST 2 (Decomposition): Is shrink from the learned branch?")
+        print(f"{'='*70}")
+        print(f"  x0_pred = c_skip * x_c + c_out * F_x")
+        print(f"  x_skip = c_skip * x_c")
+        print(f"  x_out = c_out * F_x (learned contribution)")
+        print()
+        print(f"  {'σ':>8} | {'c_skip':>8} | {'c_out':>8} | {'rms_skip':>10} | {'rms_out':>10} | {'rms_pred':>10} | {'rms_tgt':>10} | {'out/tgt':>8}")
+        print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*10} | {'-'*10} | {'-'*10} | {'-'*10} | {'-'*8}")
+        
+        for sigma_val in fixed_eval_sigmas:
+            torch.manual_seed(42 + int(sigma_val * 1000))
+            
+            sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
+            sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
+            
+            eps_fixed = torch.randn_like(V_target_fixed)
+            V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+            V_t_fixed = V_t_fixed * mask_f
+            
+            # Compute preconditioning
+            c_skip, c_out, c_in, c_noise = uet.edm_precond(sigma_fixed, sigma_data)
+            
+            # Center x
+            x_c, _ = uet.center_only(V_t_fixed, mask_fixed)
+            x_in = c_in * x_c
+            
+            # Get F_x from network
+            F_x = score_net_unwrapped.forward(
+                x_in, c_noise, H_fixed, mask_fixed, 
+                self_cond=None, sigma_raw=sigma_fixed, x_raw=x_c, c_in=c_in
+            )
+            if isinstance(F_x, tuple):
+                F_x = F_x[0]
+            
+            # Decompose
+            x_skip = c_skip * x_c * mask_f
+            x_out = c_out * F_x * mask_f
+            x0_pred = (x_skip + x_out) * mask_f
+            
+            # Center target for comparison
+            V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+            V_tgt_c = V_tgt_c * mask_f
+            
+            # RMS values
+            rms_skip = masked_rms(x_skip, mask_f)
+            rms_out = masked_rms(x_out, mask_f)
+            rms_pred = masked_rms(x0_pred, mask_f)
+            rms_tgt = masked_rms(V_tgt_c, mask_f)
+            
+            out_over_tgt = rms_out / max(rms_tgt, 1e-8)
+            
+            # c_skip and c_out values (take mean over batch)
+            c_skip_val = c_skip.mean().item()
+            c_out_val = c_out.mean().item()
+            
+            print(f"  {sigma_val:8.3f} | {c_skip_val:8.4f} | {c_out_val:8.4f} | {rms_skip:10.4f} | {rms_out:10.4f} | {rms_pred:10.4f} | {rms_tgt:10.4f} | {out_over_tgt:8.4f}")
+        
+        print()
+        print(f"  INTERPRETATION:")
+        print(f"    As σ increases, c_skip → 0 and c_out → σ_data")
+        print(f"    If rms(x_out)/rms(target) is << 1 at mid/high σ:")
+        print(f"      → Learned branch (F_x) is under-scaled, causing shrink")
+        print(f"    If rms(x_out)/rms(target) ≈ 1 but x0_pred still shrinks:")
+        print(f"      → Bug in combination or centering")
+        
+        # =====================================================================
+        # TEST 3: Does a different time signal change behavior?
+        # =====================================================================
+        print(f"\n{'='*70}")
+        print(f"TEST 3 (A/B 6): Does a different time signal change behavior?")
+        print(f"{'='*70}")
+        print(f"  A = Current: c_noise = log(σ)/4")
+        print(f"  B = Alternative: c_noise = log(σ) (unscaled)")
+        print()
+        print(f"  {'σ':>8} | {'scale_r_A':>10} | {'scale_r_B':>10} | {'Jacc_A':>8} | {'Jacc_B':>8} | {'mean_diff':>10}")
+        print(f"  {'-'*8} | {'-'*10} | {'-'*10} | {'-'*8} | {'-'*8} | {'-'*10}")
+        
+        for sigma_val in fixed_eval_sigmas:
+            torch.manual_seed(42 + int(sigma_val * 1000))
+            
+            sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
+            sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
+            
+            eps_fixed = torch.randn_like(V_target_fixed)
+            V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+            V_t_fixed = V_t_fixed * mask_f
+            
+            # A: Normal forward (uses c_noise = log(σ)/4)
+            x0_pred_A = score_net_unwrapped.forward_edm(
+                V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
+                sigma_data, self_cond=None
+            )
+            if isinstance(x0_pred_A, tuple):
+                x0_pred_A = x0_pred_A[0]
+            
+            # B: Alternative time signal (c_noise = log(σ), unscaled)
+            c_skip, c_out, c_in, _ = uet.edm_precond(sigma_fixed, sigma_data)
+            
+            # Alternative c_noise: just log(σ), no /4 scaling
+            c_noise_alt = sigma_fixed.log().view(-1, 1)  # Note: no /4
+            
+            x_c, _ = uet.center_only(V_t_fixed, mask_fixed)
+            x_in = c_in * x_c
+            
+            F_x_B = score_net_unwrapped.forward(
+                x_in, 
+                c_noise_alt,  # Alternative time signal
+                H_fixed, 
+                mask_fixed, 
+                self_cond=None, 
+                sigma_raw=sigma_fixed,
+                x_raw=x_c,
+                c_in=c_in
+            )
+            if isinstance(F_x_B, tuple):
+                F_x_B = F_x_B[0]
+            
+            x0_pred_B = c_skip * x_c + c_out * F_x_B
+            x0_pred_B = x0_pred_B * mask_f
+            
+            # Metrics
+            V_pred_A_c, _ = uet.center_only(x0_pred_A, mask_fixed)
+            V_pred_B_c, _ = uet.center_only(x0_pred_B, mask_fixed)
+            V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+            
+            scale_r_A = masked_rms(V_pred_A_c, mask_f) / max(masked_rms(V_tgt_c, mask_f), 1e-8)
+            scale_r_B = masked_rms(V_pred_B_c, mask_f) / max(masked_rms(V_tgt_c, mask_f), 1e-8)
+            
+            jacc_A = compute_jaccard_at_k(x0_pred_A, V_target_fixed, mask_fixed, k=10)
+            jacc_B = compute_jaccard_at_k(x0_pred_B, V_target_fixed, mask_fixed, k=10)
+            
+            diff_AB = (x0_pred_A - x0_pred_B).abs()
+            mean_abs_diff = (diff_AB * mask_f).sum() / valid_count
+            mean_abs_diff = mean_abs_diff.item()
+            
+            print(f"  {sigma_val:8.3f} | {scale_r_A:10.4f} | {scale_r_B:10.4f} | {jacc_A:8.4f} | {jacc_B:8.4f} | {mean_abs_diff:10.6f}")
+        
+        print()
+        print(f"  INTERPRETATION:")
+        print(f"    If A and B show LARGE differences in metrics:")
+        print(f"      → Time signal scaling matters; current /4 scaling may be sub-optimal")
+        print(f"    If A and B are nearly IDENTICAL:")
+        print(f"      → Either time conditioning path is broken, or both signals saturate similarly")
+        
+        # Restore RNG state
+        torch.set_rng_state(rng_state)
+    
+    # Restore training mode
+    if was_training_score:
+        score_net.train()
+    if was_training_ctx:
+        context_encoder.train()
+    
+    print(f"\n{'='*80}")
+    print(f"END A/B TESTS")
+    print(f"{'='*80}\n")
+
+
 def train_stageC_diffusion_generator(
     context_encoder: 'SetEncoderContext',
     generator: 'MetricSetGenerator',
@@ -5132,6 +5490,19 @@ def train_stageC_diffusion_generator(
                 
                 print(f"{'='*70}\n")
 
+                # =====================================================================
+                # A/B TESTS (every 10 epochs to avoid too much output)
+                # =====================================================================
+                if (epoch % 5 == 0) or (epoch == 0):
+                    run_ab_tests_fixed_batch(
+                        score_net=score_net,
+                        context_encoder=context_encoder,
+                        fixed_batch_data=fixed_batch_data,
+                        sigma_data=sigma_data,
+                        fixed_eval_sigmas=fixed_eval_sigmas,
+                        device=device,
+                        epoch=epoch,
+                    )
 
         # ========== END OF EPOCH: PHASE 6 + PHASE 7 REPORTING ==========
         if fabric is None or fabric.is_global_zero:
