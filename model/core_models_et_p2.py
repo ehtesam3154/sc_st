@@ -690,19 +690,23 @@ class DiffusionScoreNet(nn.Module):
         else:
             V_geom_for_bias = V_in  # Fallback for backward compatibility
         
-        # === CHATGPT FIX 3: Pick ONE geometry source, don't blend ===
-        # Policy A: If self_cond exists, use it; else use raw input
-        # This prevents geometry distortions from mixing two different estimates
-        if self_cond_canon is not None:
-            V_geom = self_cond_canon  # Use self-conditioning for geometry bias
-        else:
-            V_geom = V_geom_for_bias  # Fallback to raw centered input
+        # === CHATGPT FIX 3 (REVISED): Pick ONE geometry source, NO blending ===
+        # Policy: If self_cond exists, use it; else use x_raw (raw centered input).
+        # This prevents geometry distortions from mixing two different estimates.
+        # IMPORTANT: geom_gate is NO LONGER used for source selection or attenuation.
         
-        # geom_ok: geometry is usable when we have self_cond or at low sigma
         if self_cond_canon is not None:
-            geom_ok = torch.ones_like(geom_gate).bool()
+            V_bias_geom = self_cond_canon  # Use self-conditioning for geometry bias
         else:
-            geom_ok = (geom_gate > 0.5)
+            V_bias_geom = V_geom_for_bias  # Fallback to raw centered input (x_raw passed in)
+        
+        # V_geom is now ONLY used for distance bias computation (not blended)
+        V_geom = V_bias_geom
+        
+        # geom_ok: geometry is usable when we have valid points (mask-based, NOT σ-based)
+        # We always have x_raw, so geometry is always "ok" as long as mask has valid points
+        geom_ok = (mask.sum(dim=-1) >= 2)  # (B,) True if sample has at least 2 valid points
+
 
         # DEBUG: Log geometry source usage
         if self.training and (torch.rand(()).item() < 0.01):
@@ -746,37 +750,49 @@ class DiffusionScoreNet(nn.Module):
             sc_feat = torch.zeros(B, N, self.D_latent, device=V_t.device)
             features.append(sc_feat)
 
-        # === CHATGPT FIX 4: Compare self-cond scaling to sqrt(c_skip), not 1.0 ===
+        # === FIX: SC-SCALE identity check ===
+        # Identity: rms(sc_feat)/rms(V_in) ≈ rms(sc_canon)/rms(x_raw)
+        # This is because V_in = c_in * x_raw and sc_feat = c_in * sc_canon
+        
         if self.training and self_cond_canon is not None and (torch.rand(()).item() < 0.005):
             with torch.no_grad():
                 mask_f = mask.unsqueeze(-1).float()
-                valid_count = mask_f.sum()
                 
-                rms_vin = (V_in.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
-                rms_sc_raw = (self_cond_canon.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
-                rms_sc_scaled = (self_cond_feat_input.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                # Per-sample RMS computation
+                def _per_sample_rms(tensor, mf):
+                    """Compute RMS per sample, return (B,) tensor."""
+                    B = tensor.shape[0]
+                    denom = mf.sum(dim=(1, 2)).clamp_min(1)  # (B,)
+                    sq_sum = (tensor.pow(2) * mf).sum(dim=(1, 2))  # (B,)
+                    return (sq_sum / denom).sqrt()  # (B,)
                 
-                # Compute expected ratio from EDM theory
-                # c_in was passed in, compute c_skip for comparison
-                if sigma_raw is not None and self.sigma_data is not None:
-                    sigma_mean = sigma_raw.mean().item()
-                    sigma_data = self.sigma_data
-                    c_skip_val = sigma_data ** 2 / (sigma_mean ** 2 + sigma_data ** 2)
-                    expected_ratio = (c_skip_val ** 0.5)  # sqrt(c_skip)
+                rms_vin = _per_sample_rms(V_in, mask_f)  # (B,)
+                rms_sc_scaled = _per_sample_rms(self_cond_feat_input, mask_f)  # (B,)
+                rms_sc_canon = _per_sample_rms(self_cond_canon, mask_f)  # (B,)
+                
+                # Get x_raw_canon for identity check
+                if x_raw is not None:
+                    x_raw_canon, _ = uet.center_only(x_raw, mask)
+                    rms_xraw = _per_sample_rms(x_raw_canon, mask_f)
                 else:
-                    expected_ratio = 1.0  # Fallback
+                    rms_xraw = rms_vin  # Fallback
                 
-                actual_ratio = rms_sc_scaled / max(rms_vin, 1e-8)
+                # Compute per-sample ratios
+                ratio_scaled = rms_sc_scaled / rms_vin.clamp_min(1e-8)  # (B,)
+                ratio_raw = rms_sc_canon / rms_xraw.clamp_min(1e-8)  # (B,)
+                ratio_error = (ratio_scaled - ratio_raw).abs()  # (B,)
                 
-                print(f"\n[DEBUG-SC-SCALE] Self-cond feature scaling (FIXED):")
-                print(f"  rms(V_in)={rms_vin:.4f} (preconditioned input)")
-                print(f"  rms(self_cond_raw)={rms_sc_raw:.4f}")
-                print(f"  rms(self_cond_scaled)={rms_sc_scaled:.4f}")
-                print(f"  scaled/V_in ratio={actual_ratio:.3f}")
-                print(f"  expected ratio (sqrt(c_skip))={expected_ratio:.3f}")
-                print(f"  ratio error: {abs(actual_ratio - expected_ratio):.4f}")
-
-
+                # Print statistics using torch (no numpy needed)
+                print(f"\n[DEBUG-SC-SCALE] Self-cond identity check:")
+                print(f"  IDENTITY: rms(sc_feat)/rms(V_in) should ≈ rms(sc_canon)/rms(x_raw)")
+                print(f"  ratio_scaled: median={ratio_scaled.median():.3f} "
+                      f"p10={ratio_scaled.quantile(0.1):.3f} p90={ratio_scaled.quantile(0.9):.3f}")
+                print(f"  ratio_raw:    median={ratio_raw.median():.3f} "
+                      f"p10={ratio_raw.quantile(0.1):.3f} p90={ratio_raw.quantile(0.9):.3f}")
+                print(f"  ratio_error:  median={ratio_error.median():.4f} max={ratio_error.max():.4f}")
+                
+                if ratio_error.median() > 0.1:
+                    print(f"  ⚠️ WARNING: Identity violated! Check self_cond scaling logic.")
 
         
         # Add angle features (use V_geom which is already blended)
@@ -856,14 +872,21 @@ class DiffusionScoreNet(nn.Module):
                     bin_edges=self.st_dist_bin_edges
                 )
                 
-                # --- FIX #2 CONTINUED: Gate bias strength by smooth geom_gate ---
-                if self_cond_canon is None:
-                    # Without self_cond, bias strength depends on how much we trust V_in
-                    gate = geom_gate.view(-1, 1, 1, 1)
-                else:
-                    # With self_cond, bias is always reliable (blended geometry)
-                    gate = torch.ones_like(geom_gate).view(-1, 1, 1, 1)
-                attn_bias = attn_bias * gate
+                # === CHATGPT FIX 4 (REVISED): NO σ-attenuation of bias strength ===
+                # Gate ONLY on geometry validity (mask-based), NOT on σ.
+                # The bias should be full-strength whenever we have valid geometry.
+                # geom_ok is (B,) bool - True if sample has at least 2 valid points.
+                
+                # Create validity gate (1.0 if valid geometry, 0.0 otherwise)
+                validity_gate = geom_ok.float().view(-1, 1, 1, 1)  # (B, 1, 1, 1)
+                attn_bias = attn_bias * validity_gate
+                
+                # DEBUG: Log when bias is being zeroed due to invalid geometry (should be rare)
+                if self.training and (torch.rand(()).item() < 0.001):
+                    n_valid_geom = geom_ok.sum().item()
+                    n_total = geom_ok.numel()
+                    if n_valid_geom < n_total:
+                        print(f"[DEBUG-BIAS-GATE] {n_total - n_valid_geom}/{n_total} samples had bias zeroed (invalid geometry)")
 
                 if self.use_st_dist_head:
                     bin_embeddings = self.E_bin[bin_ids]
@@ -2414,27 +2437,77 @@ def train_stageC_diffusion_generator(
                             self_cond = (1.0 - w_gen_3d) * x0_pred_0_diff + w_gen_3d * V_gen_prior_aligned
                             
                             # === DEBUG-PRIOR-ALIGN: Alignment quality on CENTERED coords ===
+                            # === DEBUG-PRIOR-ALIGN: Make alignment interpretable ===
                             if torch.rand(1).item() < 0.01:
+                                # Store x0_pred_0_base INSIDE the debug condition (avoid clone every step)
+                                x0_pred_0_base = x0_pred_0_diff.detach()  # No clone needed if we don't modify
+                                
                                 # Helper: per-sample centered MSE
                                 def _centered_mse_batch(A, B, m):
-                                    """MSE after centering each sample. A, B: (B,N,D), m: (B,N)"""
                                     mf = m.unsqueeze(-1).float()
-                                    denom = mf.sum(dim=1, keepdim=True).clamp(min=1)  # (B,1,1)
+                                    denom = mf.sum(dim=1, keepdim=True).clamp(min=1)
                                     A_c = A - (A * mf).sum(dim=1, keepdim=True) / denom
                                     B_c = B - (B * mf).sum(dim=1, keepdim=True) / denom
                                     err2 = ((A_c - B_c).pow(2) * mf).sum(dim=(1,2)) / denom.squeeze(-1).squeeze(-1)
-                                    return err2.mean()  # average over batch
+                                    return err2.mean()
                                 
-                                mse_before = _centered_mse_batch(V_gen_prior, x0_pred_0_diff, mask)
-                                mse_after = _centered_mse_batch(V_gen_prior_aligned, x0_pred_0_diff, mask)
+                                def _centered_rms(A, m):
+                                    mf = m.unsqueeze(-1).float()
+                                    denom = mf.sum(dim=1, keepdim=True).clamp(min=1)
+                                    A_c = A - (A * mf).sum(dim=1, keepdim=True) / denom
+                                    rms = (A_c.pow(2) * mf).sum(dim=(1,2)) / denom.squeeze(-1).squeeze(-1)
+                                    return rms.mean().sqrt()
+                                
+                                mse_before = _centered_mse_batch(V_gen_prior, x0_pred_0_base, mask)
+                                mse_after = _centered_mse_batch(V_gen_prior_aligned, x0_pred_0_base, mask)
+                                delta_align = _centered_rms(V_gen_prior_aligned - V_gen_prior, mask)
+                                
+                                # Track rotation magnitude (not "failure")
+                                non_identity_count = 0
+                                svd_exception_count = 0
+                                svd_total = 0
+                                rot_traces = []
+                                
+                                for b in range(min(8, V_gen_prior.shape[0])):
+                                    mb = mask[b].bool()
+                                    n_valid = int(mb.sum().item())
+                                    if n_valid < 3:
+                                        continue
+                                    svd_total += 1
+                                    X = V_gen_prior[b, mb].float()
+                                    Y = x0_pred_0_base[b, mb].float()
+                                    X_c = X - X.mean(dim=0, keepdim=True)
+                                    Y_c = Y - Y.mean(dim=0, keepdim=True)
+                                    M = X_c.T @ Y_c
+                                    try:
+                                        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+                                        R = U @ Vh
+                                        tr = (R.trace() / R.shape[0]).item()
+                                        rot_traces.append(tr)
+                                        if tr < 0.9:  # Significant rotation needed
+                                            non_identity_count += 1
+                                    except Exception:
+                                        svd_exception_count += 1
                                 
                                 improvement = (1 - mse_after / mse_before.clamp(min=1e-8)) * 100
+                                
                                 print(f"\n[DEBUG-PRIOR-ALIGN] Generator→Diffusion alignment:")
                                 print(f"  w_gen: min={w_gen.min():.3f} mean={w_gen.mean():.3f} max={w_gen.max():.3f}")
                                 print(f"  MSE before (centered): {mse_before.item():.6f}")
                                 print(f"  MSE after (centered):  {mse_after.item():.6f}")
                                 print(f"  Alignment improvement: {improvement.item():.1f}%")
-                            
+                                print(f"  delta_align (RMS of V_aligned - V_gen): {delta_align.item():.6f}")
+                                print(f"  Non-identity rotation rate (tr(R)/D < 0.9): {non_identity_count}/{svd_total}")
+                                print(f"  SVD exceptions: {svd_exception_count}/{svd_total}")
+                                if rot_traces:
+                                    mean_tr = sum(rot_traces) / len(rot_traces)
+                                    min_tr = min(rot_traces)
+                                    print(f"  tr(R)/D: mean={mean_tr:.3f} min={min_tr:.3f}")
+                                
+                                # Decision rule
+                                if delta_align.item() < 1e-4 and abs(mse_before.item() - mse_after.item()) < 1e-6:
+                                    print(f"  ⚠️ Alignment is effectively identity → consider removing alignment code")
+                      
                             # === DEBUG-FRAME: Track rotation magnitude ===
                             if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
                                 rot_traces = []
@@ -4924,8 +4997,141 @@ def train_stageC_diffusion_generator(
                 
                 print(f"[NEW LOSSES] L_repel={L_repel.item():.3e} L_shape={L_shape.item():.3e}")
 
-                
+             
         #============ END OF EPOCH SUMMARY ============
+        # =====================================================================
+        # FIXED-BATCH EVALUATION AT FIXED SIGMAS (once per epoch)
+        # =====================================================================
+        if (fabric is None or fabric.is_global_zero) and use_st and (epoch % 5 == 0):
+            fixed_eval_sigmas = [0.05, 0.15, 0.40, 0.70, 1.20, 2.40]
+            
+            fixed_batch_data = edm_debug_state.get('fixed_batch', None)
+            
+            if fixed_batch_data is not None:
+                print(f"\n{'='*70}")
+                print(f"[FIXED-BATCH EVAL] Epoch {epoch} - Evaluating at fixed sigmas")
+                print(f"{'='*70}")
+                
+                # Set eval mode to disable dropout/stochastic layers
+                was_training_score = score_net.training
+                was_training_ctx = context_encoder.training
+                score_net.eval()
+                context_encoder.eval()
+                
+                with torch.no_grad():
+                    Z_fixed = fixed_batch_data['Z_set'].to(device)
+                    mask_fixed = fixed_batch_data['mask'].to(device)
+                    V_target_fixed = fixed_batch_data['V_target'].to(device)
+                    G_target_fixed = fixed_batch_data['G_target'].to(device)
+                    
+                    B_fixed = Z_fixed.shape[0]
+                    D_lat = score_net.D_latent if hasattr(score_net, 'D_latent') else \
+                            score_net.module.D_latent if hasattr(score_net, 'module') else 16
+                    
+                    H_fixed = context_encoder(Z_fixed, mask_fixed)
+                    
+                    print(f"  {'σ':>8} | {'scale_r':>8} | {'trace_r':>8} | {'Jacc@10':>8} | {'SC':>6}")
+                    print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*6}")
+                    
+                    # Use fixed seed for reproducible noise across epochs
+                    rng_state = torch.get_rng_state()
+                    
+                    for sigma_val in fixed_eval_sigmas:
+                        # Deterministic noise for this sigma
+                        torch.manual_seed(42 + int(sigma_val * 1000))
+                        
+                        sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
+                        sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
+                        
+                        eps_fixed = torch.randn_like(V_target_fixed)
+                        V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+                        V_t_fixed = V_t_fixed * mask_fixed.unsqueeze(-1).float()
+                        
+                        for sc_mode in ['no_sc', 'with_sc']:
+                            if sc_mode == 'with_sc' and score_net.self_conditioning:
+                                x0_pred_0_eval = score_net.forward_edm(
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
+                                    sigma_data, self_cond=None
+                                )
+                                if isinstance(x0_pred_0_eval, tuple):
+                                    x0_pred_0_eval = x0_pred_0_eval[0]
+                                
+                                x0_pred_eval = score_net.forward_edm(
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
+                                    sigma_data, self_cond=x0_pred_0_eval
+                                )
+                            else:
+                                x0_pred_eval = score_net.forward_edm(
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
+                                    sigma_data, self_cond=None
+                                )
+                            
+                            if isinstance(x0_pred_eval, tuple):
+                                x0_pred_eval = x0_pred_eval[0]
+                            
+                            mask_f_eval = mask_fixed.unsqueeze(-1).float()
+                            valid_count_eval = mask_f_eval.sum()
+                            
+                            # Scale ratio (centered)
+                            V_pred_c, _ = uet.center_only(x0_pred_eval, mask_fixed)
+                            V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+                            rms_pred = (V_pred_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt()
+                            rms_tgt = (V_tgt_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt()
+                            scale_ratio = (rms_pred / rms_tgt.clamp(min=1e-8)).item()
+                            
+                            # Trace ratio
+                            G_pred = V_pred_c @ V_pred_c.transpose(1, 2)
+                            trace_pred = torch.diagonal(G_pred, dim1=-2, dim2=-1).sum(dim=-1)
+                            trace_tgt = torch.diagonal(G_target_fixed, dim1=-2, dim2=-1).sum(dim=-1)
+                            trace_ratio = (trace_pred / trace_tgt.clamp(min=1e-8)).mean().item()
+                            
+                            # Jaccard@10 (pure torch, no numpy)
+                            jaccard_sum = 0.0
+                            jaccard_count = 0
+                            for b in range(min(4, B_fixed)):
+                                m_b = mask_fixed[b].bool()
+                                n_valid = int(m_b.sum().item())
+                                if n_valid < 15:
+                                    continue
+                                
+                                pred_b = x0_pred_eval[b, m_b]
+                                tgt_b = V_target_fixed[b, m_b]
+                                
+                                D_pred_b = torch.cdist(pred_b, pred_b)
+                                D_tgt_b = torch.cdist(tgt_b, tgt_b)
+                                
+                                k_j = min(10, n_valid - 1)
+                                _, knn_pred = D_pred_b.topk(k_j + 1, largest=False)
+                                _, knn_tgt = D_tgt_b.topk(k_j + 1, largest=False)
+                                
+                                knn_pred = knn_pred[:, 1:]  # Exclude self
+                                knn_tgt = knn_tgt[:, 1:]
+                                
+                                for i in range(n_valid):
+                                    set_pred = set(knn_pred[i].tolist())
+                                    set_tgt = set(knn_tgt[i].tolist())
+                                    inter = len(set_pred & set_tgt)
+                                    union = len(set_pred | set_tgt)
+                                    if union > 0:
+                                        jaccard_sum += inter / union
+                                        jaccard_count += 1
+                            
+                            jaccard_mean = jaccard_sum / max(jaccard_count, 1)
+                            
+                            sc_label = "SC" if sc_mode == 'with_sc' else "NO"
+                            print(f"  {sigma_val:8.3f} | {scale_ratio:8.3f} | {trace_ratio:8.3f} | {jaccard_mean:8.3f} | {sc_label:>6}")
+                    
+                    # Restore RNG state
+                    torch.set_rng_state(rng_state)
+                
+                # Restore training mode
+                if was_training_score:
+                    score_net.train()
+                if was_training_ctx:
+                    context_encoder.train()
+                
+                print(f"{'='*70}\n")
+
 
         # ========== END OF EPOCH: PHASE 6 + PHASE 7 REPORTING ==========
         if fabric is None or fabric.is_global_zero:
