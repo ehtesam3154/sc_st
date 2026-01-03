@@ -1458,6 +1458,337 @@ def run_ab_tests_fixed_batch(
         print(f"      → Time signal scaling matters; current /4 scaling may be sub-optimal")
         print(f"    If A and B are nearly IDENTICAL:")
         print(f"      → Either time conditioning path is broken, or both signals saturate similarly")
+
+
+                # =====================================================================
+        # TEST 4: Is conditioning H actually being used at high σ?
+        # =====================================================================
+        print(f"\n{'='*70}")
+        print(f"TEST 4: Is conditioning H actually being used?")
+        print(f"{'='*70}")
+        print(f"  Normal   = Standard H from context encoder")
+        print(f"  Zero-H   = Replace H with zeros (ablation)")
+        print(f"  Shuffle-H = Permute H across batch (wrong conditioning)")
+        print()
+        
+        # First, let's log H statistics to understand what we're working with
+        print(f"  H STATISTICS:")
+        H_mean = (H_fixed * mask_f).sum() / valid_count
+        H_std = ((H_fixed - H_mean).pow(2) * mask_f).sum().div(valid_count).sqrt()
+        H_norm_per_sample = (H_fixed.pow(2) * mask_f).sum(dim=(1,2)).sqrt()
+        H_mean_norm = H_norm_per_sample.mean()
+        print(f"    H_mean: {H_mean.item():.6f}")
+        print(f"    H_std:  {H_std.item():.6f}")
+        print(f"    H_mean_norm (per sample): {H_mean_norm.item():.4f}")
+        print(f"    H shape: {H_fixed.shape}")
+        print()
+        
+        # Create ablated versions of H
+        H_zero = torch.zeros_like(H_fixed)
+        
+        # Shuffle H across batch dimension (if B > 1)
+        if B_fixed > 1:
+            perm = torch.randperm(B_fixed, device=device)
+            # Make sure permutation actually shuffles (not identity)
+            while (perm == torch.arange(B_fixed, device=device)).all():
+                perm = torch.randperm(B_fixed, device=device)
+            H_shuffle = H_fixed[perm]
+        else:
+            # If only 1 sample, shuffle within the sample (permute nodes)
+            n_valid = int(mask_fixed[0].sum().item())
+            node_perm = torch.randperm(n_valid, device=device)
+            H_shuffle = H_fixed.clone()
+            H_shuffle[0, :n_valid] = H_fixed[0, node_perm]
+        
+        print(f"  {'σ':>8} | {'scale_N':>8} | {'scale_Z':>8} | {'scale_S':>8} | {'Jacc_N':>7} | {'Jacc_Z':>7} | {'Jacc_S':>7} | {'rel_diff_Z':>10} | {'rel_diff_S':>10}")
+        print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*7} | {'-'*7} | {'-'*7} | {'-'*10} | {'-'*10}")
+        
+        # Storage for per-sigma analysis
+        sigma_analysis = []
+        
+        for sigma_val in fixed_eval_sigmas:
+            torch.manual_seed(42 + int(sigma_val * 1000))
+            
+            sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
+            sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
+            
+            eps_fixed = torch.randn_like(V_target_fixed)
+            V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+            V_t_fixed = V_t_fixed * mask_f
+            
+            # Normal: with real H
+            x0_pred_normal = score_net_unwrapped.forward_edm(
+                V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
+                sigma_data, self_cond=None
+            )
+            if isinstance(x0_pred_normal, tuple):
+                x0_pred_normal = x0_pred_normal[0]
+            
+            # Zero-H: with H = 0
+            x0_pred_zero = score_net_unwrapped.forward_edm(
+                V_t_fixed, sigma_fixed, H_zero, mask_fixed, 
+                sigma_data, self_cond=None
+            )
+            if isinstance(x0_pred_zero, tuple):
+                x0_pred_zero = x0_pred_zero[0]
+            
+            # Shuffle-H: with shuffled H
+            x0_pred_shuffle = score_net_unwrapped.forward_edm(
+                V_t_fixed, sigma_fixed, H_shuffle, mask_fixed, 
+                sigma_data, self_cond=None
+            )
+            if isinstance(x0_pred_shuffle, tuple):
+                x0_pred_shuffle = x0_pred_shuffle[0]
+            
+            # Compute metrics for each
+            V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+            rms_tgt = masked_rms(V_tgt_c, mask_f)
+            
+            # Normal
+            V_pred_N_c, _ = uet.center_only(x0_pred_normal, mask_fixed)
+            scale_N = masked_rms(V_pred_N_c, mask_f) / max(rms_tgt, 1e-8)
+            jacc_N = compute_jaccard_at_k(x0_pred_normal, V_target_fixed, mask_fixed, k=10)
+            
+            # Zero-H
+            V_pred_Z_c, _ = uet.center_only(x0_pred_zero, mask_fixed)
+            scale_Z = masked_rms(V_pred_Z_c, mask_f) / max(rms_tgt, 1e-8)
+            jacc_Z = compute_jaccard_at_k(x0_pred_zero, V_target_fixed, mask_fixed, k=10)
+            
+            # Shuffle-H
+            V_pred_S_c, _ = uet.center_only(x0_pred_shuffle, mask_fixed)
+            scale_S = masked_rms(V_pred_S_c, mask_f) / max(rms_tgt, 1e-8)
+            jacc_S = compute_jaccard_at_k(x0_pred_shuffle, V_target_fixed, mask_fixed, k=10)
+            
+            # Relative difference: ||x_normal - x_ablated|| / ||x_normal||
+            rms_normal = masked_rms(x0_pred_normal, mask_f)
+            
+            diff_zero = (x0_pred_normal - x0_pred_zero).pow(2)
+            rel_diff_Z = masked_rms(x0_pred_normal - x0_pred_zero, mask_f) / max(rms_normal, 1e-8)
+            
+            diff_shuffle = (x0_pred_normal - x0_pred_shuffle).pow(2)
+            rel_diff_S = masked_rms(x0_pred_normal - x0_pred_shuffle, mask_f) / max(rms_normal, 1e-8)
+            
+            print(f"  {sigma_val:8.3f} | {scale_N:8.4f} | {scale_Z:8.4f} | {scale_S:8.4f} | {jacc_N:7.4f} | {jacc_Z:7.4f} | {jacc_S:7.4f} | {rel_diff_Z:10.4f} | {rel_diff_S:10.4f}")
+            
+            # Store for detailed analysis
+            sigma_analysis.append({
+                'sigma': sigma_val,
+                'scale_N': scale_N, 'scale_Z': scale_Z, 'scale_S': scale_S,
+                'jacc_N': jacc_N, 'jacc_Z': jacc_Z, 'jacc_S': jacc_S,
+                'rel_diff_Z': rel_diff_Z, 'rel_diff_S': rel_diff_S,
+            })
+        
+        # Detailed analysis
+        print()
+        print(f"  DETAILED ANALYSIS:")
+        print(f"  {'-'*60}")
+        
+        # Check if conditioning matters at high sigma
+        high_sigma_entries = [e for e in sigma_analysis if e['sigma'] >= 0.70]
+        low_sigma_entries = [e for e in sigma_analysis if e['sigma'] <= 0.15]
+        
+        if high_sigma_entries:
+            avg_rel_diff_Z_high = sum(e['rel_diff_Z'] for e in high_sigma_entries) / len(high_sigma_entries)
+            avg_rel_diff_S_high = sum(e['rel_diff_S'] for e in high_sigma_entries) / len(high_sigma_entries)
+            avg_jacc_drop_Z_high = sum(e['jacc_N'] - e['jacc_Z'] for e in high_sigma_entries) / len(high_sigma_entries)
+            avg_jacc_drop_S_high = sum(e['jacc_N'] - e['jacc_S'] for e in high_sigma_entries) / len(high_sigma_entries)
+            
+            print(f"  HIGH σ (≥0.70) - This is where c_skip→0, learned branch dominates:")
+            print(f"    Avg rel_diff (Zero-H):    {avg_rel_diff_Z_high:.4f}")
+            print(f"    Avg rel_diff (Shuffle-H): {avg_rel_diff_S_high:.4f}")
+            print(f"    Avg Jacc drop (Zero-H):   {avg_jacc_drop_Z_high:.4f}")
+            print(f"    Avg Jacc drop (Shuffle-H):{avg_jacc_drop_S_high:.4f}")
+            
+            if avg_rel_diff_Z_high < 0.05 and avg_rel_diff_S_high < 0.05:
+                print(f"    ⚠️  PROBLEM: H has MINIMAL effect at high σ!")
+                print(f"       → Conditioning pipeline may be broken or H is not reaching the network")
+            elif avg_rel_diff_Z_high > 0.10 or avg_rel_diff_S_high > 0.10:
+                print(f"    ✓ H IS being used at high σ (rel_diff > 0.10)")
+                print(f"       → Issue is likely objective/weighting, not conditioning pipeline")
+            else:
+                print(f"    ⚡ H has MODERATE effect at high σ (0.05 < rel_diff < 0.10)")
+                print(f"       → Conditioning works but may be weak")
+        
+        if low_sigma_entries:
+            avg_rel_diff_Z_low = sum(e['rel_diff_Z'] for e in low_sigma_entries) / len(low_sigma_entries)
+            avg_rel_diff_S_low = sum(e['rel_diff_S'] for e in low_sigma_entries) / len(low_sigma_entries)
+            
+            print(f"\n  LOW σ (≤0.15) - Skip connection dominates here:")
+            print(f"    Avg rel_diff (Zero-H):    {avg_rel_diff_Z_low:.4f}")
+            print(f"    Avg rel_diff (Shuffle-H): {avg_rel_diff_S_low:.4f}")
+        
+        # Check scale collapse pattern
+        print(f"\n  SCALE COLLAPSE PATTERN:")
+        for e in sigma_analysis:
+            collapse_indicator = ""
+            if e['scale_N'] < 0.80:
+                collapse_indicator = "⚠️ SHRINK"
+            elif e['scale_N'] > 1.20:
+                collapse_indicator = "⚠️ EXPAND"
+            else:
+                collapse_indicator = "✓ OK"
+            
+            # Does Zero-H make it worse or better?
+            zero_effect = ""
+            if abs(e['scale_Z'] - 1.0) < abs(e['scale_N'] - 1.0):
+                zero_effect = "(Zero-H closer to 1.0!)"
+            elif abs(e['scale_Z'] - 1.0) > abs(e['scale_N'] - 1.0) * 1.5:
+                zero_effect = "(Zero-H makes it worse)"
+            
+            print(f"    σ={e['sigma']:.2f}: scale_N={e['scale_N']:.3f} {collapse_indicator} {zero_effect}")
+        
+        print()
+        print(f"  INTERPRETATION GUIDE:")
+        print(f"  {'-'*60}")
+        print(f"  If rel_diff is SMALL (<0.05) at high σ:")
+        print(f"    → Model ignores H when noise is high")
+        print(f"    → Focus on: conditioning injection strength, H normalization")
+        print(f"  If rel_diff is LARGE (>0.10) but scale still collapses:")
+        print(f"    → H is used, but F_x output is under-scaled")
+        print(f"    → Focus on: scale enforcement loss, output head initialization")
+        print(f"  If Jacc drops significantly with Zero-H/Shuffle-H:")
+        print(f"    → H carries useful geometric info")
+        print(f"  If Jacc stays same with Zero-H/Shuffle-H:")
+        print(f"    → H is not helping geometry prediction")
+        
+        # =====================================================================
+        # TEST 4B: Decomposition with H ablation
+        # =====================================================================
+        print(f"\n{'='*70}")
+        print(f"TEST 4B: F_x magnitude with vs without H")
+        print(f"{'='*70}")
+        print(f"  Shows whether F_x (learned branch) changes magnitude when H is ablated")
+        print()
+        print(f"  {'σ':>8} | {'rms_Fx_N':>10} | {'rms_Fx_Z':>10} | {'rms_Fx_S':>10} | {'Fx_ratio_Z':>10} | {'Fx_ratio_S':>10}")
+        print(f"  {'-'*8} | {'-'*10} | {'-'*10} | {'-'*10} | {'-'*10} | {'-'*10}")
+        
+        for sigma_val in fixed_eval_sigmas:
+            torch.manual_seed(42 + int(sigma_val * 1000))
+            
+            sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
+            sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
+            
+            eps_fixed = torch.randn_like(V_target_fixed)
+            V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+            V_t_fixed = V_t_fixed * mask_f
+            
+            # Compute preconditioning
+            c_skip, c_out, c_in, c_noise = uet.edm_precond(sigma_fixed, sigma_data)
+            
+            x_c, _ = uet.center_only(V_t_fixed, mask_fixed)
+            x_in = c_in * x_c
+            
+            # Get F_x with normal H
+            F_x_N = score_net_unwrapped.forward(
+                x_in, c_noise, H_fixed, mask_fixed, 
+                self_cond=None, sigma_raw=sigma_fixed, x_raw=x_c, c_in=c_in
+            )
+            if isinstance(F_x_N, tuple):
+                F_x_N = F_x_N[0]
+            
+            # Get F_x with Zero H
+            F_x_Z = score_net_unwrapped.forward(
+                x_in, c_noise, H_zero, mask_fixed, 
+                self_cond=None, sigma_raw=sigma_fixed, x_raw=x_c, c_in=c_in
+            )
+            if isinstance(F_x_Z, tuple):
+                F_x_Z = F_x_Z[0]
+            
+            # Get F_x with Shuffle H
+            F_x_S = score_net_unwrapped.forward(
+                x_in, c_noise, H_shuffle, mask_fixed, 
+                self_cond=None, sigma_raw=sigma_fixed, x_raw=x_c, c_in=c_in
+            )
+            if isinstance(F_x_S, tuple):
+                F_x_S = F_x_S[0]
+            
+            rms_Fx_N = masked_rms(F_x_N, mask_f)
+            rms_Fx_Z = masked_rms(F_x_Z, mask_f)
+            rms_Fx_S = masked_rms(F_x_S, mask_f)
+            
+            Fx_ratio_Z = rms_Fx_Z / max(rms_Fx_N, 1e-8)
+            Fx_ratio_S = rms_Fx_S / max(rms_Fx_N, 1e-8)
+            
+            print(f"  {sigma_val:8.3f} | {rms_Fx_N:10.4f} | {rms_Fx_Z:10.4f} | {rms_Fx_S:10.4f} | {Fx_ratio_Z:10.4f} | {Fx_ratio_S:10.4f}")
+        
+        print()
+        print(f"  INTERPRETATION:")
+        print(f"    If Fx_ratio ≈ 1.0: F_x magnitude doesn't change when H is ablated")
+        print(f"      → Network may be ignoring H in the learned branch")
+        print(f"    If Fx_ratio significantly != 1.0: F_x magnitude depends on H")
+        print(f"      → Conditioning IS affecting the learned output magnitude")
+        
+        # =====================================================================
+        # TEST 4C: Per-sample conditioning effect
+        # =====================================================================
+        print(f"\n{'='*70}")
+        print(f"TEST 4C: Per-sample conditioning effect at σ=1.20")
+        print(f"{'='*70}")
+        print(f"  Shows if effect varies across samples (some use H, some don't)")
+        print()
+        
+        sigma_test = 1.20  # High sigma where learned branch dominates
+        torch.manual_seed(42 + int(sigma_test * 1000))
+        
+        sigma_fixed = torch.full((B_fixed,), sigma_test, device=device)
+        sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
+        
+        eps_fixed = torch.randn_like(V_target_fixed)
+        V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+        V_t_fixed = V_t_fixed * mask_f
+        
+        x0_pred_normal = score_net_unwrapped.forward_edm(
+            V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
+            sigma_data, self_cond=None
+        )
+        if isinstance(x0_pred_normal, tuple):
+            x0_pred_normal = x0_pred_normal[0]
+        
+        x0_pred_zero = score_net_unwrapped.forward_edm(
+            V_t_fixed, sigma_fixed, H_zero, mask_fixed, 
+            sigma_data, self_cond=None
+        )
+        if isinstance(x0_pred_zero, tuple):
+            x0_pred_zero = x0_pred_zero[0]
+        
+        print(f"  {'Sample':>8} | {'n_valid':>8} | {'rms_pred_N':>10} | {'rms_pred_Z':>10} | {'rel_diff':>10} | {'scale_N':>8}")
+        print(f"  {'-'*8} | {'-'*8} | {'-'*10} | {'-'*10} | {'-'*10} | {'-'*8}")
+        
+        V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+        
+        for b in range(min(B_fixed, 8)):  # Show up to 8 samples
+            m_b = mask_fixed[b].bool()
+            n_valid = int(m_b.sum().item())
+            
+            if n_valid < 5:
+                continue
+            
+            pred_N_b = x0_pred_normal[b, m_b]
+            pred_Z_b = x0_pred_zero[b, m_b]
+            tgt_b = V_tgt_c[b, m_b]
+            
+            rms_pred_N = pred_N_b.pow(2).mean().sqrt().item()
+            rms_pred_Z = pred_Z_b.pow(2).mean().sqrt().item()
+            rms_tgt_b = tgt_b.pow(2).mean().sqrt().item()
+            
+            diff_b = (pred_N_b - pred_Z_b).pow(2).mean().sqrt().item()
+            rel_diff_b = diff_b / max(rms_pred_N, 1e-8)
+            scale_N_b = rms_pred_N / max(rms_tgt_b, 1e-8)
+            
+            indicator = ""
+            if rel_diff_b < 0.02:
+                indicator = "⚠️ H ignored"
+            elif rel_diff_b > 0.15:
+                indicator = "✓ H matters"
+            
+            print(f"  {b:8d} | {n_valid:8d} | {rms_pred_N:10.4f} | {rms_pred_Z:10.4f} | {rel_diff_b:10.4f} | {scale_N_b:8.4f} {indicator}")
+        
+        print()
+        print(f"  If rel_diff varies a lot across samples:")
+        print(f"    → Some samples may have more informative H than others")
+        print(f"  If rel_diff is uniformly low:")
+        print(f"    → Systematic issue with H conditioning pathway")
+
         
         # Restore RNG state
         torch.set_rng_state(rng_state)
