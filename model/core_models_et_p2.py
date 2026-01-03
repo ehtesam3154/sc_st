@@ -2284,6 +2284,7 @@ def train_stageC_diffusion_generator(
         'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
         'gram': 2.0,           # was 1.0
         'gram_scale': 2.0,     # was 1.0
+        'out_scale': 0.5,
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -2346,7 +2347,7 @@ def train_stageC_diffusion_generator(
         'epoch': [],
         'batch_losses': [],
         'epoch_avg': {
-            'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'heat': [],
+            'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
             'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],  # ADD THESE
             'dim': [], 'triangle': [], 'radial': [],
@@ -3590,6 +3591,7 @@ def train_stageC_diffusion_generator(
             # Initialize other losses
             L_gram = torch.tensor(0.0, device=device)
             L_gram_scale = torch.tensor(0.0, device=device)
+            L_out_scale = torch.tensor(0.0, device=device)  # NEW: Learned-branch scale calibration
             L_knn_nca = torch.tensor(0.0, device=device)
             L_heat = torch.tensor(0.0, device=device)
             L_sw_st = torch.tensor(0.0, device=device)
@@ -3961,6 +3963,92 @@ def train_stageC_diffusion_generator(
 
                         # Use the same weighted approach to avoid divergence
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
+
+                        # ==================== LEARNED-BRANCH SCALE CALIBRATION (Action 1) ====================
+                        # This penalizes the LEARNED contribution (V_out = V_hat - c_skip * V_c)
+                        # specifically at high σ where the learned term must carry the output scale.
+                        # 
+                        # Key insight from A/B tests: out/tgt ratio stays too low at high σ because
+                        # L_gram_scale operates on total output, not the learned branch specifically.
+                        #
+                        # NOTE: This loss should NOT be gated by cond_only (conditional dropout).
+                        # The shrink solution is a parameterization issue that exists regardless of conditioning.
+                        if use_edm and WEIGHTS.get('out_scale', 0) > 0:
+                            # Get EDM preconditioning scalars for this batch
+                            # sigma_flat is already defined above as sigma_t.view(-1)
+                            c_skip_batch, c_out_batch, c_in_batch, _ = uet.edm_precond(sigma_flat, sigma_data)
+                            # c_skip_batch, c_out_batch, c_in_batch: (B, 1, 1)
+                            
+                            # V_c is the centered noisy input - must match forward_edm exactly
+                            # forward_edm does: x_c, _ = uet.center_only(x, mask)
+                            V_c_batch, _ = uet.center_only(V_t, mask)  # (B, N, D)
+                            
+                            # Learned contribution: V_out = V_hat - c_skip * V_c
+                            # This is c_out * F_x in the EDM decomposition
+                            # V_geom is already the centered prediction from earlier in this block
+                            V_out = V_geom - c_skip_batch * V_c_batch  # (B, N, D)
+                            V_out = V_out * m_float  # Apply mask
+                            
+                            # Compute RMS of V_out (learned branch) per sample
+                            valid_count_per_sample = m_float.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
+                            sq_sum_out = (V_out.pow(2) * m_float).sum(dim=(1, 2))  # (B,)
+                            rms_out = (sq_sum_out / valid_count_per_sample).sqrt()  # (B,)
+                            
+                            # Compute RMS of V_target (centered) - reuse V_target_batch if available
+                            # Otherwise compute it fresh
+                            if 'V_target_batch' in dir() and V_target_batch is not None:
+                                V_tgt_for_out = V_target_batch
+                            else:
+                                V_tgt_for_out, _ = uet.center_only(V_target, mask)
+                                V_tgt_for_out = V_tgt_for_out * m_float
+                            
+                            sq_sum_tgt = (V_tgt_for_out.pow(2) * m_float).sum(dim=(1, 2))  # (B,)
+                            rms_tgt_out = (sq_sum_tgt / valid_count_per_sample).sqrt()  # (B,)
+                            
+                            # Log-scale loss: penalize when learned branch is under-scaled
+                            log_ratio_out = torch.log(rms_out.clamp(min=1e-8)) - torch.log(rms_tgt_out.clamp(min=1e-8))  # (B,)
+                            
+                            # High-σ gate ONLY: (1 - c_skip)^2
+                            # This makes the loss near-zero at low σ (where c_skip ≈ 1)
+                            # and near-1 at high σ (where c_skip → 0)
+                            # NO cond_only gating - this loss should apply regardless of conditional dropout
+                            c_skip_1d = c_skip_batch.view(-1)  # (B,)
+                            gate_hi = (1.0 - c_skip_1d).pow(2)  # (B,)
+                            
+                            # Apply mask validity only (no cond_only)
+                            # gate_hi is already per-sample; we sum and normalize
+                            gate_sum_out = gate_hi.sum().clamp(min=1.0)
+                            
+                            # Compute weighted loss
+                            L_out_scale = ((log_ratio_out ** 2) * gate_hi).sum() / gate_sum_out
+                            
+                            # Debug logging - use variables that are in scope
+                            if global_step % 100 == 0 and ((fabric is None) or (hasattr(fabric, 'is_global_zero') and fabric.is_global_zero)):
+                                with torch.no_grad():
+                                    # Per-sigma bin analysis of out/tgt ratio
+                                    sigma_vals = sigma_flat  # Already in scope from EDM branch
+                                    sigma_bins_out = [(0.0, 0.1), (0.1, 0.4), (0.4, 0.7), (0.7, 1.2), (1.2, 2.4), (2.4, float('inf'))]
+                                    print(f"\n[DEBUG-OUT-SCALE] Step {global_step} - Learned-branch scale analysis:")
+                                    print(f"  {'σ-bin':>15} | {'n':>4} | {'out/tgt':>8} | {'c_skip':>8} | {'gate_hi':>8}")
+                                    print(f"  {'-'*15} | {'-'*4} | {'-'*8} | {'-'*8} | {'-'*8}")
+                                    
+                                    for lo, hi in sigma_bins_out:
+                                        in_bin = (sigma_vals >= lo) & (sigma_vals < hi)
+                                        if in_bin.any():
+                                            n_bin = in_bin.sum().item()
+                                            out_tgt_bin = (rms_out[in_bin] / rms_tgt_out[in_bin].clamp(min=1e-8)).mean().item()
+                                            c_skip_bin = c_skip_1d[in_bin].mean().item()
+                                            gate_hi_bin = gate_hi[in_bin].mean().item()
+                                            
+                                            bin_label = f"[{lo:.1f}, {hi:.1f})"
+                                            print(f"  {bin_label:>15} | {n_bin:>4} | {out_tgt_bin:>8.4f} | {c_skip_bin:>8.4f} | {gate_hi_bin:>8.4f}")
+                                    
+                                    print(f"\n  L_out_scale = {L_out_scale.item():.6f}")
+                                    print(f"  Expected: out/tgt should approach 1.0 at high σ (σ ≥ 0.7)")
+                        else:
+                            L_out_scale = torch.tensor(0.0, device=device)
+
+
 
 
                     # --- DEBUG: Per-σ-bin Gram loss verification ---
@@ -5222,6 +5310,7 @@ def train_stageC_diffusion_generator(
             L_total = (WEIGHTS['score'] * score_multiplier * L_score +
                     WEIGHTS['gram'] * L_gram +
                     WEIGHTS['gram_scale'] * L_gram_scale +
+                    WEIGHTS.get('out_scale', 0) * L_out_scale +
                     WEIGHTS['heat'] * L_heat +
                     WEIGHTS['sw_st'] * L_sw_st +
                     WEIGHTS['sw_sc'] * L_sw_sc +
@@ -5636,6 +5725,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['st_dist'] += L_st_dist.item()
             epoch_losses['gram'] += L_gram.item()
             epoch_losses['gram_scale'] += L_gram_scale.item()
+            epoch_losses['out_scale'] += L_out_scale.item()
             epoch_losses['knn_nca'] += L_knn_nca.item()
             epoch_losses['heat'] += L_heat.item()
             epoch_losses['sw_st'] += L_sw_st.item()
@@ -5719,8 +5809,9 @@ def train_stageC_diffusion_generator(
                     
                     H_fixed = context_encoder(Z_fixed, mask_fixed)
                     
-                    print(f"  {'σ':>8} | {'scale_r':>8} | {'trace_r':>8} | {'Jacc@10':>8} | {'SC':>6}")
-                    print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*6}")
+                    print(f"  {'σ':>8} | {'scale_r':>8} | {'trace_r':>8} | {'out/tgt':>8} | {'Jacc@10':>8} | {'SC':>6}")
+                    print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*6}")
+
                     
                     # Use fixed seed for reproducible noise across epochs
                     rng_state = torch.get_rng_state()
@@ -5806,9 +5897,32 @@ def train_stageC_diffusion_generator(
                                         jaccard_count += 1
                             
                             jaccard_mean = jaccard_sum / max(jaccard_count, 1)
-                            
+
+
+                            # Compute out/tgt (learned branch scale ratio)
+                            # Compute out/tgt (learned branch scale ratio)
+                            # Recompute EDM preconditioning for this sigma value
+                            c_skip_fb, c_out_fb, _, _ = uet.edm_precond(sigma_fixed, sigma_data)
+                            # c_skip_fb: (B, 1, 1)
+
+                            # V_c (centered noisy input) - same as forward_edm does
+                            V_c_fb, _ = uet.center_only(V_t_fixed, mask_fixed)
+                            V_c_fb = V_c_fb * mask_f_eval
+
+                            # Learned contribution: V_out = V_pred_centered - c_skip * V_c
+                            # V_pred_c is already computed above
+                            V_out_fb = V_pred_c - c_skip_fb * V_c_fb
+                            V_out_fb = V_out_fb * mask_f_eval
+
+                            # RMS of learned branch and target
+                            rms_out_fb = (V_out_fb.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt()
+                            # rms_tgt is already computed above as rms_tgt from V_tgt_c
+                            out_tgt_ratio = (rms_out_fb / rms_tgt.clamp(min=1e-8)).item()
+
                             sc_label = "SC" if sc_mode == 'with_sc' else "NO"
-                            print(f"  {sigma_val:8.3f} | {scale_ratio:8.3f} | {trace_ratio:8.3f} | {jaccard_mean:8.3f} | {sc_label:>6}")
+                            print(f"  {sigma_val:8.3f} | {scale_ratio:8.3f} | {trace_ratio:8.3f} | {out_tgt_ratio:8.3f} | {jaccard_mean:8.3f} | {sc_label:>6}")
+
+
                     
                     # Restore RNG state
                     torch.set_rng_state(rng_state)
@@ -5947,6 +6061,7 @@ def train_stageC_diffusion_generator(
             # Print detailed losses every 5 epochs, simple summary otherwise
             if (epoch + 1) % 5 == 0:
                 avg_gram_scale = epoch_losses['gram_scale'] / max(n_batches, 1)
+                avg_out_scale = epoch_losses['out_scale'] / max(n_batches, 1)
                 avg_heat = epoch_losses['heat'] / max(n_batches, 1)
                 avg_sw_st = epoch_losses['sw_st'] / max(n_batches, 1)
                 avg_sw_sc = epoch_losses['sw_sc'] / max(n_batches, 1)
@@ -5967,7 +6082,7 @@ def train_stageC_diffusion_generator(
                 avg_subspace = epoch_losses['subspace'] / max(n_batches, 1)
 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
-                print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f}")
+                print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f} | out_scale={avg_out_scale:.4f}")
                 print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f} | knn_nca={avg_knn_nca:.4f}")
                 print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
