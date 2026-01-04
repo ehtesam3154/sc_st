@@ -2284,7 +2284,8 @@ def train_stageC_diffusion_generator(
         'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
         'gram': 2.0,           # was 1.0
         'gram_scale': 2.0,     # was 1.0
-        'out_scale': 0.5,
+        'out_scale': 1.0,
+        'gram_learn': 1.0,
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -2347,7 +2348,8 @@ def train_stageC_diffusion_generator(
         'epoch': [],
         'batch_losses': [],
         'epoch_avg': {
-            'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 'heat': [],
+            'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 
+            'gram_learn': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
             'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],  # ADD THESE
             'dim': [], 'triangle': [], 'radial': [],
@@ -2741,7 +2743,13 @@ def train_stageC_diffusion_generator(
 
                 # === EDM: sample sigma from log-normal ===
                 if use_edm:
-                    sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
+                    # sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
+                    sigma = uet.sample_sigma_lognormal_stratified(
+                        batch_size_real, P_mean, P_std,
+                        high_sigma_fraction=0.4,  # 25% of batch guaranteed high-σ
+                        high_sigma_threshold=0.5,  # σ >= 0.5 is "high"
+                        device=device
+                    )
                     sigma = sigma.clamp(sigma_min, sigma_refine_max)
                     sigma_t = sigma.view(-1, 1, 1)
 
@@ -3592,6 +3600,7 @@ def train_stageC_diffusion_generator(
             L_gram = torch.tensor(0.0, device=device)
             L_gram_scale = torch.tensor(0.0, device=device)
             L_out_scale = torch.tensor(0.0, device=device)  # NEW: Learned-branch scale calibration
+            L_gram_learn = torch.tensor(0.0, device=device)  # ACTION 4: Learned-branch geom emphasis
             L_knn_nca = torch.tensor(0.0, device=device)
             L_heat = torch.tensor(0.0, device=device)
             L_sw_st = torch.tensor(0.0, device=device)
@@ -3875,6 +3884,102 @@ def train_stageC_diffusion_generator(
                     L_gram_diag = (diag_rel * geo_gate).sum() / gate_sum
                     L_gram = L_gram_offdiag + 0.5 * L_gram_diag
 
+                    # ==================== ACTION 4 (FINAL): TRUE LEARNED-BRANCH GEOMETRY ====================
+                    # Fixes applied:
+                    # 1. Compute Gram from V_out (not V_hat) - TRUE learned-branch supervision
+                    # 2. Tight σ gate: c_skip < 0.05 corresponds to σ > 0.73 (the actual shrink regime)
+                    # 3. Compensate c_out gradient damping with 1/c_out² (clamped)
+                    # 4. Full-batch weighted (no boolean indexing) for DDP stability
+                    
+                    if use_edm and WEIGHTS.get('gram_learn', 0) > 0:
+                        with torch.autocast(device_type='cuda', enabled=False):
+                            # Get preconditioning scalars
+                            sigma_flat_gl = sigma_t.view(-1).float()
+                            c_skip_gl, c_out_gl, _, _ = uet.edm_precond(sigma_flat_gl, sigma_data)
+                            c_skip_1d = c_skip_gl.view(-1)  # (B,)
+                            c_out_1d = c_out_gl.view(-1).clamp(min=1e-6)  # (B,)
+                            
+                            # Centered noisy input (same as forward_edm)
+                            V_c_gl, _ = uet.center_only(V_t, mask)  # (B, N, D)
+                            
+                            # LEARNED BRANCH OUTPUT: V_out = V_hat_centered - c_skip * V_c
+                            V_out_gl = (V_geom - c_skip_gl * V_c_gl) * m_float  # (B, N, D)
+                            
+                            # CORRECT TARGET for learned branch: x0_centered - c_skip * x_c
+                            V_tgt_c_gl, _ = uet.center_only(V_target, mask)
+                            V_out_tgt_gl = (V_tgt_c_gl - c_skip_gl * V_c_gl) * m_float  # (B, N, D)
+                            
+                            # FIX 2: TIGHT HIGH-σ SELECTION (c_skip < 0.05 → σ > 0.73)
+                            sel = (c_skip_1d < 0.05).float()  # (B,)
+                            
+                            # Smooth weight within selected regime
+                            w_gl = sel * (1.0 - c_skip_1d).pow(2)  # (B,)
+                            
+                            # FIX 3: COMPENSATE c_out GRADIENT DAMPING
+                            # At high σ, c_out ≈ 0.165, so 1/c_out² ≈ 36
+                            # Clamp to avoid explosion at very high σ
+                            inv_cout2 = (1.0 / c_out_1d.pow(2)).clamp(max=64.0)
+                            w_gl = w_gl * inv_cout2  # (B,)
+                            
+                            # FIX 4: FULL-BATCH WEIGHTED (no boolean indexing)
+                            # Compute Gram on V_out for ENTIRE batch
+                            G_out_pred = V_out_gl @ V_out_gl.transpose(1, 2)  # (B, N, N)
+                            G_out_tgt = V_out_tgt_gl @ V_out_tgt_gl.transpose(1, 2)  # (B, N, N)
+                            
+                            # Valid pair mask
+                            MM_gl = (m_bool.unsqueeze(-1) & m_bool.unsqueeze(-2)).float()  # (B, N, N)
+                            eye_gl = torch.eye(G_out_pred.shape[1], device=device).unsqueeze(0)
+                            P_off_gl = MM_gl * (1.0 - eye_gl)  # Off-diagonal pairs
+                            
+                            # Per-sample off-diagonal loss
+                            pair_cnt_gl = P_off_gl.sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
+                            num_gl = ((G_out_pred - G_out_tgt).pow(2) * P_off_gl).sum(dim=(1, 2)) / pair_cnt_gl
+                            den_gl = (G_out_tgt.pow(2) * P_off_gl).sum(dim=(1, 2)) / pair_cnt_gl
+                            
+                            den_med_gl = den_gl.detach().median().clamp_min(1e-12)
+                            den_gl = den_gl.clamp_min(0.05 * den_med_gl)
+                            loss_off_gl = num_gl / den_gl  # (B,)
+                            
+                            # Per-sample diagonal loss
+                            diag_p_gl = torch.diagonal(G_out_pred, dim1=-2, dim2=-1)  # (B, N)
+                            diag_t_gl = torch.diagonal(G_out_tgt, dim1=-2, dim2=-1)   # (B, N)
+                            m1_gl = m_bool.float()  # (B, N)
+                            den_d_gl = (diag_t_gl.pow(2) * m1_gl).sum(dim=-1).clamp_min(1e-8)  # (B,)
+                            loss_d_gl = ((diag_p_gl - diag_t_gl).pow(2) * m1_gl).sum(dim=-1) / den_d_gl  # (B,)
+                            
+                            # Combined per-sample loss
+                            per_sample_gl = loss_off_gl + 0.5 * loss_d_gl  # (B,)
+                            
+                            # Weighted average (w=0 for samples not in high-σ regime)
+                            wsum_gl = w_gl.sum().clamp_min(1.0)
+                            L_gram_learn = (per_sample_gl * w_gl).sum() / wsum_gl
+                            
+                            # Debug logging
+                            if global_step % 100 == 0 and ((fabric is None) or (hasattr(fabric, 'is_global_zero') and fabric.is_global_zero)):
+                                with torch.no_grad():
+                                    n_selected = (sel > 0).sum().item()
+                                    
+                                    # Gram trace ratio for V_out (only selected samples)
+                                    if n_selected > 0:
+                                        tr_pred_gl = (G_out_pred.diagonal(dim1=1, dim2=2) * m1_gl).sum(dim=1)
+                                        tr_tgt_gl = (G_out_tgt.diagonal(dim1=1, dim2=2) * m1_gl).sum(dim=1)
+                                        tr_ratio_gl = (tr_pred_gl / tr_tgt_gl.clamp(min=1e-8))
+                                        tr_ratio_selected = tr_ratio_gl[sel > 0].mean().item()
+                                    else:
+                                        tr_ratio_selected = float('nan')
+                                    
+                                    print(f"\n[ACTION4-FINAL] Step {global_step}:")
+                                    print(f"  Selected {n_selected}/{len(sel)} samples (c_skip < 0.05, i.e. σ > ~0.73)")
+                                    print(f"  V_out Gram trace ratio (selected): {tr_ratio_selected:.4f} (want → 1.0)")
+                                    print(f"  Mean 1/c_out² (selected): {inv_cout2[sel > 0].mean().item() if n_selected > 0 else 0:.2f}")
+                                    print(f"  L_gram_learn = {L_gram_learn.item():.6f}")
+                    else:
+                        L_gram_learn = torch.tensor(0.0, device=device)
+                    # ==================== END ACTION 4 (FINAL) ====================
+
+
+
+
 
                     # --- [DEBUG] Log Gram Gate Hit-Rate ---
                     if global_step % 10 == 0:
@@ -3964,91 +4069,108 @@ def train_stageC_diffusion_generator(
                         # Use the same weighted approach to avoid divergence
                         L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
 
-                        # ==================== LEARNED-BRANCH SCALE CALIBRATION (Action 1) ====================
-                        # This penalizes the LEARNED contribution (V_out = V_hat - c_skip * V_c)
-                        # specifically at high σ where the learned term must carry the output scale.
-                        # 
-                        # Key insight from A/B tests: out/tgt ratio stays too low at high σ because
-                        # L_gram_scale operates on total output, not the learned branch specifically.
+                        # ==================== LEARNED-BRANCH SCALE CALIBRATION (FIXED) ====================
+                        # FIX 1: Use CORRECT RESIDUAL TARGET for the learned branch
+                        #   Correct: V_out_tgt = x0_c - c_skip * x_c (not just x0_c)
+                        # FIX 2: Supervise in F_x SPACE to remove c_out gradient bottleneck
+                        #   Instead of supervising V_out = c_out * F_x, supervise F_x = V_out / c_out
+                        # FIX 3: Gate activates earlier (c_skip < 0.25) since shrink starts at σ ≈ 0.3-0.4
                         #
-                        # NOTE: This loss should NOT be gated by cond_only (conditional dropout).
-                        # The shrink solution is a parameterization issue that exists regardless of conditioning.
+                        # Why this fixes the stuck ~0.6 ratio:
+                        # - Old: gradients to F_x were scaled by c_out (~0.165), too weak to climb
+                        # - New: gradients hit F_x directly with full strength
+                        
                         if use_edm and WEIGHTS.get('out_scale', 0) > 0:
-                            # Get EDM preconditioning scalars for this batch
-                            # sigma_flat is already defined above as sigma_t.view(-1)
-                            c_skip_batch, c_out_batch, c_in_batch, _ = uet.edm_precond(sigma_flat, sigma_data)
-                            # c_skip_batch, c_out_batch, c_in_batch: (B, 1, 1)
-                            
-                            # V_c is the centered noisy input - must match forward_edm exactly
-                            # forward_edm does: x_c, _ = uet.center_only(x, mask)
-                            V_c_batch, _ = uet.center_only(V_t, mask)  # (B, N, D)
-                            
-                            # Learned contribution: V_out = V_hat - c_skip * V_c
-                            # This is c_out * F_x in the EDM decomposition
-                            # V_geom is already the centered prediction from earlier in this block
-                            V_out = V_geom - c_skip_batch * V_c_batch  # (B, N, D)
-                            V_out = V_out * m_float  # Apply mask
-                            
-                            # Compute RMS of V_out (learned branch) per sample
-                            valid_count_per_sample = m_float.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
-                            sq_sum_out = (V_out.pow(2) * m_float).sum(dim=(1, 2))  # (B,)
-                            rms_out = (sq_sum_out / valid_count_per_sample).sqrt()  # (B,)
-                            
-                            # Compute RMS of V_target (centered) - reuse V_target_batch if available
-                            # Otherwise compute it fresh
-                            if 'V_target_batch' in dir() and V_target_batch is not None:
-                                V_tgt_for_out = V_target_batch
-                            else:
-                                V_tgt_for_out, _ = uet.center_only(V_target, mask)
-                                V_tgt_for_out = V_tgt_for_out * m_float
-                            
-                            sq_sum_tgt = (V_tgt_for_out.pow(2) * m_float).sum(dim=(1, 2))  # (B,)
-                            rms_tgt_out = (sq_sum_tgt / valid_count_per_sample).sqrt()  # (B,)
-                            
-                            # Log-scale loss: penalize when learned branch is under-scaled
-                            log_ratio_out = torch.log(rms_out.clamp(min=1e-8)) - torch.log(rms_tgt_out.clamp(min=1e-8))  # (B,)
-                            
-                            # High-σ gate ONLY: (1 - c_skip)^2
-                            # This makes the loss near-zero at low σ (where c_skip ≈ 1)
-                            # and near-1 at high σ (where c_skip → 0)
-                            # NO cond_only gating - this loss should apply regardless of conditional dropout
-                            c_skip_1d = c_skip_batch.view(-1)  # (B,)
-                            gate_hi = (1.0 - c_skip_1d).pow(2)  # (B,)
-                            
-                            # Apply mask validity only (no cond_only)
-                            # gate_hi is already per-sample; we sum and normalize
-                            gate_sum_out = gate_hi.sum().clamp(min=1.0)
-                            
-                            # Compute weighted loss
-                            L_out_scale = ((log_ratio_out ** 2) * gate_hi).sum() / gate_sum_out
-                            
-                            # Debug logging - use variables that are in scope
-                            if global_step % 100 == 0 and ((fabric is None) or (hasattr(fabric, 'is_global_zero') and fabric.is_global_zero)):
-                                with torch.no_grad():
-                                    # Per-sigma bin analysis of out/tgt ratio
-                                    sigma_vals = sigma_flat  # Already in scope from EDM branch
-                                    sigma_bins_out = [(0.0, 0.1), (0.1, 0.4), (0.4, 0.7), (0.7, 1.2), (1.2, 2.4), (2.4, float('inf'))]
-                                    print(f"\n[DEBUG-OUT-SCALE] Step {global_step} - Learned-branch scale analysis:")
-                                    print(f"  {'σ-bin':>15} | {'n':>4} | {'out/tgt':>8} | {'c_skip':>8} | {'gate_hi':>8}")
-                                    print(f"  {'-'*15} | {'-'*4} | {'-'*8} | {'-'*8} | {'-'*8}")
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                sigma_flat_f = sigma_flat.float()
+                                c_skip_b, c_out_b, c_in_b, _ = uet.edm_precond(sigma_flat_f, sigma_data)
+                                # c_skip_b, c_out_b: (B, 1, 1)
+                                
+                                # Center noisy input and clean target in the SAME way as V_geom
+                                # V_geom is already centered(x0_pred) from the global geometry block
+                                x_c, _ = uet.center_only(V_t, mask)       # Centered noisy input
+                                x0_c, _ = uet.center_only(V_target, mask)  # Centered clean target
+                                
+                                # V_geom = centered(x0_pred) is already computed above
+                                x0_pred_c = V_geom  # (B, N, D)
+                                
+                                # CORRECT learned contribution (centered): c_out * F_x = x0_pred - c_skip * x_c
+                                V_out_pred = (x0_pred_c - c_skip_b * x_c) * m_float
+                                
+                                # CORRECT target for learned contribution: x0 - c_skip * x_c
+                                V_out_tgt = (x0_c - c_skip_b * x_c) * m_float
+                                
+                                # FIX 3: Gate on c_skip (data-driven), not σ directly
+                                # Shrink starts at σ ≈ 0.3-0.4, which corresponds to c_skip ≈ 0.2-0.3
+                                # Use earlier activation threshold
+                                c_skip_1d = c_skip_b.view(-1)  # (B,)
+                                hi = (c_skip_1d < 0.25)  # Select high-σ samples (where c_skip is small)
+                                
+                                if hi.any():
+                                    # FIX 2: Convert to F_x space to remove c_out gradient bottleneck
+                                    # F_x = V_out / c_out (this removes the c_out multiplier from gradients)
+                                    c_out_hi = c_out_b[hi].clamp(min=1e-6)  # (Bhi, 1, 1), safe division
                                     
-                                    for lo, hi in sigma_bins_out:
-                                        in_bin = (sigma_vals >= lo) & (sigma_vals < hi)
-                                        if in_bin.any():
-                                            n_bin = in_bin.sum().item()
-                                            out_tgt_bin = (rms_out[in_bin] / rms_tgt_out[in_bin].clamp(min=1e-8)).mean().item()
-                                            c_skip_bin = c_skip_1d[in_bin].mean().item()
-                                            gate_hi_bin = gate_hi[in_bin].mean().item()
-                                            
-                                            bin_label = f"[{lo:.1f}, {hi:.1f})"
-                                            print(f"  {bin_label:>15} | {n_bin:>4} | {out_tgt_bin:>8.4f} | {c_skip_bin:>8.4f} | {gate_hi_bin:>8.4f}")
+                                    Fx_pred = V_out_pred[hi] / c_out_hi  # (Bhi, N, D)
+                                    Fx_tgt = V_out_tgt[hi] / c_out_hi    # (Bhi, N, D)
                                     
-                                    print(f"\n  L_out_scale = {L_out_scale.item():.6f}")
-                                    print(f"  Expected: out/tgt should approach 1.0 at high σ (σ ≥ 0.7)")
+                                    # RMS per-sample (mask-aware)
+                                    mf_hi = m_float[hi]  # (Bhi, N, 1)
+                                    denom_pts = mf_hi.sum(dim=(1, 2)).clamp(min=1.0)  # (Bhi,)
+                                    
+                                    # Mean square per sample
+                                    ms_pred = (Fx_pred.pow(2) * mf_hi).sum(dim=(1, 2)) / denom_pts  # (Bhi,)
+                                    ms_tgt = (Fx_tgt.pow(2) * mf_hi).sum(dim=(1, 2)) / denom_pts    # (Bhi,)
+                                    
+                                    rms_pred = ms_pred.sqrt()
+                                    rms_tgt = ms_tgt.sqrt()
+                                    
+                                    # Log-ratio loss in F_x space
+                                    log_ratio_fx = torch.log(rms_pred + 1e-8) - torch.log(rms_tgt + 1e-8)
+                                    
+                                    # Smooth weighting within the selected hi set using (1 - c_skip)^2
+                                    gate_w = (1.0 - c_skip_1d[hi]).pow(2)  # (Bhi,)
+                                    L_out_scale = ((log_ratio_fx ** 2) * gate_w).sum() / gate_w.sum().clamp(min=1.0)
+                                else:
+                                    L_out_scale = torch.tensor(0.0, device=device)
+                                
+                                # Debug logging with new metrics
+                                if global_step % 100 == 0 and ((fabric is None) or (hasattr(fabric, 'is_global_zero') and fabric.is_global_zero)):
+                                    with torch.no_grad():
+                                        # Compute Fx_pred/Fx_tgt for all samples (not just hi)
+                                        c_out_all = c_out_b.clamp(min=1e-6)
+                                        Fx_pred_all = V_out_pred / c_out_all
+                                        Fx_tgt_all = V_out_tgt / c_out_all
+                                        
+                                        denom_all = m_float.sum(dim=(1, 2)).clamp(min=1.0)
+                                        rms_fx_pred_all = ((Fx_pred_all.pow(2) * m_float).sum(dim=(1, 2)) / denom_all).sqrt()
+                                        rms_fx_tgt_all = ((Fx_tgt_all.pow(2) * m_float).sum(dim=(1, 2)) / denom_all).sqrt()
+                                        ratio_fx_all = rms_fx_pred_all / rms_fx_tgt_all.clamp(min=1e-8)
+                                        
+                                        sigma_vals = sigma_flat_f
+                                        sigma_bins_out = [(0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 1.2), (1.2, 2.4), (2.4, float('inf'))]
+                                        
+                                        print(f"\n[DEBUG-OUT-SCALE-FX] Step {global_step} - F_x space scale analysis:")
+                                        print(f"  {'σ-bin':>15} | {'n':>4} | {'Fx_pred/Fx_tgt':>14} | {'c_skip':>8} | {'selected':>8}")
+                                        print(f"  {'-'*15} | {'-'*4} | {'-'*14} | {'-'*8} | {'-'*8}")
+                                        
+                                        for lo, hi_bound in sigma_bins_out:
+                                            in_bin = (sigma_vals >= lo) & (sigma_vals < hi_bound)
+                                            if in_bin.any():
+                                                n_bin = in_bin.sum().item()
+                                                fx_ratio_bin = ratio_fx_all[in_bin].mean().item()
+                                                c_skip_bin = c_skip_1d[in_bin].mean().item()
+                                                # Check if these samples are in the 'hi' selection
+                                                n_selected = (in_bin & hi).sum().item()
+                                                
+                                                bin_label = f"[{lo:.2f}, {hi_bound:.2f})"
+                                                print(f"  {bin_label:>15} | {n_bin:>4} | {fx_ratio_bin:>14.4f} | {c_skip_bin:>8.4f} | {n_selected:>8}")
+                                        
+                                        print(f"\n  L_out_scale = {L_out_scale.item():.6f}")
+                                        print(f"  Gate threshold: c_skip < 0.25 (selected {hi.sum().item()}/{len(hi)} samples)")
+                                        print(f"  TARGET: Fx_pred/Fx_tgt should approach 1.0 at high σ")
                         else:
                             L_out_scale = torch.tensor(0.0, device=device)
-
-
 
 
                     # --- DEBUG: Per-σ-bin Gram loss verification ---
@@ -5311,6 +5433,7 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['gram'] * L_gram +
                     WEIGHTS['gram_scale'] * L_gram_scale +
                     WEIGHTS.get('out_scale', 0) * L_out_scale +
+                    WEIGHTS.get('gram_learn', 0) * L_gram_learn +
                     WEIGHTS['heat'] * L_heat +
                     WEIGHTS['sw_st'] * L_sw_st +
                     WEIGHTS['sw_sc'] * L_sw_sc +
@@ -6062,6 +6185,7 @@ def train_stageC_diffusion_generator(
             if (epoch + 1) % 5 == 0:
                 avg_gram_scale = epoch_losses['gram_scale'] / max(n_batches, 1)
                 avg_out_scale = epoch_losses['out_scale'] / max(n_batches, 1)
+                avg_gram_learn = epoch_losses['gram_learn'] / max(n_batches, 1)
                 avg_heat = epoch_losses['heat'] / max(n_batches, 1)
                 avg_sw_st = epoch_losses['sw_st'] / max(n_batches, 1)
                 avg_sw_sc = epoch_losses['sw_sc'] / max(n_batches, 1)
@@ -6082,7 +6206,7 @@ def train_stageC_diffusion_generator(
                 avg_subspace = epoch_losses['subspace'] / max(n_batches, 1)
 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
-                print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f} | out_scale={avg_out_scale:.4f}")
+                print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f} | out_scale={avg_out_scale:.4f} | gram_learn={avg_gram_learn:.4f}") 
                 print(f"  heat={avg_heat:.4f} | sw_st={avg_sw_st:.4f} | sw_sc={avg_sw_sc:.4f} | knn_nca={avg_knn_nca:.4f}")
                 print(f"  overlap={avg_overlap:.4f} | ordinal_sc={avg_ordinal_sc:.4f} | st_dist={avg_st_dist:.4f}")
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
