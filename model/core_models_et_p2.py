@@ -1922,12 +1922,51 @@ def train_stageC_diffusion_generator(
     )
     # optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-4)
 
+    def safe_loss(loss, name, max_val=100.0, global_step=0, verbose=True):
+        """Clamp loss and warn if it was extreme. Replace NaN/Inf with 0."""
+        if not torch.isfinite(loss):
+            if verbose and global_step % 10 == 0:
+                print(f"[SAFE-LOSS] {name} is {'NaN' if torch.isnan(loss) else 'Inf'} at step {global_step}, replacing with 0")
+            return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+        
+        if loss.abs() > max_val:
+            if verbose and global_step % 10 == 0:
+                print(f"[SAFE-LOSS] {name}={loss.item():.4f} exceeds {max_val}, clamping")
+            return loss.clamp(-max_val, max_val)
+        
+        return loss
+
     # PATCH 8C: Separate LR for generator (needs bigger LR due to small gradients)
     optimizer = torch.optim.AdamW([
         {"params": context_encoder.parameters(), "lr": lr},
         {"params": score_net.parameters(),       "lr": lr},
         {"params": generator.parameters(),       "lr": lr * 5.0},  # generator needs bigger LR
     ], weight_decay=1e-4)
+
+
+    # ==============================================================================
+    # ADAPTIVE QUANTILE GATES (dataset-independent)
+    # ==============================================================================
+    # These gates automatically learn thresholds based on noise distribution
+    # Uses c_skip-based noise metric: noise = -log(c_skip), normalized by sigma_data
+    # 
+    # Target rates:
+    #   - gram/gram_scale: 40-60% (global structure, more tolerant of noise)
+    #   - edge/nca: 15% (local features, need clean signal)
+    #   - learn_hi: 50% high-noise (for learned-branch geometry at high sigma)
+    
+    adaptive_gates = {
+        "gram": uet.AdaptiveQuantileGate(target_rate=0.50, mode="low", warmup_steps=200),
+        "gram_scale": uet.AdaptiveQuantileGate(target_rate=0.60, mode="low", warmup_steps=200),
+        "edge": uet.AdaptiveQuantileGate(target_rate=0.15, mode="low", warmup_steps=200),
+        "nca": uet.AdaptiveQuantileGate(target_rate=0.15, mode="low", warmup_steps=200),
+        "learn_hi": uet.AdaptiveQuantileGate(target_rate=0.50, mode="high", warmup_steps=200),
+    }
+    
+    print(f"[StageC] Initialized adaptive quantile gates:")
+    for name, gate in adaptive_gates.items():
+        print(f"  {name}: target_rate={gate.target_rate:.0%} mode={gate.mode}")
+
 
 
     # --- NEW: wrap models + optimizer for DDP ---    
@@ -2792,6 +2831,58 @@ def train_stageC_diffusion_generator(
                     t_norm = t_cont / (n_timesteps - 1)
                     sigma_t = sigmas[t_idx].view(-1, 1, 1)
 
+                # ==============================================================================
+                # COMPUTE NOISE METRIC FOR ADAPTIVE GATING
+                # ==============================================================================
+                # noise = -log(c_skip) where c_skip = sigma_data^2 / (sigma^2 + sigma_data^2)
+                # Higher noise score = noisier sample (c_skip closer to 0)
+                # This is dataset-independent because c_skip is normalized by sigma_data
+                
+                if use_edm:
+                    with torch.no_grad():
+                        sigma_flat = sigma_t.view(-1)  # (B,)
+                        c_skip_b = (sigma_data ** 2) / (sigma_flat ** 2 + sigma_data ** 2 + 1e-12)
+                        noise_score = -torch.log(c_skip_b + 1e-12)  # (B,) higher = noisier
+                        
+                        # Base gate from CFG dropout
+                        base_gate = cond_only.float()  # (B,) 1.0 when conditioned
+                        
+                        # Update gate controllers with eligible (conditioned) samples only
+                        eligible = base_gate > 0.5
+                        if eligible.any():
+                            adaptive_gates["gram"].update(noise_score[eligible])
+                            adaptive_gates["gram_scale"].update(noise_score[eligible])
+                            adaptive_gates["edge"].update(noise_score[eligible])
+                            adaptive_gates["nca"].update(noise_score[eligible])
+                            adaptive_gates["learn_hi"].update(noise_score[eligible])
+                else:
+                    # Fallback for non-EDM: use t_norm as noise proxy
+                    with torch.no_grad():
+                        noise_score = t_norm.view(-1)  # (B,)
+                        base_gate = cond_only.float()
+                        
+                        eligible = base_gate > 0.5
+                        if eligible.any():
+                            for gate in adaptive_gates.values():
+                                gate.update(noise_score[eligible])
+
+                # ==============================================================================
+                # BUILD ADAPTIVE GATES FOR EACH LOSS
+                # ==============================================================================
+                if use_edm:
+                    geo_gate_gram = adaptive_gates["gram"].gate(noise_score, base_gate)
+                    geo_gate_gram_scale = adaptive_gates["gram_scale"].gate(noise_score, base_gate)
+                    geo_gate_edge = adaptive_gates["edge"].gate(noise_score, base_gate)
+                    geo_gate_nca = adaptive_gates["nca"].gate(noise_score, base_gate)
+                    geo_gate_learn_hi = adaptive_gates["learn_hi"].gate(noise_score, base_gate)
+                else:
+                    # Fallback: just use cond_only for all
+                    geo_gate_gram = base_gate
+                    geo_gate_gram_scale = base_gate
+                    geo_gate_edge = base_gate
+                    geo_gate_nca = base_gate
+                    geo_gate_learn_hi = base_gate
+
                 if not is_sc:
                     # ST batch: Ground truth from Gram matrix
                     V_target_raw = batch['V_target'].to(device)
@@ -3166,26 +3257,30 @@ def train_stageC_diffusion_generator(
                                 svd_total = 0
                                 rot_traces = []
                                 
-                                for b in range(min(8, V_gen_prior.shape[0])):
+                                for b in range(min(4, V_gen_prior.shape[0])):
                                     mb = mask[b].bool()
                                     n_valid = int(mb.sum().item())
-                                    if n_valid < 3:
+                                    if n_valid < 2:
                                         continue
-                                    svd_total += 1
                                     X = V_gen_prior[b, mb].float()
-                                    Y = x0_pred_0_base[b, mb].float()
+                                    Y = x0_pred_0_diff[b, mb].float()
                                     X_c = X - X.mean(dim=0, keepdim=True)
                                     Y_c = Y - Y.mean(dim=0, keepdim=True)
                                     M = X_c.T @ Y_c
+                                    
+                                    # PATCH 1B: Skip non-finite
+                                    if not torch.isfinite(M).all():
+                                        continue
+                                    
                                     try:
-                                        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-                                        R = U @ Vh
-                                        tr = (R.trace() / R.shape[0]).item()
-                                        rot_traces.append(tr)
-                                        if tr < 0.9:  # Significant rotation needed
-                                            non_identity_count += 1
-                                    except Exception:
-                                        svd_exception_count += 1
+                                        # PATCH 1B: CPU SVD in double precision
+                                        M_cpu = M.detach().cpu().double()
+                                        U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(M_cpu, full_matrices=False)
+                                        R_cpu = U_cpu @ Vh_cpu
+                                        rot_traces.append((R_cpu.trace() / R_cpu.shape[0]).item())
+                                    except:
+                                        pass
+
                                 
                                 improvement = (1 - mse_after / mse_before.clamp(min=1e-8)) * 100
                                 
@@ -3215,16 +3310,24 @@ def train_stageC_diffusion_generator(
                                     if n_valid < 2:
                                         continue
                                     X = V_gen_prior[b, mb].float()
-                                    Y = x0_pred_0_diff[b, mb].float()  # Use PURE diffusion
+                                    Y = x0_pred_0_diff[b, mb].float()
                                     X_c = X - X.mean(dim=0, keepdim=True)
                                     Y_c = Y - Y.mean(dim=0, keepdim=True)
                                     M = X_c.T @ Y_c
+                                    
+                                    # PATCH 1B: Skip non-finite
+                                    if not torch.isfinite(M).all():
+                                        continue
+                                    
                                     try:
-                                        U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-                                        R = U @ Vh
-                                        rot_traces.append((R.trace() / R.shape[0]).item())
+                                        # PATCH 1B: CPU SVD in double precision
+                                        M_cpu = M.detach().cpu().double()
+                                        U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(M_cpu, full_matrices=False)
+                                        R_cpu = U_cpu @ Vh_cpu
+                                        rot_traces.append((R_cpu.trace() / R_cpu.shape[0]).item())
                                     except:
                                         pass
+
                                 if rot_traces:
                                     print(f"[DEBUG-FRAME] step={global_step} mean(tr(R)/D)={sum(rot_traces)/len(rot_traces):.4f} (1.0=no rotation needed)")
                         
@@ -3434,6 +3537,15 @@ def train_stageC_diffusion_generator(
                     # Final score loss: mean over batch of (w_b * err2_b)
                     L_score = (w * err2_sample).mean()
 
+                    # FIX 4: Check if L_score is the NaN source
+                    if not torch.isfinite(L_score):
+                        print(f"[NAN-SOURCE] L_score is NaN/Inf at step {global_step}")
+                        print(f"  sigma range: [{sigma_t.min().item():.4f}, {sigma_t.max().item():.4f}]")
+                        print(f"  x0_pred range: [{x0_pred.min().item():.4f}, {x0_pred.max().item():.4f}]")
+                        print(f"  V_target range: [{V_target.min().item():.4f}, {V_target.max().item():.4f}]")
+                        # L_score = torch.tensor(0.0, device=device)  # Replace with 0
+
+
                     # ========== PHASE 6: PER-SIGMA BIN ACCUMULATION ==========
                     # FIX: use sigma_bin_edges key, not sigma_bins (avoid re-init every step)
                     if edm_debug_state.get('sigma_bin_edges', None) is None:
@@ -3597,29 +3709,59 @@ def train_stageC_diffusion_generator(
                             debug_state['score_bin_cnt'][k] += m.sum()
             
             # Initialize other losses
-            L_gram = torch.tensor(0.0, device=device)
-            L_gram_scale = torch.tensor(0.0, device=device)
-            L_out_scale = torch.tensor(0.0, device=device)  # NEW: Learned-branch scale calibration
-            L_gram_learn = torch.tensor(0.0, device=device)  # ACTION 4: Learned-branch geom emphasis
-            L_knn_nca = torch.tensor(0.0, device=device)
-            L_heat = torch.tensor(0.0, device=device)
-            L_sw_st = torch.tensor(0.0, device=device)
-            L_sw_sc = torch.tensor(0.0, device=device)
-            L_overlap = torch.tensor(0.0, device=device)
-            L_ordinal_sc = torch.tensor(0.0, device=device)
-            L_st_dist = torch.tensor(0.0, device=device)
-            L_edm_tail = torch.tensor(0.0, device=device)
-            L_gen_align = torch.tensor(0.0, device=device)
-            L_dim = torch.zeros((), device=device)
-            L_triangle = torch.zeros((), device=device)
-            L_radial = torch.zeros((), device=device)
-            L_repel = torch.tensor(0.0, device=device)   # NEW: ST repulsion
-            L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
-            L_edge = torch.tensor(0.0, device=device)   # NEW: Edge-length loss
-            L_topo = torch.tensor(0.0, device=device)   # NEW: Topology loss  
-            L_shape_spec = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
-            L_subspace = torch.tensor(0.0, device=device)
-            L_gen_scale = torch.tensor(0.0, device=device)
+            # Safe loss wrapper - apply to ALL losses before using them
+            L_gram = safe_loss(L_gram, "L_gram", max_val=50.0, global_step=global_step)
+            L_gram_scale = safe_loss(L_gram_scale, "L_gram_scale", max_val=50.0, global_step=global_step)
+            L_out_scale = safe_loss(L_out_scale, "L_out_scale", max_val=50.0, global_step=global_step)
+            L_gram_learn = safe_loss(L_gram_learn, "L_gram_learn", max_val=50.0, global_step=global_step)
+            L_knn_nca = safe_loss(L_knn_nca, "L_knn_nca", max_val=50.0, global_step=global_step)
+            L_heat = safe_loss(L_heat, "L_heat", max_val=50.0, global_step=global_step)
+            L_sw_st = safe_loss(L_sw_st, "L_sw_st", max_val=50.0, global_step=global_step)
+            L_sw_sc = safe_loss(L_sw_sc, "L_sw_sc", max_val=50.0, global_step=global_step)
+            L_overlap = safe_loss(L_overlap, "L_overlap", max_val=50.0, global_step=global_step)
+            L_ordinal_sc = safe_loss(L_ordinal_sc, "L_ordinal_sc", max_val=50.0, global_step=global_step)
+            L_st_dist = safe_loss(L_st_dist, "L_st_dist", max_val=50.0, global_step=global_step)
+            L_edm_tail = safe_loss(L_edm_tail, "L_edm_tail", max_val=50.0, global_step=global_step)
+            L_gen_align = safe_loss(L_gen_align, "L_gen_align", max_val=50.0, global_step=global_step)
+            L_dim = safe_loss(L_dim, "L_dim", max_val=50.0, global_step=global_step)
+            L_triangle = safe_loss(L_triangle, "L_triangle", max_val=50.0, global_step=global_step)
+            L_radial = safe_loss(L_radial, "L_radial", max_val=50.0, global_step=global_step)
+            L_repel = safe_loss(L_repel, "L_repel", max_val=50.0, global_step=global_step)
+            L_shape = safe_loss(L_shape, "L_shape", max_val=50.0, global_step=global_step)
+            L_edge = safe_loss(L_edge, "L_edge", max_val=50.0, global_step=global_step)
+            L_topo = safe_loss(L_topo, "L_topo", max_val=50.0, global_step=global_step)
+            L_shape_spec = safe_loss(L_shape_spec, "L_shape_spec", max_val=50.0, global_step=global_step)
+            L_subspace = safe_loss(L_subspace, "L_subspace", max_val=50.0, global_step=global_step)
+            L_gen_scale = safe_loss(L_gen_scale, "L_gen_scale", max_val=50.0, global_step=global_step)
+
+            # L_gram = safe_loss(L_gram, "L_gram", max_val=50.0, global_step=global_step)
+            # L_gram_scale = safe_loss(L_gram_scale, "L_gram_scale", max_val=50.0, global_step=global_step)
+            # L_edge = safe_loss(L_edge, "L_edge", max_val=50.0, global_step=global_step)
+            # L_knn_nca = safe_loss(L_knn_nca, "L_knn_nca", max_val=50.0, global_step=global_step)
+
+            # L_gram = torch.tensor(0.0, device=device)
+            # L_gram_scale = torch.tensor(0.0, device=device)
+            # L_out_scale = torch.tensor(0.0, device=device)  # NEW: Learned-branch scale calibration
+            # L_gram_learn = torch.tensor(0.0, device=device)  # ACTION 4: Learned-branch geom emphasis
+            # L_knn_nca = torch.tensor(0.0, device=device)
+            # L_heat = torch.tensor(0.0, device=device)
+            # L_sw_st = torch.tensor(0.0, device=device)
+            # L_sw_sc = torch.tensor(0.0, device=device)
+            # L_overlap = torch.tensor(0.0, device=device)
+            # L_ordinal_sc = torch.tensor(0.0, device=device)
+            # L_st_dist = torch.tensor(0.0, device=device)
+            # L_edm_tail = torch.tensor(0.0, device=device)
+            # L_gen_align = torch.tensor(0.0, device=device)
+            # L_dim = torch.zeros((), device=device)
+            # L_triangle = torch.zeros((), device=device)
+            # L_radial = torch.zeros((), device=device)
+            # L_repel = torch.tensor(0.0, device=device)   # NEW: ST repulsion
+            # L_shape = torch.tensor(0.0, device=device)   # NEW: ST shape/anisotropy
+            # L_edge = torch.tensor(0.0, device=device)   # NEW: Edge-length loss
+            # L_topo = torch.tensor(0.0, device=device)   # NEW: Topology loss  
+            # L_shape_spec = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
+            # L_subspace = torch.tensor(0.0, device=device)
+            # L_gen_scale = torch.tensor(0.0, device=device)
 
 
             # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
@@ -3738,9 +3880,23 @@ def train_stageC_diffusion_generator(
                     L_st_dist = torch.tensor(0.0, device=device)
 
                 with torch.autocast(device_type='cuda', enabled=False):
-                    Gt = G_target.float()
+                    # PATCH 2 (CORRECTED): Use rank-limited Gram from V_target_batch
+                    # V_target_batch is already rank ≤ D_latent from factor_from_gram
+                    # This ensures the target Gram is feasible in D_latent dimensions
+                    # (G_target from batch is full-rank from 2D coords, creating impossible pressure)
+                    Vt_c_for_gram, _ = uet.center_only(V_target_batch.float(), mask)
+                    Gt = Vt_c_for_gram @ Vt_c_for_gram.transpose(1, 2)  # (B, N, N), rank ≤ D_latent
+                    # NOTE: MM and P_off masks are applied downstream, no need to multiply here
                     B, N, _ = V_geom.shape
-
+                    
+                    # PATCH 2 DEBUG: Log Gram rank/trace comparison
+                    if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            tr_Gt_new = (Gt.diagonal(dim1=1, dim2=2) * mask.float()).sum(dim=1).mean()
+                            tr_Gt_old = (G_target.float().diagonal(dim1=1, dim2=2) * mask.float()).sum(dim=1).mean()
+                            print(f"[PATCH2-GRAM] tr(Gt_rank_limited)={tr_Gt_new.item():.4f} "
+                                  f"tr(Gt_old_fullrank)={tr_Gt_old.item():.4f} "
+                                  f"ratio={tr_Gt_new.item()/tr_Gt_old.item():.4f}")
                     
                     # Build predicted Gram *with* true scale
                     Gp_raw = V_geom @ V_geom.transpose(1, 2)          # (B,N,N)
@@ -3870,19 +4026,61 @@ def train_stageC_diffusion_generator(
                     # NOTE: L_gram_scale is computed separately and does NOT use w_geom
 
                     # Gate geometry to conditional + low noise samples
+                    # PATCH 3A: Re-enable SNR gating for Gram loss
+                    # With sigma_data≈0.17, sigma=0.5 is ~3x sigma_data, so use sigma<=0.4 as "low noise"
+                    # PATCH 3A (CORRECTED): Re-enable SNR gating for Gram loss
+                    # Starting thresholds - tune based on hit-rate debug below
+                    # Target: ~30-60% hit rate for Gram (global structure)
                     if rho is not None:
-                        low_noise = (rho <= 20.0)
+                        # rho = sigma * sqrt(D) / edge_scale
+                        # Start with rho <= 5.0 and calibrate
+                        low_noise_gram = (rho <= 5.0)
                     else:
-                        low_noise = (sigma_vec <= 1.5)
-                    geo_gate = cond_only #bypass gate for now
-
-                    # Always compute, weight by gate (ensures same graph across ranks)
+                        # Fallback: sigma <= 0.5 (moderate noise)
+                        low_noise_gram = (sigma_vec <= 0.5)
+                    # geo_gate = cond_only * low_noise_gram.float()
+                    # Use adaptive gate (replaces hardcoded rho threshold)
+                    geo_gate = geo_gate_gram
                     gate_sum = geo_gate.sum().clamp(min=1.0)
-                    # L_gram = (per_set_relative_loss * geo_gate).sum() / gate_sum
-                    # PATCH 6: Include diagonal distribution loss
+                    
+                    # Sanitize per-sample losses BEFORE gating (NaN * 0 = NaN)
+                    per_set_relative_loss = torch.nan_to_num(per_set_relative_loss, nan=0.0, posinf=0.0, neginf=0.0)
+                    diag_rel = torch.nan_to_num(diag_rel, nan=0.0, posinf=0.0, neginf=0.0)
+                    
                     L_gram_offdiag = (per_set_relative_loss * geo_gate).sum() / gate_sum
                     L_gram_diag = (diag_rel * geo_gate).sum() / gate_sum
                     L_gram = L_gram_offdiag + 0.5 * L_gram_diag
+
+                    
+                    # PATCH 3 CALIBRATION DEBUG: Log gate hit-rates and rho distribution
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            hit_rate_gram = (geo_gate > 0).float().mean().item()
+                            cond_rate = cond_only.float().mean().item()
+                            low_noise_rate = low_noise_gram.float().mean().item()
+                            
+                            print(f"\n[PATCH3-GATE-CALIBRATION] Step {global_step}:")
+                            print(f"  Gram gate: hit_rate={hit_rate_gram:.2%} "
+                                  f"(cond_only={cond_rate:.2%}, low_noise={low_noise_rate:.2%})")
+                            
+                            if rho is not None:
+                                rho_cpu = rho.detach().cpu()
+                                print(f"  rho: p10={rho_cpu.quantile(0.1).item():.2f} "
+                                      f"p50={rho_cpu.quantile(0.5).item():.2f} "
+                                      f"p90={rho_cpu.quantile(0.9).item():.2f}")
+                            else:
+                                sig_cpu = sigma_vec.detach().cpu()
+                                print(f"  sigma: p10={sig_cpu.quantile(0.1).item():.4f} "
+                                      f"p50={sig_cpu.quantile(0.5).item():.4f} "
+                                      f"p90={sig_cpu.quantile(0.9).item():.4f}")
+                            
+                            # Warn if hit rate is outside target range
+                            if hit_rate_gram < 0.20:
+                                print(f"  ⚠️ Gram hit rate too LOW (<20%) - consider relaxing threshold")
+                            elif hit_rate_gram > 0.70:
+                                print(f"  ⚠️ Gram hit rate HIGH (>70%) - consider tightening threshold")
+
+
 
                     # ==================== ACTION 4 (FINAL): TRUE LEARNED-BRANCH GEOMETRY ====================
                     # Fixes applied:
@@ -3949,10 +4147,14 @@ def train_stageC_diffusion_generator(
                             
                             # Combined per-sample loss
                             per_sample_gl = loss_off_gl + 0.5 * loss_d_gl  # (B,)
+
+                            # Sanitize per-sample loss before gating
+                            per_sample_gl = torch.nan_to_num(per_sample_gl, nan=0.0, posinf=0.0, neginf=0.0)
                             
-                            # Weighted average (w=0 for samples not in high-σ regime)
-                            wsum_gl = w_gl.sum().clamp_min(1.0)
-                            L_gram_learn = (per_sample_gl * w_gl).sum() / wsum_gl
+                            # Weighted average
+                            wsum_gl = sel.sum().clamp_min(1.0)
+                            L_gram_learn = (per_sample_gl * sel).sum() / wsum_gl
+                            
                             
                             # Debug logging
                             if global_step % 100 == 0 and ((fabric is None) or (hasattr(fabric, 'is_global_zero') and fabric.is_global_zero)):
@@ -4066,9 +4268,14 @@ def train_stageC_diffusion_generator(
                         # Log-ratio for scale-invariant gradients
                         log_ratio = torch.log(tr_p + 1e-8) - torch.log(tr_t + 1e-8)      # (B,)
 
-                        # Use the same weighted approach to avoid divergence
-                        L_gram_scale = ((log_ratio ** 2) * geo_gate).sum() / gate_sum
-
+                        # Use adaptive gate for gram_scale
+                        gate_sum_scale = geo_gate_gram_scale.sum().clamp(min=1.0)
+                        
+                        log_ratio_sq = log_ratio ** 2
+                        # Sanitize before gating
+                        log_ratio_sq = torch.nan_to_num(log_ratio_sq, nan=0.0, posinf=0.0, neginf=0.0)
+                        
+                        L_gram_scale = (log_ratio_sq * geo_gate_gram_scale).sum() / gate_sum_scale
                         # ==================== LEARNED-BRANCH SCALE CALIBRATION (FIXED) ====================
                         # FIX 1: Use CORRECT RESIDUAL TARGET for the learned branch
                         #   Correct: V_out_tgt = x0_c - c_skip * x_c (not just x0_c)
@@ -4198,21 +4405,55 @@ def train_stageC_diffusion_generator(
                                         f"trace_ratio={tr_ratio_bin:.3f}, "
                                         f"scale_loss={scale_loss_bin:.4f}")
 
-
-
                 # --- kNN NCA Loss (with float32 + autocast disabled) ---
-                # FIX: Use tau_reference (squared-distance scale) instead of fixed 0.1
+                # PATCH 5C (CORRECTED): Gate NCA and use scale compensation
                 if WEIGHTS['knn_nca'] > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
-                        L_knn_nca = uet.knn_nca_loss(
+                        # Compute per-sample NCA loss for gating
+                        L_knn_per = uet.knn_nca_loss(
                             x0_pred.float() if use_edm else V_hat.float(), 
                             V_target.float(), 
                             mask, 
                             k=15, 
-                            temperature=tau_reference  # FIX: scale-matched temperature
+                            temperature=tau_reference,
+                            return_per_sample=True,     # PATCH 5A
+                            scale_compensate=True       # PATCH 5B (detached)
                         )
+                        
+                        # Gate NCA like edge loss (local feature, needs clean signal)
+                        # Target: ~10-30% hit rate, same as edge
+                        if rho is not None:
+                            low_noise_nca = (rho <= 2.0)  # Same as edge
+                        else:
+                            low_noise_nca = (sigma_vec <= 0.3)
+                        geo_gate_nca = cond_only * low_noise_nca.float()
+
+                        # Use adaptive gate for NCA
+                        gate_sum_nca = geo_gate_nca.sum().clamp(min=1.0)
+                        
+                        L_knn_per = uet.knn_nca_loss(
+                            x0_pred.float() if use_edm else V_hat.float(), 
+                            V_target.float(), 
+                            mask, 
+                            k=15, 
+                            temperature=tau_reference,
+                            return_per_sample=True,
+                            scale_compensate=True
+                        )
+                        
+                        # Sanitize before gating (NaN * 0 = NaN)
+                        L_knn_per = torch.nan_to_num(L_knn_per, nan=0.0, posinf=0.0, neginf=0.0)
+                        
+                        L_knn_nca = (L_knn_per * geo_gate_nca).sum() / gate_sum_nca
+
+                        
+                        # Debug
+                        if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                            hit_rate_nca = (geo_gate_nca > 0).float().mean().item()
+                            print(f"  NCA gate: hit_rate={hit_rate_nca:.2%} L_knn_nca={L_knn_nca.item():.4f}")
                 else:
                     L_knn_nca = torch.tensor(0.0, device=device)
+
                 
                 # --- NCA sanity debug ---
                 # --- NCA sanity debug (ENHANCED) ---
@@ -4273,13 +4514,22 @@ def train_stageC_diffusion_generator(
                         # Use SPATIAL kNN for geometry, not expression kNN
                         knn_indices_batch = batch['knn_spatial'].to(device)
                         
-                        # SNR-based gating (edges are local → stricter threshold)
+                        # PATCH 3B (CORRECTED): Re-enable edge gating with stricter threshold
+                        # Target: ~10-30% hit rate for edge (local features)
                         if rho is not None:
-                            low_noise = (rho <= 8.0)  # Stricter: local features need cleaner signal
+                            # Edges need cleaner signal - stricter than Gram
+                            low_noise_edge = (rho <= 2.0)  # Start stricter, calibrate
                         else:
-                            low_noise = (t_norm.squeeze() < 0.6)  # Fallback
-                        # geo_gate_edge = (low_noise.float() * cond_only)
-                        geo_gate_edge = cond_only #bypass for now
+                            low_noise_edge = (sigma_vec <= 0.3)  # Stricter fallback
+                        geo_gate_edge = cond_only * low_noise_edge.float()
+                        
+                        # PATCH 3B DEBUG
+                        if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                            hit_rate_edge = (geo_gate_edge > 0).float().mean().item()
+                            print(f"  Edge gate: hit_rate={hit_rate_edge:.2%}")
+                            if hit_rate_edge < 0.05:
+                                print(f"  ⚠️ Edge hit rate very LOW (<5%) - relax threshold or check sigma sampling")
+
                         gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
 
                         # --- [DEBUG] Log Edge Gate Hit-Rate ---
@@ -4290,50 +4540,54 @@ def train_stageC_diffusion_generator(
 
 
                         # PATCH 5: Use log-ratio edge loss for multiplicative error
+                        # Use adaptive gate for edge
+                        gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
+                        
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=V_geom,
-                            V_tgt=V_target_batch,
+                            V_pred=x0_pred.float() if use_edm else V_hat.float(),
+                            V_tgt=V_target.float(),
                             knn_idx=knn_indices_batch,
                             mask=mask
                         )
-
                         
-                        # Proper per-sample gating
+                        # Sanitize before gating (NaN * 0 = NaN)
+                        L_edge_per = torch.nan_to_num(L_edge_per, nan=0.0, posinf=0.0, neginf=0.0)
+                        
                         L_edge = (L_edge_per * geo_gate_edge).sum() / gate_sum_edge
 
 
                         # === CRITICAL DEBUG: Verify Tgt identity ===
-                        if global_step % 2500 == 0 and (fabric is None or fabric.is_global_zero):
-                            with torch.no_grad():
-                                print(f"\n[TGT VERIFICATION] step={global_step}")
-                                print(f"  V_target_clean id: {id(V_target_orig)}")
-                                print(f"  batch['V_target'] id: {id(batch['V_target'])}")
+                        # if global_step % 2500 == 0 and (fabric is None or fabric.is_global_zero):
+                        #     with torch.no_grad():
+                        #         print(f"\n[TGT VERIFICATION] step={global_step}")
+                        #         print(f"  V_target_clean id: {id(V_target_orig)}")
+                        #         print(f"  batch['V_target'] id: {id(batch['V_target'])}")
                                 
-                                # Use CLONED version
-                                Tgt = V_target_orig
-                                print(f"  Tgt id: {id(Tgt)}")
+                        #         # Use CLONED version
+                        #         Tgt = V_target_orig
+                        #         print(f"  Tgt id: {id(Tgt)}")
                                 
-                                # Verify the noise equation holds
-                                # --- DEBUG 5: Check across sigma bins ---
-                                sigma_for_verify = sigma_flat if use_edm else sigma_t.view(-1)
-                                debug_samples = get_one_sample_per_sigma_bin(sigma_for_verify)
+                        #         # Verify the noise equation holds
+                        #         # --- DEBUG 5: Check across sigma bins ---
+                        #         sigma_for_verify = sigma_flat if use_edm else sigma_t.view(-1)
+                        #         debug_samples = get_one_sample_per_sigma_bin(sigma_for_verify)
                                 
-                                for bin_name, b_idx in debug_samples[:1]:  # Just check 1
-                                    m_b = mask_orig[b_idx].bool()
-                                    if m_b.sum() > 5:
-                                        noise_computed = (V_t[b_idx] - Tgt[b_idx])[m_b]
-                                        sigma_val = sigma_for_verify[b_idx].item()
-                                        noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
+                        #         for bin_name, b_idx in debug_samples[:1]:  # Just check 1
+                        #             m_b = mask_orig[b_idx].bool()
+                        #             if m_b.sum() > 5:
+                        #                 noise_computed = (V_t[b_idx] - Tgt[b_idx])[m_b]
+                        #                 sigma_val = sigma_for_verify[b_idx].item()
+                        #                 noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
                                         
-                                        diff = (noise_computed - noise_expected).abs().max().item()
-                                        print(f"  bin={bin_name} Max diff between (V_t - Tgt) and (sigma*eps): {diff:.6f} (should be ~0)")
+                        #                 diff = (noise_computed - noise_expected).abs().max().item()
+                        #                 print(f"  bin={bin_name} Max diff between (V_t - Tgt) and (sigma*eps): {diff:.6f} (should be ~0)")
                                         
-                                        if diff > 1e-4:
-                                            print(f"  bin={bin_name} 🔴 FAIL: Tgt is NOT the same V_target used to create V_t!")
-                                            print(f"  V_target_clean mean: {V_target_orig[b_idx][m_b].mean(dim=0).norm().item():.6f}")
-                                            print(f"  Tgt mean: {Tgt[b_idx][m_b].mean(dim=0).norm().item():.6f}")
-                                        else:
-                                            print(f"  bin={bin_name} ✅ PASS: Noise equation verified!")
+                        #                 if diff > 1e-4:
+                        #                     print(f"  bin={bin_name} 🔴 FAIL: Tgt is NOT the same V_target used to create V_t!")
+                        #                     print(f"  V_target_clean mean: {V_target_orig[b_idx][m_b].mean(dim=0).norm().item():.6f}")
+                        #                     print(f"  Tgt mean: {Tgt[b_idx][m_b].mean(dim=0).norm().item():.6f}")
+                        #                 else:
+                        #                     print(f"  bin={bin_name} ✅ PASS: Noise equation verified!")
 
 
                         # k-NN preservation check (identity, not just distance)
@@ -4439,7 +4693,7 @@ def train_stageC_diffusion_generator(
                                         noise_diagnostics.append((noise_point_std, noise_point_mean_norm, sig_b))
                                         sigma_list.append(sig_b)
 
-                                if noise_diagnostics:
+                                if not noise_diagnostics:
                                     # Compute per-sample ratios (the TRUE test of noise correctness)
                                     ratios = [d[0] / max(d[2], 1e-8) for d in noise_diagnostics]
                                     ratio_med = torch.tensor(ratios).median().item()
@@ -5428,6 +5682,39 @@ def train_stageC_diffusion_generator(
                     
                     print()  # Newline for readability
             # ==================== END GEOMETRY SCALE DIAGNOSTICS ====================
+            
+            # ==============================================================================
+            # GATE HEALTH DEBUG (every 200 steps)
+            # ==============================================================================
+            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero) and use_edm:
+                with torch.no_grad():
+                    def hit_rate(g): 
+                        return (g > 0).float().mean().item() if g.numel() > 0 else 0.0
+                    
+                    nq = noise_score.detach().cpu()
+                    print(f"\n[ADAPTIVE-GATES] Step {global_step}")
+                    print(f"  noise_score: p10={nq.quantile(0.1).item():.3f} "
+                            f"p50={nq.quantile(0.5).item():.3f} "
+                            f"p90={nq.quantile(0.9).item():.3f}")
+                    
+                    print(f"  gram:       thr={adaptive_gates['gram'].thr:.3f if adaptive_gates['gram'].thr else 'warmup':>8} "
+                            f"hit={hit_rate(geo_gate_gram):.1%} (target=50%)")
+                    print(f"  gram_scale: thr={adaptive_gates['gram_scale'].thr:.3f if adaptive_gates['gram_scale'].thr else 'warmup':>8} "
+                            f"hit={hit_rate(geo_gate_gram_scale):.1%} (target=60%)")
+                    print(f"  edge:       thr={adaptive_gates['edge'].thr:.3f if adaptive_gates['edge'].thr else 'warmup':>8} "
+                            f"hit={hit_rate(geo_gate_edge):.1%} (target=15%)")
+                    print(f"  nca:        thr={adaptive_gates['nca'].thr:.3f if adaptive_gates['nca'].thr else 'warmup':>8} "
+                            f"hit={hit_rate(geo_gate_nca):.1%} (target=15%)")
+                    print(f"  learn_hi:   thr={adaptive_gates['learn_hi'].thr:.3f if adaptive_gates['learn_hi'].thr else 'warmup':>8} "
+                            f"hit={hit_rate(geo_gate_learn_hi):.1%} (target=50%)")
+                    
+                    # Warn if hit rates are way off
+                    gram_hit = hit_rate(geo_gate_gram)
+                    edge_hit = hit_rate(geo_gate_edge)
+                    if gram_hit < 0.30 or gram_hit > 0.70:
+                        print(f"  ⚠️ Gram hit rate outside 30-70% range")
+                    if edge_hit < 0.05 or edge_hit > 0.30:
+                        print(f"  ⚠️ Edge hit rate outside 5-30% range")
 
             L_total = (WEIGHTS['score'] * score_multiplier * L_score +
                     WEIGHTS['gram'] * L_gram +
@@ -5732,8 +6019,65 @@ def train_stageC_diffusion_generator(
 
             if fabric is not None:
                 fabric.backward(L_total)
-                torch.nn.utils.clip_grad_norm_(params, 10.0)
                 
+                # PATCH 6 (CORRECTED): Gradient health check - BEFORE clip/step
+                nonfinite_detected = False
+                if global_step < 20 or global_step % 50 == 0:  # Check often early
+                    nonfinite_grads = 0
+                    nonfinite_param_names = []
+                    total_grad_norm_sq = 0.0
+                    
+                    # Check score_net
+                    for name, p in score_net.named_parameters():
+                        if p.grad is not None:
+                            if not torch.isfinite(p.grad).all():
+                                nonfinite_grads += 1
+                                nonfinite_param_names.append(f"score_net.{name}")
+                                nonfinite_detected = True
+                            else:
+                                total_grad_norm_sq += p.grad.norm().item() ** 2
+                    
+                    # Check context_encoder
+                    for name, p in context_encoder.named_parameters():
+                        if p.grad is not None:
+                            if not torch.isfinite(p.grad).all():
+                                nonfinite_grads += 1
+                                nonfinite_param_names.append(f"context_encoder.{name}")
+                                nonfinite_detected = True
+                            else:
+                                total_grad_norm_sq += p.grad.norm().item() ** 2
+                    
+                    total_grad_norm = math.sqrt(total_grad_norm_sq)
+                    
+                    if nonfinite_detected:
+                        # Print which parameters have NaN
+                        if fabric is None or fabric.is_global_zero:
+                            print(f"\n[NAN-DEBUG] Step {global_step}: {nonfinite_grads} params with NaN grads")
+                            print(f"  First 10 affected: {nonfinite_param_names[:10]}")
+                            
+                            # Also print loss values to see which might be causing it
+                            print(f"  Loss values at this step:")
+                            print(f"    L_score={L_score.item() if torch.isfinite(L_score) else 'NaN':.4f}")
+                            print(f"    L_gram={L_gram.item() if torch.isfinite(L_gram) else 'NaN':.4f}")
+                            print(f"    L_gram_scale={L_gram_scale.item() if torch.isfinite(L_gram_scale) else 'NaN':.4f}")
+                            print(f"    L_edge={L_edge.item() if torch.isfinite(L_edge) else 'NaN':.4f}")
+                            print(f"    L_knn_nca={L_knn_nca.item() if torch.isfinite(L_knn_nca) else 'NaN':.4f}")
+                        
+                        # Try to continue anyway with zeroed grads for affected params
+                        for name, p in score_net.named_parameters():
+                            if p.grad is not None and not torch.isfinite(p.grad).all():
+                                p.grad.zero_()
+                        for name, p in context_encoder.named_parameters():
+                            if p.grad is not None and not torch.isfinite(p.grad).all():
+                                p.grad.zero_()
+                        
+                        # DON'T skip - zero the bad grads and continue
+                        # This allows training to proceed while we debug
+                        print(f"  Zeroed NaN grads, continuing training...")
+
+                
+                torch.nn.utils.clip_grad_norm_(params, 10.0)
+          
                 # ========== PHASE 8: GRADIENT FLOW CHECKS ==========
                 if global_step % 100 == 0 and fabric.is_global_zero:
                     print(f"\n[PHASE 8] Gradient Flow (step {global_step}):")
@@ -5795,6 +6139,21 @@ def train_stageC_diffusion_generator(
                 # When not using Fabric, use manual GradScaler
                 scaler.scale(L_total).backward()
                 scaler.unscale_(optimizer)
+                
+                # PATCH 6 (CORRECTED): Gradient health check for non-Fabric path
+                nonfinite_detected = False
+                nonfinite_grads = 0
+                for p in params:
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        nonfinite_grads += 1
+                        nonfinite_detected = True
+                
+                if nonfinite_detected:
+                    optimizer.zero_grad(set_to_none=True)
+                    print(f"[PATCH6-NONFINITE] Step {global_step}: SKIPPING - nonfinite_grads={nonfinite_grads}")
+                    scaler.update()  # Still update scaler
+                    continue
+                
                 torch.nn.utils.clip_grad_norm_(params, 1000.0)
                 scaler.step(optimizer)
                 scaler.update()
@@ -5841,7 +6200,7 @@ def train_stageC_diffusion_generator(
                 gen_grad_norm = (gen_grad_norm ** 0.5) if gen_param_count > 0 else 0
                 print(f"  Generator total grad norm: {gen_grad_norm:.4f}")
 
-            
+           
             # Log
             epoch_losses['total'] += L_total.item()
             epoch_losses['score'] += L_score.item()

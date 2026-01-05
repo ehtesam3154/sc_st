@@ -427,6 +427,77 @@ def sample_sigma_lognormal(
     return sigma
 
 
+
+def sample_sigma_lognormal_stratified(
+    batch_size: int,
+    P_mean: float = -1.2,
+    P_std: float = 1.2,
+    high_sigma_fraction: float = 0.25,
+    high_sigma_threshold: float = 0.5,
+    device: str = 'cuda'
+) -> torch.Tensor:
+    """
+    Sample σ from log-normal distribution with guaranteed high-σ coverage.
+    
+    This ensures that `high_sigma_fraction` of the batch has σ >= high_sigma_threshold.
+    This addresses the issue where high-σ samples are under-represented in training,
+    causing the model to under-train on the regime where c_skip is small.
+    
+    Args:
+        batch_size: Total number of samples
+        P_mean: Mean of log(σ) distribution
+        P_std: Std of log(σ) distribution
+        high_sigma_fraction: Fraction of batch guaranteed to have σ >= threshold
+        high_sigma_threshold: The σ threshold for "high" (default 0.5)
+        device: torch device
+    
+    Returns:
+        sigma: (batch_size,)
+    """
+    n_high = int(batch_size * high_sigma_fraction)
+    n_normal = batch_size - n_high
+    
+    # Sample normal distribution (some may be high, some low)
+    if n_normal > 0:
+        rnd_normal = torch.randn(n_normal, device=device)
+        sigma_normal = (rnd_normal * P_std + P_mean).exp()
+    else:
+        sigma_normal = torch.tensor([], device=device)
+    
+    # Sample high-σ: use truncated normal above log(threshold)
+    if n_high > 0:
+        log_threshold = torch.tensor(high_sigma_threshold, device=device).log()
+        # Sample from normal, keep only those above threshold, resample if needed
+        sigma_high_list = []
+        max_attempts = 10
+        attempt = 0
+        while len(sigma_high_list) < n_high and attempt < max_attempts:
+            n_try = (n_high - len(sigma_high_list)) * 4  # Oversample
+            rnd = torch.randn(n_try, device=device)
+            log_sigma = rnd * P_std + P_mean
+            valid = log_sigma >= log_threshold
+            sigma_valid = log_sigma[valid].exp()
+            sigma_high_list.extend(sigma_valid.tolist())
+            attempt += 1
+        
+        # If we still don't have enough (very unlikely), just sample directly above threshold
+        if len(sigma_high_list) < n_high:
+            n_remaining = n_high - len(sigma_high_list)
+            # Direct uniform sampling in log space above threshold
+            log_high_direct = torch.rand(n_remaining, device=device) * 2.0 + log_threshold
+            sigma_high_list.extend(log_high_direct.exp().tolist())
+        
+        sigma_high = torch.tensor(sigma_high_list[:n_high], device=device)
+    else:
+        sigma_high = torch.tensor([], device=device)
+    
+    # Combine and shuffle
+    sigma = torch.cat([sigma_normal, sigma_high])
+    perm = torch.randperm(batch_size, device=device)
+    return sigma[perm]
+
+
+
 def edm_sigma_schedule(
     num_steps: int,
     sigma_min: float = 0.002,
@@ -3721,6 +3792,13 @@ def edge_log_ratio_loss(V_pred, V_tgt, knn_idx, mask, eps=1e-8):
         
         # Filter valid neighbors
         valid_neighbors = (knn_b >= 0) & (knn_b < n_valid)
+
+        # Debug: warn if we see indices >= n_valid (indicates global-vs-local mixup)
+        if (knn_b >= n_valid).any() and (knn_b != -1).all():
+            # This would indicate a global/local indexing bug
+            print(f"[WARN-EDGE-IDX] Sample {b}: knn contains indices >= n_valid ({n_valid}), "
+                  f"max_idx={knn_b.max().item()}. Check local indexing!")
+
         
         if not valid_neighbors.any():
             continue
@@ -3837,58 +3915,88 @@ def rigid_align_mse_no_scale(V_pred, V_tgt, mask, eps=1e-8):
         return V_pred.new_tensor(0.0)
     return loss / float(cnt)
 
-def rigid_align_apply_no_scale(V_src, V_tgt, mask, eps=1e-8):
+def rigid_align_apply_no_scale(V_src, V_tgt, mask, eps=1e-8, enforce_rotation=False):
     """
     Apply orthogonal Procrustes alignment (rotation/reflection only, NO scale).
     Aligns V_src to V_tgt and returns the aligned V_src.
     
     This is used to align generator prior into diffusion frame before blending.
     
+    PATCH 1A (CORRECTED): 
+    - Uses CPU SVD to avoid CUDA cuSOLVER failures
+    - Keeps computation in float32 for stability
+    - Wrapped in no_grad (alignment shouldn't backprop)
+    - Optional reflection enforcement (default: allow reflections)
+    
     Args:
         V_src: (B, N, D) source coordinates (e.g., generator prior)
         V_tgt: (B, N, D) target coordinates (e.g., diffusion x0_pred)
         mask: (B, N) validity mask
         eps: numerical stability
+        enforce_rotation: if True, force det(R)=+1 (no reflections). Default False.
         
     Returns:
         V_src_aligned: (B, N, D) source aligned to target frame
     """
     B, N, D = V_src.shape
     device = V_src.device
-    V_aligned = V_src.clone()
+    dtype_orig = V_src.dtype
     
-    for b in range(B):
-        mb = mask[b].bool()
-        n_valid = int(mb.sum().item())
-        if n_valid < 2:
-            continue
-        
-        # Extract valid points
-        X = V_src[b, mb].float()   # (n_valid, D) - source
-        Y = V_tgt[b, mb].float()   # (n_valid, D) - target
-        
-        # Center both
-        X_mean = X.mean(dim=0, keepdim=True)
-        Y_mean = Y.mean(dim=0, keepdim=True)
-        X_c = X - X_mean
-        Y_c = Y - Y_mean
-        
-        # Compute optimal rotation via SVD: M = X^T @ Y
-        M = X_c.T @ Y_c  # (D, D)
-        try:
-            U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-            R = U @ Vh  # (D, D) orthogonal rotation matrix
-        except:
-            # SVD failed, skip alignment for this sample
-            continue
-        
-        # Apply rotation and translate to target mean
-        X_aligned = (X_c @ R) + Y_mean  # Rotate centered, then add target mean
-        
-        # Write back aligned coordinates
-        V_aligned[b, mb] = X_aligned.to(V_aligned.dtype)
+    # Work in float32 for numerical stability
+    V_aligned = V_src.clone().float()
     
-    return V_aligned
+    # No gradients needed for alignment
+    with torch.no_grad():
+        for b in range(B):
+            mb = mask[b].bool()
+            n_valid = int(mb.sum().item())
+            if n_valid < 2:
+                continue
+            
+            # Extract valid points in float32
+            X = V_src[b, mb].float()   # (n_valid, D) - source
+            Y = V_tgt[b, mb].float()   # (n_valid, D) - target
+            
+            # Center both
+            X_mean = X.mean(dim=0, keepdim=True)
+            Y_mean = Y.mean(dim=0, keepdim=True)
+            X_c = X - X_mean
+            Y_c = Y - Y_mean
+            
+            # Compute cross-covariance: M = X^T @ Y (D x D matrix)
+            M = X_c.T @ Y_c  # float32
+            
+            # Hard guard for non-finite M
+            if not torch.isfinite(M).all():
+                continue
+            
+            # CPU SVD for robustness (D×D is tiny, ~0.001ms)
+            try:
+                M_cpu = M.detach().cpu().double()
+                U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(M_cpu, full_matrices=False)
+                R_cpu = U_cpu @ Vh_cpu
+                
+                # Optional: enforce proper rotation (det=+1, no reflection)
+                # Default OFF because generator may have learned reflected frame
+                if enforce_rotation and torch.det(R_cpu) < 0:
+                    U_cpu[:, -1] *= -1
+                    R_cpu = U_cpu @ Vh_cpu
+                
+                # Keep R in float32 on device
+                R = R_cpu.float().to(device=device)
+            except Exception:
+                # SVD failed even on CPU (rare)
+                continue
+            
+            # Apply rotation in float32: X_aligned = X_c @ R, then translate to target mean
+            X_aligned = (X_c @ R) + Y_mean  # float32
+            
+            # Write back aligned coordinates
+            V_aligned[b, mb] = X_aligned
+    
+    # Cast back to original dtype only at the end
+    return V_aligned.to(dtype_orig)
+
 
 
 def rms_log_loss(V_pred, V_tgt, mask, eps=1e-8):
@@ -3919,11 +4027,14 @@ def rms_log_loss(V_pred, V_tgt, mask, eps=1e-8):
 
 
 def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor,
-                 k: int = 15, temperature: float = 0.1, eps: float = 1e-8) -> torch.Tensor:
+                 k: int = 15, temperature: float = 0.1, eps: float = 1e-8,
+                 return_per_sample: bool = False, scale_compensate: bool = True) -> torch.Tensor:
     """
     Differentiable k-NN Neighborhood Preservation Loss using NCA-style soft retrieval.
     
-    FIXED VERSION: Properly handles masking to avoid plateau issues.
+    PATCH 5 (CORRECTED): 
+    - Added per-sample return for gating
+    - Added scale compensation (DETACHED to prevent gaming)
     
     Args:
         V_pred: (B, N, D) predicted coordinates
@@ -3932,9 +4043,11 @@ def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tenso
         k: number of neighbors
         temperature: softmax temperature (lower = sharper)
         eps: numerical stability
+        return_per_sample: if True, return (B,) per-sample losses for gating
+        scale_compensate: if True, adjust temperature based on pred/tgt scale ratio (detached)
     
     Returns:
-        Scalar loss (lower = better neighborhood preservation)
+        Scalar loss (or (B,) if return_per_sample=True)
     """
     B, N, D = V_pred.shape
     device = V_pred.device
@@ -3960,8 +4073,32 @@ def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tenso
     # kNN indices in target space
     _, knn_idx_tgt = D2_tgt_masked.topk(k, dim=-1, largest=False)          # (B, N, k)
 
+    # PATCH 5B (CORRECTED): Scale compensation - DETACHED to prevent gaming
+    if scale_compensate:
+        with torch.no_grad():  # Critical: detach scale computation
+            # Get k-th neighbor distances for scale estimation
+            d2k_tgt = torch.gather(D2_tgt_masked, 2, knn_idx_tgt)[:, :, -1]    # (B, N)
+            d2k_pred = torch.gather(D2_pred_masked.detach(), 2, knn_idx_tgt)[:, :, -1]  # (B, N)
+            
+            # Masked median per sample
+            def masked_median(x, mf):
+                x_masked = x.masked_fill(mf == 0, float('nan'))
+                return torch.nanmedian(x_masked, dim=1).values  # (B,)
+            
+            med_tgt = masked_median(d2k_tgt, mask_f).clamp(min=eps)   # (B,)
+            med_pred = masked_median(d2k_pred, mask_f).clamp(min=eps) # (B,)
+            
+            # Scale ratio: if pred is shrunk (med_pred < med_tgt), scale < 1
+            # This makes temp_eff smaller, keeping softmax sharp
+            scale = (med_pred / med_tgt).clamp(0.25, 4.0)             # (B,)
+        
+        # Apply scale (detached) to temperature
+        temp_eff = (temperature * scale).view(B, 1, 1)            # (B, 1, 1)
+    else:
+        temp_eff = temperature
+
     # Log-prob over neighbors in pred space (log_softmax for stability)
-    logits = -D2_pred_masked / (temperature + eps)                         # (B, N, N)
+    logits = -D2_pred_masked / (temp_eff + eps)                            # (B, N, N)
     logits = logits.masked_fill(invalid_pair, -1e9)
     logP = torch.log_softmax(logits, dim=-1)                               # (B, N, N)
 
@@ -3982,8 +4119,11 @@ def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tenso
 
     # Average over valid query points per sample
     loss_per_sample = (loss_per_point * mask_f).sum(dim=-1) / valid_counts # (B,)
+    
+    # PATCH 5A: Support per-sample return for gating
+    if return_per_sample:
+        return loss_per_sample  # (B,)
     return loss_per_sample.mean()
-
 
 
 def knn_jaccard_soft(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor, 
@@ -4048,3 +4188,143 @@ def knn_jaccard_soft(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.T
     if return_per_sample:
         return jaccard_per_sample
     return jaccard_per_sample.mean()
+
+
+# ==============================================================================
+# ADAPTIVE QUANTILE GATE CONTROLLER
+# ==============================================================================
+
+class AdaptiveQuantileGate:
+    """
+    Maintains an adaptive threshold so that approximately `target_rate`
+    of samples pass the gate, based on a noise score (higher = noisier).
+    
+    This makes gating dataset-independent by using relative ordering
+    instead of absolute thresholds.
+    
+    Usage:
+        gate = AdaptiveQuantileGate(target_rate=0.50, mode="low")
+        # In training loop:
+        gate.update(noise[eligible])  # Update threshold estimate
+        geo_gate = gate.gate(noise, base_gate)  # Get gate mask
+    """
+
+    def __init__(self,
+                 target_rate: float,
+                 mode: str = "low",          # "low" => pass cleanest target_rate (lowest noise)
+                 warmup_steps: int = 200,
+                 reservoir_size: int = 8192,
+                 update_every: int = 50,
+                 ema: float = 0.9,
+                 clamp_q: tuple = (0.01, 0.99),
+                 device: str = "cpu"):
+        """
+        Args:
+            target_rate: Fraction of samples to pass (e.g., 0.50 = 50%)
+            mode: "low" = pass lowest noise (cleanest), "high" = pass highest noise
+            warmup_steps: Steps before adaptive threshold kicks in
+            reservoir_size: Number of samples to keep for quantile estimation
+            update_every: Update threshold every N steps
+            ema: Exponential moving average decay for threshold smoothing
+            clamp_q: Clamp quantile to avoid extreme thresholds
+            device: Device for computations
+        """
+        self.target_rate = float(target_rate)
+        self.mode = mode
+        self.warmup_steps = int(warmup_steps)
+        self.reservoir_size = int(reservoir_size)
+        self.update_every = int(update_every)
+        self.ema = float(ema)
+        self.clamp_q = clamp_q
+        self.device = device
+
+        self._buf = []  # Use list instead of deque for easier slicing
+        self._thr = None
+        self._step = 0
+
+    @property
+    def thr(self):
+        """Current threshold (None during warmup)"""
+        return self._thr
+
+    def update(self, noise_1d: torch.Tensor):
+        """
+        Update threshold estimate with new noise samples.
+        
+        Args:
+            noise_1d: (M,) float tensor of noise scores (can be on GPU)
+        """
+        self._step += 1
+
+        # Collect finite values only
+        x = noise_1d.detach()
+        x = x[torch.isfinite(x)]
+        if x.numel() == 0:
+            return
+
+        # Move to CPU for cheap quantile computation
+        x_cpu = x.to("cpu", dtype=torch.float32).flatten().tolist()
+        self._buf.extend(x_cpu)
+        
+        # Keep only recent samples (reservoir)
+        if len(self._buf) > self.reservoir_size:
+            self._buf = self._buf[-self.reservoir_size:]
+
+        # Don't compute threshold until warmup complete
+        if self._step < self.warmup_steps:
+            return
+
+        # Only update threshold periodically
+        if (self._step % self.update_every) != 0:
+            return
+
+        if len(self._buf) < 64:
+            return
+
+        buf = torch.tensor(self._buf, dtype=torch.float32)
+
+        # For "low noise pass": want lowest target_rate => q = target_rate
+        # For "high noise pass": want highest target_rate => q = 1 - target_rate
+        if self.mode == "low":
+            q = self.target_rate
+        else:
+            q = 1.0 - self.target_rate
+
+        q = min(max(q, self.clamp_q[0]), self.clamp_q[1])
+        new_thr = torch.quantile(buf, q).item()
+
+        # EMA smoothing for stability
+        if self._thr is None:
+            self._thr = new_thr
+        else:
+            self._thr = self.ema * self._thr + (1.0 - self.ema) * new_thr
+
+    def gate(self, noise: torch.Tensor, base_gate: torch.Tensor) -> torch.Tensor:
+        """
+        Compute gate mask based on noise and current threshold.
+        
+        Args:
+            noise: (B,) tensor of noise scores on GPU
+            base_gate: (B,) {0,1} float tensor (e.g., cond_only from CFG)
+            
+        Returns:
+            (B,) float gate mask
+        """
+        # During warmup, just use base_gate (pass all conditioned samples)
+        if self._thr is None or (self._step < self.warmup_steps):
+            return base_gate
+
+        thr = torch.tensor(self._thr, device=noise.device, dtype=noise.dtype)
+
+        if self.mode == "low":
+            pass_mask = (noise <= thr)
+        else:
+            pass_mask = (noise >= thr)
+
+        return base_gate * pass_mask.float()
+    
+    def reset(self):
+        """Reset the gate controller (e.g., for new training run)"""
+        self._buf = []
+        self._thr = None
+        self._step = 0
