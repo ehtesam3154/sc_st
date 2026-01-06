@@ -4441,3 +4441,136 @@ def knn_scale_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Ten
         return per_sample_tensor
     return per_sample_tensor.mean()
 
+
+@torch.no_grad()
+def compute_local_scale_correction(
+    V_pred: torch.Tensor,
+    V_tgt: torch.Tensor,
+    mask: torch.Tensor,
+    knn_indices: torch.Tensor = None,
+    k: int = 15,
+    eps: float = 1e-8,
+    max_log_correction: float = 0.3,  # Caps correction to ~1.35x
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute per-sample local scale correction from kNN edge distances.
+    
+    Returns:
+        s: (B,) scale correction factors (multiply V_pred by this to match V_tgt scale)
+        ratio: (B,) raw ratio of median(D2_pred) / median(D2_tgt)
+        valid: (B,) bool mask indicating samples with enough edges for reliable estimate
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    
+    s_list = []
+    ratio_list = []
+    valid_list = []
+    
+    for b in range(B):
+        mb = mask[b].bool()
+        n_valid = mb.sum().item()
+        
+        if n_valid < k + 1:
+            s_list.append(torch.tensor(1.0, device=device))
+            ratio_list.append(torch.tensor(1.0, device=device))
+            valid_list.append(False)
+            continue
+        
+        V_p = V_pred[b, mb]  # (n_valid, D)
+        V_t = V_tgt[b, mb]   # (n_valid, D)
+        
+        # Get kNN edges
+        if knn_indices is not None:
+            knn_b = knn_indices[b, mb, :]  # (n_valid, k)
+            valid_neighbors = (knn_b >= 0) & (knn_b < n_valid)
+            
+            if not valid_neighbors.any():
+                s_list.append(torch.tensor(1.0, device=device))
+                ratio_list.append(torch.tensor(1.0, device=device))
+                valid_list.append(False)
+                continue
+            
+            # Compute edge distances for valid kNN pairs
+            k_size = knn_b.shape[1]
+            i_idx = torch.arange(n_valid, device=device).unsqueeze(1).expand(-1, k_size)
+            j_idx = knn_b
+            
+            edge_mask = valid_neighbors & (i_idx != j_idx)
+            i_edges = i_idx[edge_mask]
+            j_edges = j_idx[edge_mask]
+            
+            if i_edges.numel() < k:
+                s_list.append(torch.tensor(1.0, device=device))
+                ratio_list.append(torch.tensor(1.0, device=device))
+                valid_list.append(False)
+                continue
+            
+            # Compute squared edge lengths
+            d2_pred = (V_p[i_edges] - V_p[j_edges]).pow(2).sum(dim=-1)  # (n_edges,)
+            d2_tgt = (V_t[i_edges] - V_t[j_edges]).pow(2).sum(dim=-1)   # (n_edges,)
+        else:
+            # Fallback: compute all pairwise and take k nearest
+            D2_pred = torch.cdist(V_p, V_p).pow(2)
+            D2_tgt = torch.cdist(V_t, V_t).pow(2)
+            
+            D2_pred.fill_diagonal_(float('inf'))
+            D2_tgt.fill_diagonal_(float('inf'))
+            
+            knn_d2_pred, _ = D2_pred.topk(k, largest=False, dim=1)
+            knn_d2_tgt, _ = D2_tgt.topk(k, largest=False, dim=1)
+            
+            d2_pred = knn_d2_pred.flatten()
+            d2_tgt = knn_d2_tgt.flatten()
+        
+        # Compute median ratio
+        med_d2_pred = d2_pred.median()
+        med_d2_tgt = d2_tgt.median().clamp(min=eps)
+        
+        ratio = med_d2_pred / med_d2_tgt
+        
+        # Scale correction: s = sqrt(tgt/pred) to bring pred to tgt scale
+        # If pred distances are too large (ratio > 1), s < 1 shrinks them
+        log_s = 0.5 * torch.log(med_d2_tgt / med_d2_pred.clamp(min=eps))
+        
+        # Clamp correction to prevent wild jumps
+        log_s_clamped = log_s.clamp(-max_log_correction, max_log_correction)
+        s = torch.exp(log_s_clamped)
+        
+        s_list.append(s)
+        ratio_list.append(ratio)
+        valid_list.append(True)
+    
+    return (
+        torch.stack(s_list),  # (B,)
+        torch.stack(ratio_list),  # (B,)
+        torch.tensor(valid_list, device=device, dtype=torch.bool)  # (B,)
+    )
+
+
+def apply_scale_correction(V: torch.Tensor, s: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Apply per-sample scale correction around the per-sample centroid.
+    
+    Args:
+        V: (B, N, D) coordinates
+        s: (B,) scale factors
+        mask: (B, N) validity mask
+    
+    Returns:
+        V_corrected: (B, N, D) scaled coordinates
+    """
+    B, N, D = V.shape
+    m_float = mask.float().unsqueeze(-1)  # (B, N, 1)
+    
+    # Compute per-sample centroid
+    valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1).unsqueeze(-1)  # (B, 1, 1)
+    centroid = (V * m_float).sum(dim=1, keepdim=True) / valid_counts  # (B, 1, D)
+    
+    # Scale around centroid
+    V_centered = V - centroid
+    V_scaled = V_centered * s.view(-1, 1, 1)  # (B, 1, 1) broadcasts
+    V_corrected = (V_scaled + centroid) * m_float
+    
+    return V_corrected
+

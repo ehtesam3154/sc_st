@@ -1965,6 +1965,14 @@ def train_stageC_diffusion_generator(
     SCORE_HI_BOOST_FACTOR = 4.0        # 4x weight on high-noise subset
     SCORE_HI_BOOST_WARMUP = 0       # Steps before boost starts
     SCORE_HI_BOOST_RAMP = 200          # Ramp boost in over this many steps
+
+    # ==================== CHANGE C: TAIL SAFETY PARAMETERS ====================
+    TAIL_SAFETY_ENABLED = True        # Enable tail protection
+    TAIL_QUANTILE = 0.95              # Top 5% of sigma is "tail"
+    TAIL_BOOST_CAP = 2.0              # Max boost multiplier for tail samples (vs normal boost)
+    TAIL_EXPLOSION_THRESHOLD = 5.0    # If tail loss > threshold * EMA, disable boost
+    TAIL_EXPLOSION_COOLDOWN = 50      # Steps to wait before re-enabling boost
+
     
     # A/B 3: F_x-space supervision for high-noise (learned branch direct supervision)
     EXP_SCORE_FX_HI = False
@@ -3576,20 +3584,22 @@ def train_stageC_diffusion_generator(
                     
                     # Optional boost with data-driven readiness (CHANGE 2)
                     # Optional boost with data-driven readiness (CHANGE 2)
+                    # Optional boost with data-driven readiness (CHANGE 2) + TAIL SAFETY (CHANGE C)
                     if EXP_SCORE_HI_BOOST:
+                        # Initialize tail cooldown state (safe even if TAIL_SAFETY_ENABLED=False)
+                        if 'tail_boost_disabled_until' not in boost_state:
+                            boost_state['tail_boost_disabled_until'] = 0
+                        
                         # Update boost readiness from Fx scale at high-σ
-                        with torch.no_grad():
+                        if boost_state['ready'] or global_step % 10 == 0:
                             fx_ratio = boost_state.get('last_fx_ratio_hi', None)
-                            
-                            if fx_ratio is not None and fx_ratio > 0:
-                                # EMA update
+                            if fx_ratio is not None:
                                 boost_state['ema_fx_ratio_hi'] = (
                                     boost_state['ema_decay'] * boost_state['ema_fx_ratio_hi'] +
                                     (1 - boost_state['ema_decay']) * fx_ratio
                                 )
                                 
-                                # Check stability using log error (scale-invariant)
-                                fx_err = abs(math.log(boost_state['ema_fx_ratio_hi']))
+                                fx_err = abs(math.log(boost_state['ema_fx_ratio_hi'] + 1e-8))
                                 is_stable = (fx_err < boost_state['stability_tol'])
                                 
                                 if is_stable:
@@ -3597,38 +3607,51 @@ def train_stageC_diffusion_generator(
                                 else:
                                     boost_state['stable_count'] = 0
                                 
-                                # Trigger readiness
                                 if (not boost_state['ready'] and 
                                     boost_state['stable_count'] >= boost_state['min_stable_checks']):
                                     boost_state['ready'] = True
                                     boost_state['start_step'] = global_step
                                     if fabric is None or fabric.is_global_zero:
                                         print(f"\n[BOOST-READY] Boost activated at step {global_step}!")
-                                        print(f"  ema_fx_ratio_hi={boost_state['ema_fx_ratio_hi']:.4f}")
                         
                         # Compute boost ramp
                         if not boost_state['ready']:
-                            ramp = 0.0  # Boost disabled until ready
+                            ramp = 0.0
+                        elif global_step < boost_state['tail_boost_disabled_until']:
+                            ramp = 0.0  # Cooldown active
                         else:
-                            steps_since_ready = global_step - boost_state['start_step']
+                            steps_since_ready = global_step - boost_state.get('start_step', global_step)
                             ramp = min(1.0, steps_since_ready / max(1, SCORE_HI_BOOST_RAMP))
                         
-                        boost = 1.0 + ramp * (SCORE_HI_BOOST_FACTOR - 1.0) * gate_hi_score  # (B,)
+                        # Base boost
+                        base_boost = 1.0 + ramp * (SCORE_HI_BOOST_FACTOR - 1.0) * gate_hi_score  # (B,)
+                        
+                        # CHANGE C: Tail safety cap (simple, no watchdog for now)
+                        if TAIL_SAFETY_ENABLED:
+                            sigma_tail_threshold = sigma_flat.quantile(TAIL_QUANTILE)
+                            is_tail = (sigma_flat >= sigma_tail_threshold)  # (B,) bool
+                            
+                            # Cap boost for tail samples
+                            tail_boost_cap = 1.0 + ramp * (TAIL_BOOST_CAP - 1.0) * gate_hi_score
+                            boost = torch.where(is_tail, 
+                                               torch.minimum(base_boost, tail_boost_cap),
+                                               base_boost)
+                        else:
+                            boost = base_boost
+                            is_tail = torch.zeros_like(sigma_flat, dtype=torch.bool)
+                        
                         w_eff = w_eff * boost
                         
                         # Debug logging
-                        if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
-                            thr_val = score_hi_gate.thr
-                            thr_str = f"{thr_val:.3f}" if thr_val is not None else "warmup"
-                            print(f"[BOOST-READY] step={global_step} ready={boost_state['ready']} "
-                                  f"ema_fx={boost_state['ema_fx_ratio_hi']:.3f} "
-                                  f"stable_count={boost_state['stable_count']} "
-                                  f"ramp={ramp:.2f}")
-                            print(f"[SCORE-HI-BOOST] step={global_step} ramp={ramp:.2f} "
-                                  f"thr={thr_str} "
-                                  f"hit={(gate_hi_score>0).float().mean().item():.2%} "
-                                  f"boost_mean={boost.mean().item():.3f}")
-
+                        if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                            print(f"[SCORE-HI-BOOST] step={global_step} ready={boost_state['ready']} "
+                                  f"ramp={ramp:.2f} boost_mean={boost.mean().item():.3f}")
+                            if TAIL_SAFETY_ENABLED:
+                                n_tail = is_tail.sum().item()
+                                if n_tail > 0:
+                                    tail_boost_mean = boost[is_tail].mean().item()
+                                    print(f"[TAIL-SAFETY] n_tail={n_tail} tail_boost_mean={tail_boost_mean:.3f} "
+                                          f"(capped at {TAIL_BOOST_CAP:.1f}x)")
 
                     
                     # Now choose how to aggregate score loss
@@ -3980,6 +4003,7 @@ def train_stageC_diffusion_generator(
             L_gen_scale = safe_loss(L_gen_scale, "L_gen_scale", max_val=50.0, global_step=global_step)
 
             # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
+            # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
             # 1. Canonicalize V_hat (Center per set) - NOW GLOBAL for ST and SC
             with torch.autocast(device_type='cuda', enabled=False):
                 V_hat_f32 = V_hat.float()
@@ -3989,7 +4013,39 @@ def train_stageC_diffusion_generator(
                 # center per set over valid nodes
                 valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
-                V_geom = (V_hat_f32 - mean) * m_float  # (B,N,D), centered
+                V_hat_centered = (V_hat_f32 - mean) * m_float  # (B,N,D), centered but NOT clamped
+                
+                # ==================== CHANGE A2: LOCAL SCALE CLAMP ====================
+                # Apply local scale correction for geometry STRUCTURE losses
+                # This removes systematic kNN scale mismatch from shape supervision
+                knn_spatial_for_scale = batch.get('knn_spatial', None)
+                if knn_spatial_for_scale is not None:
+                    knn_spatial_for_scale = knn_spatial_for_scale.to(device)
+                
+                if (not is_sc) and knn_spatial_for_scale is not None:
+                    # Compute scale correction from kNN distances (pred vs target)
+                    s_corr, ratio_raw, valid_scale = uet.compute_local_scale_correction(
+                        V_hat_centered, V_target.float(), mask,
+                        knn_indices=knn_spatial_for_scale,
+                        k=15,
+                        max_log_correction=0.25,  # Conservative: ~1.28x max correction
+                    )
+                    
+                    # Apply correction DETACHED (model learns via knn_scale loss, not clamp gaming)
+                    s_corr_detached = s_corr.detach()
+                    V_geom = uet.apply_scale_correction(V_hat_centered, s_corr_detached, mask)
+                    
+                    # Debug: log correction stats
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            ratio_med = ratio_raw[valid_scale].median().item() if valid_scale.any() else 1.0
+                            s_med = s_corr[valid_scale].median().item() if valid_scale.any() else 1.0
+                            n_valid = valid_scale.sum().item()
+                            print(f"[SCALE-CLAMP] step={global_step} ratio_raw_med={ratio_med:.3f} "
+                                  f"s_correction_med={s_med:.3f} n_valid={n_valid}/{len(valid_scale)}")
+                else:
+                    # SC batches or no knn_spatial: no clamp, V_geom = centered
+                    V_geom = V_hat_centered
 
             # --- PATCH 7: Low-rank subspace penalty ---
             if not is_sc and WEIGHTS.get('subspace', 0) > 0:
@@ -4114,14 +4170,76 @@ def train_stageC_diffusion_generator(
                         # score_hi_gate.update(noise_score)
                         # gate_hi_score = score_hi_gate.gate(noise_score, torch.ones_like(noise_score))
 
+                # ==================== CHANGE D: MINIMUM COVERAGE FLOOR ====================
+                # Ensure at least min_count samples get geometry supervision each step
+                MIN_GEOMETRY_SAMPLES = 4  # Minimum samples per batch with geometry loss
+                
+                def ensure_minimum_coverage(gate: torch.Tensor, noise_score: torch.Tensor, 
+                                           min_count: int, prefer_low_noise: bool = True,
+                                           eligible_mask: torch.Tensor = None) -> torch.Tensor:
+                    """
+                    Ensure gate has at least min_count active samples.
+                    If fewer pass threshold, force-include best candidates from eligible set.
+                    
+                    Args:
+                        gate: (B,) current gate values
+                        noise_score: (B,) noise scores (lower = cleaner)
+                        min_count: minimum active samples
+                        prefer_low_noise: if True, prefer low-noise samples when forcing
+                        eligible_mask: (B,) bool mask of samples eligible for this loss
+                                      (e.g., ST-only, enough valid points, etc.)
+                    """
+                    if eligible_mask is None:
+                        eligible_mask = torch.ones_like(gate, dtype=torch.bool)
+                    
+                    # Only count eligible samples that are gated on
+                    n_active = ((gate > 0) & eligible_mask).sum().item()
+                    if n_active >= min_count:
+                        return gate
+                    
+                    # Need to force-include (min_count - n_active) samples
+                    n_needed = min_count - int(n_active)
+                    
+                    # Candidates: eligible samples not already gated
+                    not_gated = (gate <= 0) & eligible_mask
+                    
+                    if not_gated.sum() == 0:
+                        return gate  # No candidates available
+                    
+                    if prefer_low_noise:
+                        # Prefer low-noise samples (low noise_score)
+                        scores = noise_score.clone()
+                        scores[~not_gated] = float('inf')  # Exclude already gated or ineligible
+                    else:
+                        # Random selection among eligible
+                        scores = torch.rand_like(noise_score)
+                        scores[~not_gated] = float('inf')
+                    
+                    # Find best candidates
+                    n_to_add = min(n_needed, not_gated.sum().item())
+                    _, best_idx = scores.topk(n_to_add, largest=False)
+                    
+                    # Create new gate with forced inclusions
+                    new_gate = gate.clone()
+                    new_gate[best_idx] = 1.0
+                    
+                    return new_gate
+
+
                 # ==============================================================================
                 # BUILD ADAPTIVE GATES FOR EACH LOSS
                 # ==============================================================================
                 if use_edm:
+                    eligible_for_geo = (n_valid_per_sample >= 16) & (~is_sc_batch if 'is_sc_batch' in dir() else torch.ones(batch_size_real, dtype=torch.bool, device=device))
                     geo_gate_gram = adaptive_gates["gram"].gate(noise_score, base_gate)
                     geo_gate_gram_scale = adaptive_gates["gram_scale"].gate(noise_score, base_gate)
+
                     geo_gate_edge = adaptive_gates["edge"].gate(noise_score, base_gate)
+                    geo_gate_edge = ensure_minimum_coverage(geo_gate_edge, noise_score, MIN_GEOMETRY_SAMPLES)
+
                     geo_gate_nca = adaptive_gates["nca"].gate(noise_score, base_gate)
+                    geo_gate_nca = ensure_minimum_coverage(geo_gate_nca, noise_score, MIN_GEOMETRY_SAMPLES)
+
                     geo_gate_learn_hi = adaptive_gates["learn_hi"].gate(noise_score, base_gate)
                 else:
                     # Fallback: just use cond_only for all
@@ -4316,6 +4434,9 @@ def train_stageC_diffusion_generator(
                     # geo_gate = cond_only * low_noise_gram.float()
                     # Use adaptive gate (replaces hardcoded rho threshold)
                     geo_gate = geo_gate_gram
+                    # Apply minimum coverage floor
+                    geo_gate = ensure_minimum_coverage(geo_gate, noise_score, MIN_GEOMETRY_SAMPLES)
+
                     gate_sum = geo_gate.sum().clamp(min=1.0)
                     
                     # Sanitize per-sample losses BEFORE gating (NaN * 0 = NaN)
@@ -4691,7 +4812,8 @@ def train_stageC_diffusion_generator(
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Compute per-sample NCA loss for gating
                         L_knn_per = uet.knn_nca_loss(
-                            x0_pred.float() if use_edm else V_hat.float(), 
+                            # x0_pred.float() if use_edm else V_hat.float(), 
+                            V_geom,  # Use scale-clamped geometry for structure loss
                             V_target.float(), 
                             mask, 
                             k=15, 
@@ -4712,7 +4834,8 @@ def train_stageC_diffusion_generator(
                         gate_sum_nca = geo_gate_nca.sum().clamp(min=1.0)
                         
                         L_knn_per = uet.knn_nca_loss(
-                            x0_pred.float() if use_edm else V_hat.float(), 
+                            # x0_pred.float() if use_edm else V_hat.float(), 
+                            V_geom,  # Use scale-clamped geometry for structure loss
                             V_target.float(), 
                             mask, 
                             k=15, 
@@ -4743,7 +4866,9 @@ def train_stageC_diffusion_generator(
                         baseline = torch.log((n_valid - 1).clamp(min=1)).mean().item()
                         
                         # --- FIX: Debug NCA scale matching ---
-                        V_pred_nca = x0_pred.float() if use_edm else V_hat.float()
+                        # V_pred_nca = x0_pred.float() if use_edm else V_hat.float()
+                        V_pred_nca = V_geom  # Use scale-clamped geometry
+
                         V_tgt_nca = V_target.float()
                         
                         # Compute median kNN squared distances for pred and target
@@ -4787,34 +4912,62 @@ def train_stageC_diffusion_generator(
                             f"uniform_baseline≈{baseline:.3f} L_knn_nca={L_knn_nca.item():.3f}")
 
                 # --- kNN Scale Loss (CHANGE 3) ---
-                # --- kNN Scale Loss (CHANGE 3 - EDGE-BASED) ---
                 if WEIGHTS.get('knn_scale', 0) > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Use knn_spatial from batch (same edges as edge loss)
                         knn_spatial_batch = batch.get('knn_spatial', None)
+                        if knn_spatial_batch is not None:
+                            knn_spatial_batch = knn_spatial_batch.to(device)
                         
+                        # Use RAW (unclamped) V_hat to supervise scale learning
                         L_knn_scale_per = uet.knn_scale_loss(
-                            x0_pred.float() if use_edm else V_hat.float(),
+                            V_hat_centered,  # Raw centered, NOT V_geom (clamped)
                             V_target.float(),
                             mask,
-                            knn_indices=knn_spatial_batch,  # Use precomputed edges!
+                            knn_indices=knn_spatial_batch,
                             k=15,
                             return_per_sample=True
                         )
                         
-                        # Use same gate as NCA
-                        L_knn_scale_per = torch.nan_to_num(L_knn_scale_per, nan=0.0, posinf=0.0, neginf=0.0)
-                        L_knn_scale = (L_knn_scale_per * geo_gate_nca).sum() / gate_sum_nca
+                        # CHANGE A3: Minimal gating - only require enough valid points
+                        # Apply to ALL ST samples (not gated by noise level)
+                        n_valid_per_sample = mask.sum(dim=1)  # (B,)
+                        # Gate only on having enough valid points (no CFG exclusion)
+                        # knn_scale is about learning correct scale, applies to all ST samples
+                        is_st_eligible = (~torch.tensor(is_sc, device=device)).float() if isinstance(is_sc, bool) else (1.0 - is_sc.float())
+                        scale_gate = (n_valid_per_sample >= 16).float()  # No cond_only
                         
-                        # Debug (uses same edge-based metric)
+                        # Apply minimum coverage floor (Change D integration)
+                        if 'noise_score' in dir() and noise_score is not None:
+                            scale_gate = ensure_minimum_coverage(
+                                scale_gate, noise_score, 
+                                min_count=MIN_GEOMETRY_SAMPLES,
+                                prefer_low_noise=False  # Scale loss can apply broadly
+                            )
+
+                        gate_sum_scale = scale_gate.sum().clamp(min=1.0)
+                        
+                        L_knn_scale_per = torch.nan_to_num(L_knn_scale_per, nan=0.0, posinf=0.0, neginf=0.0)
+                        L_knn_scale = (L_knn_scale_per * scale_gate).sum() / gate_sum_scale
+                        
+                        # Extended debug with high-σ breakdown
                         if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
-                                # Report median edge ratio (matches loss definition)
-                                hit = (geo_gate_nca > 0).sum().item()
-                                print(f"[KNN-SCALE] step={global_step} gate_hit={hit}/{len(geo_gate_nca)} "
+                                hit = (scale_gate > 0).sum().item()
+                                # Compute ratio stats per sigma bin
+                                sigma_vec_dbg = sigma_t.view(-1).float()
+                                print(f"[KNN-SCALE] step={global_step} gate_hit={hit}/{len(scale_gate)} "
                                       f"L_knn_scale={L_knn_scale.item():.6f}")
+                                
+                                # Per-sigma breakdown
+                                for lo, hi_bound in [(0.0, 0.3), (0.3, 0.7), (0.7, 1.5), (1.5, 5.0)]:
+                                    in_bin = (sigma_vec_dbg >= lo) & (sigma_vec_dbg < hi_bound) & (scale_gate > 0)
+                                    if in_bin.any():
+                                        loss_bin = L_knn_scale_per[in_bin].mean().item()
+                                        print(f"  σ∈[{lo:.1f},{hi_bound:.1f}): L_knn_scale={loss_bin:.6f} n={in_bin.sum().item()}")
                 else:
                     L_knn_scale = torch.tensor(0.0, device=device)
+
 
                 # Low-noise gating - use actual drop_mask for consistency with CFG
                 if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
@@ -4852,7 +5005,8 @@ def train_stageC_diffusion_generator(
                         gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
                         
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=x0_pred.float() if use_edm else V_hat.float(),
+                            # V_pred=x0_pred.float() if use_edm else V_hat.float(),
+                            V_pred=V_geom,  # Use scale-clamped geometry for structure loss
                             V_tgt=V_target.float(),
                             knn_idx=knn_indices_batch,
                             mask=mask
@@ -5539,11 +5693,52 @@ def train_stageC_diffusion_generator(
                         mean_Vgen = (V_gen_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                         V_gen_centered = (V_gen_f32 - mean_Vgen) * m_float
                         
+                        # ==================== CHANGE B: GENERATOR SCALE CLAMP ====================
+                        # Apply same local scale correction to generator for alignment loss
+                        knn_spatial_for_gen = batch.get('knn_spatial', None)
+                        if knn_spatial_for_gen is not None:
+                            knn_spatial_for_gen = knn_spatial_for_gen.to(device)
+                            s_gen, ratio_gen, valid_gen = uet.compute_local_scale_correction(
+                                V_gen_centered, V_target_batch, mask,
+                                knn_indices=knn_spatial_for_gen,
+                                k=15,
+                                max_log_correction=0.25,
+                            )
+                            V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_gen.detach(), mask)
+                            
+                            # Debug generator scale
+                            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                                with torch.no_grad():
+                                    if valid_gen.any():
+                                        ratio_gen_med = ratio_gen[valid_gen].median().item()
+                                        print(f"[GEN-SCALE-CLAMP] step={global_step} ratio_raw_med={ratio_gen_med:.3f}")
+                        else:
+                            V_gen_geo = V_gen_centered
+                        
                         # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
-                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_centered, V_target_batch, mask)
+                        # Use CLAMPED V_gen_geo for alignment (removes scale mismatch)
+                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_geo, V_target_batch, mask)
+                        # Use RAW V_gen_centered for scale loss (supervises the model)
                         L_gen_scale = uet.rms_log_loss(V_gen_centered, V_target_batch, mask)
+
+                        # CHANGE B ADDITION: Local scale loss for generator (like knn_scale)
+                        # This ensures generator learns correct local neighborhood distances
+                        L_gen_scale_local = uet.knn_scale_loss(
+                            V_gen_centered,  # Raw (unclamped) generator output
+                            V_target_batch,
+                            mask,
+                            knn_indices=knn_spatial_for_gen,
+                            k=15,
+                            return_per_sample=False  # Scalar loss
+                        )
+                        
+                        # Combine global and local scale supervision
+                        # L_gen_scale is global RMS, L_gen_scale_local is local kNN
+                        L_gen_scale = L_gen_scale + 0.5 * L_gen_scale_local
+
                 else:
                     L_gen_align = torch.tensor(0.0, device=device)
+
 
                 # ==================== NEW MANIFOLD-AWARE REGULARIZERS ====================
                 # B1: Intrinsic dimension regularizer
