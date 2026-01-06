@@ -2405,7 +2405,7 @@ def train_stageC_diffusion_generator(
         'gram_scale': 2.0,     # was 1.0
         'out_scale': 1.0,
         'gram_learn': 1.0,
-        'knn_scale': 0.1,     # NEW: kNN distance scale calibration
+        'knn_scale': 0.2,     # NEW: kNN distance scale calibration
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -4230,17 +4230,22 @@ def train_stageC_diffusion_generator(
                 # BUILD ADAPTIVE GATES FOR EACH LOSS
                 # ==============================================================================
                 if use_edm:
-                    eligible_for_geo = (n_valid_per_sample >= 16) & (~is_sc_batch if 'is_sc_batch' in dir() else torch.ones(batch_size_real, dtype=torch.bool, device=device))
+                    n_valid_per_sample = mask.sum(dim=1)  # (B,)
+
+                    # Samples with enough valid points for geometry losses
+                    eligible_for_geo = (n_valid_per_sample >= 16)
+                    
                     geo_gate_gram = adaptive_gates["gram"].gate(noise_score, base_gate)
                     geo_gate_gram_scale = adaptive_gates["gram_scale"].gate(noise_score, base_gate)
 
                     geo_gate_edge = adaptive_gates["edge"].gate(noise_score, base_gate)
-                    geo_gate_edge = ensure_minimum_coverage(geo_gate_edge, noise_score, MIN_GEOMETRY_SAMPLES)
+                    geo_gate_edge = ensure_minimum_coverage(geo_gate_edge, noise_score, MIN_GEOMETRY_SAMPLES, eligible_mask=eligible_for_geo)
 
                     geo_gate_nca = adaptive_gates["nca"].gate(noise_score, base_gate)
-                    geo_gate_nca = ensure_minimum_coverage(geo_gate_nca, noise_score, MIN_GEOMETRY_SAMPLES)
+                    geo_gate_nca = ensure_minimum_coverage(geo_gate_nca, noise_score, MIN_GEOMETRY_SAMPLES, eligible_mask=eligible_for_geo)
 
                     geo_gate_learn_hi = adaptive_gates["learn_hi"].gate(noise_score, base_gate)
+
                 else:
                     # Fallback: just use cond_only for all
                     geo_gate_gram = base_gate
