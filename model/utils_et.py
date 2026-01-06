@@ -4328,3 +4328,116 @@ class AdaptiveQuantileGate:
         self._buf = []
         self._thr = None
         self._step = 0
+
+
+def knn_scale_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor,
+                   knn_indices: torch.Tensor = None, k: int = 15, eps: float = 1e-8,
+                   return_per_sample: bool = False) -> torch.Tensor:
+    """
+    kNN Local Distance Scale Calibration Loss (EFFICIENT: uses kNN edges, not N²).
+    
+    Penalizes median(D²_pred_edges) / median(D²_tgt_edges) being far from 1.0.
+    Uses log-ratio squared for symmetric, scale-invariant penalty.
+    
+    Args:
+        V_pred: (B, N, D) predicted coordinates
+        V_target: (B, N, D) target coordinates  
+        mask: (B, N) validity mask
+        knn_indices: (B, N, k) precomputed neighbor indices (use knn_spatial from batch)
+                     If None, computes on-the-fly (slower fallback)
+        k: number of neighbors (used if knn_indices is None)
+        eps: numerical stability
+        return_per_sample: if True, return (B,) per-sample losses for gating
+    
+    Returns:
+        Scalar loss (or (B,) if return_per_sample=True)
+    """
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    
+    per_sample_losses = []
+    
+    for b in range(B):
+        mb = mask[b].bool()
+        n_valid = mb.sum().item()
+        
+        if n_valid < k + 1:
+            per_sample_losses.append(torch.tensor(0.0, device=device))
+            continue
+        
+        # Get valid points
+        V_p = V_pred[b, mb]   # (n_valid, D)
+        V_t = V_target[b, mb] # (n_valid, D)
+        
+        # Get neighbor indices for this sample
+        if knn_indices is not None:
+            # knn_indices is (B, N, k) with indices in [0, N) or -1 for invalid
+            knn_b = knn_indices[b, mb, :]  # (n_valid, k)
+            
+            # We need to remap global indices to local (within valid points)
+            # Create mapping: global index -> local index within valid set
+            valid_indices = torch.where(mb)[0]  # (n_valid,) global indices that are valid
+            
+            # For each neighbor index, find if it's in valid set and get local index
+            # This is tricky - knn_indices are in local miniset space already
+            # Just need to handle -1 (invalid) entries
+            knn_local = knn_b.clone()
+            valid_knn_mask = (knn_local >= 0) & (knn_local < n_valid)  # (n_valid, k)
+        else:
+            # Fallback: compute kNN on-the-fly (less efficient but works)
+            D2_p = torch.cdist(V_p, V_p).pow(2)
+            D2_p.fill_diagonal_(float('inf'))
+            _, knn_local = D2_p.topk(min(k, n_valid - 1), dim=-1, largest=False)
+            valid_knn_mask = torch.ones_like(knn_local, dtype=torch.bool)
+        
+        # Gather edge squared distances using kNN indices
+        # For each point i, compute ||V[i] - V[knn[i,j]]||² for all j in 1..k
+        
+        n_pts = V_p.shape[0]
+        k_actual = knn_local.shape[1]
+        
+        # Clamp indices to valid range for gather (handle -1)
+        knn_clamped = knn_local.clamp(0, n_pts - 1)  # (n_valid, k)
+        
+        # Gather neighbor coords: (n_valid, k, D)
+        V_p_neighbors = V_p[knn_clamped]  # (n_valid, k, D)
+        V_t_neighbors = V_t[knn_clamped]
+        
+        # Source coords expanded: (n_valid, 1, D) -> broadcast with (n_valid, k, D)
+        V_p_src = V_p.unsqueeze(1)  # (n_valid, 1, D)
+        V_t_src = V_t.unsqueeze(1)
+        
+        # Squared distances on edges
+        D2_pred_edges = ((V_p_src - V_p_neighbors) ** 2).sum(dim=-1)  # (n_valid, k)
+        D2_tgt_edges = ((V_t_src - V_t_neighbors) ** 2).sum(dim=-1)
+        
+        # Mask out invalid edges
+        D2_pred_edges = D2_pred_edges * valid_knn_mask.float()
+        D2_tgt_edges = D2_tgt_edges * valid_knn_mask.float()
+        
+        # Get valid edge distances only
+        valid_edges = valid_knn_mask.flatten()
+        d2_p_valid = D2_pred_edges.flatten()[valid_edges]
+        d2_t_valid = D2_tgt_edges.flatten()[valid_edges]
+        
+        if d2_p_valid.numel() < 5:
+            per_sample_losses.append(torch.tensor(0.0, device=device))
+            continue
+        
+        # Compute medians
+        med_pred = d2_p_valid.median()
+        med_tgt = d2_t_valid.median()
+        
+        # Log-ratio squared (symmetric penalty)
+        ratio = med_pred / med_tgt.clamp(min=eps)
+        log_ratio = torch.log(ratio.clamp(min=eps))
+        loss_b = log_ratio.pow(2)
+        
+        per_sample_losses.append(loss_b)
+    
+    per_sample_tensor = torch.stack(per_sample_losses)  # (B,)
+    
+    if return_per_sample:
+        return per_sample_tensor
+    return per_sample_tensor.mean()
+
