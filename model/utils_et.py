@@ -497,6 +497,167 @@ def sample_sigma_lognormal_stratified(
     return sigma[perm]
 
 
+# ==============================================================================
+# SIGMA BIN DEFINITIONS AND HELPERS (for ChatGPT Test 0 & 1)
+# ==============================================================================
+
+SIGMA_BINS = [
+    (0.0, 0.5), 
+    (0.5, 0.7), 
+    (0.7, 1.2), 
+    (1.2, 2.4), 
+    (2.4, float("inf"))
+]
+
+def sigma_bin_counts(sigma_1d: torch.Tensor) -> list:
+    """
+    Count how many samples fall into each σ bin.
+    
+    Args:
+        sigma_1d: (B,) tensor of sigma values
+        
+    Returns:
+        List of counts for each bin in SIGMA_BINS
+    """
+    counts = []
+    for lo, hi in SIGMA_BINS:
+        m = (sigma_1d >= lo) & (sigma_1d < hi)
+        counts.append(int(m.sum().item()))
+    return counts
+
+
+def sample_sigma_lognormal_multibin(
+    batch_size: int,
+    P_mean: float,
+    P_std: float,
+    device,
+    bins=None,
+    bin_fracs=(0.25, 0.15, 0.20, 0.20, 0.20),
+    max_tries: int = 50000,
+    fallback_hi: float = 5.0,
+) -> torch.Tensor:
+    """
+    Sample σ with explicit coverage quotas per bin (ChatGPT Test 1).
+    
+    Falls back to standard stratified sampling if batch_size < number of bins.
+    """
+    if bins is None:
+        bins = SIGMA_BINS
+
+    n_bins = len(bins)
+    
+    # CRITICAL: If batch_size < number of bins, we can't guarantee coverage per bin
+    # Fall back to standard lognormal sampling
+    if batch_size < n_bins:
+        rnd = torch.randn(batch_size, device=device)
+        sigma = torch.exp(rnd * P_std + P_mean)
+        return sigma
+
+    assert len(bins) == len(bin_fracs), "bins and bin_fracs must have same length"
+    assert abs(sum(bin_fracs) - 1.0) < 1e-4, f"bin_fracs must sum to 1.0, got {sum(bin_fracs)}"
+
+    # Compute counts per bin (no minimum guarantee - will fix with rounding)
+    n_per = [int(round(batch_size * f)) for f in bin_fracs]
+    
+    # Ensure at least 1 per bin if we have enough samples
+    for i in range(len(n_per)):
+        if n_per[i] == 0:
+            n_per[i] = 1
+    
+    # Fix rounding: decrement largest bins first to match batch_size
+    while sum(n_per) > batch_size:
+        # Find bin with most samples that can be decremented
+        candidates = [(i, n_per[i]) for i in range(len(n_per)) if n_per[i] > 1]
+        if not candidates:
+            # All bins at 1, need to remove some entirely
+            # Remove from bins with smallest target fraction
+            for i in sorted(range(len(n_per)), key=lambda k: bin_fracs[k]):
+                if sum(n_per) <= batch_size:
+                    break
+                if n_per[i] > 0:
+                    n_per[i] = 0
+            break
+        else:
+            i = max(candidates, key=lambda x: x[1])[0]
+            n_per[i] -= 1
+
+    # Fix rounding: increment bins to match batch_size
+    while sum(n_per) < batch_size:
+        i = max(range(len(n_per)), key=lambda k: (bin_fracs[k] - n_per[k] / batch_size))
+        n_per[i] += 1
+
+    out = []
+    tries = 0
+
+    for (lo, hi), n_need in zip(bins, n_per):
+        if n_need == 0:
+            continue
+            
+        got = torch.empty(0, device=device)
+        
+        # Rejection sampling from lognormal
+        while got.numel() < n_need and tries < max_tries:
+            tries += 1
+            n_try = max(n_need * 8, 256)
+            s = torch.exp(torch.randn(n_try, device=device) * P_std + P_mean)
+            m = (s >= lo) & (s < hi)
+            if m.any():
+                got = torch.cat([got, s[m]], dim=0)
+
+        if got.numel() >= n_need:
+            out.append(got[:n_need])
+        else:
+            # Fallback: uniform in log-space within [lo, hi] but capped
+            lo_eff = max(lo, 1e-6)
+            hi_eff = fallback_hi if (hi == float("inf")) else min(hi, fallback_hi)
+            log_lo = math.log(lo_eff)
+            log_hi = math.log(max(hi_eff, lo_eff * 1.01))
+            out.append(torch.exp(torch.rand(n_need, device=device) * (log_hi - log_lo) + log_lo))
+
+    if len(out) == 0:
+        # Edge case: all bins got 0 samples
+        rnd = torch.randn(batch_size, device=device)
+        return torch.exp(rnd * P_std + P_mean)
+    
+    sigma = torch.cat(out, dim=0)
+    
+    # Safety check: ensure we return exactly batch_size samples
+    if sigma.numel() != batch_size:
+        # Pad or truncate
+        if sigma.numel() < batch_size:
+            extra = torch.exp(torch.randn(batch_size - sigma.numel(), device=device) * P_std + P_mean)
+            sigma = torch.cat([sigma, extra], dim=0)
+        else:
+            sigma = sigma[:batch_size]
+    
+    # Shuffle to avoid positional bias
+    sigma = sigma[torch.randperm(sigma.numel(), device=device)]
+    return sigma
+
+def compute_ramp_weight(
+    sigma_or_rho: torch.Tensor,
+    lo: float,
+    hi: float,
+    invert: bool = True
+) -> torch.Tensor:
+    """
+    Compute a smooth ramp weight for gating (ChatGPT Test 2).
+    
+    Args:
+        sigma_or_rho: (B,) noise level or SNR values
+        lo: Value below which weight = 1.0 (if invert=True)
+        hi: Value above which weight = 0.0 (if invert=True)
+        invert: If True, weight is 1.0 at low values, 0.0 at high values
+                
+    Returns:
+        (B,) float tensor of weights in [0, 1]
+    """
+    w = ((hi - sigma_or_rho) / (hi - lo + 1e-8)).clamp(0.0, 1.0)
+    if not invert:
+        w = 1.0 - w
+    return w
+
+
 
 def edm_sigma_schedule(
     num_steps: int,

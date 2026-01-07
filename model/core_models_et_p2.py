@@ -2399,6 +2399,13 @@ def train_stageC_diffusion_generator(
     #     'shape_spec': 0.0,
     # }
 
+    # ==============================================================================
+    # SCALE CLAMP CONSTANT (use single source of truth)
+    # ==============================================================================
+    # Test 3: Change to 0.50 for larger clamp range (~1.65x instead of ~1.28x)
+    MAX_LOG_CORR = 0.5  # Default: 0.25 (~1.28x). Test 3: 0.50 (~1.65x)
+
+
     WEIGHTS = {
         'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
         'gram': 2.0,           # was 1.0
@@ -2863,13 +2870,30 @@ def train_stageC_diffusion_generator(
 
                 # === EDM: sample sigma from log-normal ===
                 if use_edm:
-                    # sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
-                    sigma = uet.sample_sigma_lognormal_stratified(
-                        batch_size_real, P_mean, P_std,
-                        high_sigma_fraction=0.4,  # 25% of batch guaranteed high-σ
-                        high_sigma_threshold=0.5,  # σ >= 0.5 is "high"
-                        device=device
-                    )
+                    # ==============================================================================
+                    # SIGMA SAMPLING STRATEGY
+                    # Test 1: Set USE_MULTIBIN_SIGMA=True for multi-bin coverage
+                    # Default: False (use old stratified sampling)
+                    # ==============================================================================
+                    USE_MULTIBIN_SIGMA = True  # DEFAULT OFF for Test 0
+                    
+                    if USE_MULTIBIN_SIGMA:
+                        # Test 1: Multi-bin σ stratification (guarantees coverage in ALL bins)
+                        sigma = uet.sample_sigma_lognormal_multibin(
+                            batch_size_real, P_mean, P_std, 
+                            device=device,
+                            bin_fracs=(0.25, 0.15, 0.20, 0.20, 0.20),
+                            fallback_hi=sigma_refine_max,  # Don't pollute with σ > refine_max
+                        )
+                    else:
+                        # Old: stratified (may leave mid-high bins empty)
+                        sigma = uet.sample_sigma_lognormal_stratified(
+                            batch_size_real, P_mean, P_std,
+                            high_sigma_fraction=0.4,
+                            high_sigma_threshold=0.5,
+                            device=device
+                        )
+
                     sigma = sigma.clamp(sigma_min, sigma_refine_max)
                     sigma_t = sigma.view(-1, 1, 1)
 
@@ -2904,6 +2928,21 @@ def train_stageC_diffusion_generator(
                     log_min = math.log(sigma_min)
                     log_max = math.log(sigma_refine_max)
                     t_norm = ((log_sigma - log_min) / (log_max - log_min + 1e-8)).clamp(0, 1)  # (B,)
+
+                    # ==============================================================================
+                    # [DBG-SIGMA-BINS] Test 0: Log sigma bin coverage every 200 steps
+                    # ==============================================================================
+                    if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                        s = sigma.view(-1).float()
+                        bin_counts = uet.sigma_bin_counts(s)
+                        print(f"\n[DBG-SIGMA-BINS] step={global_step} counts={bin_counts} "
+                              f"min={s.min().item():.3f} p50={s.median().item():.3f} max={s.max().item():.3f}")
+                        
+                        # Flag bins with too few samples
+                        for i, ((lo, hi), cnt) in enumerate(zip(uet.SIGMA_BINS, bin_counts)):
+                            if cnt <= 1:
+                                print(f"  ⚠️ σ∈[{lo:.1f},{hi:.1f}): only {cnt} sample(s) - potential coverage gap!")
+
                 else:
                     # Old: quadratic bias toward low noise
                     u = torch.rand(batch_size_real, device=device)
@@ -4028,7 +4067,7 @@ def train_stageC_diffusion_generator(
                         V_hat_centered, V_target.float(), mask,
                         knn_indices=knn_spatial_for_scale,
                         k=15,
-                        max_log_correction=0.25,  # Conservative: ~1.28x max correction
+                        max_log_correction=MAX_LOG_CORR,  # Conservative: ~1.28x max correction
                     )
                     
                     # Apply correction DETACHED (model learns via knn_scale loss, not clamp gaming)
@@ -4036,6 +4075,7 @@ def train_stageC_diffusion_generator(
                     V_geom = uet.apply_scale_correction(V_hat_centered, s_corr_detached, mask)
                     
                     # Debug: log correction stats
+                    # Debug: log correction stats + clamp saturation (Test 0)
                     if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             ratio_med = ratio_raw[valid_scale].median().item() if valid_scale.any() else 1.0
@@ -4043,6 +4083,42 @@ def train_stageC_diffusion_generator(
                             n_valid = valid_scale.sum().item()
                             print(f"[SCALE-CLAMP] step={global_step} ratio_raw_med={ratio_med:.3f} "
                                   f"s_correction_med={s_med:.3f} n_valid={n_valid}/{len(valid_scale)}")
+                    
+                    # [DBG-CLAMP-SAT] Test 0: Clamp saturation by σ bin every 200 steps
+                    if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            # Use MAX_LOG_CORR constant (matches the actual clamp)
+                            s_lo = math.exp(-MAX_LOG_CORR)
+                            s_hi = math.exp(+MAX_LOG_CORR)
+                            
+                            # Saturation: correction hit the clamp bounds
+                            sat = valid_scale & (
+                                (s_corr <= (s_lo + 1e-6)) | 
+                                (s_corr >= (s_hi - 1e-6))
+                            )
+                            
+                            s = sigma_t.view(-1).float()
+                            
+                            total_sat = int(sat.sum().item())
+                            total_valid = int(valid_scale.sum().item())
+                            print(f"\n[DBG-CLAMP-SAT] step={global_step} total_sat={total_sat}/{total_valid} "
+                                  f"({100*total_sat/(total_valid+1e-8):.1f}%) MAX_LOG_CORR={MAX_LOG_CORR}")
+                            
+                            print(f"  {'σ bin':>15} | {'n':>4} | {'sat_rate':>10} | {'s_corr_med':>12}")
+                            print(f"  {'-'*15} | {'-'*4} | {'-'*10} | {'-'*12}")
+                            
+                            for (lo, hi_b) in uet.SIGMA_BINS:
+                                m = (s >= lo) & (s < hi_b) & valid_scale
+                                n = int(m.sum().item())
+                                if n == 0:
+                                    continue
+                                sat_bin = sat[m].float().mean().item()
+                                med_sc = s_corr[m].median().item()
+                                
+                                warn = " ⚠️ HIGH!" if sat_bin > 0.3 else ""
+                                print(f"  [{lo:.1f},{hi_b:.1f}){' ':>8} | {n:>4} | {sat_bin:>10.3f} | {med_sc:>12.3f}{warn}")
+
+
                 else:
                     # SC batches or no knn_spatial: no clamp, V_geom = centered
                     V_geom = V_hat_centered
@@ -4225,7 +4301,6 @@ def train_stageC_diffusion_generator(
                     
                     return new_gate
 
-
                 # ==============================================================================
                 # BUILD ADAPTIVE GATES FOR EACH LOSS
                 # ==============================================================================
@@ -4239,10 +4314,37 @@ def train_stageC_diffusion_generator(
                     geo_gate_gram_scale = adaptive_gates["gram_scale"].gate(noise_score, base_gate)
 
                     geo_gate_edge = adaptive_gates["edge"].gate(noise_score, base_gate)
-                    geo_gate_edge = ensure_minimum_coverage(geo_gate_edge, noise_score, MIN_GEOMETRY_SAMPLES, eligible_mask=eligible_for_geo)
-
                     geo_gate_nca = adaptive_gates["nca"].gate(noise_score, base_gate)
+                    
+                    # ==============================================================================
+                    # Test 2: SMOOTH RAMP for edge/NCA in mid-high σ
+                    # Apply BEFORE ensure_minimum_coverage so the floor applies to post-ramp values
+                    # ==============================================================================
+                    USE_SMOOTH_RAMP_GATING = True  # DEFAULT OFF for Test 0
+                    
+                    if USE_SMOOTH_RAMP_GATING and rho is not None:
+                        rho_lo, rho_hi = 2.0, 8.0  # Ramp parameters
+                        
+                        # Smooth ramp: 1.0 at rho <= rho_lo, 0.0 at rho >= rho_hi
+                        ramp_weight = uet.compute_ramp_weight(rho, rho_lo, rho_hi, invert=True)
+                        
+                        # Apply ramp BEFORE minimum coverage
+                        geo_gate_edge = geo_gate_edge * ramp_weight
+                        geo_gate_nca = geo_gate_nca * ramp_weight
+                        
+                        # Debug
+                        if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                            print(f"\n[DBG-RAMP] step={global_step} rho: min={rho.min():.2f} p50={rho.median():.2f} max={rho.max():.2f}")
+                            print(f"  ramp_weight: min={ramp_weight.min():.3f} p50={ramp_weight.median():.3f} max={ramp_weight.max():.3f}")
+                    
+                    # MINIMUM COVERAGE LAST (applies to final gate values)
+                    geo_gate_edge = ensure_minimum_coverage(geo_gate_edge, noise_score, MIN_GEOMETRY_SAMPLES, eligible_mask=eligible_for_geo)
                     geo_gate_nca = ensure_minimum_coverage(geo_gate_nca, noise_score, MIN_GEOMETRY_SAMPLES, eligible_mask=eligible_for_geo)
+                    
+                    # Debug gate values after all processing
+                    if USE_SMOOTH_RAMP_GATING and global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                        print(f"  edge_gate_final: mean={geo_gate_edge.mean():.3f}")
+                        print(f"  nca_gate_final: mean={geo_gate_nca.mean():.3f}")
 
                     geo_gate_learn_hi = adaptive_gates["learn_hi"].gate(noise_score, base_gate)
 
@@ -4253,6 +4355,35 @@ def train_stageC_diffusion_generator(
                     geo_gate_edge = base_gate
                     geo_gate_nca = base_gate
                     geo_gate_learn_hi = base_gate
+
+                # ==============================================================================
+                # [DBG-GATE-COV] Test 0: Per-bin gate hit rates every 200 steps
+                # Shows FINAL gate values (after ramp & minimum coverage) - what training actually uses
+                # ==============================================================================
+                if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                    s = sigma_t.view(-1).float()  # (B,)
+                    c_skip_check = (sigma_data ** 2) / (s ** 2 + sigma_data ** 2 + 1e-12)
+                    hi_mask = (c_skip_check < 0.25)  # out_scale selection criterion
+                    
+                    print(f"\n[DBG-GATE-COV] step={global_step}")
+                    print(f"  {'σ bin':>15} | {'n':>4} | {'edge':>8} | {'nca':>8} | {'gram':>8} | {'out_sel':>8}")
+                    print(f"  {'-'*15} | {'-'*4} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8}")
+                    
+                    for (lo, hi_b) in uet.SIGMA_BINS:
+                        m = (s >= lo) & (s < hi_b)
+                        n = int(m.sum().item())
+                        if n == 0:
+                            continue
+                        
+                        edge_hit = geo_gate_edge[m].float().mean().item()
+                        nca_hit = geo_gate_nca[m].float().mean().item()
+                        gram_hit = geo_gate_gram[m].float().mean().item()
+                        outsel = hi_mask[m].float().mean().item()
+                        
+                        print(f"  [{lo:.1f},{hi_b:.1f}){' ':>8} | {n:>4} | {edge_hit:>8.3f} | {nca_hit:>8.3f} | {gram_hit:>8.3f} | {outsel:>8.3f}")
+
+                # ===== ST STEP: Score + Gram + Heat + SW_ST =====
+
 
                 # ===== ST STEP: Score + Gram + Heat + SW_ST =====
 
@@ -5707,7 +5838,7 @@ def train_stageC_diffusion_generator(
                                 V_gen_centered, V_target_batch, mask,
                                 knn_indices=knn_spatial_for_gen,
                                 k=15,
-                                max_log_correction=0.25,
+                                max_log_correction=MAX_LOG_CORR,
                             )
                             V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_gen.detach(), mask)
                             
