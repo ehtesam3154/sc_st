@@ -657,6 +657,70 @@ def compute_ramp_weight(
         w = 1.0 - w
     return w
 
+# ==============================================================================
+# PER-SIGMA-BIN GATING (ChatGPT Change A - mandatory)
+# ==============================================================================
+
+def gate_per_sigma_bin(
+    noise_score: torch.Tensor,          # (B,)
+    base_gate: torch.Tensor,            # (B,) float 0/1 (cond_only mask)
+    sigma_flat: torch.Tensor,           # (B,) sigma values
+    bins: list = None,                  # uet.SIGMA_BINS
+    target_frac: float = 0.25,          # fraction of eligible samples per bin to pass
+    min_per_bin: int = 1,               # minimum samples per bin
+    eligible_mask: torch.Tensor = None  # (B,) bool mask (e.g., enough valid points)
+) -> torch.Tensor:
+    """
+    Gate edge/NCA losses per-σ-bin to ensure supervision across all noise levels.
+    
+    The global AdaptiveQuantileGate preferentially selects low-noise samples because
+    noise_score = -log(c_skip) is monotone in σ. This function gates *independently*
+    within each σ bin, so mid/high σ samples also receive edge/NCA supervision.
+    
+    Args:
+        noise_score: (B,) noise proxy (lower = cleaner)
+        base_gate: (B,) float 0/1 (CFG cond_only mask)
+        sigma_flat: (B,) sigma values for each sample
+        bins: List of (lo, hi) tuples defining σ bins. Default: SIGMA_BINS
+        target_frac: Fraction of eligible samples per bin to pass (e.g., 0.25 = 25%)
+        min_per_bin: Minimum number of samples per bin (if bin has samples)
+        eligible_mask: (B,) bool mask of samples eligible for this loss
+        
+    Returns:
+        (B,) float gate mask with per-bin coverage
+    """
+    import math
+    
+    if bins is None:
+        bins = SIGMA_BINS
+        
+    if eligible_mask is None:
+        eligible_mask = torch.ones_like(sigma_flat, dtype=torch.bool)
+    
+    device = noise_score.device
+    gate = torch.zeros_like(base_gate, dtype=torch.float32)
+    
+    for (lo, hi) in bins:
+        # Mask: eligible, conditioned, and in this σ bin
+        m = eligible_mask & (base_gate > 0.5) & (sigma_flat >= lo) & (sigma_flat < hi)
+        n = int(m.sum().item())
+        
+        if n <= 0:
+            continue
+        
+        # Number to select: target_frac of bin population, but at least min_per_bin
+        k = max(min_per_bin, int(math.ceil(target_frac * n)))
+        k = min(k, n)  # Can't select more than we have
+        
+        # Select k samples with lowest noise_score within this bin
+        scores = noise_score.clone()
+        scores[~m] = float("inf")  # Exclude samples not in this bin
+        
+        _, idx = scores.topk(k, largest=False)
+        gate[idx] = 1.0
+    
+    return gate
+
 
 
 def edm_sigma_schedule(
