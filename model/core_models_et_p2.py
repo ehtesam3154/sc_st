@@ -2763,15 +2763,16 @@ def train_stageC_diffusion_generator(
             if idx_list:
                 result.append((bin_name, idx_list[0]))
         return result
+    
 
+    # Track pin-rate for adaptive clamp (persists across steps within this training run)
+    last_pin_rate = 1.0  # Assume worst case initially
     
     for epoch in range(n_epochs):
-
         epoch_cv_sum = 0.0
         epoch_qent_sum = 0.0
         epoch_nca_loss_sum = 0.0
         epoch_nca_count = 0
-
 
         st_iter = iter(st_loader) if use_st else None
         sc_iter = iter(sc_loader) if use_sc else None
@@ -4041,16 +4042,26 @@ def train_stageC_diffusion_generator(
                 if (not is_sc) and knn_spatial_for_scale is not None:
                     knn_spatial_for_scale = knn_spatial_for_scale.to(device)
                     
-                    # Clamp cap ramps over training: start conservative, increase later
-                    # This prevents early instability while allowing normalization later
+                    # --- ADAPTIVE CLAMP CAP (ChatGPT Change 3) ---
+                    # Don't ramp max_log_correction while pin-rate is terrible (>60%).
+                    # Only allow ramping once model starts learning proper scale.
                     clamp_warmup_steps = 2000
                     max_log_base = 0.25  # ~1.28x at start
                     max_log_final = 0.50  # ~1.65x at end
-                    clamp_progress = min(1.0, global_step / clamp_warmup_steps)
-                    max_log_correction = max_log_base + clamp_progress * (max_log_final - max_log_base)
+                                        
+                    # Only allow ramp if pin-rate has improved below threshold
+                    pin_rate_threshold = 0.60
+                    if last_pin_rate <= pin_rate_threshold:
+                        # Pin-rate is acceptable, allow normal ramping
+                        clamp_progress = min(1.0, global_step / clamp_warmup_steps)
+                        max_log_correction = max_log_base + clamp_progress * (max_log_final - max_log_base)
+                    else:
+                        # Pin-rate still high, keep max_log_correction at base (don't let clamp hide problem)
+                        max_log_correction = max_log_base
                     
                     # Compute local scale correction from kNN edges (DETACHED)
-                    s_corr, ratio_raw, valid_scale = uet.compute_local_scale_correction(
+                    # Now returns 4 values including log_s_unclamped
+                    s_corr, ratio_raw, valid_scale, log_s_unclamped = uet.compute_local_scale_correction(
                         V_pred=V_hat_centered,
                         V_tgt=V_target.float(),
                         mask=mask,
@@ -4060,15 +4071,20 @@ def train_stageC_diffusion_generator(
                     )
                     
                     # Apply scale correction (detached) to get V_geom
-                    # DETACHED because we want structure losses to NOT game the clamp
-                    # Scale learning happens via knn_scale loss on V_hat_centered
                     V_geom = uet.apply_scale_correction(V_hat_centered, s_corr.detach(), mask)
                     
-                    # --- POST-CLAMP DIAGNOSTIC (required by ChatGPT) ---
+                    # --- STORE VARIABLES FOR KNN_SCALE PIN-UPWEIGHT (ChatGPT Change 2) ---
+                    # Use log_s_unclamped directly for pinned detection (more precise than ratio_raw)
+                    log_s_unclamped_for_knn = log_s_unclamped.detach()
+                    valid_scale_for_knn = valid_scale
+                    max_log_corr_for_knn = float(max_log_correction)
+
+                    
+                    # --- POST-CLAMP DIAGNOSTIC (ChatGPT updated) ---
                     if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             # Compute ratio_post (after clamp) for comparison
-                            _, ratio_post, _ = uet.compute_local_scale_correction(
+                            _, ratio_post, _, _ = uet.compute_local_scale_correction(
                                 V_pred=V_geom,
                                 V_tgt=V_target.float(),
                                 mask=mask,
@@ -4079,10 +4095,18 @@ def train_stageC_diffusion_generator(
                             
                             n_valid_samples = valid_scale.sum().item()
                             
-                            # Check if clamp is pinned (at max correction)
-                            log_s_corr = torch.log(s_corr[valid_scale] + 1e-8)
-                            pinned_frac = ((log_s_corr.abs() > max_log_correction * 0.95).sum().float() / 
-                                          max(n_valid_samples, 1)).item()
+                            # Compute pin-rate from log_s_unclamped directly (more precise)
+                            # Pinned = |log_s_unclamped| >= max_log_correction (within tolerance)
+                            tol = 0.01
+                            valid_log_s = log_s_unclamped[valid_scale]
+                            if valid_log_s.numel() > 0:
+                                pinned_frac = ((valid_log_s.abs() >= (max_log_correction - tol)).sum().float() / 
+                                              max(n_valid_samples, 1)).item()
+                            else:
+                                pinned_frac = 0.0
+                            
+                            # Update stored pin_rate for adaptive clamp cap
+                            last_pin_rate = pinned_frac
                             
                             print(f"\n[V_GEOM CLAMP] step={global_step} max_log_corr={max_log_correction:.3f}")
                             print(f"  Samples with valid scale: {int(n_valid_samples)}/{batch_size_real}")
@@ -4095,7 +4119,10 @@ def train_stageC_diffusion_generator(
                             print(f"  s_corr: p10={s_corr.quantile(0.1).item():.3f} "
                                   f"p50={s_corr.median().item():.3f} "
                                   f"p90={s_corr.quantile(0.9).item():.3f}")
-                            print(f"  Clamp pin-rate: {pinned_frac:.1%} (should decrease as knn_scale teaches)")
+                            print(f"  log_s_unclamped: p10={log_s_unclamped.quantile(0.1).item():.3f} "
+                                  f"p50={log_s_unclamped.median().item():.3f} "
+                                  f"p90={log_s_unclamped.quantile(0.9).item():.3f}")
+                            print(f"  Clamp pin-rate: {pinned_frac:.1%} (threshold for ramp: <{pin_rate_threshold:.0%})")
                             
                             # Check if clamp is helping
                             improvement = (ratio_raw.median() - 1.0).abs() - (ratio_post.median() - 1.0).abs()
@@ -4104,22 +4131,24 @@ def train_stageC_diffusion_generator(
                             else:
                                 print(f"  ⚠ Clamp not helping much (improvement={improvement.item():.3f})")
                             
-                            # --- A1: kNN INDEXING VERIFICATION (ChatGPT requested) ---
-                            # Verify once that knn_spatial indices are valid
-                            if global_step == 100:
+                            # --- kNN INDEXING VERIFICATION ---
+                            if global_step % 100 == 0:
                                 knn_max = knn_spatial_for_scale.max().item()
                                 n_max_batch = mask.shape[1]
-                                n_valid_total = mask.sum().item()
-                                # Check fraction of neighbors that are valid (mask==1)
                                 b_test = 0
                                 m_test = mask[b_test].bool()
                                 knn_test = knn_spatial_for_scale[b_test, m_test, :]
                                 valid_frac = (knn_test >= 0).float().mean().item()
                                 print(f"  [KNN-INDEX-CHECK] knn_max={knn_max}, N={n_max_batch}, "
                                       f"valid_neighbor_frac={valid_frac:.2%}")
+
                 else:
                     # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
                     V_geom = V_hat_centered
+                    # No clamp computed - set variables to None for knn_scale block
+                    log_s_unclamped_for_knn = None
+                    valid_scale_for_knn = None
+                    max_log_corr_for_knn = None
 
 
             # --- PATCH 7: Low-rank subspace penalty ---
@@ -4505,16 +4534,6 @@ def train_stageC_diffusion_generator(
                     # Keep it for the shape component but NOT for the scale component
                     sigma_vec = sigma_t.view(-1).float()  # (B,)
 
-                    # OPTION A: Remove σ-weighting entirely (pure EDM approach)
-                    # per_set_relative_loss = per_set_relative_loss  # No modification
-
-                    # OPTION B: Keep σ-weighting only for SHAPE, not for SCALE
-                    # This is applied ONLY to per_set_relative_loss (shape/structure)
-                    # L_gram_scale (below) should NOT get this weighting
-                    # w_geom = (1.0 / sigma_vec.clamp_min(0.3)).pow(1.0)
-                    # per_set_relative_loss = per_set_relative_loss * w_geom
-                    # NOTE: L_gram_scale is computed separately and does NOT use w_geom
-
                     # Gate geometry to conditional + low noise samples
                     # PATCH 3A: Re-enable SNR gating for Gram loss
                     # With sigma_data≈0.17, sigma=0.5 is ~3x sigma_data, so use sigma<=0.4 as "low noise"
@@ -4668,9 +4687,6 @@ def train_stageC_diffusion_generator(
                     else:
                         L_gram_learn = torch.tensor(0.0, device=device)
                     # ==================== END ACTION 4 (FINAL) ====================
-
-
-
 
 
                     # --- [DEBUG] Log Gram Gate Hit-Rate ---
@@ -5073,9 +5089,80 @@ def train_stageC_diffusion_generator(
                         )
                         
                         gate_sum_scale = scale_gate.sum().clamp(min=1.0)
-                        
+                                                
                         L_knn_scale_per = torch.nan_to_num(L_knn_scale_per, nan=0.0, posinf=0.0, neginf=0.0)
-                        L_knn_scale = (L_knn_scale_per * scale_gate).sum() / gate_sum_scale
+                        
+                        # --- ENHANCED PIN-AWARE UPWEIGHT (ChatGPT Change 2 + Change 4) ---
+                        # Use log_s_unclamped directly for pinned detection (more precise)
+                        # Increase alpha_max to 6.0 and make it conditional on pin-rate
+                        if log_s_unclamped_for_knn is not None:
+                            # Pinned = |log_s_unclamped| >= max_log_correction (within tolerance)
+                            tol = 0.01
+                            is_pinned_raw = (log_s_unclamped_for_knn.abs() >= (max_log_corr_for_knn - tol))
+                            
+                            # Also require valid_scale
+                            if valid_scale_for_knn is not None:
+                                is_pinned = (is_pinned_raw & valid_scale_for_knn).float()
+                            else:
+                                is_pinned = is_pinned_raw.float()
+                            
+                            # Compute current pin-rate for adaptive alpha
+                            current_pin_rate = is_pinned.mean().item()
+                            
+                            # CHANGE 4: Higher alpha_max, conditional on pin-rate
+                            # alpha_eff = alpha_max * ramp * clamp((pin_rate - 0.5) / 0.5, 0, 1)
+                            # This keeps things stable if pin-rate improves
+                            alpha_max = 6.0  # Pinned samples can reach 7x weight
+                            alpha_ramp = min(1.0, global_step / 2000.0)
+                            pin_rate_factor = max(0.0, min(1.0, (current_pin_rate - 0.5) / 0.5))
+                            alpha = alpha_max * alpha_ramp * pin_rate_factor
+                            
+                            # Minimum alpha to always give some pressure
+                            alpha = max(alpha, 1.0 * alpha_ramp)  # At least 2x for pinned after ramp
+                            
+                            pin_mult = 1.0 + alpha * is_pinned
+                            
+                            # Apply multiplier
+                            L_knn_scale_per_weighted = L_knn_scale_per * pin_mult
+                        else:
+                            pin_mult = torch.ones_like(L_knn_scale_per)
+                            is_pinned = torch.zeros_like(L_knn_scale_per)
+                            alpha = 0.0
+                            current_pin_rate = 0.0
+                            L_knn_scale_per_weighted = L_knn_scale_per
+                        
+                        # --- CHANGE 5: PINNED-ONLY GLOBAL RMS SCALE TERM ---
+                        # Add small global scale supervision for pinned samples only
+                        # This gives an additional gradient path that doesn't rely on kNN edges
+                        if log_s_unclamped_for_knn is not None and is_pinned.sum() > 0:
+                            L_rms_scale_list = []
+                            for b_idx in range(mask.shape[0]):
+                                mb = mask[b_idx].bool()
+                                if mb.sum() < 2:
+                                    L_rms_scale_list.append(torch.tensor(0.0, device=device))
+                                    continue
+                                
+                                # RMS of pred and target (centered coords)
+                                v_pred_b = V_hat_centered[b_idx, mb]  # (n_valid, D)
+                                v_tgt_b = V_target[b_idx, mb].float()
+                                
+                                rms_pred = v_pred_b.pow(2).sum(dim=-1).mean().sqrt().clamp(min=eps)
+                                rms_tgt = v_tgt_b.pow(2).sum(dim=-1).mean().sqrt().clamp(min=eps)
+                                
+                                # Log-ratio squared
+                                L_rms_b = torch.log(rms_pred / rms_tgt).pow(2)
+                                L_rms_scale_list.append(L_rms_b)
+                            
+                            L_rms_scale_per = torch.stack(L_rms_scale_list)  # (B,)
+                            
+                            # Only apply to pinned samples
+                            L_rms_scale_per = L_rms_scale_per * is_pinned * scale_gate
+                            
+                            # Add to weighted knn_scale with small coefficient
+                            rms_coef = 0.1
+                            L_knn_scale_per_weighted = L_knn_scale_per_weighted + rms_coef * L_rms_scale_per
+                        
+                        L_knn_scale = (L_knn_scale_per_weighted * scale_gate).sum() / gate_sum_scale
                         
                         # Extended debug with per-sigma breakdown
                         if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
@@ -5092,6 +5179,48 @@ def train_stageC_diffusion_generator(
                                     if in_bin.any():
                                         loss_bin = L_knn_scale_per[in_bin].mean().item()
                                         print(f"    σ∈[{lo:.1f},{hi_bound:.1f}): L_knn_scale={loss_bin:.6f} n={in_bin.sum().item()}")
+                                
+                                # --- PIN-UPWEIGHT DEBUG ---
+                                pinned_frac = is_pinned.mean().item()
+                                mean_mult = pin_mult.mean().item()
+                                print(f"  [PIN-UPWEIGHT] pinned_frac={pinned_frac:.1%} mean_mult={mean_mult:.3f} "
+                                      f"alpha={alpha:.3f} pin_rate_factor={pin_rate_factor:.3f}")
+                                
+                                # Split loss by pinned vs unpinned
+                                gated_mask = (scale_gate > 0)
+                                pinned_and_gated = (is_pinned > 0) & gated_mask
+                                unpinned_and_gated = (is_pinned == 0) & gated_mask
+                                
+                                if pinned_and_gated.any():
+                                    L_pinned = L_knn_scale_per[pinned_and_gated].mean().item()
+                                    print(f"    L_knn_scale (PINNED): {L_pinned:.6f} n={pinned_and_gated.sum().item()}")
+                                if unpinned_and_gated.any():
+                                    L_unpinned = L_knn_scale_per[unpinned_and_gated].mean().item()
+                                    print(f"    L_knn_scale (unpinned): {L_unpinned:.6f} n={unpinned_and_gated.sum().item()}")
+                                
+                                # RMS scale debug
+                                if log_s_unclamped_for_knn is not None and 'L_rms_scale_per' in dir():
+                                    L_rms_pinned = (L_rms_scale_per[pinned_and_gated]).mean().item() if pinned_and_gated.any() else 0.0
+                                    print(f"    L_rms_scale (pinned only): {L_rms_pinned:.6f}")
+
+
+                                # --- PIN-UPWEIGHT DEBUG (ChatGPT B4) ---
+                                pinned_frac = is_pinned.mean().item()
+                                mean_mult = pin_mult.mean().item()
+                                print(f"  [PIN-UPWEIGHT] pinned_frac={pinned_frac:.1%} mean_mult={mean_mult:.3f} alpha={alpha:.3f}")
+                                
+                                # Split loss by pinned vs unpinned
+                                gated_mask = (scale_gate > 0)
+                                pinned_and_gated = (is_pinned > 0) & gated_mask
+                                unpinned_and_gated = (is_pinned == 0) & gated_mask
+                                
+                                if pinned_and_gated.any():
+                                    L_pinned = L_knn_scale_per[pinned_and_gated].mean().item()
+                                    print(f"    L_knn_scale (PINNED): {L_pinned:.6f} n={pinned_and_gated.sum().item()}")
+                                if unpinned_and_gated.any():
+                                    L_unpinned = L_knn_scale_per[unpinned_and_gated].mean().item()
+                                    print(f"    L_knn_scale (unpinned): {L_unpinned:.6f} n={unpinned_and_gated.sum().item()}")
+
                 else:
                     L_knn_scale = torch.tensor(0.0, device=device)
 
@@ -5831,35 +5960,28 @@ def train_stageC_diffusion_generator(
                         V_gen_centered = (V_gen_f32 - mean_Vgen) * m_float_gen
                         
                         # ==================== CHANGE 6: GENERATOR SCALE CLAMP (Option 1 Change B) ====================
-                        # Apply same local scale correction to generator for alignment loss
-                        # This ensures alignment loss focuses on shape, not scale
+
+                        # PATCH 8: Scale-aware generator alignment losses
+                        # Use knn_spatial for generator scale clamp (same as diffusion)
                         knn_spatial_for_gen = batch.get('knn_spatial', None)
                         if knn_spatial_for_gen is not None:
                             knn_spatial_for_gen = knn_spatial_for_gen.to(device)
                             
-                            # Use same max_log_correction as diffusion (for consistency)
-                            clamp_warmup_steps = 2000
-                            max_log_base = 0.25
-                            max_log_final = 0.50
-                            clamp_progress = min(1.0, global_step / clamp_warmup_steps)
-                            max_log_correction_gen = max_log_base + clamp_progress * (max_log_final - max_log_base)
-                            
-                            s_gen, ratio_gen, valid_gen = uet.compute_local_scale_correction(
-                                V_gen_centered, V_target_batch, mask,
+                            # Compute scale correction for GENERATOR (separate from diffusion)
+                            s_corr_gen, _, valid_scale_gen, _ = uet.compute_local_scale_correction(
+                                V_pred=V_gen_centered,  # Generator output, NOT V_hat_centered
+                                V_tgt=V_target.float(),
+                                mask=mask,
                                 knn_indices=knn_spatial_for_gen,
                                 k=15,
-                                max_log_correction=max_log_correction_gen,
+                                max_log_correction=max_log_corr_for_knn if max_log_corr_for_knn is not None else 0.25,
                             )
-                            V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_gen.detach(), mask)
                             
-                            # Debug generator scale
-                            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
-                                with torch.no_grad():
-                                    if valid_gen.any():
-                                        ratio_gen_med = ratio_gen[valid_gen].median().item()
-                                        print(f"[GEN-SCALE-CLAMP] step={global_step} ratio_raw_med={ratio_gen_med:.3f}")
+                            # Apply scale correction to generator
+                            V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_corr_gen.detach(), mask)
                         else:
                             V_gen_geo = V_gen_centered
+
                         
                         # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
                         # Use CLAMPED V_gen_geo for alignment (removes scale mismatch)

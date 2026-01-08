@@ -4332,25 +4332,37 @@ class AdaptiveQuantileGate:
 
 def knn_scale_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor,
                    knn_indices: torch.Tensor = None, k: int = 15, eps: float = 1e-8,
-                   return_per_sample: bool = False) -> torch.Tensor:
+                   return_per_sample: bool = False, r_clip: float = 2.0) -> torch.Tensor:
     """
-    kNN Local Distance Scale Calibration Loss (EFFICIENT: uses kNN edges, not N²).
+    kNN Local Distance Scale Calibration Loss (GRADIENT-DENSE edgewise version).
     
-    Penalizes median(D²_pred_edges) / median(D²_tgt_edges) being far from 1.0.
-    Uses log-ratio squared for symmetric, scale-invariant penalty.
+    Instead of using median-based scalar per sample (gradient-poor), this computes
+    log-ratio MSE over ALL valid kNN edges, providing dense gradients.
+    
+    For each valid kNN edge (e):
+        r_e = log(d2_pred_e + eps) - log(d2_tgt_e + eps)
+        loss_b = mean(clamp(r_e, -r_clip, +r_clip)^2) over edges
     
     Args:
         V_pred: (B, N, D) predicted coordinates
         V_target: (B, N, D) target coordinates  
         mask: (B, N) validity mask
         knn_indices: (B, N, k) precomputed neighbor indices (use knn_spatial from batch)
-                     If None, computes on-the-fly (slower fallback)
+                     Can be in LOCAL [0, n_valid) or GLOBAL [0, N) indexing.
+                     If None, computes on-the-fly (slower fallback).
         k: number of neighbors (used if knn_indices is None)
         eps: numerical stability
         return_per_sample: if True, return (B,) per-sample losses for gating
+        r_clip: clip log-ratio per edge for robustness (default 2.0)
     
     Returns:
         Scalar loss (or (B,) if return_per_sample=True)
+    
+    Why this helps (ChatGPT reasoning):
+        The median-based version only provides gradients through ~1 edge per sample,
+        causing the scale loss to plateau early while the clamp stays pinned.
+        This edgewise version provides gradients from hundreds/thousands of edges,
+        allowing the model to continuously reduce raw scale error.
     """
     B, N, D = V_pred.shape
     device = V_pred.device
@@ -4359,80 +4371,75 @@ def knn_scale_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Ten
     
     for b in range(B):
         mb = mask[b].bool()
-        n_valid = mb.sum().item()
+        n_valid = int(mb.sum().item())
         
         if n_valid < k + 1:
             per_sample_losses.append(torch.tensor(0.0, device=device))
             continue
         
-        # Get valid points
-        V_p = V_pred[b, mb]   # (n_valid, D)
-        V_t = V_target[b, mb] # (n_valid, D)
+        # Work in full-N indexing, but only compute edges from valid sources.
+        Vp = V_pred[b]    # (N, D)
+        Vt = V_target[b]  # (N, D)
         
-        # Get neighbor indices for this sample
-        if knn_indices is not None:
-            # knn_indices is (B, N, k) with indices in [0, N) or -1 for invalid
-            knn_b = knn_indices[b, mb, :]  # (n_valid, k)
+        if knn_indices is None:
+            # Fallback: compute kNN among valid points only (slow)
+            Vp_valid = Vp[mb]
+            D2 = torch.cdist(Vp_valid, Vp_valid).pow(2)
+            D2.fill_diagonal_(float('inf'))
+            _, knn_local = D2.topk(min(k, n_valid - 1), largest=False, dim=1)  # (n_valid, k)
             
-            # We need to remap global indices to local (within valid points)
-            # Create mapping: global index -> local index within valid set
-            valid_indices = torch.where(mb)[0]  # (n_valid,) global indices that are valid
-            
-            # For each neighbor index, find if it's in valid set and get local index
-            # This is tricky - knn_indices are in local miniset space already
-            # Just need to handle -1 (invalid) entries
-            knn_local = knn_b.clone()
-            valid_knn_mask = (knn_local >= 0) & (knn_local < n_valid)  # (n_valid, k)
+            # Map local indices back to global indices
+            valid_idx = torch.where(mb)[0]  # (n_valid,)
+            knn_g = valid_idx[knn_local]    # (n_valid, k) in global indexing
+            src_g = valid_idx.unsqueeze(1).expand_as(knn_g)
         else:
-            # Fallback: compute kNN on-the-fly (less efficient but works)
-            D2_p = torch.cdist(V_p, V_p).pow(2)
-            D2_p.fill_diagonal_(float('inf'))
-            _, knn_local = D2_p.topk(min(k, n_valid - 1), dim=-1, largest=False)
-            valid_knn_mask = torch.ones_like(knn_local, dtype=torch.bool)
+            # Use provided knn indices
+            # knn_indices is (B, N, k) - extract for this sample's valid points
+            knn_g_full = knn_indices[b]  # (N, k)
+            valid_idx = torch.where(mb)[0]  # (n_valid,) global indices that are valid
+            src_g = valid_idx.unsqueeze(1)  # (n_valid, 1)
+            knn_g = knn_g_full[mb]  # (n_valid, k) neighbors
+            src_g = src_g.expand_as(knn_g)  # (n_valid, k)
+            
+            # ROBUST INDEX HANDLING (ChatGPT recommendation):
+            # Detect if indices are LOCAL [0, n_valid) or GLOBAL [0, N).
+            # If max index < n_valid, likely LOCAL - remap to global.
+            # This handles the ambiguity without requiring upstream changes.
+            if knn_g.numel() > 0:
+                knn_max = knn_g.max().item()
+                # If max neighbor index is less than n_valid, assume LOCAL indexing
+                if knn_max < n_valid and knn_max >= 0:
+                    # Check if it looks like local indexing (max should be close to n_valid-1)
+                    # Also check if any index >= n_valid would exist if global
+                    # If all indices < n_valid, remap local -> global
+                    knn_g = valid_idx[knn_g.clamp(0, n_valid - 1)]
         
-        # Gather edge squared distances using kNN indices
-        # For each point i, compute ||V[i] - V[knn[i,j]]||² for all j in 1..k
+        # Valid edge mask: neighbor index in range, neighbor is valid, not self, not -1
+        valid_src = mb[src_g]  # All True by construction
+        valid_nbr = (knn_g >= 0) & (knn_g < N) & mb[knn_g.clamp(0, N - 1)]
+        not_self = (knn_g != src_g)
+        edge_ok = valid_src & valid_nbr & not_self
         
-        n_pts = V_p.shape[0]
-        k_actual = knn_local.shape[1]
-        
-        # Clamp indices to valid range for gather (handle -1)
-        knn_clamped = knn_local.clamp(0, n_pts - 1)  # (n_valid, k)
-        
-        # Gather neighbor coords: (n_valid, k, D)
-        V_p_neighbors = V_p[knn_clamped]  # (n_valid, k, D)
-        V_t_neighbors = V_t[knn_clamped]
-        
-        # Source coords expanded: (n_valid, 1, D) -> broadcast with (n_valid, k, D)
-        V_p_src = V_p.unsqueeze(1)  # (n_valid, 1, D)
-        V_t_src = V_t.unsqueeze(1)
-        
-        # Squared distances on edges
-        D2_pred_edges = ((V_p_src - V_p_neighbors) ** 2).sum(dim=-1)  # (n_valid, k)
-        D2_tgt_edges = ((V_t_src - V_t_neighbors) ** 2).sum(dim=-1)
-        
-        # Mask out invalid edges
-        D2_pred_edges = D2_pred_edges * valid_knn_mask.float()
-        D2_tgt_edges = D2_tgt_edges * valid_knn_mask.float()
-        
-        # Get valid edge distances only
-        valid_edges = valid_knn_mask.flatten()
-        d2_p_valid = D2_pred_edges.flatten()[valid_edges]
-        d2_t_valid = D2_tgt_edges.flatten()[valid_edges]
-        
-        if d2_p_valid.numel() < 5:
+        if edge_ok.sum().item() < 8:
             per_sample_losses.append(torch.tensor(0.0, device=device))
             continue
         
-        # Compute medians
-        med_pred = d2_p_valid.median()
-        med_tgt = d2_t_valid.median()
+        src_idx = src_g[edge_ok]
+        nbr_idx = knn_g[edge_ok]
         
-        # Log-ratio squared (symmetric penalty)
-        ratio = med_pred / med_tgt.clamp(min=eps)
-        log_ratio = torch.log(ratio.clamp(min=eps))
-        loss_b = log_ratio.pow(2)
+        # Compute squared distances on edges
+        d2p = (Vp[src_idx] - Vp[nbr_idx]).pow(2).sum(dim=-1).clamp_min(eps)
+        d2t = (Vt[src_idx] - Vt[nbr_idx]).pow(2).sum(dim=-1).clamp_min(eps)
         
+        # Edgewise log-ratio
+        r = torch.log(d2p) - torch.log(d2t)
+        
+        # Robust clipping to prevent outliers from dominating
+        if r_clip is not None and r_clip > 0:
+            r = r.clamp(-r_clip, r_clip)
+        
+        # MSE over all edges (gradient-dense!)
+        loss_b = (r * r).mean()
         per_sample_losses.append(loss_b)
     
     per_sample_tensor = torch.stack(per_sample_losses)  # (B,)
@@ -4451,14 +4458,19 @@ def compute_local_scale_correction(
     k: int = 15,
     eps: float = 1e-8,
     max_log_correction: float = 0.3,  # Caps correction to ~1.35x
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    min_edges: int = 8,  # Minimum edges for valid estimate
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute per-sample local scale correction from kNN edge distances.
+    
+    ROBUST VERSION: Uses same global indexing pattern as knn_scale_loss.
+    Works in full-N indexing space to avoid ambiguity.
     
     Returns:
         s: (B,) scale correction factors (multiply V_pred by this to match V_tgt scale)
         ratio: (B,) raw ratio of median(D2_pred) / median(D2_tgt)
         valid: (B,) bool mask indicating samples with enough edges for reliable estimate
+        log_s_unclamped: (B,) the raw unclamped log-scale correction (for pinned detection)
     """
     B, N, D = V_pred.shape
     device = V_pred.device
@@ -4466,53 +4478,63 @@ def compute_local_scale_correction(
     s_list = []
     ratio_list = []
     valid_list = []
+    log_s_unclamped_list = []
     
     for b in range(B):
         mb = mask[b].bool()
-        n_valid = mb.sum().item()
+        n_valid = int(mb.sum().item())
         
         if n_valid < k + 1:
             s_list.append(torch.tensor(1.0, device=device))
             ratio_list.append(torch.tensor(1.0, device=device))
+            log_s_unclamped_list.append(torch.tensor(0.0, device=device))
             valid_list.append(False)
             continue
         
-        V_p = V_pred[b, mb]  # (n_valid, D)
-        V_t = V_tgt[b, mb]   # (n_valid, D)
+        # Work in full-N indexing space (same as knn_scale_loss)
+        Vp = V_pred[b]    # (N, D)
+        Vt = V_tgt[b]     # (N, D)
+        valid_idx = torch.where(mb)[0]  # (n_valid,) global indices that are valid
         
-        # Get kNN edges
         if knn_indices is not None:
-            knn_b = knn_indices[b, mb, :]  # (n_valid, k)
-            valid_neighbors = (knn_b >= 0) & (knn_b < n_valid)
+            # Get knn indices for valid sources
+            knn_g_full = knn_indices[b]  # (N, k)
+            knn_g = knn_g_full[mb]  # (n_valid, k) neighbors
+            src_g = valid_idx.unsqueeze(1).expand_as(knn_g)  # (n_valid, k)
             
-            if not valid_neighbors.any():
+            # ROBUST INDEX HANDLING (same pattern as knn_scale_loss):
+            # Detect if indices are LOCAL [0, n_valid) or GLOBAL [0, N).
+            if knn_g.numel() > 0:
+                knn_max = knn_g.max().item()
+                # If max neighbor index < n_valid, assume LOCAL indexing - remap to global
+                if knn_max < n_valid and knn_max >= 0:
+                    knn_g = valid_idx[knn_g.clamp(0, n_valid - 1)]
+            
+            # Valid edge mask: neighbor in range, neighbor is valid, not self, not -1
+            valid_nbr = (knn_g >= 0) & (knn_g < N) & mb[knn_g.clamp(0, N - 1)]
+            not_self = (knn_g != src_g)
+            edge_ok = valid_nbr & not_self
+            
+            if edge_ok.sum().item() < min_edges:
                 s_list.append(torch.tensor(1.0, device=device))
                 ratio_list.append(torch.tensor(1.0, device=device))
+                log_s_unclamped_list.append(torch.tensor(0.0, device=device))
                 valid_list.append(False)
                 continue
             
-            # Compute edge distances for valid kNN pairs
-            k_size = knn_b.shape[1]
-            i_idx = torch.arange(n_valid, device=device).unsqueeze(1).expand(-1, k_size)
-            j_idx = knn_b
+            src_idx = src_g[edge_ok]
+            nbr_idx = knn_g[edge_ok]
             
-            edge_mask = valid_neighbors & (i_idx != j_idx)
-            i_edges = i_idx[edge_mask]
-            j_edges = j_idx[edge_mask]
-            
-            if i_edges.numel() < k:
-                s_list.append(torch.tensor(1.0, device=device))
-                ratio_list.append(torch.tensor(1.0, device=device))
-                valid_list.append(False)
-                continue
-            
-            # Compute squared edge lengths
-            d2_pred = (V_p[i_edges] - V_p[j_edges]).pow(2).sum(dim=-1)  # (n_edges,)
-            d2_tgt = (V_t[i_edges] - V_t[j_edges]).pow(2).sum(dim=-1)   # (n_edges,)
+            # Compute squared edge lengths using global indexing
+            d2_pred = (Vp[src_idx] - Vp[nbr_idx]).pow(2).sum(dim=-1)  # (n_edges,)
+            d2_tgt = (Vt[src_idx] - Vt[nbr_idx]).pow(2).sum(dim=-1)   # (n_edges,)
         else:
-            # Fallback: compute all pairwise and take k nearest
-            D2_pred = torch.cdist(V_p, V_p).pow(2)
-            D2_tgt = torch.cdist(V_t, V_t).pow(2)
+            # Fallback: compute all pairwise among valid points and take k nearest
+            Vp_valid = Vp[mb]  # (n_valid, D)
+            Vt_valid = Vt[mb]
+            
+            D2_pred = torch.cdist(Vp_valid, Vp_valid).pow(2)
+            D2_tgt = torch.cdist(Vt_valid, Vt_valid).pow(2)
             
             D2_pred.fill_diagonal_(float('inf'))
             D2_tgt.fill_diagonal_(float('inf'))
@@ -4524,14 +4546,17 @@ def compute_local_scale_correction(
             d2_tgt = knn_d2_tgt.flatten()
         
         # Compute median ratio
-        med_d2_pred = d2_pred.median()
+        med_d2_pred = d2_pred.median().clamp(min=eps)
         med_d2_tgt = d2_tgt.median().clamp(min=eps)
         
         ratio = med_d2_pred / med_d2_tgt
         
         # Scale correction: s = sqrt(tgt/pred) to bring pred to tgt scale
         # If pred distances are too large (ratio > 1), s < 1 shrinks them
-        log_s = 0.5 * torch.log(med_d2_tgt / med_d2_pred.clamp(min=eps))
+        log_s = 0.5 * torch.log(med_d2_tgt / med_d2_pred)
+        
+        # Store unclamped log_s for pinned detection
+        log_s_unclamped_list.append(log_s.detach())
         
         # Clamp correction to prevent wild jumps
         log_s_clamped = log_s.clamp(-max_log_correction, max_log_correction)
@@ -4542,10 +4567,12 @@ def compute_local_scale_correction(
         valid_list.append(True)
     
     return (
-        torch.stack(s_list),  # (B,)
-        torch.stack(ratio_list),  # (B,)
-        torch.tensor(valid_list, device=device, dtype=torch.bool)  # (B,)
+        torch.stack(s_list),                # (B,) clamped scale factors
+        torch.stack(ratio_list),            # (B,) raw D² ratio
+        torch.tensor(valid_list, device=device, dtype=torch.bool),  # (B,) validity
+        torch.stack(log_s_unclamped_list),  # (B,) unclamped log-scale for pinned detection
     )
+
 
 
 def apply_scale_correction(V: torch.Tensor, s: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
