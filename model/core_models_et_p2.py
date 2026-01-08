@@ -40,6 +40,9 @@ except Exception:
 import time
 from contextlib import contextmanager
 
+import math
+
+
 #debug tools
 DEBUG = False #master switch for debug logging
 
@@ -1954,7 +1957,7 @@ def train_stageC_diffusion_generator(
     
     # A/B 2a: Normalize score loss by sum of weights (removes global w scaling)
     # This is the KEY fix - it prevents low-σ from dominating the gradient
-    EXP_SCORE_WNORM = False
+    EXP_SCORE_WNORM = True
     
     # A/B 2b: Boost high-noise samples in L_score (distribution shaping)
     EXP_SCORE_HI_BOOST = True
@@ -2001,9 +2004,24 @@ def train_stageC_diffusion_generator(
     adaptive_gates = {
         "gram": uet.AdaptiveQuantileGate(target_rate=0.50, mode="low", warmup_steps=200),
         "gram_scale": uet.AdaptiveQuantileGate(target_rate=0.60, mode="low", warmup_steps=200),
-        "edge": uet.AdaptiveQuantileGate(target_rate=0.15, mode="low", warmup_steps=200),
-        "nca": uet.AdaptiveQuantileGate(target_rate=0.15, mode="low", warmup_steps=200),
+        "edge": uet.AdaptiveQuantileGate(target_rate=0.30, mode="low", warmup_steps=200),  # Was 0.15
+        "nca": uet.AdaptiveQuantileGate(target_rate=0.40, mode="low", warmup_steps=200),   # Was 0.15
         "learn_hi": uet.AdaptiveQuantileGate(target_rate=0.50, mode="high", warmup_steps=200),
+    }
+
+    # ==============================================================================
+    # BOOST READINESS STATE MACHINE (CHANGE 2)
+    # ==============================================================================
+    # Boost only activates when high-σ scale is stable (Fx_pred/Fx_tgt ≈ 1.0)
+    boost_state = {
+        'ready': False,
+        'start_step': None,
+        'ema_fx_ratio_hi': 1.0,
+        'last_fx_ratio_hi': None,    # ADD THIS KEY
+        'stable_count': 0,
+        'stability_tol': 0.10,
+        'min_stable_checks': 3,
+        'ema_decay': 0.98,
     }
     
     # A/B 2: High-noise gate for score loss boosting (dataset-independent)
@@ -2379,6 +2397,7 @@ def train_stageC_diffusion_generator(
         'gram_scale': 2.0,     # was 1.0
         'out_scale': 1.0,
         'gram_learn': 1.0,
+        'knn_scale': 0.2,     # NEW: kNN distance scale calibration
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -2446,7 +2465,7 @@ def train_stageC_diffusion_generator(
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
             'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],  # ADD THESE
             'dim': [], 'triangle': [], 'radial': [],
-            'knn_nca': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': []
+            'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': []
         }
     }
 
@@ -3555,24 +3574,62 @@ def train_stageC_diffusion_generator(
                     # Start from base weights
                     w_eff = w
                     
-                    # Optional boost (distribution shaping)
+                    # Optional boost with data-driven readiness (CHANGE 2)
+                    # Optional boost with data-driven readiness (CHANGE 2)
                     if EXP_SCORE_HI_BOOST:
-                        if global_step < SCORE_HI_BOOST_WARMUP:
-                            ramp = 0.0
+                        # Update boost readiness from Fx scale at high-σ
+                        with torch.no_grad():
+                            fx_ratio = boost_state.get('last_fx_ratio_hi', None)
+                            
+                            if fx_ratio is not None and fx_ratio > 0:
+                                # EMA update
+                                boost_state['ema_fx_ratio_hi'] = (
+                                    boost_state['ema_decay'] * boost_state['ema_fx_ratio_hi'] +
+                                    (1 - boost_state['ema_decay']) * fx_ratio
+                                )
+                                
+                                # Check stability using log error (scale-invariant)
+                                fx_err = abs(math.log(boost_state['ema_fx_ratio_hi']))
+                                is_stable = (fx_err < boost_state['stability_tol'])
+                                
+                                if is_stable:
+                                    boost_state['stable_count'] += 1
+                                else:
+                                    boost_state['stable_count'] = 0
+                                
+                                # Trigger readiness
+                                if (not boost_state['ready'] and 
+                                    boost_state['stable_count'] >= boost_state['min_stable_checks']):
+                                    boost_state['ready'] = True
+                                    boost_state['start_step'] = global_step
+                                    if fabric is None or fabric.is_global_zero:
+                                        print(f"\n[BOOST-READY] Boost activated at step {global_step}!")
+                                        print(f"  ema_fx_ratio_hi={boost_state['ema_fx_ratio_hi']:.4f}")
+                        
+                        # Compute boost ramp
+                        if not boost_state['ready']:
+                            ramp = 0.0  # Boost disabled until ready
                         else:
-                            ramp = min(1.0, (global_step - SCORE_HI_BOOST_WARMUP) / max(1, SCORE_HI_BOOST_RAMP))
+                            steps_since_ready = global_step - boost_state['start_step']
+                            ramp = min(1.0, steps_since_ready / max(1, SCORE_HI_BOOST_RAMP))
                         
                         boost = 1.0 + ramp * (SCORE_HI_BOOST_FACTOR - 1.0) * gate_hi_score  # (B,)
                         w_eff = w_eff * boost
                         
-                        # Debug: Log boost stats
+                        # Debug logging
                         if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
                             thr_val = score_hi_gate.thr
                             thr_str = f"{thr_val:.3f}" if thr_val is not None else "warmup"
+                            print(f"[BOOST-READY] step={global_step} ready={boost_state['ready']} "
+                                  f"ema_fx={boost_state['ema_fx_ratio_hi']:.3f} "
+                                  f"stable_count={boost_state['stable_count']} "
+                                  f"ramp={ramp:.2f}")
                             print(f"[SCORE-HI-BOOST] step={global_step} ramp={ramp:.2f} "
                                   f"thr={thr_str} "
                                   f"hit={(gate_hi_score>0).float().mean().item():.2%} "
                                   f"boost_mean={boost.mean().item():.3f}")
+
+
                     
                     # Now choose how to aggregate score loss
                     if EXP_SCORE_WNORM:
@@ -3878,6 +3935,7 @@ def train_stageC_diffusion_generator(
             L_out_scale = torch.tensor(0.0, device=device)  # NEW: Learned-branch scale calibration
             L_gram_learn = torch.tensor(0.0, device=device)  # ACTION 4: Learned-branch geom emphasis
             L_knn_nca = torch.tensor(0.0, device=device)
+            L_knn_scale = torch.tensor(0.0, device=device)  # NEW
             L_heat = torch.tensor(0.0, device=device)
             L_sw_st = torch.tensor(0.0, device=device)
             L_sw_sc = torch.tensor(0.0, device=device)
@@ -4570,7 +4628,12 @@ def train_stageC_diffusion_generator(
                                         rms_fx_pred_all = ((Fx_pred_all.pow(2) * m_float).sum(dim=(1, 2)) / denom_all).sqrt()
                                         rms_fx_tgt_all = ((Fx_tgt_all.pow(2) * m_float).sum(dim=(1, 2)) / denom_all).sqrt()
                                         ratio_fx_all = rms_fx_pred_all / rms_fx_tgt_all.clamp(min=1e-8)
-                                        
+
+                                        # Store high-σ Fx ratio for boost readiness (CHANGE 2)
+                                        hi_mask = (c_skip_1d < 0.25)
+                                        if hi_mask.any():
+                                            boost_state['last_fx_ratio_hi'] = ratio_fx_all[hi_mask].median().item()
+           
                                         sigma_vals = sigma_flat_f
                                         sigma_bins_out = [(0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 1.2), (1.2, 2.4), (2.4, float('inf'))]
                                         
@@ -4723,7 +4786,35 @@ def train_stageC_diffusion_generator(
                         print(f"[NCA] n_valid_mean={n_valid.mean().item():.1f} "
                             f"uniform_baseline≈{baseline:.3f} L_knn_nca={L_knn_nca.item():.3f}")
 
-
+                # --- kNN Scale Loss (CHANGE 3) ---
+                # --- kNN Scale Loss (CHANGE 3 - EDGE-BASED) ---
+                if WEIGHTS.get('knn_scale', 0) > 0 and (not is_sc):
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        # Use knn_spatial from batch (same edges as edge loss)
+                        knn_spatial_batch = batch.get('knn_spatial', None)
+                        
+                        L_knn_scale_per = uet.knn_scale_loss(
+                            x0_pred.float() if use_edm else V_hat.float(),
+                            V_target.float(),
+                            mask,
+                            knn_indices=knn_spatial_batch,  # Use precomputed edges!
+                            k=15,
+                            return_per_sample=True
+                        )
+                        
+                        # Use same gate as NCA
+                        L_knn_scale_per = torch.nan_to_num(L_knn_scale_per, nan=0.0, posinf=0.0, neginf=0.0)
+                        L_knn_scale = (L_knn_scale_per * geo_gate_nca).sum() / gate_sum_nca
+                        
+                        # Debug (uses same edge-based metric)
+                        if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                            with torch.no_grad():
+                                # Report median edge ratio (matches loss definition)
+                                hit = (geo_gate_nca > 0).sum().item()
+                                print(f"[KNN-SCALE] step={global_step} gate_hit={hit}/{len(geo_gate_nca)} "
+                                      f"L_knn_scale={L_knn_scale.item():.6f}")
+                else:
+                    L_knn_scale = torch.tensor(0.0, device=device)
 
                 # Low-noise gating - use actual drop_mask for consistency with CFG
                 if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
@@ -5924,6 +6015,7 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['dim'] * L_dim +
                     WEIGHTS['triangle'] * L_triangle +
                     WEIGHTS['knn_nca'] * L_knn_nca +
+                    WEIGHTS.get('knn_scale', 0) * L_knn_scale +
                     WEIGHTS['radial'] * L_radial +
                     WEIGHTS['repel'] * L_repel +
                     WEIGHTS['shape'] * L_shape + 
@@ -6400,6 +6492,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['gram_scale'] += L_gram_scale.item()
             epoch_losses['out_scale'] += L_out_scale.item()
             epoch_losses['knn_nca'] += L_knn_nca.item()
+            epoch_losses['knn_scale'] += L_knn_scale.item()
             epoch_losses['heat'] += L_heat.item()
             epoch_losses['sw_st'] += L_sw_st.item()
             epoch_losses['sw_sc'] += L_sw_sc.item()
@@ -6417,6 +6510,8 @@ def train_stageC_diffusion_generator(
             epoch_losses['shape_spec'] += L_shape_spec.item()
             epoch_losses['gen_scale'] += L_gen_scale.item()
             epoch_losses['subspace'] += L_subspace.item()
+            epoch_losses['gram_learn'] += L_gram_learn.item()  # FIX: Was missing!
+
 
 
             def _is_rank0():
