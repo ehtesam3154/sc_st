@@ -5153,6 +5153,21 @@ def train_stageC_diffusion_generator(
                                 L_rms_b = torch.log(rms_pred / rms_tgt).pow(2)
                                 L_rms_scale_list.append(L_rms_b)
                             
+                            # --- shape safety: force per-sample tensors to (B,) ---
+                            B = mask.shape[0]
+
+                            if is_pinned.ndim > 1:
+                                # reduce any extra dims to per-sample (any pinned within a sample)
+                                is_pinned = is_pinned.view(B, -1).any(dim=1).float()
+                            else:
+                                is_pinned = is_pinned.float()
+
+                            if scale_gate.ndim > 1:
+                                # reduce any extra dims to per-sample gate
+                                scale_gate = scale_gate.view(B, -1).mean(dim=1)
+                            else:
+                                scale_gate = scale_gate.float()
+
                             L_rms_scale_per = torch.stack(L_rms_scale_list)  # (B,)
                             
                             # Only apply to pinned samples
@@ -5162,6 +5177,8 @@ def train_stageC_diffusion_generator(
                             rms_coef = 0.1
                             L_knn_scale_per_weighted = L_knn_scale_per_weighted + rms_coef * L_rms_scale_per
                         
+                        gate_sum_scale = scale_gate.sum().clamp(min=1.0)
+
                         L_knn_scale = (L_knn_scale_per_weighted * scale_gate).sum() / gate_sum_scale
                         
                         # Extended debug with per-sigma breakdown
