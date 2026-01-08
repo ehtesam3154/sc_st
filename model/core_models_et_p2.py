@@ -1965,6 +1965,13 @@ def train_stageC_diffusion_generator(
     SCORE_HI_BOOST_FACTOR = 4.0        # 4x weight on high-noise subset
     SCORE_HI_BOOST_WARMUP = 0       # Steps before boost starts
     SCORE_HI_BOOST_RAMP = 200          # Ramp boost in over this many steps
+
+        
+    # ==================== CHANGE 7: TAIL SAFETY PARAMETERS (Option 1 Change C) ====================
+    TAIL_SAFETY_ENABLED = True        # Enable tail protection
+    TAIL_QUANTILE = 0.95              # Top 5% of sigma is "tail"
+    TAIL_BOOST_CAP = 2.0              # Max boost multiplier for tail samples (vs normal 4x)
+
     
     # A/B 3: F_x-space supervision for high-noise (learned branch direct supervision)
     EXP_SCORE_FX_HI = False
@@ -3613,9 +3620,28 @@ def train_stageC_diffusion_generator(
                             steps_since_ready = global_step - boost_state['start_step']
                             ramp = min(1.0, steps_since_ready / max(1, SCORE_HI_BOOST_RAMP))
                         
-                        boost = 1.0 + ramp * (SCORE_HI_BOOST_FACTOR - 1.0) * gate_hi_score  # (B,)
-                        w_eff = w_eff * boost
+                        # Base boost
+                        base_boost = 1.0 + ramp * (SCORE_HI_BOOST_FACTOR - 1.0) * gate_hi_score  # (B,)
                         
+                        # ==================== CHANGE 7B: TAIL SAFETY CAP (Option 1 Change C) ====================
+                        # Cap boost for extreme tail samples to prevent runaway
+                        if TAIL_SAFETY_ENABLED:
+                            sigma_tail_threshold = sigma_flat.quantile(TAIL_QUANTILE)
+                            is_tail = (sigma_flat >= sigma_tail_threshold)  # (B,) bool
+                            
+                            # Cap boost for tail samples
+                            tail_boost_cap = 1.0 + ramp * (TAIL_BOOST_CAP - 1.0) * gate_hi_score
+                            boost = torch.where(is_tail, 
+                                               torch.minimum(base_boost, tail_boost_cap),
+                                               base_boost)
+                        else:
+                            boost = base_boost
+                            is_tail = torch.zeros_like(sigma_flat, dtype=torch.bool)
+                        
+                        w_eff = w_eff * boost
+
+                        
+                        # Debug logging
                         # Debug logging
                         if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
                             thr_val = score_hi_gate.thr
@@ -3628,6 +3654,15 @@ def train_stageC_diffusion_generator(
                                   f"thr={thr_str} "
                                   f"hit={(gate_hi_score>0).float().mean().item():.2%} "
                                   f"boost_mean={boost.mean().item():.3f}")
+                            
+                            # CHANGE 7C: Tail safety debug
+                            if TAIL_SAFETY_ENABLED:
+                                n_tail = is_tail.sum().item()
+                                if n_tail > 0:
+                                    tail_boost_mean = boost[is_tail].mean().item()
+                                    print(f"[TAIL-SAFETY] n_tail={n_tail} tail_boost_mean={tail_boost_mean:.3f} "
+                                          f"(capped at {TAIL_BOOST_CAP:.1f}x vs {SCORE_HI_BOOST_FACTOR:.1f}x)")
+
 
 
                     
@@ -3980,16 +4015,112 @@ def train_stageC_diffusion_generator(
             L_gen_scale = safe_loss(L_gen_scale, "L_gen_scale", max_val=50.0, global_step=global_step)
 
             # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
-            # 1. Canonicalize V_hat (Center per set) - NOW GLOBAL for ST and SC
+            # ==================== NEW GLOBAL GEOMETRY BLOCK ====================
+            # ChatGPT EDM8-style approach:
+            #   V_hat_centered = raw centered prediction → SCALE supervision (knn_scale only)
+            #   V_geom = centered + locally clamped → STRUCTURE supervision (Gram, Edge, NCA, etc.)
+            #
+            # WHY: Structure losses should focus on shape/neighborhood, not waste gradients on scale.
+            #      Scale errors are corrected by knn_scale loss on raw (unclamped) tensor.
+            #      Using same tensor for both creates "split-brain" supervision (Option 2 failure).
+            
             with torch.autocast(device_type='cuda', enabled=False):
                 V_hat_f32 = V_hat.float()
                 m_bool = mask.bool()
                 m_float = mask.float().unsqueeze(-1)
                 
-                # center per set over valid nodes
+                # --- Step A: Compute V_hat_centered (raw centered, for knn_scale ONLY) ---
                 valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
-                V_geom = (V_hat_f32 - mean) * m_float  # (B,N,D), centered
+                V_hat_centered = (V_hat_f32 - mean) * m_float  # (B,N,D), centered but NOT clamped
+                
+                # --- Step B: Compute V_geom (centered + locally clamped, for STRUCTURE losses) ---
+                # Use kNN-based local scale correction (detached) if we have spatial kNN and this is ST
+                knn_spatial_for_scale = batch.get('knn_spatial', None)
+                
+                if (not is_sc) and knn_spatial_for_scale is not None:
+                    knn_spatial_for_scale = knn_spatial_for_scale.to(device)
+                    
+                    # Clamp cap ramps over training: start conservative, increase later
+                    # This prevents early instability while allowing normalization later
+                    clamp_warmup_steps = 2000
+                    max_log_base = 0.25  # ~1.28x at start
+                    max_log_final = 0.50  # ~1.65x at end
+                    clamp_progress = min(1.0, global_step / clamp_warmup_steps)
+                    max_log_correction = max_log_base + clamp_progress * (max_log_final - max_log_base)
+                    
+                    # Compute local scale correction from kNN edges (DETACHED)
+                    s_corr, ratio_raw, valid_scale = uet.compute_local_scale_correction(
+                        V_pred=V_hat_centered,
+                        V_tgt=V_target.float(),
+                        mask=mask,
+                        knn_indices=knn_spatial_for_scale,
+                        k=15,
+                        max_log_correction=max_log_correction,
+                    )
+                    
+                    # Apply scale correction (detached) to get V_geom
+                    # DETACHED because we want structure losses to NOT game the clamp
+                    # Scale learning happens via knn_scale loss on V_hat_centered
+                    V_geom = uet.apply_scale_correction(V_hat_centered, s_corr.detach(), mask)
+                    
+                    # --- POST-CLAMP DIAGNOSTIC (required by ChatGPT) ---
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            # Compute ratio_post (after clamp) for comparison
+                            _, ratio_post, _ = uet.compute_local_scale_correction(
+                                V_pred=V_geom,
+                                V_tgt=V_target.float(),
+                                mask=mask,
+                                knn_indices=knn_spatial_for_scale,
+                                k=15,
+                                max_log_correction=max_log_correction,
+                            )
+                            
+                            n_valid_samples = valid_scale.sum().item()
+                            
+                            # Check if clamp is pinned (at max correction)
+                            log_s_corr = torch.log(s_corr[valid_scale] + 1e-8)
+                            pinned_frac = ((log_s_corr.abs() > max_log_correction * 0.95).sum().float() / 
+                                          max(n_valid_samples, 1)).item()
+                            
+                            print(f"\n[V_GEOM CLAMP] step={global_step} max_log_corr={max_log_correction:.3f}")
+                            print(f"  Samples with valid scale: {int(n_valid_samples)}/{batch_size_real}")
+                            print(f"  ratio_raw (V_hat_centered): p10={ratio_raw.quantile(0.1).item():.3f} "
+                                  f"p50={ratio_raw.median().item():.3f} "
+                                  f"p90={ratio_raw.quantile(0.9).item():.3f}")
+                            print(f"  ratio_post (V_geom clamped): p10={ratio_post.quantile(0.1).item():.3f} "
+                                  f"p50={ratio_post.median().item():.3f} "
+                                  f"p90={ratio_post.quantile(0.9).item():.3f}")
+                            print(f"  s_corr: p10={s_corr.quantile(0.1).item():.3f} "
+                                  f"p50={s_corr.median().item():.3f} "
+                                  f"p90={s_corr.quantile(0.9).item():.3f}")
+                            print(f"  Clamp pin-rate: {pinned_frac:.1%} (should decrease as knn_scale teaches)")
+                            
+                            # Check if clamp is helping
+                            improvement = (ratio_raw.median() - 1.0).abs() - (ratio_post.median() - 1.0).abs()
+                            if improvement.item() > 0:
+                                print(f"  ✓ Clamp is helping: pulled ratio {improvement.item():.3f} closer to 1.0")
+                            else:
+                                print(f"  ⚠ Clamp not helping much (improvement={improvement.item():.3f})")
+                            
+                            # --- A1: kNN INDEXING VERIFICATION (ChatGPT requested) ---
+                            # Verify once that knn_spatial indices are valid
+                            if global_step == 100:
+                                knn_max = knn_spatial_for_scale.max().item()
+                                n_max_batch = mask.shape[1]
+                                n_valid_total = mask.sum().item()
+                                # Check fraction of neighbors that are valid (mask==1)
+                                b_test = 0
+                                m_test = mask[b_test].bool()
+                                knn_test = knn_spatial_for_scale[b_test, m_test, :]
+                                valid_frac = (knn_test >= 0).float().mean().item()
+                                print(f"  [KNN-INDEX-CHECK] knn_max={knn_max}, N={n_max_batch}, "
+                                      f"valid_neighbor_frac={valid_frac:.2%}")
+                else:
+                    # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
+                    V_geom = V_hat_centered
+
 
             # --- PATCH 7: Low-rank subspace penalty ---
             if not is_sc and WEIGHTS.get('subspace', 0) > 0:
@@ -4117,12 +4248,95 @@ def train_stageC_diffusion_generator(
                 # ==============================================================================
                 # BUILD ADAPTIVE GATES FOR EACH LOSS
                 # ==============================================================================
+                
+                # --- MINIMUM COVERAGE FLOOR (prevents Option 2 starvation) ---
+                MIN_GEOMETRY_SAMPLES = 4  # Minimum samples per batch with geometry loss
+                
+                def ensure_minimum_coverage(gate: torch.Tensor, score: torch.Tensor, 
+                                           min_count: int, prefer_low_score: bool = True,
+                                           eligible_mask: torch.Tensor = None) -> torch.Tensor:
+                    """
+                    Ensure gate has at least min_count active samples.
+                    If fewer pass threshold, force-include best candidates from eligible set.
+                    
+                    This prevents geometry gates from starving (Option 2 had 6.25% hit rate → Jaccard collapsed).
+                    
+                    Args:
+                        gate: (B,) current gate values
+                        score: (B,) score for ranking candidates (lower = preferred if prefer_low_score)
+                        min_count: minimum active samples
+                        prefer_low_score: if True, prefer low score when forcing (e.g., low noise for structure)
+                                         if False, prefer low score too but for different meaning (e.g., low c_skip = high σ)
+                        eligible_mask: (B,) bool mask of samples eligible for this loss
+                    """
+                    if eligible_mask is None:
+                        eligible_mask = torch.ones(gate.shape[0], device=gate.device, dtype=torch.bool)
+                    
+                    # Only count eligible samples that are gated on
+                    n_active = ((gate > 0) & eligible_mask).sum().item()
+                    if n_active >= min_count:
+                        return gate
+                    
+                    # Need to force-include (min_count - n_active) samples
+                    n_needed = min_count - int(n_active)
+                    
+                    # Candidates: eligible samples not already gated
+                    not_gated = (gate <= 0) & eligible_mask
+                    
+                    if not_gated.sum() == 0:
+                        return gate  # No candidates available
+                    
+                    # Score for ranking (low score = preferred)
+                    scores = score.clone()
+                    scores[~not_gated] = float('inf')  # Exclude already gated or ineligible
+                    
+                    if not prefer_low_score:
+                        # Invert so low score becomes high (for learn_hi: want high σ = low c_skip)
+                        scores = -scores
+                        scores[~not_gated] = float('inf')
+                    
+                    # Find best candidates
+                    n_to_add = min(n_needed, int(not_gated.sum().item()))
+                    _, best_idx = scores.topk(n_to_add, largest=False)
+                    
+                    # Create new gate with forced inclusions
+                    new_gate = gate.clone()
+                    new_gate[best_idx] = 1.0
+                    
+                    return new_gate
+                
+                # Eligibility: MUST include base_gate (ChatGPT A2 correction)
+                # This prevents forcing uncond samples into geometry losses
+                n_valid_per_sample = mask.sum(dim=1)  # (B,)
+                eligible_for_geo = (n_valid_per_sample >= 16) & (base_gate > 0.5)
+                
                 if use_edm:
                     geo_gate_gram = adaptive_gates["gram"].gate(noise_score, base_gate)
                     geo_gate_gram_scale = adaptive_gates["gram_scale"].gate(noise_score, base_gate)
                     geo_gate_edge = adaptive_gates["edge"].gate(noise_score, base_gate)
                     geo_gate_nca = adaptive_gates["nca"].gate(noise_score, base_gate)
                     geo_gate_learn_hi = adaptive_gates["learn_hi"].gate(noise_score, base_gate)
+                    
+                    # Apply minimum coverage floor to each gate
+                    # Structure losses: prefer low noise (clean signal)
+                    geo_gate_gram = ensure_minimum_coverage(
+                        geo_gate_gram, noise_score, MIN_GEOMETRY_SAMPLES, 
+                        prefer_low_score=True, eligible_mask=eligible_for_geo)
+                    geo_gate_gram_scale = ensure_minimum_coverage(
+                        geo_gate_gram_scale, noise_score, MIN_GEOMETRY_SAMPLES,
+                        prefer_low_score=True, eligible_mask=eligible_for_geo)
+                    geo_gate_edge = ensure_minimum_coverage(
+                        geo_gate_edge, noise_score, MIN_GEOMETRY_SAMPLES,
+                        prefer_low_score=True, eligible_mask=eligible_for_geo)
+                    geo_gate_nca = ensure_minimum_coverage(
+                        geo_gate_nca, noise_score, MIN_GEOMETRY_SAMPLES,
+                        prefer_low_score=True, eligible_mask=eligible_for_geo)
+                    
+                    # --- A3: learn_hi needs HIGHEST σ (lowest c_skip) when forcing ---
+                    # Use c_skip_b as score, prefer_low_score=True means prefer low c_skip = high σ
+                    geo_gate_learn_hi = ensure_minimum_coverage(
+                        geo_gate_learn_hi, c_skip_b, MIN_GEOMETRY_SAMPLES,
+                        prefer_low_score=True, eligible_mask=eligible_for_geo)
                 else:
                     # Fallback: just use cond_only for all
                     geo_gate_gram = base_gate
@@ -4130,6 +4344,7 @@ def train_stageC_diffusion_generator(
                     geo_gate_edge = base_gate
                     geo_gate_nca = base_gate
                     geo_gate_learn_hi = base_gate
+
 
                 # ===== ST STEP: Score + Gram + Heat + SW_ST =====
 
@@ -4690,15 +4905,42 @@ def train_stageC_diffusion_generator(
                 if WEIGHTS['knn_nca'] > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Compute per-sample NCA loss for gating
+                        # L_knn_per = uet.knn_nca_loss(
+                        #     x0_pred.float() if use_edm else V_hat.float(), 
+                        #     V_target.float(), 
+                        #     mask, 
+                        #     k=15, 
+                        #     temperature=tau_reference,
+                        #     return_per_sample=True,     # PATCH 5A
+                        #     scale_compensate=True       # PATCH 5B (detached)
+                        # )
+
+                        # CHANGE 4A: Use V_geom (clamped) for NCA loss
+                        # NCA measures neighborhood identity preservation - should be scale-invariant
+                        # KEEP scale_compensate=True as per ChatGPT instruction
+                        # KEEP temperature=tau_reference (data-driven, do NOT hardcode)
+                        # L_knn_per = uet.knn_nca_loss(
+                        #     V_geom,              # Clamped structure tensor
+                        #     V_target.float(),    # Raw target (ChatGPT: don't rewire target)
+                        #     mask, 
+                        #     k=15, 
+                        #     temperature=tau_reference,  # DO NOT CHANGE - keep data-driven
+                        #     return_per_sample=True,
+                        #     scale_compensate=True       # KEEP THIS - ChatGPT explicit
+                        # )
+
+                        # CHANGE 4B: Use V_geom (clamped) for NCA loss (second call)
                         L_knn_per = uet.knn_nca_loss(
-                            x0_pred.float() if use_edm else V_hat.float(), 
-                            V_target.float(), 
+                            V_geom,              # Clamped structure tensor
+                            V_target.float(),    # Raw target
                             mask, 
                             k=15, 
                             temperature=tau_reference,
-                            return_per_sample=True,     # PATCH 5A
-                            scale_compensate=True       # PATCH 5B (detached)
+                            return_per_sample=True,
+                            scale_compensate=True
                         )
+
+
                         
                         # Gate NCA like edge loss (local feature, needs clean signal)
                         # Target: ~10-30% hit rate, same as edge
@@ -4743,8 +4985,14 @@ def train_stageC_diffusion_generator(
                         baseline = torch.log((n_valid - 1).clamp(min=1)).mean().item()
                         
                         # --- FIX: Debug NCA scale matching ---
-                        V_pred_nca = x0_pred.float() if use_edm else V_hat.float()
-                        V_tgt_nca = V_target.float()
+                        # V_pred_nca = x0_pred.float() if use_edm else V_hat.float()
+                        # V_tgt_nca = V_target.float()
+
+                        # --- FIX: Debug NCA scale matching (using structure tensors) ---
+                        # CHANGE 4C: Match what NCA actually sees during training
+                        V_pred_nca = V_geom            # Matches what NCA actually sees
+                        V_tgt_nca = V_target.float()   # Matches what NCA actually sees
+
                         
                         # Compute median kNN squared distances for pred and target
                         D2_pred_list = []
@@ -4788,33 +5036,65 @@ def train_stageC_diffusion_generator(
 
                 # --- kNN Scale Loss (CHANGE 3) ---
                 # --- kNN Scale Loss (CHANGE 3 - EDGE-BASED) ---
+                # --- kNN Scale Loss (CHANGE 5 - EDM8 style) ---
+                # KEY: knn_scale supervises SCALE learning, so it MUST see RAW (unclamped) tensor
+                # Structure losses see V_geom (clamped); knn_scale sees V_hat_centered (raw)
+                # This is the ONLY loss that uses V_hat_centered
                 if WEIGHTS.get('knn_scale', 0) > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Use knn_spatial from batch (same edges as edge loss)
                         knn_spatial_batch = batch.get('knn_spatial', None)
+                        if knn_spatial_batch is not None:
+                            knn_spatial_batch = knn_spatial_batch.to(device)
                         
+                        # CHANGE 5: Use V_hat_centered (RAW, NOT clamped V_geom)
+                        # This is critical - knn_scale needs to see actual scale error to teach it
                         L_knn_scale_per = uet.knn_scale_loss(
-                            x0_pred.float() if use_edm else V_hat.float(),
+                            V_hat_centered,  # RAW centered - this is the KEY difference
                             V_target.float(),
                             mask,
-                            knn_indices=knn_spatial_batch,  # Use precomputed edges!
+                            knn_indices=knn_spatial_batch,
                             k=15,
                             return_per_sample=True
                         )
                         
-                        # Use same gate as NCA
-                        L_knn_scale_per = torch.nan_to_num(L_knn_scale_per, nan=0.0, posinf=0.0, neginf=0.0)
-                        L_knn_scale = (L_knn_scale_per * geo_gate_nca).sum() / gate_sum_nca
+                        # CHANGE 5: OWN GATE with broad coverage (decoupled from NCA)
+                        # knn_scale should apply to ALL ST samples, not be gated by noise level
+                        # Only require enough valid points (no cond_only per Option 1 - broader coverage)
+                        scale_gate = (n_valid_per_sample >= 16).float()
                         
-                        # Debug (uses same edge-based metric)
+                        # Apply minimum coverage floor (scale can learn broadly)
+                        # Use noise_score but prefer_low_score=False means we accept any noise level
+                        scale_gate = ensure_minimum_coverage(
+                            scale_gate, noise_score, 
+                            min_count=MIN_GEOMETRY_SAMPLES,
+                            prefer_low_score=False,  # Scale loss can apply to any noise level
+                            eligible_mask=(n_valid_per_sample >= 16)
+                        )
+                        
+                        gate_sum_scale = scale_gate.sum().clamp(min=1.0)
+                        
+                        L_knn_scale_per = torch.nan_to_num(L_knn_scale_per, nan=0.0, posinf=0.0, neginf=0.0)
+                        L_knn_scale = (L_knn_scale_per * scale_gate).sum() / gate_sum_scale
+                        
+                        # Extended debug with per-sigma breakdown
                         if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
-                                # Report median edge ratio (matches loss definition)
-                                hit = (geo_gate_nca > 0).sum().item()
-                                print(f"[KNN-SCALE] step={global_step} gate_hit={hit}/{len(geo_gate_nca)} "
+                                hit = (scale_gate > 0).sum().item()
+                                print(f"\n[KNN-SCALE] step={global_step} gate_hit={hit}/{len(scale_gate)} "
                                       f"L_knn_scale={L_knn_scale.item():.6f}")
+                                print(f"  (Using V_hat_centered = RAW, teaching scale correction)")
+                                
+                                # Per-sigma breakdown
+                                sigma_vec_dbg = sigma_t.view(-1).float()
+                                for lo, hi_bound in [(0.0, 0.3), (0.3, 0.7), (0.7, 1.5), (1.5, 5.0)]:
+                                    in_bin = (sigma_vec_dbg >= lo) & (sigma_vec_dbg < hi_bound) & (scale_gate > 0)
+                                    if in_bin.any():
+                                        loss_bin = L_knn_scale_per[in_bin].mean().item()
+                                        print(f"    σ∈[{lo:.1f},{hi_bound:.1f}): L_knn_scale={loss_bin:.6f} n={in_bin.sum().item()}")
                 else:
                     L_knn_scale = torch.tensor(0.0, device=device)
+
 
                 # Low-noise gating - use actual drop_mask for consistency with CFG
                 if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
@@ -4851,12 +5131,23 @@ def train_stageC_diffusion_generator(
                         # Use adaptive gate for edge
                         gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
                         
+                        # L_edge_per = uet.edge_log_ratio_loss(
+                        #     V_pred=x0_pred.float() if use_edm else V_hat.float(),
+                        #     V_tgt=V_target.float(),
+                        #     knn_idx=knn_indices_batch,
+                        #     mask=mask
+                        # )
+                        # CHANGE 3: Use V_geom (clamped) for edge loss
+                        # Edge is a STRUCTURE loss - it measures local neighborhood shape
+                        # Using clamped V_geom removes systematic scale bias from gradients
+                        # Scale learning happens via knn_scale on V_hat_centered
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=x0_pred.float() if use_edm else V_hat.float(),
+                            V_pred=V_geom,  # Clamped structure tensor, NOT raw x0_pred
                             V_tgt=V_target.float(),
                             knn_idx=knn_indices_batch,
                             mask=mask
                         )
+
                         
                         # Sanitize before gating (NaN * 0 = NaN)
                         L_edge_per = torch.nan_to_num(L_edge_per, nan=0.0, posinf=0.0, neginf=0.0)
@@ -5534,14 +5825,61 @@ def train_stageC_diffusion_generator(
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Center V_gen
                         V_gen_f32 = V_gen.float()
-                        m_float = mask.float().unsqueeze(-1)
-                        valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
-                        mean_Vgen = (V_gen_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
-                        V_gen_centered = (V_gen_f32 - mean_Vgen) * m_float
+                        m_float_gen = mask.float().unsqueeze(-1)
+                        valid_counts_gen = mask.sum(dim=1, keepdim=True).clamp(min=1)
+                        mean_Vgen = (V_gen_f32 * m_float_gen).sum(dim=1, keepdim=True) / valid_counts_gen.unsqueeze(-1)
+                        V_gen_centered = (V_gen_f32 - mean_Vgen) * m_float_gen
+                        
+                        # ==================== CHANGE 6: GENERATOR SCALE CLAMP (Option 1 Change B) ====================
+                        # Apply same local scale correction to generator for alignment loss
+                        # This ensures alignment loss focuses on shape, not scale
+                        knn_spatial_for_gen = batch.get('knn_spatial', None)
+                        if knn_spatial_for_gen is not None:
+                            knn_spatial_for_gen = knn_spatial_for_gen.to(device)
+                            
+                            # Use same max_log_correction as diffusion (for consistency)
+                            clamp_warmup_steps = 2000
+                            max_log_base = 0.25
+                            max_log_final = 0.50
+                            clamp_progress = min(1.0, global_step / clamp_warmup_steps)
+                            max_log_correction_gen = max_log_base + clamp_progress * (max_log_final - max_log_base)
+                            
+                            s_gen, ratio_gen, valid_gen = uet.compute_local_scale_correction(
+                                V_gen_centered, V_target_batch, mask,
+                                knn_indices=knn_spatial_for_gen,
+                                k=15,
+                                max_log_correction=max_log_correction_gen,
+                            )
+                            V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_gen.detach(), mask)
+                            
+                            # Debug generator scale
+                            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                                with torch.no_grad():
+                                    if valid_gen.any():
+                                        ratio_gen_med = ratio_gen[valid_gen].median().item()
+                                        print(f"[GEN-SCALE-CLAMP] step={global_step} ratio_raw_med={ratio_gen_med:.3f}")
+                        else:
+                            V_gen_geo = V_gen_centered
                         
                         # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
-                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_centered, V_target_batch, mask)
+                        # Use CLAMPED V_gen_geo for alignment (removes scale mismatch)
+                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_geo, V_target_batch, mask)
+                        # Use RAW V_gen_centered for scale loss (supervises the model)
                         L_gen_scale = uet.rms_log_loss(V_gen_centered, V_target_batch, mask)
+                        
+                        # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
+                        # This ensures generator learns correct local neighborhood distances
+                        if knn_spatial_for_gen is not None:
+                            L_gen_scale_local = uet.knn_scale_loss(
+                                V_gen_centered,  # Raw (unclamped) generator output
+                                V_target_batch,
+                                mask,
+                                knn_indices=knn_spatial_for_gen,
+                                k=15,
+                                return_per_sample=False  # Scalar loss
+                            )
+                            # Combine global and local scale supervision
+                            L_gen_scale = L_gen_scale + 0.5 * L_gen_scale_local
                 else:
                     L_gen_align = torch.tensor(0.0, device=device)
 
