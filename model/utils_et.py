@@ -4459,7 +4459,8 @@ def compute_local_scale_correction(
     eps: float = 1e-8,
     max_log_correction: float = 0.3,  # Caps correction to ~1.35x
     min_edges: int = 8,  # Minimum edges for valid estimate
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
     """
     Compute per-sample local scale correction from kNN edge distances.
     
@@ -4471,6 +4472,8 @@ def compute_local_scale_correction(
         ratio: (B,) raw ratio of median(D2_pred) / median(D2_tgt)
         valid: (B,) bool mask indicating samples with enough edges for reliable estimate
         log_s_unclamped: (B,) the raw unclamped log-scale correction (for pinned detection)
+        edges_used: (B,) number of valid kNN edges used per sample
+        neighbor_frac: (B,) fraction of possible kNN edges that were valid (edges_used / n_valid*k)
     """
     B, N, D = V_pred.shape
     device = V_pred.device
@@ -4479,6 +4482,9 @@ def compute_local_scale_correction(
     ratio_list = []
     valid_list = []
     log_s_unclamped_list = []
+    edges_used_list = []
+    neighbor_frac_list = []
+
     
     for b in range(B):
         mb = mask[b].bool()
@@ -4489,6 +4495,8 @@ def compute_local_scale_correction(
             ratio_list.append(torch.tensor(1.0, device=device))
             log_s_unclamped_list.append(torch.tensor(0.0, device=device))
             valid_list.append(False)
+            edges_used_list.append(torch.tensor(0, device=device, dtype=torch.long))
+            neighbor_frac_list.append(torch.tensor(0.0, device=device))
             continue
         
         # Work in full-N indexing space (same as knn_scale_loss)
@@ -4514,12 +4522,19 @@ def compute_local_scale_correction(
             valid_nbr = (knn_g >= 0) & (knn_g < N) & mb[knn_g.clamp(0, N - 1)]
             not_self = (knn_g != src_g)
             edge_ok = valid_nbr & not_self
-            
+
+            # Compute coverage stats (before early-exit check)
+            edges_used_b = edge_ok.sum()
+            possible_edges_b = src_g.numel()  # n_valid * k
+            neighbor_frac_b = edges_used_b.float() / max(possible_edges_b, 1)
+       
             if edge_ok.sum().item() < min_edges:
                 s_list.append(torch.tensor(1.0, device=device))
                 ratio_list.append(torch.tensor(1.0, device=device))
                 log_s_unclamped_list.append(torch.tensor(0.0, device=device))
                 valid_list.append(False)
+                edges_used_list.append(edges_used_b)
+                neighbor_frac_list.append(neighbor_frac_b)
                 continue
             
             src_idx = src_g[edge_ok]
@@ -4544,6 +4559,11 @@ def compute_local_scale_correction(
             
             d2_pred = knn_d2_pred.flatten()
             d2_tgt = knn_d2_tgt.flatten()
+
+            # Fallback is "dense" - all edges used
+            edges_used_b = torch.tensor(d2_pred.numel(), device=device, dtype=torch.long)
+            neighbor_frac_b = torch.tensor(1.0, device=device)
+
         
         # Compute median ratio
         med_d2_pred = d2_pred.median().clamp(min=eps)
@@ -4561,6 +4581,10 @@ def compute_local_scale_correction(
         # Clamp correction to prevent wild jumps
         log_s_clamped = log_s.clamp(-max_log_correction, max_log_correction)
         s = torch.exp(log_s_clamped)
+
+        edges_used_list.append(edges_used_b)
+        neighbor_frac_list.append(neighbor_frac_b)
+
         
         s_list.append(s)
         ratio_list.append(ratio)
@@ -4571,7 +4595,10 @@ def compute_local_scale_correction(
         torch.stack(ratio_list),            # (B,) raw D² ratio
         torch.tensor(valid_list, device=device, dtype=torch.bool),  # (B,) validity
         torch.stack(log_s_unclamped_list),  # (B,) unclamped log-scale for pinned detection
+        torch.stack(edges_used_list),       # (B,) edges used
+        torch.stack(neighbor_frac_list),    # (B,) neighbor coverage fraction
     )
+
 
 
 
