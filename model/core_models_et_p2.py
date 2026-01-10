@@ -2451,6 +2451,21 @@ def train_stageC_diffusion_generator(
     p_uncond = 0.10
     # sigma_gate = 5.0
 
+    # ======== A/B TEST 2: Force Conditional-Only Training ========
+    # Environment-controlled override for testing hypothesis:
+    # "CFG context-drop training encourages averaged geometry that blurs 
+    #  fine neighborhoods"
+    #
+    # When GEMS_FORCE_COND_ONLY=1, we bypass all CFG dropout and train
+    # with full context at all times. This tests whether conditional-drop
+    # is the source of "local blur" that hurts kNN@10.
+    import os
+    FORCE_COND_ONLY = (os.getenv("GEMS_FORCE_COND_ONLY", "0") == "1")
+    if FORCE_COND_ONLY:
+        print("[A/B TEST 2] FORCE_COND_ONLY=True: Disabling CFG context dropout entirely")
+    # ======== END A/B TEST 2 INIT ========
+
+
     # CFG config - PATCH 9: schedule p_uncond to avoid blocking early learning
     p_uncond_max = 0.10
     cfg_warmup_start = 20   # Don't use CFG dropout for first N epochs
@@ -3013,23 +3028,41 @@ def train_stageC_diffusion_generator(
 
                 # ===== CFG: Drop context ONLY for score network =====
                 # PATCH 9: Schedule p_uncond to avoid blocking early learning
-                if epoch < cfg_warmup_start:
+                # A/B TEST 2: Override when FORCE_COND_ONLY is set
+                
+                if FORCE_COND_ONLY:
+                    # Bypass CFG dropout entirely for testing
                     p_uncond_curr = 0.0
+                    drop_bool = torch.zeros(batch_size_real, device=device)
+                    view_shape = [batch_size_real] + [1] * (H.ndim - 1)
+                    drop_mask = drop_bool.view(*view_shape)
+                    H_train = H  # Full context always
                 else:
-                    t_warmup = (epoch - cfg_warmup_start) / float(max(cfg_warmup_len, 1))
-                    t_warmup = max(0.0, min(1.0, t_warmup))
-                    p_uncond_curr = p_uncond_max * t_warmup
-                
-                drop_probs = torch.rand(batch_size_real, device=device)
-                drop_bool = (drop_probs < p_uncond_curr).float()
+                    # Original CFG schedule logic
+                    if epoch < cfg_warmup_start:
+                        p_uncond_curr = 0.0
+                    else:
+                        t_warmup = (epoch - cfg_warmup_start) / float(max(cfg_warmup_len, 1))
+                        t_warmup = max(0.0, min(1.0, t_warmup))
+                        p_uncond_curr = p_uncond_max * t_warmup
+                    
+                    drop_probs = torch.rand(batch_size_real, device=device)
+                    drop_bool = (drop_probs < p_uncond_curr).float()
+                    
+                    # Dynamically reshape drop_mask to match H's dimensions
+                    # If H is (B, C), makes (B, 1). If H is (B, N, C), makes (B, 1, 1)
+                    view_shape = [batch_size_real] + [1] * (H.ndim - 1)
+                    drop_mask = drop_bool.view(*view_shape)
+                    
+                    H_train = H * (1.0 - drop_mask)
 
-                
-                # Dynamically reshape drop_mask to match H's dimensions
-                # If H is (B, C), makes (B, 1). If H is (B, N, C), makes (B, 1, 1)
-                view_shape = [batch_size_real] + [1] * (H.ndim - 1)
-                drop_mask = drop_bool.view(*view_shape)
-                
-                H_train = H * (1.0 - drop_mask)
+                # ======== A/B TEST 2 DEBUG: CFG Status ========
+                if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                    uncond_rate = drop_bool.mean().item()
+                    print(f"[CFG] epoch={epoch} step={global_step} p_uncond_curr={p_uncond_curr:.4f} "
+                          f"drop_rate={uncond_rate:.4f} FORCE_COND_ONLY={FORCE_COND_ONLY}")
+                # ======== END A/B TEST 2 DEBUG ========
+
                 
                 # For ST: still load G_target (needed for Gram loss later)
                 if not is_sc:
@@ -3092,6 +3125,73 @@ def train_stageC_diffusion_generator(
 
                 if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                     check_target_scale_consistency(V_target, G_target, mask)
+
+
+                # ======== A/B TEST 1 DEBUG: kNN Coverage Metrics ========
+                # Measures what fraction of nodes have their true spatial kNN neighbors
+                # present in the miniset. This tells us if training has enough signal
+                # to learn kNN@10 ordering.
+                if global_step % 100 == 0 and (not is_sc) and (fabric is None or fabric.is_global_zero):
+                    with torch.no_grad():
+                        # Get knn_spatial from batch (on CPU to avoid overhead)
+                        knn_spatial_cpu = batch.get('knn_spatial', None)
+                        mask_cpu = batch['mask'].cpu()
+                        
+                        if knn_spatial_cpu is not None:
+                            if knn_spatial_cpu.is_cuda:
+                                knn_spatial_cpu = knn_spatial_cpu.cpu()
+                            
+                            k_eval = 10  # Evaluate coverage for top-10 neighbors
+                            k_avail = knn_spatial_cpu.shape[2] if knn_spatial_cpu.ndim == 3 else knn_spatial_cpu.shape[1]
+                            k_eval = min(k_eval, k_avail)
+                            
+                            # For each batch element and each valid node, check how many of its
+                            # k_eval nearest spatial neighbors are present (not -1)
+                            # knn_spatial_cpu shape: (B, N, K)
+                            B_size = knn_spatial_cpu.shape[0]
+                            
+                            total_valid_nodes = 0
+                            total_present_neighbors = 0
+                            total_possible_neighbors = 0
+                            nodes_with_full_k = 0
+                            present_counts = []
+                            
+                            for b_idx in range(B_size):
+                                valid_mask = mask_cpu[b_idx]  # (N,) bool
+                                n_valid = valid_mask.sum().item()
+                                if n_valid == 0:
+                                    continue
+                                
+                                knn_b = knn_spatial_cpu[b_idx, valid_mask, :k_eval]  # (n_valid, k_eval)
+                                present = (knn_b != -1)  # (n_valid, k_eval) bool
+                                
+                                n_present = present.sum().item()
+                                n_possible = n_valid * k_eval
+                                
+                                total_valid_nodes += n_valid
+                                total_present_neighbors += n_present
+                                total_possible_neighbors += n_possible
+                                
+                                # Count nodes that have all k_eval neighbors present
+                                full_k_mask = present.all(dim=1)  # (n_valid,) bool
+                                nodes_with_full_k += full_k_mask.sum().item()
+                                
+                                # Track per-node present count for median
+                                present_counts.extend(present.sum(dim=1).tolist())
+                            
+                            if total_possible_neighbors > 0:
+                                cov10 = total_present_neighbors / total_possible_neighbors
+                                full10 = nodes_with_full_k / max(total_valid_nodes, 1)
+                                med10 = float(torch.tensor(present_counts).float().median().item()) if present_counts else 0.0
+                                
+                                # Get patch_mode from dataset if available
+                                patch_mode_str = getattr(st_dataset, 'patch_mode', 'unknown') if st_dataset else 'unknown'
+                                
+                                print(f"[KNN_COVERAGE] step={global_step} epoch={epoch} "
+                                      f"cov10={cov10:.4f} full10={full10:.4f} med10={med10:.1f}/10 "
+                                      f"mode={patch_mode_str}")
+                # ======== END A/B TEST 1 DEBUG ========
+
 
                 # DEBUG: Check which samples have correct noise
                 # DEBUG: Check which samples have correct noise
