@@ -4627,3 +4627,306 @@ def apply_scale_correction(V: torch.Tensor, s: torch.Tensor, mask: torch.Tensor)
     V_corrected = (V_scaled + centroid) * m_float
     
     return V_corrected
+
+
+# ==============================================================================
+# PROBE METRICS: ST-IDENT AUDIT (Hypothesis 3 - Data Ceiling)
+# ==============================================================================
+
+def st_ident_audit(Z_expr: torch.Tensor, 
+                   V_coords: torch.Tensor, 
+                   mask: torch.Tensor,
+                   k: int = 10) -> Dict[str, float]:
+    """
+    Identifiability Audit: Can expression features recover true spatial neighbors?
+    
+    This tests whether kNN@10 is information-theoretically achievable from expression.
+    If spatial neighbors routinely rank far away in expression space, no diffusion
+    objective can recover exact kNN@10 reliably.
+    
+    Args:
+        Z_expr: (B, N, D) expression embeddings (from encoder or PCA)
+        V_coords: (B, N, 2) or (B, N, D) ground truth spatial coordinates
+        mask: (B, N) validity mask
+        k: number of neighbors to check (default 10 to match target metric)
+    
+    Returns:
+        Dict with:
+            - 'expr_knn_overlap': fraction of expr kNN that are spatial kNN
+            - 'median_rank_spatial_in_expr': median rank of spatial neighbors in expr space
+            - 'p90_rank_spatial_in_expr': 90th percentile rank
+            - 'local_ambiguity_index': how many near-ties exist in expression distances
+    
+    Debug tag: [ST-IDENT]
+    """
+    B, N, D_z = Z_expr.shape
+    device = Z_expr.device
+    
+    results = {
+        'expr_knn_overlap': 0.0,
+        'median_rank_spatial_in_expr': 0.0,
+        'p90_rank_spatial_in_expr': 0.0,
+        'local_ambiguity_index': 0.0
+    }
+    
+    all_overlaps = []
+    all_ranks = []
+    all_ambiguity = []
+    
+    for b in range(B):
+        m_b = mask[b].bool()
+        n_valid = m_b.sum().item()
+        
+        if n_valid < k + 2:
+            continue
+        
+        Z_b = Z_expr[b, m_b]  # (n_valid, D_z)
+        V_b = V_coords[b, m_b]  # (n_valid, 2 or D)
+        
+        # Expression-space distances
+        D_expr = torch.cdist(Z_b, Z_b)  # (n_valid, n_valid)
+        D_expr.fill_diagonal_(float('inf'))  # exclude self
+        
+        # Spatial distances
+        D_spatial = torch.cdist(V_b, V_b)
+        D_spatial.fill_diagonal_(float('inf'))
+        
+        # kNN in each space
+        _, knn_expr = D_expr.topk(k, dim=1, largest=False)  # (n_valid, k)
+        _, knn_spatial = D_spatial.topk(k, dim=1, largest=False)  # (n_valid, k)
+        
+        # 1. kNN overlap: what fraction of expr neighbors are spatial neighbors?
+        overlap_count = 0
+        for i in range(n_valid):
+            expr_set = set(knn_expr[i].tolist())
+            spatial_set = set(knn_spatial[i].tolist())
+            overlap_count += len(expr_set & spatial_set)
+        overlap = overlap_count / (n_valid * k)
+        all_overlaps.append(overlap)
+        
+        # 2. Rank of spatial neighbors in expression distance ordering
+        # For each point, sort by expr distance and find ranks of true spatial neighbors
+        D_expr_sorted_idx = D_expr.argsort(dim=1)  # (n_valid, n_valid-1 effective)
+        
+        ranks_this_batch = []
+        for i in range(n_valid):
+            spatial_neighbors = knn_spatial[i]  # (k,) indices of true spatial neighbors
+            expr_order = D_expr_sorted_idx[i]  # sorted indices by expr distance
+            
+            # Find rank of each spatial neighbor in expr ordering
+            for sn in spatial_neighbors:
+                rank = (expr_order == sn).nonzero(as_tuple=True)[0]
+                if len(rank) > 0:
+                    ranks_this_batch.append(rank[0].item())
+        
+        if ranks_this_batch:
+            all_ranks.extend(ranks_this_batch)
+        
+        # 3. Local ambiguity index: (d_k - d_1) / (d_1 + eps)
+        # If this is tiny, many near-ties → kNN unstable
+        # Use expression distances
+        D_expr_sorted, _ = D_expr.sort(dim=1)
+        d_1 = D_expr_sorted[:, 0]  # nearest
+        d_k = D_expr_sorted[:, min(k-1, n_valid-2)]  # k-th nearest
+        
+        ambiguity = ((d_k - d_1) / (d_1 + 1e-8)).mean().item()
+        all_ambiguity.append(ambiguity)
+    
+    if all_overlaps:
+        results['expr_knn_overlap'] = float(np.median(all_overlaps))
+    if all_ranks:
+        ranks_arr = np.array(all_ranks)
+        results['median_rank_spatial_in_expr'] = float(np.median(ranks_arr))
+        results['p90_rank_spatial_in_expr'] = float(np.percentile(ranks_arr, 90))
+    if all_ambiguity:
+        results['local_ambiguity_index'] = float(np.median(all_ambiguity))
+    
+    return results
+
+
+# ==============================================================================
+# PROBE METRICS: Near-Miss, Margin, Edge Spearman (Hypothesis 4 - Near-Ties)
+# ==============================================================================
+
+def compute_probe_metrics(V_pred: torch.Tensor,
+                          V_target: torch.Tensor,
+                          mask: torch.Tensor,
+                          knn_spatial: Optional[torch.Tensor] = None,
+                          k: int = 10) -> Dict[str, float]:
+    """
+    Compute discriminative probe metrics that detect failure modes missed by correlation.
+    
+    These metrics directly measure near-miss and margin, which correlation cannot detect.
+    
+    Args:
+        V_pred: (B, N, D) predicted coordinates
+        V_target: (B, N, D) ground truth coordinates  
+        mask: (B, N) validity mask
+        knn_spatial: (B, N, k) optional precomputed spatial kNN indices
+        k: number of neighbors
+    
+    Returns:
+        Dict with:
+            - 'knn10_overlap': standard kNN overlap
+            - 'knn20_overlap': kNN@20 overlap  
+            - 'nearmiss_ratio_p50': median ratio of pred-neighbor-GT-dist to true-neighbor-GT-dist
+            - 'nearmiss_ratio_p90': 90th percentile of above
+            - 'margin_d11_d10_p50': median d11/d10 ratio (near-ties detector)
+            - 'margin_d11_d10_p90': 90th percentile
+            - 'edge_spearman': Spearman on GT kNN edge lengths
+            - 'dist_spearman': global distance Spearman
+            - 'dist_pearson': global distance Pearson
+    
+    Debug tags: [PROBE-KNN], [PROBE-NEARMISS], [PROBE-MARGIN], [PROBE-EDGE], [PROBE-DIST]
+    """
+    from scipy.stats import spearmanr, pearsonr
+    
+    B, N, D = V_pred.shape
+    device = V_pred.device
+    
+    results = {
+        'knn10_overlap': 0.0,
+        'knn20_overlap': 0.0,
+        'knn50_overlap': 0.0,
+        'nearmiss_ratio_p50': 0.0,
+        'nearmiss_ratio_p90': 0.0,
+        'margin_d11_d10_p50': 0.0,
+        'margin_d11_d10_p90': 0.0,
+        'edge_spearman': 0.0,
+        'dist_spearman': 0.0,
+        'dist_pearson': 0.0
+    }
+    
+    all_knn10_overlaps = []
+    all_knn20_overlaps = []
+    all_knn50_overlaps = []
+    all_nearmiss_ratios = []
+    all_margins = []
+    all_edge_pred = []
+    all_edge_gt = []
+    all_dist_pred = []
+    all_dist_gt = []
+    
+    for b in range(B):
+        m_b = mask[b].bool()
+        n_valid = m_b.sum().item()
+        
+        if n_valid < k + 2:
+            continue
+        
+        V_p = V_pred[b, m_b]  # (n_valid, D)
+        V_t = V_target[b, m_b]  # (n_valid, D)
+        
+        # Pairwise distances
+        D_pred = torch.cdist(V_p, V_p)  # (n_valid, n_valid)
+        D_gt = torch.cdist(V_t, V_t)
+        
+        D_pred.fill_diagonal_(float('inf'))
+        D_gt.fill_diagonal_(float('inf'))
+        
+        # ---- kNN Overlap at k=10, 20, 50 ----
+        for k_test, overlap_list in [(10, all_knn10_overlaps), 
+                                      (20, all_knn20_overlaps),
+                                      (50, all_knn50_overlaps)]:
+            if n_valid < k_test + 1:
+                continue
+            _, knn_pred = D_pred.topk(k_test, dim=1, largest=False)
+            _, knn_gt = D_gt.topk(k_test, dim=1, largest=False)
+            
+            overlap_count = 0
+            for i in range(n_valid):
+                pred_set = set(knn_pred[i].tolist())
+                gt_set = set(knn_gt[i].tolist())
+                overlap_count += len(pred_set & gt_set)
+            overlap_list.append(overlap_count / (n_valid * k_test))
+        
+        # ---- Near-Miss Ratio ----
+        # For each point: ratio of median GT dist of pred neighbors to median GT dist of true neighbors
+        _, knn_pred_10 = D_pred.topk(k, dim=1, largest=False)
+        _, knn_gt_10 = D_gt.topk(k, dim=1, largest=False)
+        
+        for i in range(n_valid):
+            pred_neighbors = knn_pred_10[i]  # (k,) indices
+            true_neighbors = knn_gt_10[i]
+            
+            # GT distances to pred's chosen neighbors
+            gt_dist_to_pred_neighbors = D_gt[i, pred_neighbors]
+            gt_dist_to_true_neighbors = D_gt[i, true_neighbors]
+            
+            median_pred_neigh_gt_dist = gt_dist_to_pred_neighbors.median().item()
+            median_true_neigh_gt_dist = gt_dist_to_true_neighbors.median().item()
+            
+            if median_true_neigh_gt_dist > 1e-8:
+                ratio = median_pred_neigh_gt_dist / median_true_neigh_gt_dist
+                all_nearmiss_ratios.append(ratio)
+        
+        # ---- Margin (d11/d10) in predicted space ----
+        # Detects near-ties: if d11 ≈ d10, kNN identity is unstable
+        if n_valid >= 12:
+            D_pred_sorted, _ = D_pred.sort(dim=1)
+            d_10 = D_pred_sorted[:, 9]   # 10th nearest (0-indexed: index 9)
+            d_11 = D_pred_sorted[:, 10]  # 11th nearest
+            
+            margins = d_11 / (d_10 + 1e-8)
+            all_margins.extend(margins.tolist())
+        
+        # ---- Edge Spearman on GT kNN edges ----
+        # Compare edge lengths for true spatial neighbors
+        for i in range(n_valid):
+            true_neighbors = knn_gt_10[i].tolist()
+            for j in true_neighbors:
+                if j > i:  # avoid double counting
+                    all_edge_pred.append(D_pred[i, j].item())
+                    all_edge_gt.append(D_gt[i, j].item())
+        
+        # ---- Global Distance Correlation (subsample for efficiency) ----
+        # Take upper triangle
+        triu_idx = torch.triu_indices(n_valid, n_valid, offset=1, device=device)
+        d_pred_flat = D_pred[triu_idx[0], triu_idx[1]]
+        d_gt_flat = D_gt[triu_idx[0], triu_idx[1]]
+        
+        # Subsample if too many pairs
+        max_pairs = 5000
+        if len(d_pred_flat) > max_pairs:
+            perm = torch.randperm(len(d_pred_flat))[:max_pairs]
+            d_pred_flat = d_pred_flat[perm]
+            d_gt_flat = d_gt_flat[perm]
+        
+        all_dist_pred.extend(d_pred_flat.cpu().tolist())
+        all_dist_gt.extend(d_gt_flat.cpu().tolist())
+    
+    # ---- Aggregate Results ----
+    if all_knn10_overlaps:
+        results['knn10_overlap'] = float(np.median(all_knn10_overlaps))
+    if all_knn20_overlaps:
+        results['knn20_overlap'] = float(np.median(all_knn20_overlaps))
+    if all_knn50_overlaps:
+        results['knn50_overlap'] = float(np.median(all_knn50_overlaps))
+    
+    if all_nearmiss_ratios:
+        arr = np.array(all_nearmiss_ratios)
+        results['nearmiss_ratio_p50'] = float(np.median(arr))
+        results['nearmiss_ratio_p90'] = float(np.percentile(arr, 90))
+    
+    if all_margins:
+        arr = np.array(all_margins)
+        results['margin_d11_d10_p50'] = float(np.median(arr))
+        results['margin_d11_d10_p90'] = float(np.percentile(arr, 90))
+    
+    if len(all_edge_pred) > 10:
+        try:
+            spear, _ = spearmanr(all_edge_pred, all_edge_gt)
+            results['edge_spearman'] = float(spear) if not np.isnan(spear) else 0.0
+        except:
+            pass
+    
+    if len(all_dist_pred) > 10:
+        try:
+            spear, _ = spearmanr(all_dist_pred, all_dist_gt)
+            pear, _ = pearsonr(all_dist_pred, all_dist_gt)
+            results['dist_spearman'] = float(spear) if not np.isnan(spear) else 0.0
+            results['dist_pearson'] = float(pear) if not np.isnan(pear) else 0.0
+        except:
+            pass
+    
+    return results

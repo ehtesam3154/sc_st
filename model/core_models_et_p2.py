@@ -42,6 +42,9 @@ from contextlib import contextmanager
 
 import math
 
+from typing import List, Dict, Optional, Tuple
+
+
 
 #debug tools
 DEBUG = False #master switch for debug logging
@@ -1804,6 +1807,400 @@ def run_ab_tests_fixed_batch(
     print(f"{'='*80}\n")
 
 
+def run_probe_eval_multi_sigma(
+    probe_state: Dict,
+    score_net: nn.Module,
+    context_encoder: nn.Module,
+    sigma_data: float,
+    device: str,
+    sigma_list: List[float],
+    seed: int = 42,
+    global_step: int = 0,
+    epoch: int = 0,
+    fabric = None,
+) -> Dict[float, Dict[str, float]]:
+    """
+    Evaluate the model on a fixed probe batch at MULTIPLE sigma levels.
+    
+    This tests whether the model can recover structure at different noise levels.
+    High-sigma probes test "structure formation from far away" which is critical
+    for understanding inference failures.
+    
+    Args:
+        probe_state: dict with 'Z_set', 'V_target', 'mask', 'knn_spatial'
+        score_net: diffusion score network
+        context_encoder: context encoder
+        sigma_data: EDM sigma_data parameter
+        device: torch device string
+        sigma_list: list of sigma values to probe (e.g., [0.2, 0.8, 1.5, 2.0, 2.5, 3.0])
+        seed: random seed for reproducible noise
+        global_step: current training step
+        epoch: current epoch
+        fabric: optional Fabric object
+    
+    Returns:
+        Dict mapping sigma -> metrics dict
+    """
+    if not probe_state.get('batch_captured', False):
+        return {}
+    
+    # Move probe tensors to device
+    Z_probe = probe_state['Z_set'].unsqueeze(0).to(device)  # (1, N, D_z)
+    V_target = probe_state['V_target'].unsqueeze(0).to(device)  # (1, N, D)
+    mask_probe = probe_state['mask'].unsqueeze(0).to(device)  # (1, N)
+    n_probe = probe_state['n_probe']
+    
+    # Get model in eval mode
+    was_training_score = score_net.training
+    was_training_ctx = context_encoder.training
+    score_net.eval()
+    context_encoder.eval()
+    
+    # Unwrap if DDP wrapped
+    score_net_unwrapped = score_net.module if hasattr(score_net, 'module') else score_net
+    
+    all_results = {}
+    
+    with torch.no_grad():
+        B, N, D = V_target.shape
+        
+        # Get context (same for all sigmas)
+        H = context_encoder(Z_probe, mask_probe)
+        
+        # Center V_target for fair comparison (do once)
+        V_target_centered, _ = uet.center_only(V_target, mask_probe)
+        
+        # ========== GT-MARGIN: Compute ground truth margin (once) ==========
+        # This tells us if low margin is inherent to the dataset geometry
+        V_t_flat = V_target_centered[0, mask_probe[0].bool()]  # (n_valid, D)
+        D_gt = torch.cdist(V_t_flat, V_t_flat)
+        D_gt.fill_diagonal_(float('inf'))
+        D_gt_sorted, _ = D_gt.sort(dim=1)
+        
+        n_valid = V_t_flat.shape[0]
+        if n_valid >= 12:
+            d_10_gt = D_gt_sorted[:, 9]   # 10th nearest
+            d_11_gt = D_gt_sorted[:, 10]  # 11th nearest
+            gt_margin = (d_11_gt / (d_10_gt + 1e-8))
+            gt_margin_p50 = gt_margin.median().item()
+            gt_margin_p90 = gt_margin.quantile(0.9).item()
+        else:
+            gt_margin_p50 = 0.0
+            gt_margin_p90 = 0.0
+        
+        # Store GT margin in results (only need to report once)
+        all_results['gt_margin'] = {
+            'd11_d10_p50': gt_margin_p50,
+            'd11_d10_p90': gt_margin_p90
+        }
+        
+        # ========== Loop over sigma levels ==========
+        for sigma_val in sigma_list:
+            # Generate deterministic noise (same noise pattern for each sigma, scaled differently)
+            g = torch.Generator(device=device)
+            g.manual_seed(seed)
+            eps = torch.randn(B, N, D, generator=g, device=device)
+            
+            # Build noisy input at this sigma
+            sigma = torch.tensor([sigma_val], device=device)
+            V_t = V_target + sigma.view(1, 1, 1) * eps
+            
+            # Center V_t (same preprocessing as training)
+            V_t_centered, _ = uet.center_only(V_t, mask_probe)
+            
+            # Forward pass to get x0_pred
+            result = score_net_unwrapped.forward_edm(
+                V_t_centered, sigma, H, mask_probe, sigma_data, 
+                self_cond=None, return_debug=False
+            )
+            
+            if isinstance(result, tuple):
+                x0_pred = result[0]
+            else:
+                x0_pred = result
+            
+            # Center x0_pred (same as training V_geom computation)
+            x0_pred_centered, _ = uet.center_only(x0_pred, mask_probe)
+            
+            # Compute probe metrics
+            probe_metrics = uet.compute_probe_metrics(
+                x0_pred_centered, 
+                V_target_centered, 
+                mask_probe,
+                knn_spatial=None,
+                k=10
+            )
+            
+            probe_metrics['sigma'] = sigma_val
+            probe_metrics['n_probe'] = n_probe
+            
+            all_results[sigma_val] = probe_metrics
+    
+    # Restore training mode
+    if was_training_score:
+        score_net.train()
+    if was_training_ctx:
+        context_encoder.train()
+    
+    return all_results
+
+
+def print_probe_results_multi_sigma(all_results: Dict, global_step: int, epoch: int):
+    """Print probe results for all sigma levels with standardized tags."""
+    if not all_results:
+        return
+    
+    # Print GT-MARGIN first (only once, not per sigma)
+    if 'gt_margin' in all_results:
+        gt_m = all_results['gt_margin']
+        print(f"\n[GT-MARGIN] epoch={epoch} d11_d10_p50={gt_m['d11_d10_p50']:.4f} "
+              f"d11_d10_p90={gt_m['d11_d10_p90']:.4f}")
+        if gt_m['d11_d10_p50'] < 1.05:
+            print(f"[GT-MARGIN] ⚠️ GT itself has tiny margins - kNN@10 is inherently fragile for this geometry")
+    
+    # Print per-sigma results
+    sigma_keys = sorted([k for k in all_results.keys() if isinstance(k, float)])
+    
+    for sigma_val in sigma_keys:
+        results = all_results[sigma_val]
+        
+        # [PROBE-KNN] tag
+        print(f"\n[PROBE-KNN] step={global_step} epoch={epoch} sigma={sigma_val:.3f} "
+              f"knn10={results.get('knn10_overlap', 0):.4f} "
+              f"knn20={results.get('knn20_overlap', 0):.4f} "
+              f"knn50={results.get('knn50_overlap', 0):.4f}")
+        
+        # [PROBE-NEARMISS] tag
+        print(f"[PROBE-NEARMISS] step={global_step} epoch={epoch} sigma={sigma_val:.3f} "
+              f"ratio10_p50={results.get('nearmiss_ratio_p50', 0):.4f} "
+              f"ratio10_p90={results.get('nearmiss_ratio_p90', 0):.4f}")
+        
+        # [PROBE-MARGIN] tag
+        print(f"[PROBE-MARGIN] step={global_step} epoch={epoch} sigma={sigma_val:.3f} "
+              f"d11_d10_p50={results.get('margin_d11_d10_p50', 0):.4f} "
+              f"d11_d10_p90={results.get('margin_d11_d10_p90', 0):.4f}")
+        
+        # [PROBE-EDGE] tag
+        print(f"[PROBE-EDGE] step={global_step} epoch={epoch} sigma={sigma_val:.3f} "
+              f"spear_edge10={results.get('edge_spearman', 0):.4f}")
+        
+        # [PROBE-DIST] tag
+        print(f"[PROBE-DIST] step={global_step} epoch={epoch} sigma={sigma_val:.3f} "
+              f"spear={results.get('dist_spearman', 0):.4f} "
+              f"pear={results.get('dist_pearson', 0):.4f}")
+    
+    # Summary interpretation
+    print(f"\n[PROBE-SUMMARY] epoch={epoch}")
+    
+    # Compare low vs high sigma
+    if 0.2 in all_results and 3.0 in all_results:
+        low = all_results[0.2]
+        high = all_results[3.0]
+        
+        knn_drop = low.get('knn10_overlap', 0) - high.get('knn10_overlap', 0)
+        nearmiss_rise = high.get('nearmiss_ratio_p50', 0) - low.get('nearmiss_ratio_p50', 0)
+        
+        print(f"  σ=0.2 → σ=3.0: kNN10 drop={knn_drop:.4f}, nearmiss rise={nearmiss_rise:.4f}")
+        
+        if knn_drop > 0.3:
+            print(f"  ⚠️ Large kNN degradation at high sigma - structure formation is weak")
+        if nearmiss_rise > 1.0:
+            print(f"  ⚠️ Near-miss explodes at high sigma - high-σ conditioning needs work")
+
+
+def run_probe_open_loop_sample(
+    probe_state: Dict,
+    score_net: nn.Module,
+    context_encoder: nn.Module,
+    sigma_data: float,
+    device: str,
+    n_steps: int = 20,
+    sigma_max: float = 3.0,
+    sigma_min: float = 0.02,
+    rho: float = 7.0,
+    seed: int = 42,
+    global_step: int = 0,
+    epoch: int = 0,
+    trace_sigmas: List[float] = None,
+    fabric = None,
+) -> Dict[str, float]:
+    """
+    Run open-loop EDM sampling on the fixed probe batch.
+    
+    This tests whether the model can generate correct structure from noise,
+    not just denoise a noisy GT. This is the missing discriminator between
+    "teacher-forced looks great" and "inference fails".
+    
+    Args:
+        probe_state: dict with 'Z_set', 'V_target', 'mask'
+        score_net: diffusion score network
+        context_encoder: context encoder
+        sigma_data: EDM sigma_data parameter
+        device: torch device string
+        n_steps: number of sampling steps
+        sigma_max: starting sigma
+        sigma_min: ending sigma
+        rho: Karras schedule parameter
+        seed: random seed for reproducible noise
+        global_step: current training step
+        epoch: current epoch
+        trace_sigmas: list of sigmas at which to print intermediate metrics
+        fabric: optional Fabric object
+    
+    Returns:
+        Dict with final metrics
+    
+    Tags: [PROBE-SAMPLE-END], [PROBE-SAMPLE-TRACE]
+    """
+    if not probe_state.get('batch_captured', False):
+        return {}
+    
+    if trace_sigmas is None:
+        trace_sigmas = [3.0, 1.5, 0.8, 0.2]
+    
+    # Move probe tensors to device
+    Z_probe = probe_state['Z_set'].unsqueeze(0).to(device)  # (1, N, D_z)
+    V_target = probe_state['V_target'].unsqueeze(0).to(device)  # (1, N, D)
+    mask_probe = probe_state['mask'].unsqueeze(0).to(device)  # (1, N)
+    
+    B, N, D = V_target.shape
+    
+    # Get model in eval mode
+    was_training_score = score_net.training
+    was_training_ctx = context_encoder.training
+    score_net.eval()
+    context_encoder.eval()
+    
+    # Unwrap if DDP wrapped
+    score_net_unwrapped = score_net.module if hasattr(score_net, 'module') else score_net
+    
+    results = {
+        'n_steps': n_steps,
+        'sigma_max': sigma_max,
+        'sigma_min': sigma_min,
+    }
+    trace_results = []
+    
+    with torch.no_grad():
+        # ========== Build Karras sigma schedule ==========
+        # sigmas[i] = (sigma_max^(1/rho) + i/(n_steps-1) * (sigma_min^(1/rho) - sigma_max^(1/rho)))^rho
+        step_indices = torch.linspace(0, 1, n_steps + 1, device=device)
+        sigmas = (sigma_max ** (1/rho) + step_indices * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
+        sigmas[-1] = 0  # Final sigma is 0 (clean)
+        
+        # ========== Get context (once) ==========
+        H = context_encoder(Z_probe, mask_probe)
+        
+        # ========== Initialize from noise ==========
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        x = sigmas[0] * torch.randn(B, N, D, generator=g, device=device)
+        
+        # Center target for comparison
+        V_target_centered, _ = uet.center_only(V_target, mask_probe)
+        
+        # ========== Sampling loop (Euler) ==========
+        for i in range(n_steps):
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+            
+            # Center current state
+            x_centered, _ = uet.center_only(x, mask_probe)
+            
+            # Get denoised prediction
+            sigma_batch = sigma.view(1)
+            denoised = score_net_unwrapped.forward_edm(
+                x_centered, sigma_batch, H, mask_probe, sigma_data,
+                self_cond=None, return_debug=False
+            )
+            
+            if isinstance(denoised, tuple):
+                denoised = denoised[0]
+            
+            # Center denoised
+            denoised_centered, _ = uet.center_only(denoised, mask_probe)
+            
+            # ========== Check if we should trace at this sigma ==========
+            sigma_val = sigma.item()
+            for trace_sig in trace_sigmas:
+                # Check if this is the closest step to the trace sigma
+                if i == 0 or sigmas[i-1].item() >= trace_sig > sigma_val:
+                    # Compute quick metrics at this point
+                    trace_metrics = uet.compute_probe_metrics(
+                        denoised_centered, V_target_centered, mask_probe, k=10
+                    )
+                    trace_results.append({
+                        'sigma': trace_sig,
+                        'knn10': trace_metrics.get('knn10_overlap', 0),
+                        'nearmiss_p50': trace_metrics.get('nearmiss_ratio_p50', 0),
+                    })
+                    break
+            
+            # ========== Euler step ==========
+            if sigma_next > 0:
+                # d = (x - denoised) / sigma
+                d = (x_centered - denoised_centered) / sigma
+                # x_next = x + (sigma_next - sigma) * d
+                x = x_centered + (sigma_next - sigma) * d
+            else:
+                # Final step: just use denoised
+                x = denoised_centered
+        
+        # ========== Final metrics ==========
+        # x is now the final sample (should be close to clean)
+        x_final_centered, _ = uet.center_only(x, mask_probe)
+        
+        final_metrics = uet.compute_probe_metrics(
+            x_final_centered, V_target_centered, mask_probe, k=10
+        )
+        
+        results.update(final_metrics)
+        results['trace'] = trace_results
+    
+    # Restore training mode
+    if was_training_score:
+        score_net.train()
+    if was_training_ctx:
+        context_encoder.train()
+    
+    return results
+
+
+def print_probe_sample_results(results: Dict, global_step: int, epoch: int):
+    """Print open-loop probe sampling results."""
+    if not results:
+        return
+    
+    n_steps = results.get('n_steps', 20)
+    sigma_max = results.get('sigma_max', 3.0)
+    sigma_min = results.get('sigma_min', 0.02)
+    
+    # Print trace (intermediate sigmas)
+    if 'trace' in results and results['trace']:
+        for t in results['trace']:
+            print(f"[PROBE-SAMPLE-TRACE] epoch={epoch} sigma={t['sigma']:.3f} "
+                  f"knn10={t['knn10']:.4f} nearmiss_p50={t['nearmiss_p50']:.4f}")
+    
+    # Print final
+    print(f"\n[PROBE-SAMPLE-END] step={global_step} epoch={epoch} steps={n_steps} "
+          f"sigmax={sigma_max:.2f} sigmin={sigma_min:.3f}")
+    print(f"[PROBE-SAMPLE-END] knn10={results.get('knn10_overlap', 0):.4f} "
+          f"nearmiss_p50={results.get('nearmiss_ratio_p50', 0):.4f} "
+          f"margin_p50={results.get('margin_d11_d10_p50', 0):.4f} "
+          f"edge_spear={results.get('edge_spearman', 0):.4f} "
+          f"dist_spear={results.get('dist_spearman', 0):.4f}")
+    
+    # Interpretation
+    knn10 = results.get('knn10_overlap', 0)
+    nearmiss = results.get('nearmiss_ratio_p50', 0)
+    
+    if knn10 < 0.3 and nearmiss > 2.0:
+        print(f"[PROBE-SAMPLE-END] ⚠️ Open-loop sampling fails! "
+              f"Structure not recovered from noise.")
+    elif knn10 > 0.5 and nearmiss < 1.5:
+        print(f"[PROBE-SAMPLE-END] ✓ Open-loop sampling works well!")
+
+
 def train_stageC_diffusion_generator(
     context_encoder: 'SetEncoderContext',
     generator: 'MetricSetGenerator',
@@ -2505,6 +2902,37 @@ def train_stageC_diffusion_generator(
         'baseline_mse': None,  # Phase 1: baseline reference
     }
 
+    # ========== PROBE BATCH STATE INITIALIZATION (ChatGPT Hypothesis 3 & 4) ==========
+    # These probes provide discriminative metrics that cannot "look healthy" while kNN@10 fails
+    probe_state = {
+        'batch_captured': False,        # Whether probe batch has been captured
+        'Z_set': None,                  # (N_probe, D_z) encoder embeddings
+        'V_target': None,               # (N_probe, D_latent) ground truth geometry
+        'mask': None,                   # (N_probe,) validity mask (all True for probe)
+        'knn_spatial': None,            # (N_probe, k) spatial kNN indices
+        'n_probe': 0,                   # Number of probe points
+        'slide_id': None,               # Source slide ID
+        'probe_indices': None,          # Global indices in original slide
+        'st_ident_computed': False,     # Whether ST-IDENT audit was run
+    }
+    
+    # Probe evaluation config
+    # ========== PROBE CONFIGURATION (hardcoded defaults) ==========
+    PROBE_SIGMAS = [0.2, 0.8, 1.5, 2.0, 2.5, 3.0]  # Multiple sigma levels to probe
+    PROBE_SEED = 42             # Fixed seed for reproducible noise  
+    PROBE_K = 10                # Match target kNN metric (k=10)
+    N_PROBE_TARGET = 256        # Target probe batch size
+
+    # ========== OPEN-LOOP PROBE SAMPLER CONFIG ==========
+    PROBE_SAMPLE_STEPS = 20
+    PROBE_SAMPLE_SIGMA_MAX = 3.0
+    PROBE_SAMPLE_SIGMA_MIN = 0.02
+    PROBE_SAMPLE_RHO = 7.0  # Karras schedule
+    PROBE_SAMPLE_TRACE_SIGMAS = [3.0, 2.3, 1.5, 0.8, 0.2]  # Sigmas to log during trajectory
+
+
+
+
     # Compute sigma_data once at start    
     def sync_scalar(value: float, device: str) -> float:
         t = torch.tensor([value], device=device, dtype=torch.float32)
@@ -2867,7 +3295,7 @@ def train_stageC_diffusion_generator(
             batch_size_real = Z_set.shape[0]
             
             D_latent = score_net.D_latent
-            
+       
             # ===== FORWARD PASS WITH AMP =====
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
                 # Context encoding
@@ -2933,12 +3361,7 @@ def train_stageC_diffusion_generator(
                     G_target = batch['G_target'].to(device)  # For geometry losses
                     D_latent = score_net.D_latent
 
-                    # CRITICAL CHECK: Dimension compatibility
-                    assert V_target_raw.shape[-1] == D_latent, \
-                        f"V_target dim {V_target_raw.shape[-1]} != D_latent {D_latent}"
-                    
                     # --- PATCH 3: Canonicalize ST target coordinates from Gram ---
-                    # This ensures the target is centered and exactly consistent with G_target.
                     V_target = torch.zeros_like(V_target_raw)
                     for i in range(batch_size_real):
                         n_valid = int(mask[i].sum().item())
@@ -2948,6 +3371,81 @@ def train_stageC_diffusion_generator(
                         V_i = uet.factor_from_gram(G_i, D_latent).to(V_target_raw.dtype)
                         V_target[i, :n_valid] = V_i
                     # --------------------------------------------------------
+
+                    # ========== PROBE BATCH CAPTURE (once, rank-0 only) ==========
+                    # Must be AFTER V_target canonicalization so we capture the same
+                    # targets the model is trained on
+                    if not probe_state['batch_captured'] and (fabric is None or fabric.is_global_zero):
+                        n_valid_total = mask.sum().item()
+                        
+                        if n_valid_total >= N_PROBE_TARGET:
+                            # Find the batch item with most valid points
+                            n_per_sample = mask.sum(dim=1)  # (B,)
+                            best_idx = n_per_sample.argmax().item()
+                            n_best = int(n_per_sample[best_idx].item())
+                            
+                            if n_best >= N_PROBE_TARGET:
+                                # Take the first N_PROBE_TARGET valid points from this sample
+                                m_best = mask[best_idx].bool()
+                                valid_indices = torch.where(m_best)[0][:N_PROBE_TARGET]
+                                
+                                # Store probe batch (CPU for persistence)
+                                # Use CANONICALIZED V_target (what model trains on)
+                                probe_state['Z_set'] = Z_set[best_idx, valid_indices].detach().cpu()
+                                probe_state['V_target'] = V_target[best_idx, valid_indices].detach().cpu()
+                                probe_state['mask'] = torch.ones(len(valid_indices), dtype=torch.bool)
+                                probe_state['n_probe'] = len(valid_indices)
+                                probe_state['batch_captured'] = True
+                                
+                                # Compute spatial kNN for this probe (fixed reference)
+                                V_probe = probe_state['V_target']
+                                D_probe = torch.cdist(V_probe, V_probe)
+                                D_probe.fill_diagonal_(float('inf'))
+                                _, knn_spatial_probe = D_probe.topk(PROBE_K, dim=1, largest=False)
+                                probe_state['knn_spatial'] = knn_spatial_probe
+                                
+                                # Get slide info if available
+                                if 'overlap_info' in batch:
+                                    oi = batch['overlap_info'][best_idx]
+                                    probe_state['slide_id'] = oi.get('slide_id', None)
+                                    probe_state['probe_indices'] = oi.get('indices', None)
+                                
+                                print(f"\n[PROBE-SNAP] step={global_step} n={probe_state['n_probe']} "
+                                      f"n_valid={n_best} k_spatial={PROBE_K}")
+                                print(f"[PROBE-SNAP] Probe batch captured and fixed for training evaluation")
+
+                    # ========== ST-IDENT AUDIT (once, after probe capture) ==========
+                    if probe_state['batch_captured'] and not probe_state['st_ident_computed'] and \
+                       (fabric is None or fabric.is_global_zero):
+                        print(f"\n[ST-IDENT] Running identifiability audit on probe batch...")
+                        
+                        # Run audit: can expression recover spatial neighbors?
+                        Z_probe = probe_state['Z_set'].unsqueeze(0).to(device)  # (1, N, D_z)
+                        V_probe = probe_state['V_target'].unsqueeze(0).to(device)  # (1, N, D)
+                        m_probe = probe_state['mask'].unsqueeze(0).to(device)  # (1, N)
+                        
+                        ident_results = uet.st_ident_audit(Z_probe, V_probe, m_probe, k=PROBE_K)
+                        
+                        print(f"[ST-IDENT] step={global_step} "
+                              f"expr_knn{PROBE_K}={ident_results['expr_knn_overlap']:.4f} "
+                              f"median_rank_spatial{PROBE_K}_in_expr={ident_results['median_rank_spatial_in_expr']:.1f} "
+                              f"p90_rank={ident_results['p90_rank_spatial_in_expr']:.1f}")
+                        print(f"[ST-IDENT] local_ambiguity_index={ident_results['local_ambiguity_index']:.4f}")
+                        
+                        # Interpretation guidance
+                        if ident_results['expr_knn_overlap'] < 0.35:
+                            print(f"[ST-IDENT] ⚠️ WARNING: Expression kNN overlap is low ({ident_results['expr_knn_overlap']:.2f})")
+                            print(f"[ST-IDENT] This suggests kNN@{PROBE_K} may be near data ceiling - "
+                                  "consider adding celltype/morphology features")
+                        
+                        if ident_results['median_rank_spatial_in_expr'] > 50:
+                            print(f"[ST-IDENT] ⚠️ WARNING: Spatial neighbors rank poorly in expression space")
+                            print(f"[ST-IDENT] Median rank {ident_results['median_rank_spatial_in_expr']:.0f} >> 10 "
+                                  "means expression doesn't strongly encode spatial locality")
+                        
+                        probe_state['st_ident_computed'] = True
+                        probe_state['st_ident_results'] = ident_results
+
                     
                     # Optional: Compute generator output for alignment training
                     if WEIGHTS['gen_align'] > 0:
@@ -5127,10 +5625,18 @@ def train_stageC_diffusion_generator(
                         L_knn_nca = (L_knn_per * geo_gate_nca).sum() / gate_sum_nca
 
                         
-                        # Debug
+                        # Debug - ENHANCED with temperature stats for A/B testing
                         if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                             hit_rate_nca = (geo_gate_nca > 0).float().mean().item()
+                            
+                            # Get effective temperature stats for NCA-PARAM tag
+                            # tau_reference is the base temperature (squared 15-NN distance)
+                            k_nca = 15  # Current k value
+                            temp_used = tau_reference  # Could be modified in A/B test
+                            
                             print(f"  NCA gate: hit_rate={hit_rate_nca:.2%} L_knn_nca={L_knn_nca.item():.4f}")
+                            print(f"[NCA-PARAM] step={global_step} k={k_nca} temp={temp_used:.5f}")
+
                 else:
                     L_knn_nca = torch.tensor(0.0, device=device)
 
@@ -7342,6 +7848,86 @@ def train_stageC_diffusion_generator(
                         device=device,
                         epoch=epoch,
                     )
+        # =====================================================================
+        # PROBE EVALUATION (ChatGPT Hypothesis 4 - Multi-Sigma Discriminative Metrics)
+        # =====================================================================
+        if (fabric is None or fabric.is_global_zero) and use_st and probe_state.get('batch_captured', False):
+            print(f"\n{'='*70}")
+            print(f"[PROBE EVAL] Epoch {epoch+1} - Multi-Sigma Discriminative Metrics")
+            print(f"{'='*70}")
+            
+            probe_results = run_probe_eval_multi_sigma(
+                probe_state=probe_state,
+                score_net=score_net,
+                context_encoder=context_encoder,
+                sigma_data=sigma_data,
+                device=device,
+                sigma_list=PROBE_SIGMAS,  # [0.2, 0.8, 1.5, 2.0, 2.5, 3.0]
+                seed=PROBE_SEED,
+                global_step=global_step,
+                epoch=epoch,
+                fabric=fabric,
+            )
+            
+            print_probe_results_multi_sigma(probe_results, global_step, epoch)
+            
+            # Store key metrics in history for tracking
+            if 'probe_knn10_s02' not in history['epoch_avg']:
+                # Initialize tracking for each sigma
+                for sig in PROBE_SIGMAS:
+                    sig_tag = f"s{str(sig).replace('.', '')}"
+                    history['epoch_avg'][f'probe_knn10_{sig_tag}'] = []
+                    history['epoch_avg'][f'probe_nearmiss_{sig_tag}'] = []
+            
+            for sig in PROBE_SIGMAS:
+                if sig in probe_results:
+                    sig_tag = f"s{str(sig).replace('.', '')}"
+                    history['epoch_avg'][f'probe_knn10_{sig_tag}'].append(
+                        probe_results[sig].get('knn10_overlap', 0))
+                    history['epoch_avg'][f'probe_nearmiss_{sig_tag}'].append(
+                        probe_results[sig].get('nearmiss_ratio_p50', 0))
+            
+            print(f"{'='*70}\n")
+
+        # =====================================================================
+        # OPEN-LOOP PROBE SAMPLING (Check 1 - Trajectory Consistency)
+        # =====================================================================
+        if (fabric is None or fabric.is_global_zero) and use_st and probe_state.get('batch_captured', False):
+            print(f"\n{'='*70}")
+            print(f"[PROBE SAMPLE] Epoch {epoch+1} - Open-Loop Trajectory Test")
+            print(f"{'='*70}")
+            
+            sample_results = run_probe_open_loop_sample(
+                probe_state=probe_state,
+                score_net=score_net,
+                context_encoder=context_encoder,
+                sigma_data=sigma_data,
+                device=device,
+                n_steps=PROBE_SAMPLE_STEPS,
+                sigma_max=PROBE_SAMPLE_SIGMA_MAX,
+                sigma_min=PROBE_SAMPLE_SIGMA_MIN,
+                rho=PROBE_SAMPLE_RHO,
+                seed=PROBE_SEED,
+                global_step=global_step,
+                epoch=epoch,
+                trace_sigmas=PROBE_SAMPLE_TRACE_SIGMAS,
+                fabric=fabric,
+            )
+            
+            print_probe_sample_results(sample_results, global_step, epoch)
+            
+            # Store in history
+            if 'probe_sample_knn10' not in history['epoch_avg']:
+                history['epoch_avg']['probe_sample_knn10'] = []
+                history['epoch_avg']['probe_sample_nearmiss'] = []
+            
+            history['epoch_avg']['probe_sample_knn10'].append(
+                sample_results.get('knn10_overlap', 0))
+            history['epoch_avg']['probe_sample_nearmiss'].append(
+                sample_results.get('nearmiss_ratio_p50', 0))
+            
+            print(f"{'='*70}\n")
+
 
         # ========== END OF EPOCH: PHASE 6 + PHASE 7 REPORTING ==========
         if fabric is None or fabric.is_global_zero:
