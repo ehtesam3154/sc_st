@@ -4028,13 +4028,15 @@ def rms_log_loss(V_pred, V_tgt, mask, eps=1e-8):
 
 def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor,
                  k: int = 15, temperature: float = 0.1, eps: float = 1e-8,
-                 return_per_sample: bool = False, scale_compensate: bool = True) -> torch.Tensor:
+                 return_per_sample: bool = False, scale_compensate: bool = True,
+                 point_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Differentiable k-NN Neighborhood Preservation Loss using NCA-style soft retrieval.
     
-    PATCH 5 (CORRECTED): 
-    - Added per-sample return for gating
-    - Added scale compensation (DETACHED to prevent gaming)
+    PATCH 6 (COMPETITOR TRAINING):
+    - Added point_weight for anchor-only training signal
+    - Neighbors are computed over full set (core + extras)
+    - Loss signal comes only from weighted (anchor) points
     
     Args:
         V_pred: (B, N, D) predicted coordinates
@@ -4045,6 +4047,9 @@ def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tenso
         eps: numerical stability
         return_per_sample: if True, return (B,) per-sample losses for gating
         scale_compensate: if True, adjust temperature based on pred/tgt scale ratio (detached)
+        point_weight: Optional (B, N) per-point weights for anchor-only training.
+                      If None, all valid points contribute equally.
+                      Typically: mask.float() * anchor_mask.float() for competitor training.
     
     Returns:
         Scalar loss (or (B,) if return_per_sample=True)
@@ -4073,43 +4078,38 @@ def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tenso
     # kNN indices in target space
     _, knn_idx_tgt = D2_tgt_masked.topk(k, dim=-1, largest=False)          # (B, N, k)
 
-    # PATCH 5B (CORRECTED): Scale compensation - DETACHED to prevent gaming
+    # Scale compensation - DETACHED to prevent gaming
     if scale_compensate:
-        with torch.no_grad():  # Critical: detach scale computation
-            # Get k-th neighbor distances for scale estimation
-            d2k_tgt = torch.gather(D2_tgt_masked, 2, knn_idx_tgt)[:, :, -1]    # (B, N)
-            d2k_pred = torch.gather(D2_pred_masked.detach(), 2, knn_idx_tgt)[:, :, -1]  # (B, N)
+        with torch.no_grad():
+            d2k_tgt = torch.gather(D2_tgt_masked, 2, knn_idx_tgt)[:, :, -1]
+            d2k_pred = torch.gather(D2_pred_masked.detach(), 2, knn_idx_tgt)[:, :, -1]
             
-            # Masked median per sample
             def masked_median(x, mf):
                 x_masked = x.masked_fill(mf == 0, float('nan'))
-                return torch.nanmedian(x_masked, dim=1).values  # (B,)
+                return torch.nanmedian(x_masked, dim=1).values
             
-            med_tgt = masked_median(d2k_tgt, mask_f).clamp(min=eps)   # (B,)
-            med_pred = masked_median(d2k_pred, mask_f).clamp(min=eps) # (B,)
+            med_tgt = masked_median(d2k_tgt, mask_f).clamp(min=eps)
+            med_pred = masked_median(d2k_pred, mask_f).clamp(min=eps)
             
-            # Scale ratio: if pred is shrunk (med_pred < med_tgt), scale < 1
-            # This makes temp_eff smaller, keeping softmax sharp
-            scale = (med_pred / med_tgt).clamp(0.25, 4.0)             # (B,)
+            scale = (med_pred / med_tgt).clamp(0.25, 4.0)
         
-        # Apply scale (detached) to temperature
-        temp_eff = (temperature * scale).view(B, 1, 1)            # (B, 1, 1)
+        temp_eff = (temperature * scale).view(B, 1, 1)
     else:
         temp_eff = temperature
 
-    # Log-prob over neighbors in pred space (log_softmax for stability)
-    logits = -D2_pred_masked / (temp_eff + eps)                            # (B, N, N)
+    # Log-prob over neighbors in pred space
+    logits = -D2_pred_masked / (temp_eff + eps)
     logits = logits.masked_fill(invalid_pair, -1e9)
-    logP = torch.log_softmax(logits, dim=-1)                               # (B, N, N)
+    logP = torch.log_softmax(logits, dim=-1)
 
     # Gather log-prob for true neighbors
     logP_true = torch.gather(logP, dim=2, index=knn_idx_tgt)               # (B, N, k)
 
-    # Neighbor validity (handles n_valid < k+1)
-    mask_j = mask_f.unsqueeze(1).expand(-1, N, -1)                         # (B, N, N)
-    neigh_valid = torch.gather(mask_j, dim=2, index=knn_idx_tgt)           # (B, N, k)
+    # Neighbor validity
+    mask_j = mask_f.unsqueeze(1).expand(-1, N, -1)
+    neigh_valid = torch.gather(mask_j, dim=2, index=knn_idx_tgt)
 
-    # Only count valid query points i, and valid gathered neighbors
+    # Query point validity
     query_valid = mask_f.unsqueeze(-1)                                     # (B, N, 1)
     w = query_valid * neigh_valid                                          # (B, N, k)
 
@@ -4117,13 +4117,20 @@ def knn_nca_loss(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tenso
     denom = w.sum(dim=-1).clamp(min=1.0)                                   # (B, N)
     loss_per_point = -(logP_true * w).sum(dim=-1) / denom                  # (B, N)
 
-    # Average over valid query points per sample
-    loss_per_sample = (loss_per_point * mask_f).sum(dim=-1) / valid_counts # (B,)
+    # ========== NEW: Apply point weighting for anchor-only training ==========
+    if point_weight is not None:
+        # point_weight should be (B, N), typically: mask * anchor_mask
+        effective_weight = point_weight * mask_f  # Ensure masked points have zero weight
+        weight_sum_per_sample = effective_weight.sum(dim=-1).clamp(min=1.0)  # (B,)
+        loss_per_sample = (loss_per_point * effective_weight).sum(dim=-1) / weight_sum_per_sample  # (B,)
+    else:
+        # Original behavior: all valid points contribute equally
+        loss_per_sample = (loss_per_point * mask_f).sum(dim=-1) / valid_counts  # (B,)
     
-    # PATCH 5A: Support per-sample return for gating
     if return_per_sample:
-        return loss_per_sample  # (B,)
+        return loss_per_sample
     return loss_per_sample.mean()
+
 
 
 def knn_jaccard_soft(V_pred: torch.Tensor, V_target: torch.Tensor, mask: torch.Tensor, 

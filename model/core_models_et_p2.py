@@ -2234,6 +2234,16 @@ def train_stageC_diffusion_generator(
     z_noise_std: float= 0.02, # guassian noise std (relative to feature rms)
     z_dropout_rate: float = 0.1, # feature dropout rate (5-20%)
     aug_prob: float = 0.5, #prob to apply augmentation per batch
+    # ========== COMPETITOR TRAINING PARAMS (ChatGPT hypothesis test) ==========
+    compete_train: bool = False,
+    compete_n_extra: int = 128,
+    compete_n_rand: int = 64,
+    compete_n_hard: int = 64,
+    compete_use_pos_closure: bool = True,
+    compete_k_pos: int = 10,
+    compete_expr_knn_k: int = 50,
+    compete_anchor_only: bool = True,
+    compete_diag_every: int = 200,
 ):
     
     # Initialize debug tracking
@@ -5557,35 +5567,18 @@ def train_stageC_diffusion_generator(
                                         f"scale_loss={scale_loss_bin:.4f}")
 
                 # --- kNN NCA Loss (with float32 + autocast disabled) ---
-                # PATCH 5C (CORRECTED): Gate NCA and use scale compensation
+                # PATCH 6 (COMPETITOR): Use anchor_mask for point weighting
                 if WEIGHTS['knn_nca'] > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
-                        # Compute per-sample NCA loss for gating
-                        # L_knn_per = uet.knn_nca_loss(
-                        #     x0_pred.float() if use_edm else V_hat.float(), 
-                        #     V_target.float(), 
-                        #     mask, 
-                        #     k=15, 
-                        #     temperature=tau_reference,
-                        #     return_per_sample=True,     # PATCH 5A
-                        #     scale_compensate=True       # PATCH 5B (detached)
-                        # )
-
-                        # CHANGE 4A: Use V_geom (clamped) for NCA loss
-                        # NCA measures neighborhood identity preservation - should be scale-invariant
-                        # KEEP scale_compensate=True as per ChatGPT instruction
-                        # KEEP temperature=tau_reference (data-driven, do NOT hardcode)
-                        # L_knn_per = uet.knn_nca_loss(
-                        #     V_geom,              # Clamped structure tensor
-                        #     V_target.float(),    # Raw target (ChatGPT: don't rewire target)
-                        #     mask, 
-                        #     k=15, 
-                        #     temperature=tau_reference,  # DO NOT CHANGE - keep data-driven
-                        #     return_per_sample=True,
-                        #     scale_compensate=True       # KEEP THIS - ChatGPT explicit
-                        # )
-
-                        # CHANGE 4B: Use V_geom (clamped) for NCA loss (second call)
+                        # Get anchor_mask from batch (if available)
+                        if 'anchor_mask' in batch and compete_anchor_only:
+                            anchor_mask_batch = batch['anchor_mask'].to(device)  # (B, N)
+                            # point_weight = mask * anchor_mask (only anchors contribute to loss)
+                            point_weight = mask.float() * anchor_mask_batch.float()
+                        else:
+                            point_weight = None  # All valid points contribute
+                        
+                        # Compute NCA loss with point weighting
                         L_knn_per = uet.knn_nca_loss(
                             V_geom,              # Clamped structure tensor
                             V_target.float(),    # Raw target
@@ -5593,52 +5586,112 @@ def train_stageC_diffusion_generator(
                             k=15, 
                             temperature=tau_reference,
                             return_per_sample=True,
-                            scale_compensate=True
+                            scale_compensate=True,
+                            point_weight=point_weight,  # NEW: anchor-only weighting
                         )
-
-
                         
-                        # Gate NCA like edge loss (local feature, needs clean signal)
-                        # Target: ~10-30% hit rate, same as edge
-                        if rho is not None:
-                            low_noise_nca = (rho <= 2.0)  # Same as edge
-                        else:
-                            low_noise_nca = (sigma_vec <= 0.3)
-                        # geo_gate_nca = cond_only * low_noise_nca.float()
-
-                        # Use adaptive gate for NCA
+                        # Gate NCA (same as before)
                         gate_sum_nca = geo_gate_nca.sum().clamp(min=1.0)
                         
-                        # L_knn_per = uet.knn_nca_loss(
-                        #     x0_pred.float() if use_edm else V_hat.float(), 
-                        #     V_target.float(), 
-                        #     mask, 
-                        #     k=15, 
-                        #     temperature=tau_reference,
-                        #     return_per_sample=True,
-                        #     scale_compensate=True
-                        # )
-                        
-                        # Sanitize before gating (NaN * 0 = NaN)
+                        # Sanitize before gating
                         L_knn_per = torch.nan_to_num(L_knn_per, nan=0.0, posinf=0.0, neginf=0.0)
                         
                         L_knn_nca = (L_knn_per * geo_gate_nca).sum() / gate_sum_nca
 
-                        
-                        # Debug - ENHANCED with temperature stats for A/B testing
+                        # Debug - ENHANCED with competitor info
                         if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                             hit_rate_nca = (geo_gate_nca > 0).float().mean().item()
                             
-                            # Get effective temperature stats for NCA-PARAM tag
-                            # tau_reference is the base temperature (squared 15-NN distance)
-                            k_nca = 15  # Current k value
-                            temp_used = tau_reference  # Could be modified in A/B test
-                            
-                            print(f"  NCA gate: hit_rate={hit_rate_nca:.2%} L_knn_nca={L_knn_nca.item():.4f}")
-                            print(f"[NCA-PARAM] step={global_step} k={k_nca} temp={temp_used:.5f}")
+                            # Log anchor coverage if competitor training
+                            if point_weight is not None:
+                                anchor_rate = (point_weight > 0).float().sum(dim=1).mean().item()
+                                total_pts = mask.float().sum(dim=1).mean().item()
+                                print(f"  NCA gate: hit={hit_rate_nca:.2%} L={L_knn_nca.item():.4f} "
+                                      f"anchors/total={anchor_rate:.1f}/{total_pts:.1f}")
+                            else:
+                                print(f"  NCA gate: hit_rate={hit_rate_nca:.2%} L_knn_nca={L_knn_nca.item():.4f}")
 
                 else:
                     L_knn_nca = torch.tensor(0.0, device=device)
+
+                # ==============================================================================
+                # [COMPETITOR-DIAG] Training-time competitor diagnostics (ChatGPT requested)
+                # ==============================================================================
+                if compete_train and (global_step % compete_diag_every == 0) and (fabric is None or fabric.is_global_zero):
+                    if not is_sc and 'global_indices' in batch and 'anchor_mask' in batch:
+                        with torch.no_grad():
+                            global_indices = batch['global_indices'].to(device)  # (B, N)
+                            anchor_mask_b = batch['anchor_mask'].to(device)  # (B, N)
+                            
+                            # Get slide's full GT kNN for coverage computation
+                            # (requires access to targets_dict through batch)
+                            coverage_k = 10
+                            precision_k = 10
+                            
+                            coverage_scores = []
+                            precision_scores = []
+                            intruder_scores = []
+                            
+                            B_diag = mask.shape[0]
+                            for b in range(min(B_diag, 4)):  # Sample up to 4 batches for speed
+                                m_b = mask[b]
+                                anchor_b = anchor_mask_b[b] & m_b
+                                global_idx_b = global_indices[b]
+                                
+                                if anchor_b.sum() < 3:
+                                    continue
+                                
+                                # Get V_geom for this sample
+                                V_b = V_geom[b][m_b]  # (n_valid, D)
+                                n_valid = V_b.shape[0]
+                                
+                                if n_valid < coverage_k + 1:
+                                    continue
+                                
+                                # Compute predicted kNN within batch
+                                D_pred = torch.cdist(V_b, V_b)
+                                D_pred.fill_diagonal_(float('inf'))
+                                _, pred_knn = torch.topk(D_pred, k=coverage_k, largest=False)
+                                
+                                # Map to global indices
+                                local_to_global = global_idx_b[m_b]  # (n_valid,)
+                                pred_knn_global = local_to_global[pred_knn]  # (n_valid, k)
+                                
+                                # For coverage: we need full slide GT neighbors
+                                # This requires access to the dataset's targets
+                                # For now, approximate with V_target kNN as "GT"
+                                V_tgt_b = V_target[b][m_b]
+                                D_tgt = torch.cdist(V_tgt_b, V_tgt_b)
+                                D_tgt.fill_diagonal_(float('inf'))
+                                _, tgt_knn = torch.topk(D_tgt, k=coverage_k, largest=False)
+                                tgt_knn_global = local_to_global[tgt_knn]
+                                
+                                # Compute precision: fraction of pred neighbors that are in GT neighbors
+                                anchor_local = anchor_b[m_b].nonzero(as_tuple=True)[0]
+                                for a in anchor_local[:10]:  # Sample anchors
+                                    pred_set = set(pred_knn_global[a].tolist())
+                                    tgt_set = set(tgt_knn_global[a].tolist())
+                                    
+                                    if len(pred_set) > 0:
+                                        precision = len(pred_set & tgt_set) / len(pred_set)
+                                        precision_scores.append(precision)
+                                        intruder_scores.append(1.0 - precision)
+                            
+                            if precision_scores:
+                                mean_precision = sum(precision_scores) / len(precision_scores)
+                                mean_intruder = sum(intruder_scores) / len(intruder_scores)
+                                
+                                print(f"\n[COMPETITOR-DIAG] step={global_step}")
+                                print(f"  precision@{precision_k}={mean_precision:.3f} "
+                                      f"intruder@{precision_k}={mean_intruder:.3f}")
+                                print(f"  (lower intruder = better competitor robustness)")
+                                
+                                # Log compete_debug counters if available
+                                if 'compete_debug' in batch and batch['compete_debug']:
+                                    cd = batch['compete_debug'][0]  # First sample's debug info
+                                    print(f"  miniset composition: core={cd.get('n_core', 'N/A')} "
+                                          f"pos={cd.get('n_pos', 'N/A')} rand={cd.get('n_rand', 'N/A')} "
+                                          f"hard={cd.get('n_hard', 'N/A')} total={cd.get('n_total', 'N/A')}")
 
                 
                 # --- NCA sanity debug ---

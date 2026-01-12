@@ -529,11 +529,20 @@ class STSetDataset(Dataset):
         n_max: int = 256,
         D_latent: int = 16,
         num_samples: int = 10000,
-        knn_k: int = 12,  # NEW parameter
+        knn_k: int = 12,
         device: str = 'cuda',
-        landmarks_L: int=32,
+        landmarks_L: int = 32,
         pool_mult: float = 4.0,
-        stochastic_tau: float = 1.0
+        stochastic_tau: float = 1.0,
+        # ========== NEW: Competitor training params ==========
+        compete_train: bool = False,
+        compete_n_extra: int = 128,
+        compete_n_rand: int = 64,
+        compete_n_hard: int = 64,
+        compete_use_pos_closure: bool = True,
+        compete_k_pos: int = 10,
+        compete_expr_knn_k: int = 50,
+        compete_anchor_only: bool = True,
     ):
         self.targets_dict = targets_dict
         self.encoder = encoder
@@ -542,21 +551,50 @@ class STSetDataset(Dataset):
         self.n_max = n_max
         self.D_latent = D_latent
         self.num_samples = num_samples
-        self.knn_k = knn_k  # Store knn_k
+        self.knn_k = knn_k
         self.device = device
         self.slide_ids = list(targets_dict.keys())
         self.landmarks_L = 0
 
-        #store stoachastic sampling params
+        # Store stochastic sampling params
         self.pool_mult = pool_mult
         self.stochastic_tau = stochastic_tau
         
+        # ========== NEW: Store competitor training params ==========
+        self.compete_train = compete_train
+        self.compete_n_extra = compete_n_extra
+        self.compete_n_rand = compete_n_rand
+        self.compete_n_hard = compete_n_hard
+        self.compete_use_pos_closure = compete_use_pos_closure
+        self.compete_k_pos = compete_k_pos
+        self.compete_expr_knn_k = compete_expr_knn_k
+        self.compete_anchor_only = compete_anchor_only
+        
         # Precompute encoder embeddings for all slides
         self.Z_dict = {}
+        self.expr_knn_indices = {}  # NEW: expression-based kNN for hard negatives
+        
         with torch.no_grad():
             for slide_id, st_expr in st_gene_expr_dict.items():
                 Z = self.encoder(st_expr.to(device))
-                self.Z_dict[slide_id] = Z.cpu() #changed to store on cpu
+                self.Z_dict[slide_id] = Z.cpu()
+                
+                # ========== NEW: Precompute expression kNN for hard negatives ==========
+                if compete_train and compete_n_hard > 0:
+                    n_spots = Z.shape[0]
+                    # Normalize embeddings for cosine similarity
+                    Z_norm = F.normalize(Z, p=2, dim=1)  # (n_spots, h_dim)
+                    # Compute similarity matrix
+                    sim_matrix = Z_norm @ Z_norm.T  # (n_spots, n_spots)
+                    # Mask out self-similarity
+                    sim_matrix.fill_diagonal_(-float('inf'))
+                    # Get top-K most similar (expression neighbors)
+                    k_expr = min(compete_expr_knn_k, n_spots - 1)
+                    _, expr_knn_idx = torch.topk(sim_matrix, k=k_expr, dim=1)  # (n_spots, k_expr)
+                    self.expr_knn_indices[slide_id] = expr_knn_idx.cpu()
+                    print(f"[STSetDataset] Computed expression kNN for slide {slide_id}: "
+                          f"{n_spots} spots, k={k_expr}")
+
     
     def __len__(self):
         return self.num_samples
@@ -574,177 +612,174 @@ class STSetDataset(Dataset):
         debug_this_sample = (idx < 3)
 
         # ------------------------------------------------------------------
-        # NEW sampling: pure local kNN patch in TRUE ST distance space
+        # CORE PATCH SAMPLING: pure local kNN patch in TRUE ST distance space
         # ------------------------------------------------------------------
-        # Pick a random center
         center_idx = np.random.randint(0, m)
-
-        # Distances from this center in true ST distance matrix
         D_row = targets.D[center_idx]  # (m,)
-
-        # Exclude the center itself
+        
         all_idx = torch.arange(m)
         mask_self = all_idx != center_idx
-        dists = D_row[mask_self]        # (m-1,)
+        dists = D_row[mask_self]
         idx_no_self = all_idx[mask_self]
 
         if idx_no_self.numel() == 0:
-            # Tiny slide fallback
-            indices = all_idx[:n]
+            indices_core = all_idx[:n]
         else:
-            # Sort by distance (nearest first)
-            sort_order = torch.argsort(dists)          # ascending
-            sorted_neighbors = idx_no_self[sort_order] # (m-1,)
+            sort_order = torch.argsort(dists)
+            sorted_neighbors = idx_no_self[sort_order]
             sorted_dists = dists[sort_order]
 
-            # Determine pool size: min of (pool_mult * n, available neighbors)
-            n_neighbors_needed = n - 1  # We need n-1 neighbors (plus center)
+            n_neighbors_needed = n - 1
             K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n))
-            K_pool = max(K_pool, n_neighbors_needed)  # At least enough to sample from
+            K_pool = max(K_pool, n_neighbors_needed)
 
-            #create the pool
-            pool = sorted_neighbors[: K_pool]
-            pool_d = sorted_dists[: K_pool]
+            pool = sorted_neighbors[:K_pool]
+            pool_d = sorted_dists[:K_pool]
 
             if pool.numel() <= n_neighbors_needed:
                 neighbors = pool
             else:
                 weights = torch.softmax(-pool_d / self.stochastic_tau, dim=0)
-
                 sampled_idx = torch.multinomial(weights, n_neighbors_needed, replacement=False)
                 neighbors = pool[sampled_idx]
-            
-            #combine center + sampled nhbrs
-            indices = torch.cat([
+
+            indices_core = torch.cat([
                 torch.tensor([center_idx], dtype=torch.long),
                 neighbors
             ])
 
-
-            # If we still have fewer than n (tiny slide), pad with random others
-            if indices.numel() < n:
-                missing = n - indices.numel()
-                mask_extra = ~torch.isin(all_idx, indices)
+            if indices_core.numel() < n:
+                missing = n - indices_core.numel()
+                mask_extra = ~torch.isin(all_idx, indices_core)
                 extra_pool = all_idx[mask_extra]
                 if extra_pool.numel() > 0:
                     perm = torch.randperm(extra_pool.numel())
                     add = extra_pool[perm[:min(missing, extra_pool.numel())]]
-                    indices = torch.cat([indices, add])
+                    indices_core = torch.cat([indices_core, add])
 
-        # Shuffle order to avoid any positional bias
-        indices = indices[torch.randperm(indices.numel())]
+        # Shuffle core to avoid positional bias
+        indices_core = indices_core[torch.randperm(indices_core.numel())]
+        n_core = indices_core.numel()
 
-        # # ------------------------------------------------------------------
-        # # New sampling: center-based near / mid / far using true distances
-        # # ------------------------------------------------------------------
-        # # Pick a random center
-        # center_idx = np.random.randint(0, m)
-
-        # # Full distance row for this center (true ST nuclear distances)
-        # D_row = targets.D[center_idx]  # (m,)
-
-        # # Exclude the center itself
-        # all_idx = torch.arange(m)
-        # mask_self = all_idx != center_idx
-        # dists = D_row[mask_self]           # (m-1,)
-        # idx_no_self = all_idx[mask_self]   # (m-1,)
-
-        # # Safeguard for tiny slides
-        # if idx_no_self.numel() == 0:
-        #     indices = all_idx[:n]
-        # else:
-        #     # Compute distance quantiles (on CPU tensors)
-        #     # You can tune these
-        #     q_near = torch.quantile(dists, 0.2)
-        #     q_mid  = torch.quantile(dists, 0.6)
-        #     q_far  = torch.quantile(dists, 0.9)
-
-        #     # Define buckets
-        #     near_mask = dists <= q_near
-        #     mid_mask  = (dists > q_near) & (dists <= q_mid)
-        #     far_mask  = dists >= q_far
-
-        #     near_idx_all = idx_no_self[near_mask]
-        #     mid_idx_all  = idx_no_self[mid_mask]
-        #     far_idx_all  = idx_no_self[far_mask]
-
-        #     # Allocate counts per tier (you can tune these ratios)
-        #     n_near = int(0.4 * n)
-        #     n_mid  = int(0.3 * n)
-        #     n_far  = n - n_near - n_mid
-
-        #     # Helper to sample from a bucket with fallback
-        #     def sample_from_bucket(bucket, k, fallback_pool):
-        #         bucket = bucket
-        #         if bucket.numel() >= k:
-        #             # random sample without replacement
-        #             perm = torch.randperm(bucket.numel())
-        #             return bucket[perm[:k]]
-        #         else:
-        #             # take what we have, fill remaining from fallback_pool
-        #             taken = bucket
-        #             remaining = k - bucket.numel()
-        #             if remaining > 0 and fallback_pool.numel() > 0:
-        #                 # exclude already taken
-        #                 mask_fp = ~torch.isin(fallback_pool, taken)
-        #                 pool2 = fallback_pool[mask_fp]
-        #                 if pool2.numel() > 0:
-        #                     perm = torch.randperm(pool2.numel())
-        #                     add = pool2[perm[:min(remaining, pool2.numel())]]
-        #                     taken = torch.cat([taken, add])
-        #             return taken
-
-        #     # Global fallback pool (all non-center indices)
-        #     fallback_pool = idx_no_self
-
-        #     # Sample from each bucket
-        #     near_idx = sample_from_bucket(near_idx_all, n_near, fallback_pool)
-        #     mid_idx  = sample_from_bucket(mid_idx_all,  n_mid,  fallback_pool)
-        #     far_idx  = sample_from_bucket(far_idx_all,  n_far,  fallback_pool)
-
-        #     # Combine, maybe shuffle
-        #     indices = torch.cat([near_idx, mid_idx, far_idx])
-        #     # If, due to fallbacks, we got more than n, trim
-        #     if indices.numel() > n:
-        #         perm = torch.randperm(indices.numel())
-        #         indices = indices[perm[:n]]
-        #     # If we got fewer, pad with random others (unlikely but safe)
-        #     elif indices.numel() < n:
-        #         missing = n - indices.numel()
-        #         mask_extra = ~torch.isin(all_idx, indices)
-        #         extra_pool = all_idx[mask_extra]
-        #         if extra_pool.numel() > 0:
-        #             perm = torch.randperm(extra_pool.numel())
-        #             add = extra_pool[perm[:min(missing, extra_pool.numel())]]
-        #             indices = torch.cat([indices, add])
-
-        # # Shuffle to avoid any ordering bias
-        # indices = indices[torch.randperm(indices.numel())]
+        # ------------------------------------------------------------------
+        # COMPETITOR EXPANSION (ChatGPT hypothesis test)
+        # ------------------------------------------------------------------
+        indices_extra = []
+        n_pos_added = 0
+        n_rand_added = 0
+        n_hard_added = 0
+        
+        if self.compete_train:
+            already_included = set(indices_core.tolist())
+            
+            # 1) POSITIVE CLOSURE: Include GT spatial neighbors not in core
+            if self.compete_use_pos_closure and self.compete_k_pos > 0:
+                pos_closure_candidates = []
+                for local_i in range(n_core):
+                    global_i = indices_core[local_i].item()
+                    # Get GT spatial neighbors from targets.knn_spatial
+                    gt_neighbors = targets.knn_spatial[global_i]  # (k,)
+                    for neighbor in gt_neighbors.tolist():
+                        if neighbor >= 0 and neighbor not in already_included:
+                            pos_closure_candidates.append(neighbor)
+                
+                # Deduplicate and cap
+                pos_closure_candidates = list(set(pos_closure_candidates))
+                n_pos_max = self.compete_n_extra // 2  # Reserve half for pos closure
+                if len(pos_closure_candidates) > n_pos_max:
+                    perm = torch.randperm(len(pos_closure_candidates))[:n_pos_max]
+                    pos_closure_candidates = [pos_closure_candidates[i] for i in perm.tolist()]
+                
+                if pos_closure_candidates:
+                    pos_tensor = torch.tensor(pos_closure_candidates, dtype=torch.long)
+                    indices_extra.append(pos_tensor)
+                    n_pos_added = len(pos_closure_candidates)
+                    already_included.update(pos_closure_candidates)
+            
+            # 2) RANDOM DISTRACTORS
+            if self.compete_n_rand > 0:
+                available = [i for i in range(m) if i not in already_included]
+                n_rand = min(self.compete_n_rand, len(available))
+                if n_rand > 0:
+                    rand_idx = torch.randperm(len(available))[:n_rand]
+                    rand_distractors = torch.tensor([available[i] for i in rand_idx.tolist()], 
+                                                    dtype=torch.long)
+                    indices_extra.append(rand_distractors)
+                    n_rand_added = n_rand
+                    already_included.update(rand_distractors.tolist())
+            
+            # 3) HARD NEGATIVES (expression-similar distractors)
+            if self.compete_n_hard > 0 and slide_id in self.expr_knn_indices:
+                expr_knn = self.expr_knn_indices[slide_id]  # (m, k_expr)
+                hard_candidates = []
+                
+                # Sample hard negatives from expression neighbors of core points
+                anchor_indices = indices_core[:min(10, n_core)]  # Use subset of anchors
+                for anchor in anchor_indices.tolist():
+                    expr_neighbors = expr_knn[anchor].tolist()
+                    for neighbor in expr_neighbors:
+                        if neighbor not in already_included:
+                            hard_candidates.append(neighbor)
+                
+                hard_candidates = list(set(hard_candidates))
+                n_hard = min(self.compete_n_hard, len(hard_candidates))
+                if n_hard > 0:
+                    perm = torch.randperm(len(hard_candidates))[:n_hard]
+                    hard_distractors = torch.tensor([hard_candidates[i] for i in perm.tolist()],
+                                                    dtype=torch.long)
+                    indices_extra.append(hard_distractors)
+                    n_hard_added = n_hard
+        
+        # Combine core + extra
+        if indices_extra:
+            indices_extra_cat = torch.cat(indices_extra)
+            indices_all = torch.cat([indices_core, indices_extra_cat])
+            indices_all = torch.unique(indices_all)  # Remove any duplicates
+        else:
+            indices_all = indices_core
+        
+        # Cap total size for memory
+        n_total_max = n_core + self.compete_n_extra if self.compete_train else n_core
+        if indices_all.numel() > n_total_max:
+            # Keep all core points, subsample extras
+            core_set = set(indices_core.tolist())
+            extras_in_all = [i.item() for i in indices_all if i.item() not in core_set]
+            n_extras_to_keep = n_total_max - n_core
+            if n_extras_to_keep > 0 and len(extras_in_all) > n_extras_to_keep:
+                perm = torch.randperm(len(extras_in_all))[:n_extras_to_keep]
+                extras_to_keep = [extras_in_all[i] for i in perm.tolist()]
+            else:
+                extras_to_keep = extras_in_all[:n_extras_to_keep]
+            indices_all = torch.cat([indices_core, torch.tensor(extras_to_keep, dtype=torch.long)])
+        
+        # Create anchor mask (True for core points, False for extras)
+        anchor_mask = torch.zeros(indices_all.numel(), dtype=torch.bool)
+        core_set = set(indices_core.tolist())
+        for i, idx in enumerate(indices_all.tolist()):
+            if idx in core_set:
+                anchor_mask[i] = True
+        
+        # Use indices_all for all downstream processing
+        indices = indices_all
+        n_total = indices.numel()
 
         # Store actual base size BEFORE adding landmarks
         base_n = indices.shape[0]
 
-        # Extract kNN indices for this miniset
-        # targets.knn_indices is (m, k_full) in global indexing
-        # We need to map to local indexing [0..n-1]
-
-        # Create mapping from global to local indices
+        # ------------------------------------------------------------------
+        # kNN mapping (same as before, but using indices which may include extras)
+        # ------------------------------------------------------------------
         global_to_local = torch.full((m,), -1, dtype=torch.long)
-        global_to_local[indices] = torch.arange(n, dtype=torch.long)
+        global_to_local[indices] = torch.arange(n_total, dtype=torch.long)
 
-        # Get kNN indices for selected spots (still in global indexing)
-        knn_global = targets.knn_indices[indices]  # (n, k)
+        knn_global = targets.knn_indices[indices]  # (n_total, k)
+        knn_local = global_to_local[knn_global]
 
-        # Map to local indexing
-        knn_local = global_to_local[knn_global]  # (n, k)
-        # Any neighbor not in this miniset will be -1 (invalid)
-
-        # Also get SPATIAL kNN for geometry losses
-        knn_spatial_global = targets.knn_spatial[indices]  # (n, k)
+        knn_spatial_global = targets.knn_spatial[indices]
         knn_spatial_local = global_to_local[knn_spatial_global]
 
         # ------------------------------------------------------------------
-        # Landmarks via FPS in embedding space (unchanged)
+        # Landmarks (unchanged)
         # ------------------------------------------------------------------
         if self.landmarks_L > 0:
             Z_subset = self.Z_dict[slide_id][indices]
@@ -755,6 +790,9 @@ class STSetDataset(Dataset):
 
             is_landmark = torch.zeros(indices.shape[0], dtype=torch.bool)
             is_landmark[base_n:] = True
+            
+            # Extend anchor_mask for landmarks (landmarks are NOT anchors)
+            anchor_mask = torch.cat([anchor_mask, torch.zeros(n_landmarks, dtype=torch.bool)])
         else:
             is_landmark = torch.zeros(base_n, dtype=torch.bool)
 
@@ -764,7 +802,7 @@ class STSetDataset(Dataset):
         }
 
         # ------------------------------------------------------------------
-        # Rest of your code: unchanged
+        # Rest of data extraction (same as before)
         # ------------------------------------------------------------------
         Z_set = self.Z_dict[slide_id][indices]
         y_hat_subset = targets.y_hat[indices]
@@ -792,63 +830,12 @@ class STSetDataset(Dataset):
             't_list': targets.t_list
         }
 
-        # ------------------------------------------------------------------
-        # NEW: Extract topology pairs for this miniset
-        # ------------------------------------------------------------------
-        # Map global topology pairs to local indices
-        # Only keep pairs where BOTH points are in the miniset
-        
-        def extract_topo_pairs(pairs_global, dists_global, indices, global_to_local):
-            """Extract topology pairs that exist within miniset"""
-            if len(pairs_global) == 0:
-                return torch.zeros((0, 2), dtype=torch.long), torch.zeros(0, dtype=torch.float32)
-            
-            pairs_local = []
-            dists_local = []
-            
-            for idx_pair, (i_global, j_global) in enumerate(pairs_global):
-                # Check if both points are in miniset
-                i_local = global_to_local[i_global.item()]
-                j_local = global_to_local[j_global.item()]
-                
-                if i_local != -1 and j_local != -1:
-                    pairs_local.append([i_local, j_local])
-                    dists_local.append(dists_global[idx_pair])
-            
-            if len(pairs_local) == 0:
-                return torch.zeros((0, 2), dtype=torch.long), torch.zeros(0, dtype=torch.float32)
-            
-            return (
-                torch.tensor(pairs_local, dtype=torch.long),
-                torch.tensor(dists_local, dtype=torch.float32)
-            )
-        
-        # # global_to_local is already defined above (line 683-684)
-        # topo_pairs_0_local, topo_dists_0_local = extract_topo_pairs(
-        #     targets.topo_pairs_0, targets.topo_dists_0, indices, global_to_local
-        # )
-        # topo_pairs_1_local, topo_dists_1_local = extract_topo_pairs(
-        #     targets.topo_pairs_1, targets.topo_dists_1, indices, global_to_local
-        # )
-        
-        # topo_info = {
-        #     'pairs_0': topo_pairs_0_local,
-        #     'dists_0': topo_dists_0_local,
-        #     'pairs_1': topo_pairs_1_local,
-        #     'dists_1': topo_dists_1_local,
-        # }
-
-        # ------------------------------------------------------------------
-        # NEW: Compute PH directly on this miniset (not from full slide)
-        # ------------------------------------------------------------------
-        # Get miniset GT coordinates
-        y_hat_miniset = targets.y_hat[indices].cpu().numpy()  # (n, 2)
-        
-        # Compute PH pairs for THIS miniset (already in local indices)
+        # Compute PH for topology
+        y_hat_miniset = targets.y_hat[indices].cpu().numpy()
         topo_result = uet.compute_persistent_pairs(
-            y_hat_miniset, 
-            max_pairs_0d=min(20, n // 4),  # Scale with miniset size
-            max_pairs_1d=min(10, n // 8)
+            y_hat_miniset,
+            max_pairs_0d=min(20, n_nodes // 4),
+            max_pairs_1d=min(10, n_nodes // 8)
         )
         
         topo_info = {
@@ -856,6 +843,17 @@ class STSetDataset(Dataset):
             'dists_0': torch.from_numpy(topo_result['dists_0']).float(),
             'pairs_1': torch.from_numpy(topo_result['pairs_1']).long(),
             'dists_1': torch.from_numpy(topo_result['dists_1']).float(),
+        }
+
+        # ------------------------------------------------------------------
+        # COMPETITOR DEBUG COUNTERS
+        # ------------------------------------------------------------------
+        compete_debug = {
+            'n_core': n_core,
+            'n_pos': n_pos_added,
+            'n_rand': n_rand_added,
+            'n_hard': n_hard_added,
+            'n_total': n_total,
         }
 
         return {
@@ -871,9 +869,14 @@ class STSetDataset(Dataset):
             'n': len(indices),
             'overlap_info': overlap_info,
             'knn_indices': knn_local,
-            'topo_info': topo_info,  # NEW
-            'knn_spatial': knn_spatial_local
+            'topo_info': topo_info,
+            'knn_spatial': knn_spatial_local,
+            # ========== NEW: Competitor training fields ==========
+            'anchor_mask': anchor_mask,
+            'global_indices': indices,
+            'compete_debug': compete_debug,
         }
+
 
             
 def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -907,6 +910,12 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     knn_batch = torch.full((batch_size, n_max, knn_k), -1, dtype=torch.long, device=device)
     knn_spatial_batch = torch.full((batch_size, n_max, knn_k), -1, dtype=torch.long, device=device)
 
+    # ========== NEW: Competitor training batch tensors ==========
+    anchor_mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
+    global_indices_batch = torch.full((batch_size, n_max), -1, dtype=torch.long, device=device)
+    compete_debug_batch = []
+
+
 
     for i, item in enumerate(batch):
         n = item['n']
@@ -927,6 +936,19 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
         if 'knn_spatial' in item:
             knn_spatial_batch[i, :n, :] = item['knn_spatial'][:n, :]
+
+        # ========== NEW: Competitor fields ==========
+        if 'anchor_mask' in item:
+            anchor_mask_batch[i, :n] = item['anchor_mask'][:n]
+        else:
+            anchor_mask_batch[i, :n] = True  # Default: all points are anchors
+        
+        if 'global_indices' in item:
+            global_indices_batch[i, :n] = item['global_indices'][:n]
+        
+        if 'compete_debug' in item:
+            compete_debug_batch.append(item['compete_debug'])
+
     
 
     return {
@@ -946,6 +968,10 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'knn_indices': knn_batch,
         'topo_info': topo_info_batch,
         'knn_spatial': knn_spatial_batch,
+        # ========== NEW: Competitor training fields ==========
+        'anchor_mask': anchor_mask_batch,
+        'global_indices': global_indices_batch,
+        'compete_debug': compete_debug_batch,
     }
 
 class SCSetDataset(Dataset):
