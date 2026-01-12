@@ -974,10 +974,226 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'compete_debug': compete_debug_batch,
     }
 
+# class SCSetDataset(Dataset):
+#     """
+#     SC mini-sets with intentional overlap, using a prebuilt K-NN index.
+#     Returns CPU-pinned tensors; collate moves to CUDA in batch.
+#     """
+#     def __init__(
+#         self,
+#         sc_gene_expr: torch.Tensor,
+#         encoder: "SharedEncoder",
+#         n_min: int = 64,
+#         n_max: int = 256,
+#         n_large_min: int = 384,
+#         n_large_max: int = 512,
+#         large_fraction: float = 0.15,
+#         overlap_min: int = 20,
+#         overlap_max: int = 512,
+#         num_samples: int = 5000,
+#         K_nbrs: int = 2048,
+#         device: str = "cuda",
+#         landmarks_L: int = 32
+#     ):
+#         self.n_min = n_min
+#         self.n_max = n_max
+#         self.n_large_min = n_min
+#         self.n_large_max = n_max
+#         self.large_fraction = large_fraction
+#         self.overlap_min = overlap_min
+#         self.overlap_max = overlap_max
+#         self.num_samples = num_samples
+#         self.device = device
+#         self.landmarks_L = 0
+
+#         # Encode all SC cells once (CUDA), then keep a CPU pinned copy
+#         print("encoding SC cells....")
+#         encoder.eval()
+#         with torch.no_grad():
+#             chunks, bs = [], 1024
+#             for s in range(0, sc_gene_expr.shape[0], bs):
+#                 z = encoder(sc_gene_expr[s:s+bs].to(device))
+#                 chunks.append(z)
+#             Z_all = torch.cat(chunks, 0).contiguous()
+#         print(f"SC embeddings computed: {Z_all.shape}")
+
+#         self.h_dim = Z_all.shape[1]
+#         self.Z_cpu = Z_all.detach().to("cpu", non_blocking=True).pin_memory()
+
+#         # Build neighbor index once (CPU pinned)
+#         self.nbr_idx = uet.build_topk_index(Z_all, K=K_nbrs, block=min(4096, Z_all.shape[0]))
+
+#         # Compute embedding-based kNN indices (for NCA loss)
+#         print(f"[SC Dataset] Computing embedding-based kNN indices...")
+#         n_sc = self.Z_cpu.shape[0]
+#         knn_k = min(K_nbrs, 20)  # Use smaller k for NCA loss
+
+#         # Compute distance matrix in chunks to save memory
+#         self.knn_indices = torch.zeros(n_sc, knn_k, dtype=torch.long)
+
+#         chunk_size = 2048
+#         for i in range(0, n_sc, chunk_size):
+#             end_i = min(i + chunk_size, n_sc)
+#             D_chunk = torch.cdist(self.Z_cpu[i:end_i], self.Z_cpu)
+            
+#             for local_i, global_i in enumerate(range(i, end_i)):
+#                 dists_from_i = D_chunk[local_i]
+#                 dists_from_i_copy = dists_from_i.clone()
+#                 dists_from_i_copy[global_i] = float('inf')  # Exclude self
+#                 _, indices = torch.topk(dists_from_i_copy, k=min(knn_k, n_sc-1), largest=False)
+#                 self.knn_indices[global_i, :len(indices)] = indices
+#                 if len(indices) < knn_k:
+#                     self.knn_indices[global_i, len(indices):] = -1
+
+#         print(f"[SC Dataset] kNN indices computed: {self.knn_indices.shape}")
+
+#     def __len__(self):
+#         return self.num_samples
+
+#     def __getitem__(self, idx):
+#         N = self.Z_cpu.shape[0]
+#         # Decide set size
+#         if torch.rand(1).item() < self.large_fraction:
+#             n_set = int(torch.randint(self.n_large_min, self.n_large_max + 1, (1,)).item())
+#         else:
+#             n_set = int(torch.randint(self.n_min, self.n_max + 1, (1,)).item())
+#         n_set = min(n_set, N)
+
+#         # Overlap size
+#         n_ov_max = min(self.overlap_max, n_set // 2 if n_set >= 2 else 0)
+#         n_overlap = int(torch.randint(self.overlap_min, max(self.overlap_min + 1, n_ov_max + 1), (1,)).item()) if n_ov_max >= self.overlap_min else 0
+
+#         # Seed & neighbor-based sets (CPU index)
+#         i = int(torch.randint(N, (1,)).item())
+#         A = self.nbr_idx[i, :n_set]        # (n_set,) cpu long
+
+#         if n_overlap > 0:
+#             ov_pos = torch.randperm(n_set)[:n_overlap]         # positions in A
+#             shared_global = A[ov_pos]
+#         else:
+#             ov_pos = torch.tensor([], dtype=torch.long)
+#             shared_global = ov_pos
+
+#         # pick nearby seed j
+#         k_nn = min(50, self.nbr_idx.shape[1] - 1) if self.nbr_idx.shape[1] > 1 else 0
+#         if k_nn > 0:
+#             near = self.nbr_idx[i, 1:k_nn+1]
+#             j = int(near[torch.randint(len(near), (1,))].item())
+#         else:
+#             j = (i + 1) % N
+
+#         cand = self.nbr_idx[j]             # (K,)
+#         # remove A \ overlap
+#         non_sharedA_pos = torch.arange(n_set)
+#         if n_overlap > 0:
+#             non_sharedA_pos = non_sharedA_pos[~torch.isin(non_sharedA_pos, ov_pos)]
+#         # non_shared_A = A[non_sharedA_pos]
+#         # mask = ~torch.isin(cand, non_shared_A)
+#         # cand = cand[mask]
+
+#         # n_new = n_set - n_overlap
+#         # new_B = cand[:n_new]
+#         # B = torch.cat([shared_global, new_B])[:n_set]
+#         mask = ~torch.isin(cand, A)
+#         cand = cand[mask]
+
+#         n_new = n_set - n_overlap
+#         new_B = cand[:n_new]
+#         B = torch.cat([shared_global, new_B])[:n_set]
+
+#         # positions of shared in A and B
+#         mapB = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
+#         mapB[B] = torch.arange(B.numel(), dtype=torch.long)
+#         shared_A_pos = ov_pos
+#         shared_B_pos = mapB[shared_global]
+
+#         # Add landmarks from union (but cap total size at n_set)
+#         if self.landmarks_L > 0:
+#             # Get union of A and B
+#             union = torch.unique(torch.cat([A, B]))
+#             Z_union = self.Z_cpu[union]
+
+#             # FPS on union to select landmarks
+#             landmark_local = uet.farthest_point_sampling(
+#                 Z_union, 
+#                 min(self.landmarks_L, len(union)),
+#                 device='cpu'
+#             )
+
+#             landmark_global = union[landmark_local]
+            
+#             # Remove any landmarks already in A or B (prevent duplicates)
+#             new_landmarks_A = landmark_global[~torch.isin(landmark_global, A)]
+#             new_landmarks_B = landmark_global[~torch.isin(landmark_global, B)]
+
+#             # Cap landmarks to ensure final size doesn't exceed n_set
+#             space_left_A = n_set - A.numel()
+#             space_left_B = n_set - B.numel()
+            
+#             new_landmarks_A = new_landmarks_A[:space_left_A]
+#             new_landmarks_B = new_landmarks_B[:space_left_B]
+
+#             # Append only NEW landmarks to both sets
+#             A = torch.cat([A, new_landmarks_A])
+#             B = torch.cat([B, new_landmarks_B])
+
+#             # Update shared indices to include landmarks
+#             n_landmarks = len(landmark_global)
+#             landmark_pos_A = torch.arange(len(A) - len(new_landmarks_A), len(A))
+#             landmark_pos_B = torch.arange(len(B) - len(new_landmarks_B), len(B))
+
+#             shared_A_pos = torch.cat([shared_A_pos, landmark_pos_A])
+#             shared_B_pos = torch.cat([shared_B_pos, landmark_pos_B])
+
+#             # Create is_landmark masks
+#             is_landmark_A = torch.zeros(len(A), dtype=torch.bool)
+#             is_landmark_A[-len(new_landmarks_A):] = True
+#             is_landmark_B = torch.zeros(len(B), dtype=torch.bool)
+#             is_landmark_B[-len(new_landmarks_B):] = True
+#         else:
+#             is_landmark_A = torch.zeros(len(A), dtype=torch.bool)
+#             is_landmark_B = torch.zeros(len(B), dtype=torch.bool)
+
+#         # Pull CPU pinned slices (do NOT move to CUDA here)
+#         Z_A = self.Z_cpu[A]
+#         Z_B = self.Z_cpu[B]
+
+#         # Duplicate guards
+#         assert A.numel() == A.unique().numel(), f"Set A has duplicates: {A.numel()} vs {A.unique().numel()}"
+#         assert B.numel() == B.unique().numel(), f"Set B has duplicates: {B.numel()} vs {B.unique().numel()}"
+
+#         # Extract kNN indices for minisets A and B, map to local indexing
+#         global_to_local_A = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
+#         global_to_local_A[A] = torch.arange(len(A), dtype=torch.long)
+#         knn_global_A = self.knn_indices[A]  # (n_A, k)
+#         knn_local_A = global_to_local_A[knn_global_A]  # Map to local indices
+
+#         global_to_local_B = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
+#         global_to_local_B[B] = torch.arange(len(B), dtype=torch.long)
+#         knn_global_B = self.knn_indices[B]  # (n_B, k)
+#         knn_local_B = global_to_local_B[knn_global_B]  # Map to local indices
+
+#         return {
+#             "Z_A": Z_A, "Z_B": Z_B,
+#             "n_A": int(A.numel()), "n_B": int(B.numel()),
+#             "shared_A": shared_A_pos,
+#             "shared_B": shared_B_pos,
+#             "is_sc": True,
+#             "is_landmark_A": is_landmark_A,  # ADD THIS
+#             "is_landmark_B": is_landmark_B,  # ADD THIS
+#             "global_indices_A": A,  # ADD THIS
+#             "global_indices_B": B,   # ADD THIS
+#             "knn_indices_A": knn_local_A,  # ADD THIS
+#             "knn_indices_B": knn_local_B 
+#         }
+    
+
 class SCSetDataset(Dataset):
     """
-    SC mini-sets with intentional overlap, using a prebuilt K-NN index.
-    Returns CPU-pinned tensors; collate moves to CUDA in batch.
+    SC mini-sets sampled like STSetDataset:
+    - pick random center
+    - build local patch using embedding-space distances
+    - stochastic sampling from a distance-weighted pool
     """
     def __init__(
         self,
@@ -985,26 +1201,22 @@ class SCSetDataset(Dataset):
         encoder: "SharedEncoder",
         n_min: int = 64,
         n_max: int = 256,
-        n_large_min: int = 384,
-        n_large_max: int = 512,
-        large_fraction: float = 0.15,
-        overlap_min: int = 20,
-        overlap_max: int = 512,
         num_samples: int = 5000,
-        K_nbrs: int = 2048,
+        knn_k: int = 12,
         device: str = "cuda",
-        landmarks_L: int = 32
+        landmarks_L: int = 0,
+        pool_mult: float = 4.0,
+        stochastic_tau: float = 1.0,
+        K_nbrs: int = 2048,
     ):
         self.n_min = n_min
         self.n_max = n_max
-        self.n_large_min = n_min
-        self.n_large_max = n_max
-        self.large_fraction = large_fraction
-        self.overlap_min = overlap_min
-        self.overlap_max = overlap_max
         self.num_samples = num_samples
         self.device = device
-        self.landmarks_L = 0
+        self.landmarks_L = landmarks_L
+
+        self.pool_mult = pool_mult
+        self.stochastic_tau = stochastic_tau
 
         # Encode all SC cells once (CUDA), then keep a CPU pinned copy
         print("encoding SC cells....")
@@ -1020,31 +1232,26 @@ class SCSetDataset(Dataset):
         self.h_dim = Z_all.shape[1]
         self.Z_cpu = Z_all.detach().to("cpu", non_blocking=True).pin_memory()
 
-        # Build neighbor index once (CPU pinned)
+        # Optional: precompute a big neighbor index (not required for sampling logic)
         self.nbr_idx = uet.build_topk_index(Z_all, K=K_nbrs, block=min(4096, Z_all.shape[0]))
 
-        # Compute embedding-based kNN indices (for NCA loss)
+        # Compute embedding-based kNN indices (for NCA loss or downstream graph use)
         print(f"[SC Dataset] Computing embedding-based kNN indices...")
         n_sc = self.Z_cpu.shape[0]
-        knn_k = min(K_nbrs, 20)  # Use smaller k for NCA loss
-
-        # Compute distance matrix in chunks to save memory
+        knn_k = min(knn_k, n_sc - 1) if n_sc > 1 else 0
         self.knn_indices = torch.zeros(n_sc, knn_k, dtype=torch.long)
 
         chunk_size = 2048
         for i in range(0, n_sc, chunk_size):
             end_i = min(i + chunk_size, n_sc)
             D_chunk = torch.cdist(self.Z_cpu[i:end_i], self.Z_cpu)
-            
+
             for local_i, global_i in enumerate(range(i, end_i)):
                 dists_from_i = D_chunk[local_i]
                 dists_from_i_copy = dists_from_i.clone()
                 dists_from_i_copy[global_i] = float('inf')  # Exclude self
-                _, indices = torch.topk(dists_from_i_copy, k=min(knn_k, n_sc-1), largest=False)
+                _, indices = torch.topk(dists_from_i_copy, k=knn_k, largest=False)
                 self.knn_indices[global_i, :len(indices)] = indices
-                if len(indices) < knn_k:
-                    self.knn_indices[global_i, len(indices):] = -1
-
         print(f"[SC Dataset] kNN indices computed: {self.knn_indices.shape}")
 
     def __len__(self):
@@ -1052,140 +1259,92 @@ class SCSetDataset(Dataset):
 
     def __getitem__(self, idx):
         N = self.Z_cpu.shape[0]
-        # Decide set size
-        if torch.rand(1).item() < self.large_fraction:
-            n_set = int(torch.randint(self.n_large_min, self.n_large_max + 1, (1,)).item())
-        else:
-            n_set = int(torch.randint(self.n_min, self.n_max + 1, (1,)).item())
+        n_set = int(torch.randint(self.n_min, self.n_max + 1, (1,)).item())
         n_set = min(n_set, N)
 
-        # Overlap size
-        n_ov_max = min(self.overlap_max, n_set // 2 if n_set >= 2 else 0)
-        n_overlap = int(torch.randint(self.overlap_min, max(self.overlap_min + 1, n_ov_max + 1), (1,)).item()) if n_ov_max >= self.overlap_min else 0
+        # Pick center
+        center_idx = int(torch.randint(N, (1,)).item())
 
-        # Seed & neighbor-based sets (CPU index)
-        i = int(torch.randint(N, (1,)).item())
-        A = self.nbr_idx[i, :n_set]        # (n_set,) cpu long
+        # Distance from center in embedding space
+        center_vec = self.Z_cpu[center_idx].unsqueeze(0)
+        dists = torch.cdist(center_vec, self.Z_cpu).squeeze(0)  # (N,)
 
-        if n_overlap > 0:
-            ov_pos = torch.randperm(n_set)[:n_overlap]         # positions in A
-            shared_global = A[ov_pos]
+        all_idx = torch.arange(N)
+        mask_self = all_idx != center_idx
+        idx_no_self = all_idx[mask_self]
+        dists_no_self = dists[mask_self]
+
+        if idx_no_self.numel() == 0:
+            indices_core = all_idx[:n_set]
         else:
-            ov_pos = torch.tensor([], dtype=torch.long)
-            shared_global = ov_pos
+            sort_order = torch.argsort(dists_no_self)
+            sorted_neighbors = idx_no_self[sort_order]
+            sorted_dists = dists_no_self[sort_order]
 
-        # pick nearby seed j
-        k_nn = min(50, self.nbr_idx.shape[1] - 1) if self.nbr_idx.shape[1] > 1 else 0
-        if k_nn > 0:
-            near = self.nbr_idx[i, 1:k_nn+1]
-            j = int(near[torch.randint(len(near), (1,))].item())
-        else:
-            j = (i + 1) % N
+            n_neighbors_needed = n_set - 1
+            K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_set))
+            K_pool = max(K_pool, n_neighbors_needed)
 
-        cand = self.nbr_idx[j]             # (K,)
-        # remove A \ overlap
-        non_sharedA_pos = torch.arange(n_set)
-        if n_overlap > 0:
-            non_sharedA_pos = non_sharedA_pos[~torch.isin(non_sharedA_pos, ov_pos)]
-        # non_shared_A = A[non_sharedA_pos]
-        # mask = ~torch.isin(cand, non_shared_A)
-        # cand = cand[mask]
+            pool = sorted_neighbors[:K_pool]
+            pool_d = sorted_dists[:K_pool]
 
-        # n_new = n_set - n_overlap
-        # new_B = cand[:n_new]
-        # B = torch.cat([shared_global, new_B])[:n_set]
-        mask = ~torch.isin(cand, A)
-        cand = cand[mask]
+            if pool.numel() <= n_neighbors_needed:
+                neighbors = pool
+            else:
+                weights = torch.softmax(-pool_d / self.stochastic_tau, dim=0)
+                sampled_idx = torch.multinomial(weights, n_neighbors_needed, replacement=False)
+                neighbors = pool[sampled_idx]
 
-        n_new = n_set - n_overlap
-        new_B = cand[:n_new]
-        B = torch.cat([shared_global, new_B])[:n_set]
+            indices_core = torch.cat([
+                torch.tensor([center_idx], dtype=torch.long),
+                neighbors
+            ])
 
-        # positions of shared in A and B
-        mapB = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
-        mapB[B] = torch.arange(B.numel(), dtype=torch.long)
-        shared_A_pos = ov_pos
-        shared_B_pos = mapB[shared_global]
+            # If still short, pad with random unused points
+            if indices_core.numel() < n_set:
+                missing = n_set - indices_core.numel()
+                mask_extra = ~torch.isin(all_idx, indices_core)
+                extra_pool = all_idx[mask_extra]
+                if extra_pool.numel() > 0:
+                    perm = torch.randperm(extra_pool.numel())
+                    add = extra_pool[perm[:min(missing, extra_pool.numel())]]
+                    indices_core = torch.cat([indices_core, add])
 
-        # Add landmarks from union (but cap total size at n_set)
+        # Shuffle to avoid positional bias
+        indices = indices_core[torch.randperm(indices_core.numel())]
+        n_total = indices.numel()
+
+        # Optional landmarks
         if self.landmarks_L > 0:
-            # Get union of A and B
-            union = torch.unique(torch.cat([A, B]))
-            Z_union = self.Z_cpu[union]
+            Z_subset = self.Z_cpu[indices]
+            n_landmarks = min(self.landmarks_L, n_total)
+            landmark_indices = uet.farthest_point_sampling(Z_subset, n_landmarks, device='cpu')
+            landmark_global = indices[landmark_indices]
+            indices = torch.cat([indices, landmark_global])
 
-            # FPS on union to select landmarks
-            landmark_local = uet.farthest_point_sampling(
-                Z_union, 
-                min(self.landmarks_L, len(union)),
-                device='cpu'
-            )
-
-            landmark_global = union[landmark_local]
-            
-            # Remove any landmarks already in A or B (prevent duplicates)
-            new_landmarks_A = landmark_global[~torch.isin(landmark_global, A)]
-            new_landmarks_B = landmark_global[~torch.isin(landmark_global, B)]
-
-            # Cap landmarks to ensure final size doesn't exceed n_set
-            space_left_A = n_set - A.numel()
-            space_left_B = n_set - B.numel()
-            
-            new_landmarks_A = new_landmarks_A[:space_left_A]
-            new_landmarks_B = new_landmarks_B[:space_left_B]
-
-            # Append only NEW landmarks to both sets
-            A = torch.cat([A, new_landmarks_A])
-            B = torch.cat([B, new_landmarks_B])
-
-            # Update shared indices to include landmarks
-            n_landmarks = len(landmark_global)
-            landmark_pos_A = torch.arange(len(A) - len(new_landmarks_A), len(A))
-            landmark_pos_B = torch.arange(len(B) - len(new_landmarks_B), len(B))
-
-            shared_A_pos = torch.cat([shared_A_pos, landmark_pos_A])
-            shared_B_pos = torch.cat([shared_B_pos, landmark_pos_B])
-
-            # Create is_landmark masks
-            is_landmark_A = torch.zeros(len(A), dtype=torch.bool)
-            is_landmark_A[-len(new_landmarks_A):] = True
-            is_landmark_B = torch.zeros(len(B), dtype=torch.bool)
-            is_landmark_B[-len(new_landmarks_B):] = True
+            is_landmark = torch.zeros(indices.shape[0], dtype=torch.bool)
+            is_landmark[n_total:] = True
         else:
-            is_landmark_A = torch.zeros(len(A), dtype=torch.bool)
-            is_landmark_B = torch.zeros(len(B), dtype=torch.bool)
+            is_landmark = torch.zeros(n_total, dtype=torch.bool)
 
-        # Pull CPU pinned slices (do NOT move to CUDA here)
-        Z_A = self.Z_cpu[A]
-        Z_B = self.Z_cpu[B]
+        # Extract Z_set
+        Z_set = self.Z_cpu[indices]
 
-        # Duplicate guards
-        assert A.numel() == A.unique().numel(), f"Set A has duplicates: {A.numel()} vs {A.unique().numel()}"
-        assert B.numel() == B.unique().numel(), f"Set B has duplicates: {B.numel()} vs {B.unique().numel()}"
-
-        # Extract kNN indices for minisets A and B, map to local indexing
-        global_to_local_A = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
-        global_to_local_A[A] = torch.arange(len(A), dtype=torch.long)
-        knn_global_A = self.knn_indices[A]  # (n_A, k)
-        knn_local_A = global_to_local_A[knn_global_A]  # Map to local indices
-
-        global_to_local_B = torch.full((self.Z_cpu.shape[0],), -1, dtype=torch.long)
-        global_to_local_B[B] = torch.arange(len(B), dtype=torch.long)
-        knn_global_B = self.knn_indices[B]  # (n_B, k)
-        knn_local_B = global_to_local_B[knn_global_B]  # Map to local indices
+        # Map kNN to local indices
+        global_to_local = torch.full((N,), -1, dtype=torch.long)
+        global_to_local[indices] = torch.arange(indices.numel(), dtype=torch.long)
+        knn_global = self.knn_indices[indices]  # (n, k)
+        knn_local = global_to_local[knn_global]
 
         return {
-            "Z_A": Z_A, "Z_B": Z_B,
-            "n_A": int(A.numel()), "n_B": int(B.numel()),
-            "shared_A": shared_A_pos,
-            "shared_B": shared_B_pos,
+            "Z_set": Z_set,
+            "n": int(indices.numel()),
             "is_sc": True,
-            "is_landmark_A": is_landmark_A,  # ADD THIS
-            "is_landmark_B": is_landmark_B,  # ADD THIS
-            "global_indices_A": A,  # ADD THIS
-            "global_indices_B": B,   # ADD THIS
-            "knn_indices_A": knn_local_A,  # ADD THIS
-            "knn_indices_B": knn_local_B 
+            "is_landmark": is_landmark,
+            "global_indices": indices,
+            "knn_indices": knn_local,
         }
+
 
 from typing import List, Dict
 
