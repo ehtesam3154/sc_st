@@ -12479,57 +12479,61 @@ def sample_sc_edm_patchwise(
             print(f"\n[LOCAL_REFINE] Running local density refinement...")
             print(f"  [LOCAL_REFINE] steps={local_refine_steps}, lr={local_refine_lr}, anchor_weight={local_refine_anchor_weight}")
         
-        X_refined = X_global.clone().detach().requires_grad_(True)
-        X_anchor = X_global.clone().detach()  # Anchor to preserve global structure
-        
-        # Build embedding kNN graph for local structure
-        k_local = min(20, n_sc - 1)
-        Z_all_device = Z_all.to(device)
-        D_Z = torch.cdist(Z_all_device, Z_all_device)
-        D_Z.fill_diagonal_(float('inf'))
-        _, knn_idx = D_Z.topk(k_local, largest=False, dim=1)  # (n_sc, k_local)
-        
-        optimizer = torch.optim.Adam([X_refined], lr=local_refine_lr)
-        
-        for step in range(local_refine_steps):
-            optimizer.zero_grad()
+        # Enable gradients for refinement (even if called from torch.no_grad() context)
+        with torch.enable_grad():
+            X_refined = X_global.clone().detach().to(device).requires_grad_(True)
+            X_anchor = X_global.clone().detach().to(device)
             
-            # Compute current distances for kNN edges
-            loss_local = 0.0
-            n_edges = 0
+            # Build embedding kNN graph for local structure
+            k_local = min(20, n_sc - 1)
+            Z_all_device = Z_all.to(device)
+            D_Z = torch.cdist(Z_all_device, Z_all_device)
+            D_Z.fill_diagonal_(float('inf'))
+            _, knn_idx = D_Z.topk(k_local, largest=False, dim=1)  # (n_sc, k_local)
             
-            for i in range(n_sc):
-                neighbors = knn_idx[i]
+            optimizer = torch.optim.Adam([X_refined], lr=local_refine_lr)
+            
+            # Vectorized version for efficiency (avoid Python loop over all cells)
+            # Precompute target distances for all edges
+            src_idx = torch.arange(n_sc, device=device).unsqueeze(1).expand(-1, k_local).reshape(-1)
+            dst_idx = knn_idx.reshape(-1)
+            
+            # Target distances in embedding space (fixed)
+            d_Z_edges = torch.norm(Z_all_device[src_idx] - Z_all_device[dst_idx], dim=1)  # (n_sc * k_local,)
+            
+            # Reshape for per-cell normalization
+            d_Z_per_cell = d_Z_edges.reshape(n_sc, k_local)
+            d_Z_means = d_Z_per_cell.mean(dim=1, keepdim=True).clamp(min=1e-8)
+            d_Z_normalized = (d_Z_per_cell / d_Z_means).reshape(-1)
+            
+            for step in range(local_refine_steps):
+                optimizer.zero_grad()
                 
-                # Target distances (from embedding space)
-                d_Z_neighbors = torch.norm(Z_all_device[neighbors] - Z_all_device[i].unsqueeze(0), dim=1)
+                # Predicted distances (changes each step)
+                d_X_edges = torch.norm(X_refined[src_idx] - X_refined[dst_idx], dim=1)
                 
-                # Predicted distances
-                d_X_neighbors = torch.norm(X_refined[neighbors] - X_refined[i].unsqueeze(0), dim=1)
+                # Per-cell normalization for scale-free loss
+                d_X_per_cell = d_X_edges.reshape(n_sc, k_local)
+                d_X_means = d_X_per_cell.mean(dim=1, keepdim=True).clamp(min=1e-8)
+                d_X_normalized = (d_X_per_cell / d_X_means).reshape(-1)
                 
-                # Scale-free loss: match distance ratios
-                d_Z_norm = d_Z_neighbors / d_Z_neighbors.mean().clamp(min=1e-8)
-                d_X_norm = d_X_neighbors / d_X_neighbors.mean().clamp(min=1e-8)
+                # Loss: match normalized distance patterns
+                loss_local = ((d_X_normalized - d_Z_normalized) ** 2).mean()
                 
-                loss_local += ((d_X_norm - d_Z_norm) ** 2).sum()
-                n_edges += len(neighbors)
+                # Anchor loss (preserve global structure)
+                loss_anchor = ((X_refined - X_anchor) ** 2).mean()
+                
+                # Total loss
+                loss = loss_local + local_refine_anchor_weight * loss_anchor
+                
+                loss.backward()
+                optimizer.step()
+                
+                if DEBUG_FLAG and (step % 20 == 0 or step == local_refine_steps - 1):
+                    print(f"    [LOCAL_REFINE] step={step}: loss_local={loss_local.item():.4f} loss_anchor={loss_anchor.item():.4f}")
             
-            loss_local = loss_local / n_edges
-            
-            # Anchor loss (preserve global structure)
-            loss_anchor = ((X_refined - X_anchor) ** 2).mean()
-            
-            # Total loss
-            loss = loss_local + local_refine_anchor_weight * loss_anchor
-            
-            loss.backward()
-            optimizer.step()
-            
-            if DEBUG_FLAG and (step % 20 == 0 or step == local_refine_steps - 1):
-                print(f"    [LOCAL_REFINE] step={step}: loss_local={loss_local.item():.4f} loss_anchor={loss_anchor.item():.4f}")
-        
-        # Use refined coordinates - RECOMPUTE EDM
-        X_global = X_refined.detach()
+            # Use refined coordinates
+            X_global = X_refined.detach()
         
         if DEBUG_FLAG:
             print(f"  [LOCAL_REFINE] ✓ Refinement complete, recomputing EDM...")
@@ -12550,7 +12554,16 @@ def sample_sc_edm_patchwise(
             D_edm = D_edm * scale_factor
         
         result["D_edm"] = D_edm
-
+        
+        # Also update coords if return_coords is True
+        if return_coords:
+            n = D_edm.shape[0]
+            Jn = torch.eye(n) - torch.ones(n, n) / n
+            B = -0.5 * (Jn @ (D_edm**2) @ Jn)
+            coords = uet.classical_mds(B.to(device), d_out=2).detach().cpu()
+            coords_canon = uet.canonicalize_coords(coords).detach().cpu()
+            result["coords"] = coords
+            result["coords_canon"] = coords_canon
 
     
     if "cuda" in device:
