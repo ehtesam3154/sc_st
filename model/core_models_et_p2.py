@@ -10312,9 +10312,9 @@ def sample_sc_edm_patchwise(
     _pass_number: int = 1,  # Internal: which pass are we on (1 or 2)
     _coords_from_pass1: Optional[torch.Tensor] = None,  # Internal: coords from pass 1 for rebuilding patches
     # --- ST-STYLE STOCHASTIC PATCH SAMPLING ---
-    pool_mult: float = 4.0,
-    stochastic_tau: float = 1.0,
-    tau_mode: str = "adaptive_median",
+    pool_mult: float = 2.0,
+    stochastic_tau: float = 0.8,
+    tau_mode: str = "adaptive_kth",
     ensure_connected: bool = True,
     # --- MERGE MODE (Test 2 ablation) ---
     merge_mode: str = "mean",  # "mean", "median", "geomedian", "best_patch"
@@ -11827,7 +11827,8 @@ def sample_sc_edm_patchwise(
 
 
         # ======================================================================
-        # Step A: Compute rotations (NO scale accumulation)
+        # Step A: Compute SIMILARITY transforms (rotation + constrained scale)
+        # Key fix: Tighter scale bounds to prevent inflation (ChatGPT recommendation)
         # ======================================================================
         for k in range(K):
             S_k = patch_indices[k]
@@ -11835,14 +11836,12 @@ def sample_sc_edm_patchwise(
             X_k = X_global[S_k]                         # (m_k, D)
             m_k = V_k.shape[0]
 
-
             # Centrality weights (same as Step B initialization)
             center_k = V_k.mean(dim=0, keepdim=True)       # (1, D)
             dists = torch.norm(V_k - center_k, dim=1, keepdim=True)   # (m_k, 1)
             max_d = dists.max().clamp_min(1e-6)
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)          # (m_k, 1)
-
 
             # Weighted centroids
             w_sum = weights_k.sum()
@@ -11853,36 +11852,39 @@ def sample_sc_edm_patchwise(
             Xc = X_k - mu_X
             Vc = V_k - mu_V
 
-
             # Apply sqrt weights for proper weighted Procrustes
             w_sqrt = weights_k.sqrt()
             Xc_w = Xc * w_sqrt
             Vc_w = Vc * w_sqrt
 
-
             # Weighted cross-covariance
             C = Xc_w.T @ Vc_w
             
-            # SVD for rotation
+            # SVD for ORTHONORMAL rotation (no shear)
             U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
             R_k = U @ Vh
+            # Ensure proper rotation (det = +1), not reflection
             if torch.det(R_k) < 0:
                 U[:, -1] *= -1
                 R_k = U @ Vh
 
-
-            # Compute per-patch scale (no clamp initially - let's see natural values)
-            numer = S_vals.sum()
-            denom = (Vc_w ** 2).sum().clamp_min(1e-8)
-            s_k_raw = numer / denom
-
-
-            # Gentle safety clamp (wide range to allow data-driven values)
-            s_k = s_k_raw.clamp(0.3, 3.0)
-
+            # Compute per-patch scale
+            if align_freeze_scale:
+                # ChatGPT recommendation A.1: Force s_k = 1 for rigid Procrustes
+                s_k = torch.tensor(1.0, device=V_k.device)
+            else:
+                # Compute optimal scale from Procrustes
+                numer = S_vals.sum()
+                denom = (Vc_w ** 2).sum().clamp_min(1e-8)
+                s_k_raw = numer / denom
+                
+                # ChatGPT recommendation A.2: TIGHTER scale clamp to prevent 2× inflation
+                # align_scale_clamp defaults to (0.8, 1.2) - much tighter than before
+                s_k = s_k_raw.clamp(align_scale_clamp[0], align_scale_clamp[1])
 
             R_list.append(R_k)
             s_list.append(s_k)
+
 
 
         # ======================================================================
@@ -12059,14 +12061,30 @@ def sample_sc_edm_patchwise(
         cell_confidence = torch.zeros(n_sc, device=device_X)
         
         if merge_mode == "mean":
-            # Weighted mean (original behavior)
+            # Weighted mean with overlap-consistency weighting (ChatGPT recommendation A.3)
+            # Cells with high disagreement across patches get down-weighted
             for i in range(n_sc):
                 if cell_predictions[i]:
                     coords_list = torch.stack([c for c, w in cell_predictions[i]])
                     weights_list = torch.tensor([w for c, w in cell_predictions[i]], device=device_X)
-                    weights_norm = weights_list / weights_list.sum().clamp(min=1e-8)
+                    
+                    # If multiple predictions, compute agreement-based weights
+                    if len(cell_predictions[i]) > 1:
+                        # Compute pairwise distances between predictions
+                        centroid = coords_list.mean(dim=0)
+                        deviations = torch.norm(coords_list - centroid, dim=1)
+                        # Inverse deviation weighting: closer to consensus = higher weight
+                        inv_dev = 1.0 / (deviations + 1e-6)
+                        agreement_weights = inv_dev / inv_dev.sum()
+                        # Combine centrality and agreement weights
+                        combined_weights = weights_list * agreement_weights
+                    else:
+                        combined_weights = weights_list
+                    
+                    weights_norm = combined_weights / combined_weights.sum().clamp(min=1e-8)
                     new_X[i] = (coords_list * weights_norm.unsqueeze(-1)).sum(dim=0)
                     cell_confidence[i] = len(cell_predictions[i])
+
         
         elif merge_mode == "median":
             # Coordinate-wise median (more robust to outliers)
@@ -12179,26 +12197,24 @@ def sample_sc_edm_patchwise(
 
         # ===================================================================
         # [TEST1_POSTALIGN_PREMERGE] Post-alignment, pre-merge kNN diagnostic
+        # Only run on LAST iteration to avoid spam
         # ===================================================================
-        if DEBUG_FLAG and debug_knn and gt_coords is not None:
+        if DEBUG_FLAG and debug_knn and gt_coords is not None and it == n_align_iters - 1:
             print("\n" + "="*70)
-            print("[TEST1_POSTALIGN_PREMERGE] POST-ALIGN, PRE-MERGE KNN ANALYSIS")
+            print("[TEST1_POSTALIGN_PREMERGE] POST-ALIGN, PRE-MERGE KNN ANALYSIS (final iteration)")
             print("="*70)
             
-            # Collect aligned coordinates for each patch
+            # Collect aligned coordinates for each patch using current transforms
             patch_coords_aligned_list = []
-            for k in range(K):
-                S_k = patch_indices[k]
-                # Apply the alignment transform to get aligned coords
-                # X_k_aligned = s_k * (patch_coords[k] @ R_k) + t_k
-                if k < len(patch_coords):
-                    coords_k = patch_coords[k].to(gt_coords.device)
-                    # Apply stored transform (you need to save R_k, s_k, t_k during alignment)
-                    if hasattr(patch_coords[k], 'aligned'):
-                        patch_coords_aligned_list.append(patch_coords[k].aligned)
-                    else:
-                        # If transforms not stored, use raw coords (pre-alignment)
-                        patch_coords_aligned_list.append(coords_k)
+            for k_pa in range(K):
+                if k_pa < len(patch_coords) and k_pa < len(R_list) and k_pa < len(s_list) and k_pa < len(t_list):
+                    coords_k = patch_coords[k_pa].to(device)
+                    R_k_pa = R_list[k_pa].to(device)
+                    s_k_pa = s_list[k_pa].to(device) if torch.is_tensor(s_list[k_pa]) else torch.tensor(s_list[k_pa], device=device)
+                    t_k_pa = t_list[k_pa].to(device)
+                    # Apply transform: X_aligned = s * (V @ R^T) + t
+                    coords_aligned = s_k_pa * (coords_k @ R_k_pa.T) + t_k_pa
+                    patch_coords_aligned_list.append(coords_aligned.cpu())
                 else:
                     patch_coords_aligned_list.append(None)
             
@@ -12210,16 +12226,24 @@ def sample_sc_edm_patchwise(
                 k_list=debug_k_list,
             )
             
-            for k in debug_k_list:
-                if postalign_results[k]:
-                    vals = postalign_results[k]
-                    print(f"  [TEST1_POSTALIGN_PREMERGE] k={k}: mean={np.mean(vals):.3f} p50={np.median(vals):.3f} p10={np.percentile(vals, 10):.3f} p90={np.percentile(vals, 90):.3f}")
+            for k_debug in debug_k_list:
+                if postalign_results[k_debug]:
+                    vals = postalign_results[k_debug]
+                    print(f"  [TEST1_POSTALIGN_PREMERGE] k={k_debug}: mean={np.mean(vals):.3f} p50={np.median(vals):.3f} p10={np.percentile(vals, 10):.3f} p90={np.percentile(vals, 90):.3f}")
             
-            # Compare to pre-stitch values (if available)
-            print(f"\n  [TEST1_POSTALIGN_PREMERGE] COMPARISON:")
-            print(f"    If post-align ≈ pre-stitch → MERGE is causing kNN drop")
-            print(f"    If post-align < pre-stitch → ALIGNMENT TRANSFORMS are causing distortion")
+            # Compare to pre-stitch values
+            for k_debug in debug_k_list:
+                if prestitch_knn_overlap_list.get(k_debug) and postalign_results.get(k_debug):
+                    pre_mean = np.mean(prestitch_knn_overlap_list[k_debug])
+                    post_mean = np.mean(postalign_results[k_debug])
+                    delta = post_mean - pre_mean
+                    print(f"  [TEST1] k={k_debug}: PRE-STITCH={pre_mean:.3f} → POST-ALIGN={post_mean:.3f} (Δ={delta:+.3f})")
+            
+            print(f"\n  [TEST1_POSTALIGN_PREMERGE] INTERPRETATION:")
+            print(f"    If POST-ALIGN ≈ PRE-STITCH → MERGE is causing kNN drop")
+            print(f"    If POST-ALIGN < PRE-STITCH → ALIGNMENT TRANSFORMS are causing distortion")
             print("="*70 + "\n")
+
 
     # ===================================================================
     # [PATCH-KNN-VS-GT] POST-STITCH: Compare final global coords to GT
@@ -12533,10 +12557,61 @@ def sample_sc_edm_patchwise(
                     print(f"    [LOCAL_REFINE] step={step}: loss_local={loss_local.item():.4f} loss_anchor={loss_anchor.item():.4f}")
             
             # Use refined coordinates
+            # Use refined coordinates
             X_global = X_refined.detach()
         
         if DEBUG_FLAG:
-            print(f"  [LOCAL_REFINE] ✓ Refinement complete, recomputing EDM...")
+            print(f"  [LOCAL_REFINE] ✓ Refinement complete")
+        
+        # ===================================================================
+        # [POST-REFINE KNN] Diagnostic after local refinement (ChatGPT recommendation D)
+        # ===================================================================
+        if DEBUG_FLAG and debug_knn and gt_coords is not None:
+            print("\n" + "="*70)
+            print("[POST-REFINE KNN] kNN ANALYSIS AFTER LOCAL REFINEMENT")
+            print("="*70)
+            
+            with torch.no_grad():
+                gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+                
+                # Use same subset as post-stitch for comparability
+                M = min(n_sc, debug_global_subset)
+                subset_idx = torch.randperm(n_sc)[:M]
+                
+                X_subset = X_global[subset_idx].float()
+                gt_subset = gt_coords_t[subset_idx]
+                
+                for k_val in debug_k_list:
+                    if M > k_val + 1:
+                        knn_pred, _ = _knn_indices_dists(X_subset, k_val)
+                        knn_gt, _ = _knn_indices_dists(gt_subset, k_val)
+                        overlap = _knn_overlap_score(knn_pred, knn_gt)
+                        
+                        print(f"  [POST-REFINE KNN] k={k_val}: mean={overlap.mean().item():.3f} "
+                              f"p50={overlap.median().item():.3f} "
+                              f"p10={overlap.quantile(0.1).item():.3f} "
+                              f"p90={overlap.quantile(0.9).item():.3f}")
+                
+                # Also compute local density ratio after refinement
+                for k_density in [10, 20]:
+                    D_gt = torch.cdist(gt_subset, gt_subset)
+                    D_gt.fill_diagonal_(float('inf'))
+                    d_gt_sorted, _ = D_gt.topk(k_density, largest=False, dim=1)
+                    r_gt_k = d_gt_sorted[:, -1]
+                    
+                    D_pr = torch.cdist(X_subset, X_subset)
+                    D_pr.fill_diagonal_(float('inf'))
+                    d_pr_sorted, _ = D_pr.topk(k_density, largest=False, dim=1)
+                    r_pr_k = d_pr_sorted[:, -1]
+                    
+                    ratio = r_pr_k / r_gt_k.clamp(min=1e-8)
+                    print(f"  [POST-REFINE DENSITY] k={k_density}: r_pr/r_gt p50={ratio.median().item():.2f}")
+            
+            print("="*70 + "\n")
+        
+        if DEBUG_FLAG:
+            print(f"  [LOCAL_REFINE] Recomputing EDM...")
+
         
         # Recompute EDM with refined coordinates
         X_full = X_global
