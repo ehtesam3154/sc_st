@@ -9764,16 +9764,16 @@ def sample_sc_edm_single_patch(
 #                 U[:, -1] *= -1
 #                 R_k = U @ Vh
 
-#             # Compute per-patch scale (no clamp initially - let's see natural values)
-#             numer = S_vals.sum()
-#             denom = (Vc_w ** 2).sum().clamp_min(1e-8)
-#             s_k_raw = numer / denom
+            # # Compute per-patch scale (no clamp initially - let's see natural values)
+            # numer = S_vals.sum()
+            # denom = (Vc_w ** 2).sum().clamp_min(1e-8)
+            # s_k_raw = numer / denom
 
-#             # Gentle safety clamp (wide range to allow data-driven values)
-#             s_k = s_k_raw.clamp(0.3, 3.0)
+            # # Gentle safety clamp (wide range to allow data-driven values)
+            # s_k = s_k_raw.clamp(0.3, 3.0)
 
-#             R_list.append(R_k)
-#             s_list.append(s_k)
+            # R_list.append(R_k)
+            # s_list.append(s_k)
 
 #         # ======================================================================
 #         # NO GLOBAL SCALE RECOMPUTATION - use fixed s_global = 1.0
@@ -10270,10 +10270,6 @@ def sample_sc_edm_single_patch(
 #     return result
 
 
-# ==============================================================================
-# STAGE D: SC INFERENCE (PATCH-BASED GLOBAL ALIGNMENT)
-# ==============================================================================
-
 
 def sample_sc_edm_patchwise(
     sc_gene_expr: torch.Tensor,
@@ -10312,9 +10308,9 @@ def sample_sc_edm_patchwise(
     _pass_number: int = 1,  # Internal: which pass are we on (1 or 2)
     _coords_from_pass1: Optional[torch.Tensor] = None,  # Internal: coords from pass 1 for rebuilding patches
     # --- ST-STYLE STOCHASTIC PATCH SAMPLING ---
-    pool_mult: float = 2.0,
-    stochastic_tau: float = 0.8,
-    tau_mode: str = "adaptive_kth",
+    pool_mult: float = 4.0,
+    stochastic_tau: float = 1.0,
+    tau_mode: str = "adaptive_median",
     ensure_connected: bool = True,
     # --- MERGE MODE (Test 2 ablation) ---
     merge_mode: str = "mean",  # "mean", "median", "geomedian", "best_patch"
@@ -11807,443 +11803,400 @@ def sample_sc_edm_patchwise(
 
 
 
-    # 5.2 Alternating Procrustes alignment (SIMPLIFIED: fixed scale, single iteration)
-    s_global = 1.0
-    
-    print(f"\n[ALIGN] Using FIXED global scale s_global={s_global} (no dynamic scaling)")
-    print(f"[ALIGN] Running simplified alignment with {n_align_iters} iteration(s)...")
-    
-    for it in range(n_align_iters):
-        if DEBUG_FLAG:
-            print(f"\n[ALIGN] Iteration {it + 1}/{n_align_iters}")
+    # ===================================================================
+    # 5.2 PGSO: Pose-Graph Stitching via Global Least-Squares Solve
+    # ===================================================================
+    # Key insight: Instead of iteratively aligning patches to a drifting global
+    # reference, we compute pairwise transforms on overlaps and solve a global
+    # least-squares system that enforces loop closure constraints.
+    # ===================================================================
 
+    print(f"\n[PGSO] Starting Pose-Graph Stitching with Global Least-Squares Solve...")
 
-        R_list: List[torch.Tensor] = []
-        t_list: List[torch.Tensor] = []
-        s_list: List[torch.Tensor] = []
-        
-        # For global alignment loss tracking
-        per_patch_mse = []
+    # ===================================================================
+    # PGSO-A: Build overlap graph and compute pairwise Procrustes transforms
+    # ===================================================================
+    MIN_OVERLAP_FOR_EDGE = 30  # Minimum shared cells to consider an edge
 
+    def weighted_procrustes_2d(X_src, X_tgt, weights=None):
+        """
+        Compute similarity transform (R, s, t) mapping X_src -> X_tgt.
+        Convention: X_tgt ≈ s * (X_src @ R.T) + t  (row-vector convention)
 
-        # ======================================================================
-        # Step A: Compute SIMILARITY transforms (rotation + constrained scale)
-        # Key fix: Tighter scale bounds to prevent inflation (ChatGPT recommendation)
-        # ======================================================================
-        for k in range(K):
-            S_k = patch_indices[k]
-            V_k = patch_coords[k].to(X_global.device)   # (m_k, D)
-            X_k = X_global[S_k]                         # (m_k, D)
-            m_k = V_k.shape[0]
-
-            # Centrality weights (same as Step B initialization)
-            center_k = V_k.mean(dim=0, keepdim=True)       # (1, D)
-            dists = torch.norm(V_k - center_k, dim=1, keepdim=True)   # (m_k, 1)
-            max_d = dists.max().clamp_min(1e-6)
-            weights_k = 1.0 - (dists / (max_d * 1.2))
-            weights_k = weights_k.clamp(min=0.01)          # (m_k, 1)
-
-            # Weighted centroids
-            w_sum = weights_k.sum()
-            mu_X = (weights_k * X_k).sum(dim=0, keepdim=True) / w_sum
-            mu_V = (weights_k * V_k).sum(dim=0, keepdim=True) / w_sum
-            
-            # Center
-            Xc = X_k - mu_X
-            Vc = V_k - mu_V
-
-            # Apply sqrt weights for proper weighted Procrustes
-            w_sqrt = weights_k.sqrt()
-            Xc_w = Xc * w_sqrt
-            Vc_w = Vc * w_sqrt
-
-            # Weighted cross-covariance
-            C = Xc_w.T @ Vc_w
-            
-            # SVD for ORTHONORMAL rotation (no shear)
-            U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
-            R_k = U @ Vh
-            # Ensure proper rotation (det = +1), not reflection
-            if torch.det(R_k) < 0:
-                U[:, -1] *= -1
-                R_k = U @ Vh
-
-            # Compute per-patch scale
-            if align_freeze_scale:
-                # ChatGPT recommendation A.1: Force s_k = 1 for rigid Procrustes
-                s_k = torch.tensor(1.0, device=V_k.device)
-            else:
-                # Compute optimal scale from Procrustes
-                numer = S_vals.sum()
-                denom = (Vc_w ** 2).sum().clamp_min(1e-8)
-                s_k_raw = numer / denom
-                
-                # ChatGPT recommendation A.2: TIGHTER scale clamp to prevent 2× inflation
-                # align_scale_clamp defaults to (0.8, 1.2) - much tighter than before
-                s_k = s_k_raw.clamp(align_scale_clamp[0], align_scale_clamp[1])
-
-            R_list.append(R_k)
-            s_list.append(s_k)
-
-
-
-        # ======================================================================
-        # NO GLOBAL SCALE RECOMPUTATION - use fixed s_global = 1.0
-        # ======================================================================
-        if DEBUG_FLAG and it == 0:
-            # print(f"[ALIGN] Using FIXED s_global={s_global} (not recomputed from patches)")
-            s_tensor = torch.stack(s_list)
-            print(f"[ALIGN] per-patch s_k: "
-                  f"min={s_tensor.min().item():.3f} "
-                  f"p25={s_tensor.quantile(0.25).item():.3f} "
-                  f"p50={s_tensor.quantile(0.50).item():.3f} "
-                  f"p75={s_tensor.quantile(0.75).item():.3f} "
-                  f"max={s_tensor.max().item():.3f}")
-            
-            # Show how many are hitting clamps
-            n_clamp_low = (s_tensor < 0.31).sum().item()
-            n_clamp_high = (s_tensor > 2.99).sum().item()
-            if n_clamp_low > 0 or n_clamp_high > 0:
-                print(f"[ALIGN] WARNING: {n_clamp_low} patches hit lower clamp, "
-                    f"{n_clamp_high} hit upper clamp - consider adjusting bounds")
-
-
-        # ======================================================================
-        # Step A (cont.): Compute translations and track alignment error
-        # ======================================================================
-        for k in range(K):
-            S_k = patch_indices[k]
-            V_k = patch_coords[k].to(X_global.device)
-            X_k = X_global[S_k]
-            R_k = R_list[k]
-            s_k = s_list[k]
-
-
-            # Recompute centrality weights (or cache from above)
-            center_k = V_k.mean(dim=0, keepdim=True)
-            dists = torch.norm(V_k - center_k, dim=1, keepdim=True)
-            max_d = dists.max().clamp_min(1e-6)
-            weights_k = 1.0 - (dists / (max_d * 1.2))
-            weights_k = weights_k.clamp(min=0.01)
-
-
-            w_sum = weights_k.sum()
-            mu_X = (weights_k * X_k).sum(dim=0, keepdim=True) / w_sum
-            mu_V = (weights_k * V_k).sum(dim=0, keepdim=True) / w_sum
-
-
-            # Translation using this patch's scale
-            t_k = (mu_X - s_k * (mu_V @ R_k.T)).squeeze(0)
-            t_list.append(t_k)
-
-
-            # Track patch alignment error with current X_global
-            X_hat_k = s_k * (V_k @ R_k.T) + t_k  # (m_k, D)
-            sqerr = (X_hat_k - X_k).pow(2).sum(dim=1)  # (m_k,)
-            patch_mse = sqerr.mean().item()
-            per_patch_mse.append(patch_mse)
-
-
-        if DEBUG_FLAG:
-            per_patch_mse_t = torch.tensor(per_patch_mse)
-            print(f"[ALIGN] per-patch mse: "
-                f"p10={per_patch_mse_t.quantile(0.10).item():.4e} "
-                f"p50={per_patch_mse_t.quantile(0.50).item():.4e} "
-                f"p90={per_patch_mse_t.quantile(0.90).item():.4e}")
-
-
-            # DEBUG 5: Transform magnitudes
-            R_norms = []
-            t_norms = []
-            for k_t in range(K):
-                R_k_t = R_list[k_t]
-                t_k_t = t_list[k_t]
-                # how far from identity?
-                R_norms.append((R_k_t - torch.eye(D_latent, device=R_k_t.device)).pow(2).sum().sqrt().item())
-                t_norms.append(t_k_t.norm().item())
-            R_norms_t = torch.tensor(R_norms)
-            t_norms_t = torch.tensor(t_norms)
-            print(f"[ALIGN-TRANSFORMS] iter={it+1} "
-                f"R_dev_from_I: p50={R_norms_t.quantile(0.5).item():.3f} "
-                f"p90={R_norms_t.quantile(0.9).item():.3f} "
-                f"t_norm: p50={t_norms_t.quantile(0.5).item():.3f} "
-                f"p90={t_norms_t.quantile(0.9).item():.3f}")
-            
-        # ===================================================================
-        # DIAGNOSTIC C: STITCHING QUALITY
-        # ===================================================================
-        if DEBUG_FLAG and it == 0:  # Only on first iteration
-            print(f"\n[DIAGNOSTIC C] Stitching Analysis (Iteration {it+1}):")
-            
-            # C2: Per-cell multi-patch disagreement
-            sum_x = torch.zeros(n_sc, D_latent, dtype=torch.float32, device=device)
-            sum_x2 = torch.zeros(n_sc, D_latent, dtype=torch.float32, device=device)
-            count = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
-            
-            for k_idx in range(K):
-                S_k = patch_indices[k_idx].to(device)
-                V_k = patch_coords[k_idx].to(device)
-                R_k = R_list[k_idx].to(device)
-                t_k = t_list[k_idx].to(device)
-                s_k = s_list[k_idx].to(device)
-                
-                X_hat = s_k * (V_k @ R_k.T) + t_k
-                
-                sum_x.index_add_(0, S_k, X_hat)
-                sum_x2.index_add_(0, S_k, X_hat**2)
-                count.index_add_(0, S_k, torch.ones(len(S_k), 1, device=device))
-            
-            mean = sum_x / count.clamp_min(1)
-            var = (sum_x2 / count.clamp_min(1)) - mean**2
-            cell_var = var.mean(dim=1).cpu().numpy()
-            
-            print(f"  Per-cell disagreement:")
-            print(f"    p50: {np.median(cell_var):.4f}")
-            print(f"    p90: {np.percentile(cell_var, 90):.4f}")
-            print(f"    p95: {np.percentile(cell_var, 95):.4f}")
-            
-            if np.median(cell_var) > 0.5:
-                print("  ⚠️  HIGH VARIANCE: Patches strongly disagree → STITCHING PROBLEM")
-            
-            # Plot
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(10, 4))
-            plt.hist(cell_var, bins=50, edgecolor='black', alpha=0.7, color='purple')
-            plt.axvline(np.median(cell_var), color='red', linestyle='--', 
-                       label=f'Median={np.median(cell_var):.3f}')
-            plt.xlabel('Per-cell Variance')
-            plt.ylabel('Count')
-            plt.title('Multi-Patch Coordinate Disagreement')
-            plt.legend()
-            plt.grid(alpha=0.3)
-            plt.tight_layout()
-            plt.show()
-
-
-        # ======================================================================
-        # Step B: update X from all patch transforms (centrality-weighted)
-        # ======================================================================
-        # ===================================================================
-        # MERGE PATCH COORDINATES INTO GLOBAL COORDINATES
-        # ===================================================================
-        if DEBUG_FLAG:
-            print(f"\n[MERGE] Using merge_mode='{merge_mode}'")
-        
-        device_X = X_global.device
-        
-        # Collect all predictions for each cell
-        cell_predictions = [[] for _ in range(n_sc)]  # List of (coord, weight) tuples per cell
-        cell_patch_ids = [[] for _ in range(n_sc)]    # Track which patch each prediction came from
-        
-        for k in range(K):
-            S_k = patch_indices[k].to(device_X)
-            V_k = patch_coords[k].to(device_X)
-            R_k = R_list[k].to(device_X)
-            t_k = t_list[k].to(device_X)
-            s_k = s_list[k].to(device_X)
-            
-            # Transform patch coords to global frame
-            X_hat_k = s_k * (V_k @ R_k.T) + t_k
-            
-            # Compute centrality weights
-            center_k = V_k.mean(dim=0, keepdim=True)
-            dists = torch.norm(V_k - center_k, dim=1, keepdim=True)
-            max_d = dists.max().clamp_min(1e-6)
-            weights_k = 1.0 - (dists / (max_d * 1.2))
-            weights_k = weights_k.clamp(min=0.01)
-            
-            for local_idx, global_idx in enumerate(S_k.tolist()):
-                cell_predictions[global_idx].append((X_hat_k[local_idx], weights_k[local_idx, 0]))
-                cell_patch_ids[global_idx].append(k)
-        
-        # Compute final coordinates based on merge_mode
-        new_X = torch.zeros(n_sc, D_latent, device=device_X)
-        cell_confidence = torch.zeros(n_sc, device=device_X)
-        
-        if merge_mode == "mean":
-            # Weighted mean with overlap-consistency weighting (ChatGPT recommendation A.3)
-            # Cells with high disagreement across patches get down-weighted
-            for i in range(n_sc):
-                if cell_predictions[i]:
-                    coords_list = torch.stack([c for c, w in cell_predictions[i]])
-                    weights_list = torch.tensor([w for c, w in cell_predictions[i]], device=device_X)
-                    
-                    # If multiple predictions, compute agreement-based weights
-                    if len(cell_predictions[i]) > 1:
-                        # Compute pairwise distances between predictions
-                        centroid = coords_list.mean(dim=0)
-                        deviations = torch.norm(coords_list - centroid, dim=1)
-                        # Inverse deviation weighting: closer to consensus = higher weight
-                        inv_dev = 1.0 / (deviations + 1e-6)
-                        agreement_weights = inv_dev / inv_dev.sum()
-                        # Combine centrality and agreement weights
-                        combined_weights = weights_list * agreement_weights
-                    else:
-                        combined_weights = weights_list
-                    
-                    weights_norm = combined_weights / combined_weights.sum().clamp(min=1e-8)
-                    new_X[i] = (coords_list * weights_norm.unsqueeze(-1)).sum(dim=0)
-                    cell_confidence[i] = len(cell_predictions[i])
-
-        
-        elif merge_mode == "median":
-            # Coordinate-wise median (more robust to outliers)
-            for i in range(n_sc):
-                if cell_predictions[i]:
-                    coords_list = torch.stack([c for c, w in cell_predictions[i]])
-                    new_X[i] = coords_list.median(dim=0).values
-                    cell_confidence[i] = len(cell_predictions[i])
-        
-        elif merge_mode == "geomedian":
-            # Geometric median (Weiszfeld algorithm - most robust)
-            def weiszfeld_geomedian(points, weights=None, max_iter=50, tol=1e-6):
-                """Compute geometric median using Weiszfeld's algorithm."""
-                if len(points) == 1:
-                    return points[0]
-                if weights is None:
-                    weights = torch.ones(len(points), device=points.device)
-                weights = weights / weights.sum()
-                
-                # Initialize with weighted mean
-                y = (points * weights.unsqueeze(-1)).sum(dim=0)
-                
-                for _ in range(max_iter):
-                    dists = torch.norm(points - y.unsqueeze(0), dim=1).clamp(min=1e-8)
-                    w = weights / dists
-                    w = w / w.sum()
-                    y_new = (points * w.unsqueeze(-1)).sum(dim=0)
-                    
-                    if torch.norm(y_new - y) < tol:
-                        break
-                    y = y_new
-                
-                return y
-            
-            for i in range(n_sc):
-                if cell_predictions[i]:
-                    coords_list = torch.stack([c for c, w in cell_predictions[i]])
-                    weights_list = torch.tensor([w for c, w in cell_predictions[i]], device=device_X)
-                    new_X[i] = weiszfeld_geomedian(coords_list, weights_list)
-                    cell_confidence[i] = len(cell_predictions[i])
-        
-        elif merge_mode == "best_patch":
-            # Pick single best patch per cell (no averaging - Test 2 ablation)
-            for i in range(n_sc):
-                if cell_predictions[i]:
-                    # Select patch with highest weight for this cell
-                    best_idx = max(range(len(cell_predictions[i])), 
-                                   key=lambda j: cell_predictions[i][j][1])
-                    new_X[i] = cell_predictions[i][best_idx][0]
-                    cell_confidence[i] = 1  # Single patch used
-        
+        Returns: R (2,2), s (scalar), t (2,), residual (scalar)
+        """
+        n = X_src.shape[0]
+        if weights is None:
+            weights = torch.ones(n, 1, device=X_src.device)
         else:
-            raise ValueError(f"Unknown merge_mode: {merge_mode}")
-        
-        # Handle cells not covered by any patch
-        mask_seen2 = cell_confidence > 0
-        new_X[~mask_seen2] = X_global[~mask_seen2]
-        
-        # ===================================================================
-        # [TEST2_MERGE_ABLATION] Merge mode diagnostic
-        # ===================================================================
-        if DEBUG_FLAG:
-            coverage_counts = torch.tensor([len(cell_predictions[i]) for i in range(n_sc)], dtype=torch.float32)
-            print(f"\n[TEST2_MERGE_ABLATION] merge_mode='{merge_mode}'")
-            print(f"  [TEST2_MERGE_ABLATION] coverage: min={coverage_counts.min():.0f} p50={coverage_counts.median():.0f} max={coverage_counts.max():.0f}")
-            print(f"  [TEST2_MERGE_ABLATION] cells with coverage=1: {(coverage_counts == 1).sum().item()}")
-            print(f"  [TEST2_MERGE_ABLATION] cells with coverage>=3: {(coverage_counts >= 3).sum().item()}")
-        
-        # Recenter and rescale
-        new_X = new_X - new_X.mean(dim=0, keepdim=True)
-        
-        # Enforce target scale at every iteration (data-driven)
-        rms_current = new_X.pow(2).mean().sqrt()
-        scale_correction = rms_target / (rms_current + 1e-8)
-        new_X = new_X * scale_correction
-        
-        X_global = new_X
+            weights = weights.view(-1, 1)
 
+        w_sum = weights.sum()
+        mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
+        mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
 
-        if DEBUG_FLAG:
-            rms_new = new_X.pow(2).mean().sqrt().item()
-            print(f"[new ALIGN] iter={it + 1} coords_rms={rms_new:.3f} (global scale)")
+        Xc = X_src - mu_src
+        Yc = X_tgt - mu_tgt
 
+        w_sqrt = weights.sqrt()
+        Xc_w = Xc * w_sqrt
+        Yc_w = Yc * w_sqrt
 
-        # DEBUG 4: Patch consistency after alignment iteration
-        patch_fit_errs = []
-        for k_check in range(K):
-            S_k_check = patch_indices[k_check].to(device_X)
-            V_k_check = patch_coords[k_check].to(device_X)
-            X_k_check = X_global[S_k_check]
+        # Cross-covariance: C = Y.T @ X (for row-vector convention)
+        C = Yc_w.T @ Xc_w  # (D, D)
 
+        U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
+        R = U @ Vh
 
-            # Compare distances within patch before/after stitching
-            D_V = torch.cdist(V_k_check, V_k_check)
-            D_X = torch.cdist(X_k_check, X_k_check)
-            # normalize by RMS to ignore global scale
-            D_V = D_V / (D_V.pow(2).mean().sqrt().clamp_min(1e-6))
-            D_X = D_X / (D_X.pow(2).mean().sqrt().clamp_min(1e-6))
-            err = (D_V - D_X).abs().mean().item()
-            patch_fit_errs.append(err)
+        # Ensure proper rotation (det = +1)
+        if torch.det(R) < 0:
+            U[:, -1] *= -1
+            R = U @ Vh
 
+        # Scale: s = trace(S) / ||Xc_w||^2
+        numer = S_vals.sum()
+        denom = (Xc_w ** 2).sum().clamp_min(1e-8)
+        s = numer / denom
 
-        patch_fit_errs_t = torch.tensor(patch_fit_errs)
-        print(f"[ALIGN-CHECK] iter={it+1} patch dist mismatch: "
-              f"p10={patch_fit_errs_t.quantile(0.10).item():.4e} "
-              f"p50={patch_fit_errs_t.quantile(0.50).item():.4e} "
-              f"p90={patch_fit_errs_t.quantile(0.90).item():.4e} "
-              f"max={patch_fit_errs_t.max().item():.4e}")
+        # Translation: t = mu_tgt - s * (mu_src @ R.T)
+        t = (mu_tgt - s * (mu_src @ R.T)).squeeze(0)
 
+        # Residual
+        X_hat = s * (X_src @ R.T) + t
+        residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
 
-        # ===================================================================
-        # [TEST1_POSTALIGN_PREMERGE] Post-alignment, pre-merge kNN diagnostic
-        # Only run on LAST iteration to avoid spam
-        # ===================================================================
-        if DEBUG_FLAG and debug_knn and gt_coords is not None and it == n_align_iters - 1:
-            print("\n" + "="*70)
-            print("[TEST1_POSTALIGN_PREMERGE] POST-ALIGN, PRE-MERGE KNN ANALYSIS (final iteration)")
-            print("="*70)
-            
-            # Collect aligned coordinates for each patch using current transforms
-            patch_coords_aligned_list = []
-            for k_pa in range(K):
-                if k_pa < len(patch_coords) and k_pa < len(R_list) and k_pa < len(s_list) and k_pa < len(t_list):
-                    coords_k = patch_coords[k_pa].to(device)
-                    R_k_pa = R_list[k_pa].to(device)
-                    s_k_pa = s_list[k_pa].to(device) if torch.is_tensor(s_list[k_pa]) else torch.tensor(s_list[k_pa], device=device)
-                    t_k_pa = t_list[k_pa].to(device)
-                    # Apply transform: X_aligned = s * (V @ R^T) + t
-                    coords_aligned = s_k_pa * (coords_k @ R_k_pa.T) + t_k_pa
-                    patch_coords_aligned_list.append(coords_aligned.cpu())
-                else:
-                    patch_coords_aligned_list.append(None)
-            
-            # Compute post-align pre-merge kNN
-            postalign_results = compute_postalign_premerge_knn(
-                patch_coords_aligned=patch_coords_aligned_list,
-                patch_indices=patch_indices,
-                gt_coords=gt_coords.cpu(),
-                k_list=debug_k_list,
-            )
-            
-            for k_debug in debug_k_list:
-                if postalign_results[k_debug]:
-                    vals = postalign_results[k_debug]
-                    print(f"  [TEST1_POSTALIGN_PREMERGE] k={k_debug}: mean={np.mean(vals):.3f} p50={np.median(vals):.3f} p10={np.percentile(vals, 10):.3f} p90={np.percentile(vals, 90):.3f}")
-            
-            # Compare to pre-stitch values
-            for k_debug in debug_k_list:
-                if prestitch_knn_overlap_list.get(k_debug) and postalign_results.get(k_debug):
-                    pre_mean = np.mean(prestitch_knn_overlap_list[k_debug])
-                    post_mean = np.mean(postalign_results[k_debug])
-                    delta = post_mean - pre_mean
-                    print(f"  [TEST1] k={k_debug}: PRE-STITCH={pre_mean:.3f} → POST-ALIGN={post_mean:.3f} (Δ={delta:+.3f})")
-            
-            print(f"\n  [TEST1_POSTALIGN_PREMERGE] INTERPRETATION:")
-            print(f"    If POST-ALIGN ≈ PRE-STITCH → MERGE is causing kNN drop")
-            print(f"    If POST-ALIGN < PRE-STITCH → ALIGNMENT TRANSFORMS are causing distortion")
-            print("="*70 + "\n")
+        return R, s, t, residual
 
+    # Project all patches to 2D via global PCA
+    print(f"[PGSO-A] Projecting patches to 2D for pose graph solve...")
+
+    # Gather all patch coords for PCA
+    all_coords_for_pca = []
+    for k in range(K):
+        all_coords_for_pca.append(patch_coords[k])
+    all_coords_cat = torch.cat(all_coords_for_pca, dim=0)  # (sum_m_k, D_latent)
+
+    # Compute PCA basis (top 2 components)
+    all_coords_centered = all_coords_cat - all_coords_cat.mean(dim=0, keepdim=True)
+    cov = all_coords_centered.T @ all_coords_centered / all_coords_centered.shape[0]
+    eigs, vecs = torch.linalg.eigh(cov)
+    # eigh returns in ascending order, we want descending
+    pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2) - top 2 eigenvectors
+
+    # Project each patch to 2D
+    patch_coords_2d = []
+    for k in range(K):
+        V_k = patch_coords[k]  # (m_k, D_latent)
+        V_k_centered = V_k - V_k.mean(dim=0, keepdim=True)
+        V_k_2d = V_k_centered @ pca_basis  # (m_k, 2)
+        patch_coords_2d.append(V_k_2d)
+
+    if DEBUG_FLAG:
+        eig_ratio = eigs[-1] / eigs[-2] if eigs[-2] > 1e-8 else float('inf')
+        print(f"[PGSO-A] PCA eigenvalues: top2=[{eigs[-1].item():.4f}, {eigs[-2].item():.4f}], ratio={eig_ratio:.2f}")
+
+    # Build overlap graph edges
+    print(f"[PGSO-A] Computing pairwise Procrustes on overlapping patches...")
+    edges = []  # List of (a, b, R_ab, s_ab, t_ab, weight, n_overlap)
+
+    for a in range(K):
+        S_a = set(patch_indices[a].tolist())
+        V_a_2d = patch_coords_2d[a]
+
+        for b in range(a + 1, K):
+            S_b = set(patch_indices[b].tolist())
+            shared = S_a & S_b
+
+            if len(shared) < MIN_OVERLAP_FOR_EDGE:
+                continue
+
+            shared_list = list(shared)
+
+            # Get positions in each patch
+            pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
+            pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
+
+            idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
+            idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
+
+            V_shared_a = V_a_2d[idx_a]  # (n_shared, 2)
+            V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
+
+            # Compute Procrustes: V_b ≈ s_ab * (V_a @ R_ab.T) + t_ab
+            R_ab, s_ab, t_ab, residual = weighted_procrustes_2d(V_shared_a, V_shared_b)
+
+            # Weight by overlap size and inverse residual
+            weight = len(shared) / (residual.item() + 0.01)
+
+            edges.append({
+                'a': a, 'b': b,
+                'R_ab': R_ab, 's_ab': s_ab, 't_ab': t_ab,
+                'weight': weight, 'n_overlap': len(shared),
+                'residual': residual.item()
+            })
+
+    n_edges = len(edges)
+    print(f"[PGSO-A] Built {n_edges} overlap edges (min_overlap={MIN_OVERLAP_FOR_EDGE})")
+
+    if DEBUG_FLAG and n_edges > 0:
+        residuals = [e['residual'] for e in edges]
+        overlaps = [e['n_overlap'] for e in edges]
+        print(f"[PGSO-A] Edge residuals: min={min(residuals):.4f} p50={np.median(residuals):.4f} max={max(residuals):.4f}")
+        print(f"[PGSO-A] Edge overlaps: min={min(overlaps)} p50={np.median(overlaps):.0f} max={max(overlaps)}")
+
+    # ===================================================================
+    # PGSO-B1: Global least-squares solve for rotations and log-scales
+    # ===================================================================
+    print(f"\n[PGSO-B1] Solving global rotations and scales...")
+
+    if n_edges == 0:
+        print("[PGSO-B1] WARNING: No overlap edges! Falling back to identity transforms.")
+        theta_global = torch.zeros(K)
+        ell_global = torch.zeros(K)
+    else:
+        # Convert each edge rotation to angle
+        theta_edges = []
+        ell_edges = []
+        edge_weights = []
+        edge_pairs = []
+
+        for e in edges:
+            R_ab = e['R_ab']
+            s_ab = e['s_ab']
+
+            # Extract angle: theta = atan2(R[1,0], R[0,0])
+            theta_ab = torch.atan2(R_ab[1, 0], R_ab[0, 0]).item()
+            ell_ab = torch.log(s_ab).item()
+
+            theta_edges.append(theta_ab)
+            ell_edges.append(ell_ab)
+            edge_weights.append(e['weight'])
+            edge_pairs.append((e['a'], e['b']))
+
+        theta_edges = torch.tensor(theta_edges)
+        ell_edges = torch.tensor(ell_edges)
+        edge_weights = torch.tensor(edge_weights)
+
+        # Build incidence matrix: A[e, k] = +1 if k=b, -1 if k=a for edge e=(a,b)
+        # Constraint: theta_b - theta_a = theta_ab
+        A = torch.zeros(n_edges, K)
+        for e_idx, (a, b) in enumerate(edge_pairs):
+            A[e_idx, a] = -1.0
+            A[e_idx, b] = 1.0
+
+        # Weight the system
+        W = torch.diag(edge_weights.sqrt())
+        A_w = W @ A
+
+        # Anchor first patch: theta_0 = 0, ell_0 = 0
+        # Remove first column from A, solve for remaining K-1 variables
+        A_reduced = A_w[:, 1:]
+
+        # Solve for angles: A_reduced @ theta[1:] = W @ theta_edges
+        b_theta = W @ theta_edges
+        theta_reduced, _, _, _ = torch.linalg.lstsq(A_reduced, b_theta.unsqueeze(1))
+        theta_global = torch.cat([torch.zeros(1), theta_reduced.squeeze(1)])
+
+        # Solve for log-scales: A_reduced @ ell[1:] = W @ ell_edges
+        b_ell = W @ ell_edges
+        ell_reduced, _, _, _ = torch.linalg.lstsq(A_reduced, b_ell.unsqueeze(1))
+        ell_global = torch.cat([torch.zeros(1), ell_reduced.squeeze(1)])
+
+        # Center log-scales around 0 (median scale = 1)
+        ell_global = ell_global - ell_global.median()
+
+        # Soft clamp scales to prevent extreme drift
+        SCALE_CLAMP_MIN = 0.85
+        SCALE_CLAMP_MAX = 1.15
+        ell_global = ell_global.clamp(np.log(SCALE_CLAMP_MIN), np.log(SCALE_CLAMP_MAX))
+
+    # Convert back to R, s
+    s_global_list = torch.exp(ell_global)
+    R_global_list = []
+    for k in range(K):
+        theta_k = theta_global[k]
+        c, s_rot = torch.cos(theta_k), torch.sin(theta_k)
+        R_k = torch.tensor([[c, -s_rot], [s_rot, c]])
+        R_global_list.append(R_k)
+
+    if DEBUG_FLAG:
+        print(f"[PGSO-B1] Global angles (deg): min={theta_global.min().item()*180/np.pi:.1f} "
+              f"p50={theta_global.median().item()*180/np.pi:.1f} "
+              f"max={theta_global.max().item()*180/np.pi:.1f}")
+        print(f"[PGSO-B1] Global scales: min={s_global_list.min().item():.3f} "
+              f"p50={s_global_list.median().item():.3f} "
+              f"max={s_global_list.max().item():.3f}")
+
+    # ===================================================================
+    # PGSO-B2: Global least-squares solve for translations
+    # ===================================================================
+    print(f"\n[PGSO-B2] Solving global translations...")
+
+    if n_edges == 0:
+        print("[PGSO-B2] WARNING: No overlap edges! Setting translations to 0.")
+        t_global_list = [torch.zeros(2) for _ in range(K)]
+    else:
+        # Build translation constraints
+        # Constraint: t_a - t_b = s_b * (t_ab @ R_b.T)
+        # This is a 2K x 2K system (t is 2D for each patch)
+
+        # Build block system: for each edge (a,b), we have 2 equations
+        A_t = torch.zeros(n_edges * 2, K * 2)
+        b_t = torch.zeros(n_edges * 2)
+
+        for e_idx, e in enumerate(edges):
+            a, b = e['a'], e['b']
+            R_b = R_global_list[b]
+            s_b = s_global_list[b]
+            t_ab = e['t_ab']  # (2,)
+
+            # RHS: s_b * (t_ab @ R_b.T)
+            rhs = s_b * (t_ab @ R_b.T)
+
+            # LHS: t_a - t_b
+            # Equations for x-component
+            A_t[e_idx * 2, a * 2] = 1.0      # t_a[0]
+            A_t[e_idx * 2, b * 2] = -1.0     # -t_b[0]
+            b_t[e_idx * 2] = rhs[0].item()
+
+            # Equations for y-component
+            A_t[e_idx * 2 + 1, a * 2 + 1] = 1.0   # t_a[1]
+            A_t[e_idx * 2 + 1, b * 2 + 1] = -1.0  # -t_b[1]
+            b_t[e_idx * 2 + 1] = rhs[1].item()
+
+        # Weight the system
+        W_t = torch.zeros(n_edges * 2, n_edges * 2)
+        for e_idx, e in enumerate(edges):
+            w = np.sqrt(e['weight'])
+            W_t[e_idx * 2, e_idx * 2] = w
+            W_t[e_idx * 2 + 1, e_idx * 2 + 1] = w
+
+        A_t_w = W_t @ A_t
+        b_t_w = W_t @ b_t
+
+        # Anchor first patch: t_0 = 0
+        # Remove columns 0 and 1 (x and y of patch 0)
+        A_t_reduced = A_t_w[:, 2:]
+
+        # Solve
+        t_reduced, _, _, _ = torch.linalg.lstsq(A_t_reduced, b_t_w.unsqueeze(1))
+        t_flat = torch.cat([torch.zeros(2), t_reduced.squeeze(1)])
+
+        t_global_list = [t_flat[k*2:(k+1)*2] for k in range(K)]
+
+    if DEBUG_FLAG:
+        t_norms = torch.tensor([t.norm().item() for t in t_global_list])
+        print(f"[PGSO-B2] Translation norms: min={t_norms.min().item():.3f} "
+              f"p50={t_norms.median().item():.3f} "
+              f"max={t_norms.max().item():.3f}")
+
+    # ===================================================================
+    # PGSO-C: Apply global transforms to each patch (in 2D space)
+    # ===================================================================
+    print(f"\n[PGSO-C] Applying global transforms to patches...")
+
+    patch_coords_transformed = []
+    for k in range(K):
+        V_k_2d = patch_coords_2d[k]  # (m_k, 2)
+        R_k = R_global_list[k]
+        s_k = s_global_list[k]
+        t_k = t_global_list[k]
+
+        # Transform: X_hat_k = s_k * (V_k @ R_k.T) + t_k
+        X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
+        patch_coords_transformed.append(X_hat_k)
+
+    # ===================================================================
+    # PGSO-CHECK: Verify transform consistency
+    # ===================================================================
+    if DEBUG_FLAG and n_edges > 0:
+        print(f"\n[PGSO-CHECK] Verifying transform consistency on overlap edges...")
+
+        dist_mismatches = []
+        for e in edges[:min(50, len(edges))]:  # Check first 50 edges
+            a, b = e['a'], e['b']
+            shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
+
+            pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
+            pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
+
+            idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
+            idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
+
+            X_a = patch_coords_transformed[a][idx_a]
+            X_b = patch_coords_transformed[b][idx_b]
+
+            # Distance matrices
+            D_a = torch.cdist(X_a, X_a)
+            D_b = torch.cdist(X_b, X_b)
+            D_a_norm = D_a / (D_a.pow(2).mean().sqrt().clamp_min(1e-6))
+            D_b_norm = D_b / (D_b.pow(2).mean().sqrt().clamp_min(1e-6))
+
+            mismatch = (D_a_norm - D_b_norm).abs().mean().item()
+            dist_mismatches.append(mismatch)
+
+        print(f"[PGSO-CHECK] Patch dist mismatch: p10={np.percentile(dist_mismatches, 10):.4f} "
+              f"p50={np.median(dist_mismatches):.4f} "
+              f"p90={np.percentile(dist_mismatches, 90):.4f}")
+
+    # ===================================================================
+    # PGSO-D: Merge transformed patches (simple weighted mean)
+    # ===================================================================
+    print(f"\n[PGSO-D] Merging patches with weighted mean...")
+
+    # Work in 2D space (the transformed coordinates)
+    X_global = torch.zeros(n_sc, 2, dtype=torch.float32, device=device)
+    W_global = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
+
+    for k in range(K):
+        S_k = patch_indices[k].to(device)
+        X_hat_k = patch_coords_transformed[k].to(device)
+        V_k_2d = patch_coords_2d[k].to(device)
+
+        # Centrality weights
+        center_k = V_k_2d.mean(dim=0, keepdim=True)
+        dists = torch.norm(V_k_2d - center_k, dim=1, keepdim=True)
+        max_d = dists.max().clamp_min(1e-6)
+        weights_k = 1.0 - (dists / (max_d * 1.2))
+        weights_k = weights_k.clamp(min=0.01)
+
+        X_global.index_add_(0, S_k, X_hat_k * weights_k)
+        W_global.index_add_(0, S_k, weights_k)
+
+    # Normalize
+    mask_seen = W_global.squeeze(-1) > 0
+    X_global[mask_seen] /= W_global[mask_seen]
+
+    # Recenter
+    X_global = X_global - X_global.mean(dim=0, keepdim=True)
+
+    # Rescale to target RMS
+    rms_current = X_global.pow(2).mean().sqrt()
+    scale_correction = rms_target / (rms_current + 1e-8)
+    X_global = X_global * scale_correction
+
+    if DEBUG_FLAG:
+        coverage_counts = torch.tensor([len(memberships[i]) for i in range(n_sc)], dtype=torch.float32)
+        rms_final = X_global.pow(2).mean().sqrt().item()
+        print(f"[PGSO-D] Final X_global: shape={tuple(X_global.shape)}, rms={rms_final:.3f}")
+        print(f"[PGSO-D] Coverage: min={coverage_counts.min():.0f} p50={coverage_counts.median():.0f} max={coverage_counts.max():.0f}")
+
+    # Expand X_global back to D_latent dimensions for compatibility with downstream code
+    # We'll use the 2D coords for now since they're what we actually computed
+    # Pad with zeros for dimensions 3..D_latent
+    if D_latent > 2:
+        X_global_full = torch.zeros(n_sc, D_latent, dtype=torch.float32, device=device)
+        X_global_full[:, :2] = X_global
+        X_global = X_global_full
+
+    # Store R_list, s_list, t_list for diagnostics compatibility
+    R_list = [R.to(device) if R.shape[0] == D_latent else torch.eye(D_latent, device=device) for R in R_global_list]
+    s_list = [s.to(device) if torch.is_tensor(s) else torch.tensor(s, device=device) for s in s_global_list]
+    t_list = [t.to(device) if t.shape[0] == D_latent else torch.zeros(D_latent, device=device) for t in t_global_list]
+
+    # ===================================================================
+    # POST-PGSO DIAGNOSTICS
+    # ===================================================================
 
     # ===================================================================
     # [PATCH-KNN-VS-GT] POST-STITCH: Compare final global coords to GT
@@ -12557,61 +12510,10 @@ def sample_sc_edm_patchwise(
                     print(f"    [LOCAL_REFINE] step={step}: loss_local={loss_local.item():.4f} loss_anchor={loss_anchor.item():.4f}")
             
             # Use refined coordinates
-            # Use refined coordinates
             X_global = X_refined.detach()
         
         if DEBUG_FLAG:
-            print(f"  [LOCAL_REFINE] ✓ Refinement complete")
-        
-        # ===================================================================
-        # [POST-REFINE KNN] Diagnostic after local refinement (ChatGPT recommendation D)
-        # ===================================================================
-        if DEBUG_FLAG and debug_knn and gt_coords is not None:
-            print("\n" + "="*70)
-            print("[POST-REFINE KNN] kNN ANALYSIS AFTER LOCAL REFINEMENT")
-            print("="*70)
-            
-            with torch.no_grad():
-                gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
-                
-                # Use same subset as post-stitch for comparability
-                M = min(n_sc, debug_global_subset)
-                subset_idx = torch.randperm(n_sc)[:M]
-                
-                X_subset = X_global[subset_idx].float()
-                gt_subset = gt_coords_t[subset_idx]
-                
-                for k_val in debug_k_list:
-                    if M > k_val + 1:
-                        knn_pred, _ = _knn_indices_dists(X_subset, k_val)
-                        knn_gt, _ = _knn_indices_dists(gt_subset, k_val)
-                        overlap = _knn_overlap_score(knn_pred, knn_gt)
-                        
-                        print(f"  [POST-REFINE KNN] k={k_val}: mean={overlap.mean().item():.3f} "
-                              f"p50={overlap.median().item():.3f} "
-                              f"p10={overlap.quantile(0.1).item():.3f} "
-                              f"p90={overlap.quantile(0.9).item():.3f}")
-                
-                # Also compute local density ratio after refinement
-                for k_density in [10, 20]:
-                    D_gt = torch.cdist(gt_subset, gt_subset)
-                    D_gt.fill_diagonal_(float('inf'))
-                    d_gt_sorted, _ = D_gt.topk(k_density, largest=False, dim=1)
-                    r_gt_k = d_gt_sorted[:, -1]
-                    
-                    D_pr = torch.cdist(X_subset, X_subset)
-                    D_pr.fill_diagonal_(float('inf'))
-                    d_pr_sorted, _ = D_pr.topk(k_density, largest=False, dim=1)
-                    r_pr_k = d_pr_sorted[:, -1]
-                    
-                    ratio = r_pr_k / r_gt_k.clamp(min=1e-8)
-                    print(f"  [POST-REFINE DENSITY] k={k_density}: r_pr/r_gt p50={ratio.median().item():.2f}")
-            
-            print("="*70 + "\n")
-        
-        if DEBUG_FLAG:
-            print(f"  [LOCAL_REFINE] Recomputing EDM...")
-
+            print(f"  [LOCAL_REFINE] ✓ Refinement complete, recomputing EDM...")
         
         # Recompute EDM with refined coordinates
         X_full = X_global
