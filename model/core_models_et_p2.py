@@ -11868,7 +11868,12 @@ def sample_sc_edm_patchwise(
         return R, s, t, residual
 
     # Project all patches to 2D via global PCA
-    print(f"[PGSO-A] Projecting patches to 2D for pose graph solve...")
+    # ===================================================================
+    # ===================================================================
+    # Project all patches to 2D via GLOBAL PCA
+    # (Per-patch PCA caused rotation degeneracy collapse - reverted)
+    # ===================================================================
+    print(f"[PGSO-A] Projecting patches to 2D via global PCA...")
 
     # Gather all patch coords for PCA
     all_coords_for_pca = []
@@ -11885,15 +11890,34 @@ def sample_sc_edm_patchwise(
 
     # Project each patch to 2D
     patch_coords_2d = []
+    patch_eig_ratios_2d = []  # Track per-patch anisotropy in 2D for rotation weighting
+    
     for k in range(K):
         V_k = patch_coords[k]  # (m_k, D_latent)
         V_k_centered = V_k - V_k.mean(dim=0, keepdim=True)
         V_k_2d = V_k_centered @ pca_basis  # (m_k, 2)
         patch_coords_2d.append(V_k_2d)
+        
+        # Compute anisotropy in 2D for this patch (used for rotation confidence)
+        cov_2d = V_k_2d.T @ V_k_2d / V_k_2d.shape[0]
+        eigs_2d = torch.linalg.eigvalsh(cov_2d)
+        eig_ratio_2d = (eigs_2d.max() / eigs_2d.min().clamp(min=1e-8)).item()
+        patch_eig_ratios_2d.append(eig_ratio_2d)
 
     if DEBUG_FLAG:
         eig_ratio = eigs[-1] / eigs[-2] if eigs[-2] > 1e-8 else float('inf')
-        print(f"[PGSO-A] PCA eigenvalues: top2=[{eigs[-1].item():.4f}, {eigs[-2].item():.4f}], ratio={eig_ratio:.2f}")
+        print(f"[PGSO-A] Global PCA eigenvalues: top2=[{eigs[-1].item():.4f}, {eigs[-2].item():.4f}], ratio={eig_ratio:.2f}")
+        
+        # Report per-patch 2D anisotropy (for rotation confidence diagnostic)
+        eig_ratios_2d_t = torch.tensor(patch_eig_ratios_2d)
+        print(f"[PGSO-A] Per-patch 2D anisotropy (eig_max/eig_min):")
+        print(f"    p25={eig_ratios_2d_t.quantile(0.25).item():.1f} "
+              f"p50={eig_ratios_2d_t.median().item():.1f} "
+              f"p75={eig_ratios_2d_t.quantile(0.75).item():.1f} "
+              f"max={eig_ratios_2d_t.max().item():.1f}")
+        if eig_ratios_2d_t.median() > 10:
+            print(f"    ⚠️ HIGH ANISOTROPY: Patches are near-1D in 2D space → rotation is ill-conditioned")
+
 
     # Build overlap graph edges
     print(f"[PGSO-A] Computing pairwise Procrustes on overlapping patches...")
@@ -11926,7 +11950,12 @@ def sample_sc_edm_patchwise(
             R_ab, s_ab, t_ab, residual = weighted_procrustes_2d(V_shared_a, V_shared_b)
 
             # Weight by overlap size and inverse residual
-            weight = len(shared) / (residual.item() + 0.01)
+            # weight = len(shared) / (residual.item() + 0.01)
+            
+            # Weight by overlap size and inverse residual SQUARED (stronger penalty)
+            # This downweights bad edges much more aggressively
+            weight = len(shared) / (residual.item() ** 2 + 1e-4)
+
 
             edges.append({
                 'a': a, 'b': b,
@@ -11935,8 +11964,55 @@ def sample_sc_edm_patchwise(
                 'residual': residual.item()
             })
 
+    n_edges_raw = len(edges)
+    
+    # ===================================================================
+    # [PGSO-A-FILTER] Hard filter: keep only edges with residual <= p50
+    # This removes the worst half of edges to improve LS solve quality
+    # ===================================================================
+    if n_edges_raw > 0:
+        residuals_all = torch.tensor([e['residual'] for e in edges])
+        residual_thresh = residuals_all.median().item()
+        
+        # Filter edges but ensure we keep enough for connectivity
+        edges_filtered = [e for e in edges if e['residual'] <= residual_thresh]
+        
+        # Check connectivity after filtering
+        import networkx as nx
+        G_check = nx.Graph()
+        G_check.add_nodes_from(range(K))
+        for e in edges_filtered:
+            G_check.add_edge(e['a'], e['b'])
+        n_components = nx.number_connected_components(G_check)
+        
+        if n_components == 1:
+            # Graph still connected, use filtered edges
+            edges = edges_filtered
+            if DEBUG_FLAG:
+                print(f"[PGSO-A-FILTER] Filtered {n_edges_raw} → {len(edges)} edges "
+                      f"(residual <= {residual_thresh:.4f})")
+        else:
+            # Filtering disconnects graph, fall back to softer filter (p75)
+            residual_thresh_soft = residuals_all.quantile(0.75).item()
+            edges_filtered_soft = [e for e in edges if e['residual'] <= residual_thresh_soft]
+            
+            G_check2 = nx.Graph()
+            G_check2.add_nodes_from(range(K))
+            for e in edges_filtered_soft:
+                G_check2.add_edge(e['a'], e['b'])
+            
+            if nx.number_connected_components(G_check2) == 1:
+                edges = edges_filtered_soft
+                if DEBUG_FLAG:
+                    print(f"[PGSO-A-FILTER] Soft filter {n_edges_raw} → {len(edges)} edges "
+                          f"(residual <= {residual_thresh_soft:.4f}, p50 disconnected)")
+            else:
+                if DEBUG_FLAG:
+                    print(f"[PGSO-A-FILTER] No filtering (would disconnect graph)")
+    
     n_edges = len(edges)
-    print(f"[PGSO-A] Built {n_edges} overlap edges (min_overlap={MIN_OVERLAP_FOR_EDGE})")
+    print(f"[PGSO-A] Using {n_edges} overlap edges (min_overlap={MIN_OVERLAP_FOR_EDGE})")
+
 
     if DEBUG_FLAG and n_edges > 0:
         residuals = [e['residual'] for e in edges]
@@ -11946,6 +12022,20 @@ def sample_sc_edm_patchwise(
 
     # ===================================================================
     # PGSO-B1: Global least-squares solve for rotations and log-scales
+    # ===================================================================
+    # 
+    # Math derivation (from ChatGPT):
+    # Edge a→b means: V_b ≈ s_ab * (V_a @ R_ab.T) + t_ab  (Procrustes output)
+    # Global pose: X = s_k * (V_k @ R_k.T) + t_k
+    # 
+    # Loop closure constraint: G_a = G_b ∘ T_ab
+    # This gives:
+    #   θ_a - θ_b = θ_ab  (NOT θ_b - θ_a = θ_ab)
+    #   ℓ_a - ℓ_b = ℓ_ab  (where ℓ = log(s))
+    #   t_a - t_b = s_b * (t_ab @ R_b.T)
+    #
+    # With incidence A[e,a]=-1, A[e,b]=+1, we encode: θ_b - θ_a = RHS
+    # So we need RHS = -θ_ab to get: θ_b - θ_a = -θ_ab ⟺ θ_a - θ_b = θ_ab
     # ===================================================================
     print(f"\n[PGSO-B1] Solving global rotations and scales...")
 
@@ -11960,9 +12050,17 @@ def sample_sc_edm_patchwise(
         edge_weights = []
         edge_pairs = []
 
+        # ===================================================================
+        # Compute rotation confidence per edge based on overlap geometry
+        # When overlap is near-1D, rotation is ill-conditioned and should
+        # be downweighted to prevent collapse
+        # ===================================================================
+        ROTATION_CONFIDENCE_THRESHOLD = 5.0  # anisotropy ratio above which rotation is unreliable
+        
         for e in edges:
             R_ab = e['R_ab']
             s_ab = e['s_ab']
+            a, b = e['a'], e['b']
 
             # Extract angle: theta = atan2(R[1,0], R[0,0])
             theta_ab = torch.atan2(R_ab[1, 0], R_ab[0, 0]).item()
@@ -11970,37 +12068,173 @@ def sample_sc_edm_patchwise(
 
             theta_edges.append(theta_ab)
             ell_edges.append(ell_ab)
-            edge_weights.append(e['weight'])
             edge_pairs.append((e['a'], e['b']))
+            
+            # Base weight from overlap size and residual
+            base_weight = e['weight']
+            
+            # Compute rotation confidence from overlap anisotropy
+            # Use the more anisotropic of the two patches (conservative)
+            aniso_a = patch_eig_ratios_2d[a] if a < len(patch_eig_ratios_2d) else 1.0
+            aniso_b = patch_eig_ratios_2d[b] if b < len(patch_eig_ratios_2d) else 1.0
+            max_aniso = max(aniso_a, aniso_b)
+            
+            # Rotation confidence: 1.0 when isotropic, drops toward 0 when highly anisotropic
+            # c = 1 / max_aniso, then clip(c / c_threshold, 0, 1)
+            rot_confidence = min(1.0, ROTATION_CONFIDENCE_THRESHOLD / max_aniso)
+            
+            edge_weights.append(base_weight)
+            
+            # Store rotation confidence separately (will be used for theta system only)
+            if not hasattr(e, 'rot_confidence'):
+                e['rot_confidence'] = rot_confidence
+
 
         theta_edges = torch.tensor(theta_edges)
         ell_edges = torch.tensor(ell_edges)
         edge_weights = torch.tensor(edge_weights)
 
         # Build incidence matrix: A[e, k] = +1 if k=b, -1 if k=a for edge e=(a,b)
-        # Constraint: theta_b - theta_a = theta_ab
+        # This encodes: θ_b - θ_a = RHS
         A = torch.zeros(n_edges, K)
         for e_idx, (a, b) in enumerate(edge_pairs):
             A[e_idx, a] = -1.0
             A[e_idx, b] = 1.0
 
         # Weight the system
-        W = torch.diag(edge_weights.sqrt())
-        A_w = W @ A
+        # W = torch.diag(edge_weights.sqrt())
+        # A_w = W @ A
+
+        # ===================================================================
+        # Separate weights for rotation vs scale systems
+        # Rotation uses confidence-weighted to handle near-1D patches
+        # ===================================================================
+        
+        # Collect rotation confidences
+        rot_confidences = torch.tensor([e.get('rot_confidence', 1.0) for e in edges])
+        
+        # Theta weights: base_weight * rot_confidence
+        theta_weights = edge_weights * rot_confidences
+        
+        # Scale weights: just base_weight (scale is still meaningful in 1D)
+        scale_weights = edge_weights
+        
+        if DEBUG_FLAG:
+            print(f"[PGSO-B1] Rotation confidence: p25={rot_confidences.quantile(0.25).item():.3f} "
+                  f"p50={rot_confidences.median().item():.3f} "
+                  f"p75={rot_confidences.quantile(0.75).item():.3f}")
+            if rot_confidences.median() < 0.5:
+                print(f"    ⚠️ LOW ROTATION CONFIDENCE: Most edges have unreliable rotation estimates")
+        
+        # Weight matrices
+        W_theta = torch.diag(theta_weights.sqrt())
+        W_scale = torch.diag(scale_weights.sqrt())
+        
+        A_w_theta = W_theta @ A
+        A_w_scale = W_scale @ A
+
 
         # Anchor first patch: theta_0 = 0, ell_0 = 0
         # Remove first column from A, solve for remaining K-1 variables
-        A_reduced = A_w[:, 1:]
+        A_reduced_theta = A_w_theta[:, 1:]
+        A_reduced_scale = A_w_scale[:, 1:]
 
-        # Solve for angles: A_reduced @ theta[1:] = W @ theta_edges
-        b_theta = W @ theta_edges
-        theta_reduced, _, _, _ = torch.linalg.lstsq(A_reduced, b_theta.unsqueeze(1))
+        # ===================================================================
+        # FIX: Negate RHS to match correct constraint direction
+        # Correct constraint: θ_a - θ_b = θ_ab  ⟺  θ_b - θ_a = -θ_ab
+        # Since A encodes (θ_b - θ_a), we need RHS = -θ_ab
+        # ===================================================================
+        b_theta = W_theta @ (-theta_edges)  # NEGATED, rotation-confidence weighted
+        theta_reduced, _, _, _ = torch.linalg.lstsq(A_reduced_theta, b_theta.unsqueeze(1))
         theta_global = torch.cat([torch.zeros(1), theta_reduced.squeeze(1)])
 
-        # Solve for log-scales: A_reduced @ ell[1:] = W @ ell_edges
-        b_ell = W @ ell_edges
-        ell_reduced, _, _, _ = torch.linalg.lstsq(A_reduced, b_ell.unsqueeze(1))
+        # Same fix for log-scales (uses scale weights, not rotation weights)
+        b_ell = W_scale @ (-ell_edges)  # NEGATED, normal weights
+        ell_reduced, _, _, _ = torch.linalg.lstsq(A_reduced_scale, b_ell.unsqueeze(1))
         ell_global = torch.cat([torch.zeros(1), ell_reduced.squeeze(1)])
+
+
+        # ===================================================================
+        # DEBUG: Check B1 residuals (should be small if correct)
+        # ===================================================================
+        if DEBUG_FLAG:
+            # Predicted edge measurements from solved global poses
+            theta_pred = []
+            ell_pred = []
+            for e_idx, (a, b) in enumerate(edge_pairs):
+                # Constraint was: θ_a - θ_b = θ_ab
+                theta_pred.append((theta_global[a] - theta_global[b]).item())
+                ell_pred.append((ell_global[a] - ell_global[b]).item())
+            theta_pred = torch.tensor(theta_pred)
+            ell_pred = torch.tensor(ell_pred)
+            
+            # Residuals
+            theta_resid = theta_pred - theta_edges
+            # Wrap angle residuals to [-π, π]
+            theta_resid = torch.atan2(torch.sin(theta_resid), torch.cos(theta_resid))
+            ell_resid = ell_pred - ell_edges
+            
+            print(f"[PGSO-B1-CHECK] θ residual (deg): p50={theta_resid.abs().median().item()*180/np.pi:.2f} "
+                  f"p90={theta_resid.abs().quantile(0.9).item()*180/np.pi:.2f}")
+            print(f"[PGSO-B1-CHECK] ℓ residual: p50={ell_resid.abs().median().item():.4f} "
+                  f"p90={ell_resid.abs().quantile(0.9).item():.4f}")
+
+
+        # ===================================================================
+        # OPTIONAL: 2-iteration reweighted LS with wrapped angle residuals
+        # Uses rotation-confidence weighting for theta
+        # ===================================================================
+        for refine_iter in range(2):
+            # Compute residuals with current solution
+            theta_resid_list = []
+            ell_resid_list = []
+            for e_idx, (a, b) in enumerate(edge_pairs):
+                # Predicted edge: θ_a - θ_b
+                theta_pred = theta_global[a] - theta_global[b]
+                theta_meas = theta_edges[e_idx]
+                # Wrap residual to [-π, π]
+                resid_theta = theta_pred - theta_meas
+                resid_theta = torch.atan2(torch.sin(torch.tensor(resid_theta)), 
+                                          torch.cos(torch.tensor(resid_theta))).item()
+                theta_resid_list.append(resid_theta)
+                
+                # Log-scale residual (no wrapping needed)
+                ell_pred = ell_global[a] - ell_global[b]
+                ell_resid_list.append((ell_pred - ell_edges[e_idx]).item())
+            
+            theta_resid = torch.tensor(theta_resid_list)
+            ell_resid = torch.tensor(ell_resid_list)
+            
+            # Reweight: downweight high-residual edges
+            resid_mag = theta_resid.abs() + 0.5 * ell_resid.abs()
+            resid_scale = resid_mag.median().clamp(min=0.01)
+            reweight_factor = 1.0 / (1.0 + (resid_mag / resid_scale) ** 2)
+            
+            # Apply reweighting to both systems (keep rotation confidence for theta)
+            new_theta_weights = theta_weights * reweight_factor
+            new_scale_weights = scale_weights * reweight_factor
+            
+            W_theta = torch.diag(new_theta_weights.sqrt())
+            W_scale = torch.diag(new_scale_weights.sqrt())
+            A_w_theta = W_theta @ A
+            A_w_scale = W_scale @ A
+            A_reduced_theta = A_w_theta[:, 1:]
+            A_reduced_scale = A_w_scale[:, 1:]
+            
+            # Re-solve with new weights (NEGATED RHS)
+            b_theta = W_theta @ (-theta_edges)
+            theta_reduced, _, _, _ = torch.linalg.lstsq(A_reduced_theta, b_theta.unsqueeze(1))
+            theta_global = torch.cat([torch.zeros(1), theta_reduced.squeeze(1)])
+            
+            b_ell = W_scale @ (-ell_edges)
+            ell_reduced, _, _, _ = torch.linalg.lstsq(A_reduced_scale, b_ell.unsqueeze(1))
+            ell_global = torch.cat([torch.zeros(1), ell_reduced.squeeze(1)])
+            
+            if DEBUG_FLAG:
+                print(f"[PGSO-B1] Refine iter {refine_iter+1}: "
+                      f"θ_resid_p50={theta_resid.abs().median().item()*180/np.pi:.2f}° "
+                      f"ℓ_resid_p50={ell_resid.abs().median().item():.4f}")
+
 
         # Center log-scales around 0 (median scale = 1)
         ell_global = ell_global - ell_global.median()
@@ -12009,6 +12243,7 @@ def sample_sc_edm_patchwise(
         SCALE_CLAMP_MIN = 0.85
         SCALE_CLAMP_MAX = 1.15
         ell_global = ell_global.clamp(np.log(SCALE_CLAMP_MIN), np.log(SCALE_CLAMP_MAX))
+
 
     # Convert back to R, s
     s_global_list = torch.exp(ell_global)
@@ -12089,6 +12324,29 @@ def sample_sc_edm_patchwise(
         print(f"[PGSO-B2] Translation norms: min={t_norms.min().item():.3f} "
               f"p50={t_norms.median().item():.3f} "
               f"max={t_norms.max().item():.3f}")
+        
+        # ===================================================================
+        # DEBUG: Check B2 residuals (should be small if B1+B2 are consistent)
+        # ===================================================================
+        if n_edges > 0:
+            t_resid_norms = []
+            for e in edges[:min(50, len(edges))]:
+                a, b = e['a'], e['b']
+                R_b = R_global_list[b]
+                s_b = s_global_list[b]
+                t_ab = e['t_ab']
+                
+                # Expected: t_a - t_b = s_b * (t_ab @ R_b.T)
+                lhs = t_global_list[a] - t_global_list[b]
+                rhs = s_b * (t_ab @ R_b.T)
+                resid = (lhs - rhs).norm().item()
+                t_resid_norms.append(resid)
+            
+            t_resid_norms = torch.tensor(t_resid_norms)
+            print(f"[PGSO-B2-CHECK] Translation residual norms: "
+                  f"p50={t_resid_norms.median().item():.4f} "
+                  f"p90={t_resid_norms.quantile(0.9).item():.4f}")
+
 
     # ===================================================================
     # PGSO-C: Apply global transforms to each patch (in 2D space)
@@ -12106,6 +12364,7 @@ def sample_sc_edm_patchwise(
         X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
         patch_coords_transformed.append(X_hat_k)
 
+
     # ===================================================================
     # PGSO-CHECK: Verify transform consistency
     # ===================================================================
@@ -12113,6 +12372,8 @@ def sample_sc_edm_patchwise(
         print(f"\n[PGSO-CHECK] Verifying transform consistency on overlap edges...")
 
         dist_mismatches = []
+        coord_mismatches = []  # NEW: Direct coordinate mismatch after transform
+        
         for e in edges[:min(50, len(edges))]:  # Check first 50 edges
             a, b = e['a'], e['b']
             shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
@@ -12126,6 +12387,10 @@ def sample_sc_edm_patchwise(
             X_a = patch_coords_transformed[a][idx_a]
             X_b = patch_coords_transformed[b][idx_b]
 
+            # NEW: Direct coordinate mismatch (should be small after correct PGSO)
+            coord_diff = (X_a - X_b).norm(dim=1)
+            coord_mismatches.append(coord_diff.mean().item())
+
             # Distance matrices
             D_a = torch.cdist(X_a, X_a)
             D_b = torch.cdist(X_b, X_b)
@@ -12135,9 +12400,90 @@ def sample_sc_edm_patchwise(
             mismatch = (D_a_norm - D_b_norm).abs().mean().item()
             dist_mismatches.append(mismatch)
 
+        print(f"[PGSO-CHECK] Coord mismatch (should be small): "
+              f"p50={np.median(coord_mismatches):.4f} "
+              f"p90={np.percentile(coord_mismatches, 90):.4f}")
         print(f"[PGSO-CHECK] Patch dist mismatch: p10={np.percentile(dist_mismatches, 10):.4f} "
               f"p50={np.median(dist_mismatches):.4f} "
               f"p90={np.percentile(dist_mismatches, 90):.4f}")
+        
+        # Interpretation
+        # Normalize coord mismatch by RMS for meaningful threshold
+        coord_mismatch_norm = np.median(coord_mismatches) / rms_target
+        print(f"  [PGSO-CHECK] Coord mismatch / RMS = {coord_mismatch_norm:.3f}")
+        
+        if coord_mismatch_norm > 0.5:
+            print(f"    ⚠️ WARNING: Large coord mismatch (>{50}% of RMS) → alignment failed")
+        elif coord_mismatch_norm > 0.2:
+            print(f"    ⚠️ MODERATE: Coord mismatch is {coord_mismatch_norm*100:.0f}% of RMS")
+        else:
+            print(f"    ✓ Coord mismatch is small (<20% of RMS) → alignment is working")
+
+
+
+        # ===================================================================
+        # [PGSO-CHECK-TRANSFORM] Verify predicted vs measured transforms
+        # From G_a ≈ G_b ∘ T_ab, we can compute: T_ab_pred = G_b^-1 ∘ G_a
+        # Compare to measured T_ab from Procrustes
+        # ===================================================================
+        print(f"\n[PGSO-CHECK-TRANSFORM] Comparing predicted vs measured edge transforms...")
+        
+        scale_errors = []
+        rot_errors = []
+        trans_errors = []
+        
+        for e in edges[:min(30, len(edges))]:
+            a, b = e['a'], e['b']
+            
+            # Measured from Procrustes
+            R_ab_meas = e['R_ab']
+            s_ab_meas = e['s_ab']
+            t_ab_meas = e['t_ab']
+            
+            # Predicted from global poses: T_ab = G_b^-1 ∘ G_a
+            # G_k(x) = s_k * (x @ R_k.T) + t_k
+            # G_b^-1(y) = (1/s_b) * ((y - t_b) @ R_b)
+            # T_ab_pred = G_b^-1 ∘ G_a
+            #   s_pred = s_a / s_b
+            #   R_pred = R_b.T @ R_a  (since R^-1 = R.T for rotation)
+            #   t_pred = (1/s_b) * ((t_a - t_b) @ R_b)
+            
+            R_a, R_b = R_global_list[a], R_global_list[b]
+            s_a, s_b = s_global_list[a], s_global_list[b]
+            t_a, t_b = t_global_list[a], t_global_list[b]
+            
+            s_ab_pred = s_a / s_b
+            R_ab_pred = R_b.T @ R_a
+            t_ab_pred = (1.0 / s_b) * ((t_a - t_b) @ R_b)
+            
+            # Errors
+            scale_err = abs(torch.log(s_ab_pred) - torch.log(s_ab_meas)).item()
+            
+            # Rotation error (wrapped)
+            theta_pred = torch.atan2(R_ab_pred[1, 0], R_ab_pred[0, 0])
+            theta_meas = torch.atan2(R_ab_meas[1, 0], R_ab_meas[0, 0])
+            rot_err = torch.atan2(torch.sin(theta_pred - theta_meas), 
+                                  torch.cos(theta_pred - theta_meas)).abs().item()
+            
+            trans_err = (t_ab_pred - t_ab_meas).norm().item()
+            
+            scale_errors.append(scale_err)
+            rot_errors.append(rot_err)
+            trans_errors.append(trans_err)
+        
+        scale_errors = torch.tensor(scale_errors)
+        rot_errors = torch.tensor(rot_errors)
+        trans_errors = torch.tensor(trans_errors)
+        
+        print(f"  [PGSO-CHECK-TRANSFORM] Scale error (log): "
+              f"p50={scale_errors.median().item():.4f} "
+              f"p90={scale_errors.quantile(0.9).item():.4f}")
+        print(f"  [PGSO-CHECK-TRANSFORM] Rotation error (rad): "
+              f"p50={rot_errors.median().item():.4f} ({rot_errors.median().item()*180/np.pi:.1f}°) "
+              f"p90={rot_errors.quantile(0.9).item():.4f} ({rot_errors.quantile(0.9).item()*180/np.pi:.1f}°)")
+        print(f"  [PGSO-CHECK-TRANSFORM] Translation error: "
+              f"p50={trans_errors.median().item():.4f} "
+              f"p90={trans_errors.quantile(0.9).item():.4f}")
 
     # ===================================================================
     # PGSO-D: Merge transformed patches (simple weighted mean)
@@ -12180,6 +12526,236 @@ def sample_sc_edm_patchwise(
         rms_final = X_global.pow(2).mean().sqrt().item()
         print(f"[PGSO-D] Final X_global: shape={tuple(X_global.shape)}, rms={rms_final:.3f}")
         print(f"[PGSO-D] Coverage: min={coverage_counts.min():.0f} p50={coverage_counts.median():.0f} max={coverage_counts.max():.0f}")
+
+    # ===================================================================
+    # [PGSO-REFINE] Post-PGSO refinement: FULL SIMILARITY (bundle adjustment)
+    # 
+    # Rationale: Edge-based pose graph can be consistent but still fail
+    # when Procrustes residuals are large. Direct optimization of overlap
+    # point agreement (bundle adjustment) minimizes the actual coord mismatch.
+    #
+    # Alternating minimization:
+    #   (A) Patch→global Procrustes: fit (R_k, s_k, t_k) per patch
+    #   (B) Global merge: weighted average of all patch predictions
+    #
+    # Guardrail: For near-1D patches (high anisotropy), freeze rotation
+    # to prevent instability.
+    # ===================================================================
+    pgso_refine_iters = int(n_align_iters) if n_align_iters > 1 else 0
+    
+    # Anisotropy threshold: if patch eig_ratio > this, freeze rotation
+    ANISO_FREEZE_ROTATION_THRESH = 50.0
+    ANISO_FREEZE_SCALE_THRESH = 200.0  # Even more extreme: also freeze scale
+    
+    if pgso_refine_iters > 0 and DEBUG_FLAG:
+        print(f"\n[PGSO-REFINE] Running {pgso_refine_iters} FULL SIMILARITY refinement iterations...")
+        print(f"    (Bundle adjustment: optimizing overlap point agreement directly)")
+        print(f"    Guardrail: freeze rotation if patch anisotropy > {ANISO_FREEZE_ROTATION_THRESH}")
+    
+    # Track metrics across iterations
+    refine_coord_mismatches = []
+    refine_procrustes_residuals = []
+    
+    for refine_iter in range(pgso_refine_iters):
+        # ===============================================================
+        # Step A: Patch→global Procrustes (full similarity, with guardrails)
+        # ===============================================================
+        new_patch_coords_transformed = []
+        iter_residuals = []
+        n_frozen_rot = 0
+        n_frozen_scale = 0
+        
+        for k in range(K):
+            S_k = patch_indices[k]
+            V_k_2d = patch_coords_2d[k]  # Patch coords in 2D
+            X_k_global = X_global[S_k, :2].cpu()  # Current global coords for this patch's cells
+            
+            # Compute centrality weights
+            center_k = V_k_2d.mean(dim=0, keepdim=True)
+            dists = torch.norm(V_k_2d - center_k, dim=1)
+            max_d = dists.max().clamp_min(1e-6)
+            weights_k = 1.0 - (dists / (max_d * 1.2))
+            weights_k = weights_k.clamp(min=0.01)
+            
+            # Get patch anisotropy in 2D (already computed earlier)
+            aniso_k = patch_eig_ratios_2d[k] if k < len(patch_eig_ratios_2d) else 1.0
+            
+            # Decide what to freeze based on anisotropy
+            freeze_rotation = (aniso_k > ANISO_FREEZE_ROTATION_THRESH)
+            freeze_scale = (aniso_k > ANISO_FREEZE_SCALE_THRESH)
+            
+            if freeze_rotation:
+                n_frozen_rot += 1
+            if freeze_scale:
+                n_frozen_scale += 1
+            
+            if freeze_rotation:
+                # Keep rotation from PGSO (or identity if not available)
+                R_k_fixed = R_global_list[k] if k < len(R_global_list) else torch.eye(2)
+                
+                if freeze_scale:
+                    # Only solve translation
+                    s_k_fixed = s_global_list[k] if k < len(s_global_list) else torch.tensor(1.0)
+                    V_k_rotscaled = s_k_fixed * (V_k_2d @ R_k_fixed.T)
+                    diff = X_k_global - V_k_rotscaled
+                    w = weights_k.unsqueeze(1)
+                    t_k_new = (w * diff).sum(dim=0) / w.sum()
+                    R_k, s_k, t_k = R_k_fixed, s_k_fixed, t_k_new
+                    residual_k = ((s_k * (V_k_2d @ R_k.T) + t_k - X_k_global) ** 2).sum(dim=1).sqrt().mean()
+                else:
+                    # Solve scale + translation with fixed rotation
+                    # Apply fixed rotation first
+                    V_k_rotated = V_k_2d @ R_k_fixed.T
+                    
+                    # Weighted Procrustes for scale+translation only
+                    # X_k_global ≈ s * V_k_rotated + t
+                    w = weights_k.unsqueeze(1)
+                    w_sum = w.sum()
+                    mu_src = (w * V_k_rotated).sum(dim=0, keepdim=True) / w_sum
+                    mu_tgt = (w * X_k_global).sum(dim=0, keepdim=True) / w_sum
+                    
+                    Vc = V_k_rotated - mu_src
+                    Yc = X_k_global - mu_tgt
+                    
+                    # Scale: s = sum(w * Yc · Vc) / sum(w * Vc · Vc)
+                    numer = (w * Yc * Vc).sum()
+                    denom = (w * Vc * Vc).sum().clamp_min(1e-8)
+                    s_k = numer / denom
+                    s_k = s_k.clamp(0.5, 2.0)  # Safety clamp
+                    
+                    # Translation
+                    t_k = (mu_tgt - s_k * mu_src).squeeze(0)
+                    R_k = R_k_fixed
+                    
+                    residual_k = ((s_k * V_k_rotated + t_k - X_k_global) ** 2).sum(dim=1).sqrt().mean()
+            else:
+                # Full similarity Procrustes
+                R_k, s_k, t_k, residual_k = weighted_procrustes_2d(
+                    V_k_2d, X_k_global, weights_k
+                )
+            
+            iter_residuals.append(residual_k.item() if torch.is_tensor(residual_k) else residual_k)
+            
+            # Apply transform
+            X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
+            new_patch_coords_transformed.append(X_hat_k)
+            
+            # Update global lists for next iteration
+            R_global_list[k] = R_k
+            s_global_list[k] = s_k if torch.is_tensor(s_k) else torch.tensor(s_k)
+            t_global_list[k] = t_k
+        
+        # ===============================================================
+        # Step B: Global merge (weighted average of all patch predictions)
+        # ===============================================================
+        X_global_new = torch.zeros(n_sc, 2, dtype=torch.float32, device=device)
+        W_global_new = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
+        
+        for k in range(K):
+            S_k = patch_indices[k].to(device)
+            X_hat_k = new_patch_coords_transformed[k].to(device)
+            V_k_2d = patch_coords_2d[k].to(device)
+            
+            # Centrality weights
+            center_k = V_k_2d.mean(dim=0, keepdim=True)
+            dists = torch.norm(V_k_2d - center_k, dim=1, keepdim=True)
+            max_d = dists.max().clamp_min(1e-6)
+            weights_k = 1.0 - (dists / (max_d * 1.2))
+            weights_k = weights_k.clamp(min=0.01)
+            
+            X_global_new.index_add_(0, S_k, X_hat_k * weights_k)
+            W_global_new.index_add_(0, S_k, weights_k)
+        
+        mask_seen = W_global_new.squeeze(-1) > 0
+        X_global_new[mask_seen] /= W_global_new[mask_seen]
+        X_global_new = X_global_new - X_global_new.mean(dim=0, keepdim=True)
+        
+        # Rescale to target RMS
+        rms_new = X_global_new.pow(2).mean().sqrt()
+        scale_correction = rms_target / (rms_new + 1e-8)
+        X_global_new = X_global_new * scale_correction
+        
+        # Update X_global
+        X_global[:, :2] = X_global_new
+        
+        # Update transformed coords for next iteration
+        patch_coords_transformed = new_patch_coords_transformed
+        
+        # ===============================================================
+        # Compute overlap coord mismatch for this iteration
+        # ===============================================================
+        iter_coord_mismatches = []
+        for e in edges[:min(30, len(edges))]:
+            a, b = e['a'], e['b']
+            shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
+            if len(shared_list) < 10:
+                continue
+            
+            pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
+            pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
+            
+            idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
+            idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
+            
+            X_a = patch_coords_transformed[a][idx_a]
+            X_b = patch_coords_transformed[b][idx_b]
+            
+            coord_diff = (X_a - X_b).norm(dim=1).mean().item()
+            iter_coord_mismatches.append(coord_diff)
+        
+        if iter_coord_mismatches:
+            coord_mismatch_p50 = np.median(iter_coord_mismatches)
+            coord_mismatch_norm = coord_mismatch_p50 / rms_target
+            refine_coord_mismatches.append(coord_mismatch_norm)
+        
+        iter_residuals_t = torch.tensor(iter_residuals)
+        refine_procrustes_residuals.append(iter_residuals_t.median().item())
+        
+        # ===============================================================
+        # Print progress
+        # ===============================================================
+        if DEBUG_FLAG and (refine_iter < 5 or refine_iter == pgso_refine_iters - 1 or (refine_iter + 1) % 5 == 0):
+            coord_str = f"{coord_mismatch_norm:.3f}" if iter_coord_mismatches else "N/A"
+            print(f"  [PGSO-REFINE] iter={refine_iter}: "
+                  f"Procrustes_resid_p50={iter_residuals_t.median().item():.4f} "
+                  f"coord_mismatch/RMS={coord_str} "
+                  f"frozen_rot={n_frozen_rot}/{K} frozen_scale={n_frozen_scale}/{K}")
+    
+    # ===============================================================
+    # Post-refinement diagnostics
+    # ===============================================================
+    if pgso_refine_iters > 0 and DEBUG_FLAG:
+        # Check if solution collapsed
+        cov_check = torch.cov(X_global[:, :2].T)
+        eigs_check = torch.linalg.eigvalsh(cov_check)
+        eig_ratio_check = (eigs_check.max() / eigs_check.min().clamp(min=1e-8)).item()
+        
+        print(f"\n[PGSO-REFINE] SUMMARY:")
+        print(f"  Final RMS={X_global[:,:2].pow(2).mean().sqrt().item():.3f} "
+              f"eig_ratio={eig_ratio_check:.1f}")
+        
+        if len(refine_coord_mismatches) >= 2:
+            improvement = refine_coord_mismatches[0] - refine_coord_mismatches[-1]
+            print(f"  Coord mismatch/RMS: {refine_coord_mismatches[0]:.3f} → {refine_coord_mismatches[-1]:.3f} "
+                  f"(Δ={improvement:.3f})")
+            if improvement > 0.05:
+                print(f"    ✓ Refinement improved overlap agreement")
+            elif improvement < -0.05:
+                print(f"    ⚠️ WARNING: Refinement made overlap agreement worse!")
+            else:
+                print(f"    → Refinement had minimal effect on overlap agreement")
+        
+        if len(refine_procrustes_residuals) >= 2:
+            print(f"  Procrustes residual p50: {refine_procrustes_residuals[0]:.4f} → {refine_procrustes_residuals[-1]:.4f}")
+        
+        if eig_ratio_check > 100:
+            print(f"    ⚠️ WARNING: Solution may be collapsing (eig_ratio > 100)")
+        elif eig_ratio_check > 20:
+            print(f"    ⚠️ CAUTION: Solution is becoming anisotropic (eig_ratio={eig_ratio_check:.1f})")
+        else:
+            print(f"    ✓ Solution shape is reasonable (eig_ratio={eig_ratio_check:.1f})")
+
+
 
     # Expand X_global back to D_latent dimensions for compatibility with downstream code
     # We'll use the 2D coords for now since they're what we actually computed
