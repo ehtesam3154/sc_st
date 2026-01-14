@@ -709,7 +709,17 @@ class GEMSModel:
         local_refine_steps: int = 100,
         local_refine_lr: float = 0.01,
         local_refine_anchor_weight: float = 0.1,
+        # --- DGSO: Distance-Graph Stitch Optimization ---
+        enable_dgso: bool = False,
+        dgso_k_edge: int = 15,
+        dgso_iters: int = 1000,
+        dgso_lr: float = 1e-2,
+        dgso_batch_size: int = 100000,
+        dgso_huber_delta: float = 0.1,
+        dgso_anchor_lambda: float = 0.01,
+        dgso_log_every: int = 100,
     ) -> Dict[str, torch.Tensor]:
+
         """
         SC inference using patch-based global alignment (no masked/frozen points).
         """
@@ -796,8 +806,18 @@ class GEMSModel:
             local_refine_steps=local_refine_steps,
             local_refine_lr=local_refine_lr,
             local_refine_anchor_weight=local_refine_anchor_weight,
+            # --- DGSO params ---
+            enable_dgso=enable_dgso,
+            dgso_k_edge=dgso_k_edge,
+            dgso_iters=dgso_iters,
+            dgso_lr=dgso_lr,
+            dgso_batch_size=dgso_batch_size,
+            dgso_huber_delta=dgso_huber_delta,
+            dgso_anchor_lambda=dgso_anchor_lambda,
+            dgso_log_every=dgso_log_every,
         )
         return res
+
 
     def infer_sc_single_patch(
         self,
