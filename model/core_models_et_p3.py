@@ -291,8 +291,18 @@ class GEMSModel:
         z_noise_std: float = 0.02,
         z_dropout_rate: float = 0.1,
         aug_prob: float = 0.5,
+        # ========== COMPETITOR TRAINING (ChatGPT hypothesis test) ==========
+        compete_train: bool = False,
+        compete_n_extra: int = 128,
+        compete_n_rand: int = 64,
+        compete_n_hard: int = 64,
+        compete_use_pos_closure: bool = True,
+        compete_k_pos: int = 10,
+        compete_expr_knn_k: int = 50,
+        compete_anchor_only: bool = True,
+        compete_diag_every: int = 200,
 
-):
+    ):
         """
         Train diffusion generator with mixed ST/SC regimen.
         """
@@ -327,6 +337,15 @@ class GEMSModel:
                 landmarks_L=self.cfg['dataset']['landmarks_L'],
                 pool_mult=pool_mult,
                 stochastic_tau=stochastic_tau,
+                # ========== COMPETITOR TRAINING PARAMS ==========
+                compete_train=compete_train,
+                compete_n_extra=compete_n_extra,
+                compete_n_rand=compete_n_rand,
+                compete_n_hard=compete_n_hard,
+                compete_use_pos_closure=compete_use_pos_closure,
+                compete_k_pos=compete_k_pos,
+                compete_expr_knn_k=compete_expr_knn_k,
+                compete_anchor_only=compete_anchor_only,
             )
         else:
             st_dataset = None
@@ -388,6 +407,17 @@ class GEMSModel:
             z_noise_std=z_noise_std,
             z_dropout_rate=z_dropout_rate,
             aug_prob=aug_prob,
+            # ========== COMPETITOR TRAINING PARAMS ==========
+            compete_train=compete_train,
+            compete_n_extra=compete_n_extra,
+            compete_n_rand=compete_n_rand,
+            compete_n_hard=compete_n_hard,
+            compete_use_pos_closure=compete_use_pos_closure,
+            compete_k_pos=compete_k_pos,
+            compete_expr_knn_k=compete_expr_knn_k,
+            compete_anchor_only=compete_anchor_only,
+            compete_diag_every=compete_diag_every,
+
         )
 
         # Store sigma_data for inference
@@ -543,6 +573,104 @@ class GEMSModel:
         print("="*60)
     
     
+    # def infer_sc_patchwise(
+    #     self,
+    #     sc_gene_expr: torch.Tensor,
+    #     n_timesteps_sample: int = 160,
+    #     sigma_min: float = None,
+    #     sigma_max: float = None,
+    #     return_coords: bool = True,
+    #     patch_size: int = 384,
+    #     coverage_per_cell: float = 4.0,
+    #     n_align_iters: int = 10,
+    #     eta: float = 0.0,
+    #     guidance_scale: float = 3.0,
+    #     debug_flag: bool = True,
+    #     debug_every: int = 10,
+    #     fixed_patch_graph: Optional[dict] = None,
+    #     # --- DEBUG KNN ARGS ---
+    #     gt_coords: Optional[torch.Tensor] = None,
+    #     debug_knn: bool = False,
+    #     debug_max_patches: int = 20,
+    #     debug_k_list: Tuple[int, int] = (10, 20),
+    #     debug_global_subset: int = 4096,
+    #     debug_gap_k: int = 10,
+    #     two_pass: bool = False,
+    # ) -> Dict[str, torch.Tensor]:
+    #     """
+    #     SC inference using patch-based global alignment (no masked/frozen points).
+    #     """
+    #     from core_models_et_p2 import sample_sc_edm_patchwise
+
+    #     # Prepare CORAL params if enabled
+    #     coral_params = None
+    #     if hasattr(self, 'coral_enabled') and self.coral_enabled:
+    #         coral_params = {
+    #             'mu_sc': self.coral_mu_sc,
+    #             'mu_st': self.coral_mu_st,
+    #             'A': self.coral_A,
+    #             'B': self.coral_B,
+    #         }
+    #         print("[CORAL] Applying CORAL transformation during SC inference")
+
+    #     # If you have a stored ST scale, you can pass it; otherwise None
+    #     target_st_p95 = getattr(self, "target_st_p95", None)
+
+    #     sigma_data = getattr(self, 'sigma_data', None)
+
+    #     # Use model's EDM parameters if not provided
+    #     if sigma_min is None:
+    #         sigma_min = getattr(self, 'sigma_min', 0.002)
+    #     if sigma_max is None:
+    #         sigma_max = getattr(self, 'sigma_max', 80.0)
+        
+    #     print(f"[Inference] Using sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.2f}, sigma_data={sigma_data:.4f}")
+
+    #     if sigma_data is None:
+    #         raise ValueError("sigma_data not set - load from checkpoint or compute from data")
+
+
+
+    #     # Use EMA weights for inference if available
+    #     ctx_enc = self.context_encoder_ema if self.context_encoder_ema is not None else self.context_encoder
+    #     sc_net = self.score_net_ema if self.score_net_ema is not None else self.score_net
+        
+    #     # Ensure EMA models are in eval mode
+    #     ctx_enc.eval()
+    #     sc_net.eval()
+        
+    #     res = sample_sc_edm_patchwise(
+    #         sc_gene_expr=sc_gene_expr,
+    #         encoder=self.encoder,
+    #         context_encoder=ctx_enc,
+    #         score_net=sc_net,
+    #         generator=self.generator,  # NEW: pass generator for refinement mode
+    #         target_st_p95=target_st_p95,
+    #         n_timesteps_sample=n_timesteps_sample,
+    #         sigma_min=sigma_min,
+    #         sigma_max=sigma_max,
+    #         sigma_data=sigma_data,
+    #         guidance_scale=guidance_scale,
+    #         eta=eta,
+    #         device=self.device,
+    #         patch_size=patch_size,
+    #         coverage_per_cell=coverage_per_cell,
+    #         n_align_iters=n_align_iters,
+    #         return_coords=return_coords,
+    #         DEBUG_FLAG=debug_flag,
+    #         DEBUG_EVERY=debug_every,
+    #         fixed_patch_graph=fixed_patch_graph,
+    #         coral_params=coral_params,
+    #         gt_coords=gt_coords,
+    #         debug_knn=debug_knn,
+    #         debug_max_patches=debug_max_patches,
+    #         debug_k_list=debug_k_list,
+    #         debug_global_subset=debug_global_subset,
+    #         debug_gap_k=debug_gap_k,
+    #         two_pass=two_pass,
+    #     )
+    #     return res
+
     def infer_sc_patchwise(
         self,
         sc_gene_expr: torch.Tensor,
@@ -558,6 +686,29 @@ class GEMSModel:
         debug_flag: bool = True,
         debug_every: int = 10,
         fixed_patch_graph: Optional[dict] = None,
+        # --- DEBUG KNN ARGS ---
+        gt_coords: Optional[torch.Tensor] = None,
+        debug_knn: bool = False,
+        debug_max_patches: int = 20,
+        debug_k_list: Tuple[int, int] = (10, 20),
+        debug_global_subset: int = 4096,
+        debug_gap_k: int = 10,
+        two_pass: bool = False,
+        # --- ST-STYLE STOCHASTIC PATCH SAMPLING ---
+        pool_mult: float = 2.0,
+        stochastic_tau: float = 0.8,
+        tau_mode: str = "adaptive_kth",
+        ensure_connected: bool = True,
+        # --- MERGE MODE ---
+        # merge_mode: str = "mean",
+        # --- ALIGNMENT CONSTRAINTS ---
+        align_freeze_scale: bool = True,
+        align_scale_clamp: Tuple[float, float] = (1.0, 1.0),
+        # --- LOCAL REFINEMENT ---
+        local_refine: bool = False,
+        local_refine_steps: int = 100,
+        local_refine_lr: float = 0.01,
+        local_refine_anchor_weight: float = 0.1,
     ) -> Dict[str, torch.Tensor]:
         """
         SC inference using patch-based global alignment (no masked/frozen points).
@@ -623,9 +774,30 @@ class GEMSModel:
             DEBUG_EVERY=debug_every,
             fixed_patch_graph=fixed_patch_graph,
             coral_params=coral_params,
+            gt_coords=gt_coords,
+            debug_knn=debug_knn,
+            debug_max_patches=debug_max_patches,
+            debug_k_list=debug_k_list,
+            debug_global_subset=debug_global_subset,
+            debug_gap_k=debug_gap_k,
+            two_pass=two_pass,
+            # --- ST-STYLE STOCHASTIC PATCH SAMPLING ---
+            pool_mult=pool_mult,
+            stochastic_tau=stochastic_tau,
+            tau_mode=tau_mode,
+            ensure_connected=ensure_connected,
+            # --- MERGE MODE ---
+            # merge_mode=merge_mode,
+            # --- ALIGNMENT CONSTRAINTS ---
+            align_freeze_scale=align_freeze_scale,
+            align_scale_clamp=align_scale_clamp,
+            # --- LOCAL REFINEMENT ---
+            local_refine=local_refine,
+            local_refine_steps=local_refine_steps,
+            local_refine_lr=local_refine_lr,
+            local_refine_anchor_weight=local_refine_anchor_weight,
         )
         return res
-    
 
     def infer_sc_single_patch(
         self,
@@ -804,16 +976,24 @@ class GEMSModel:
         
         with torch.no_grad():
             for idx in range(len(sc_dataset)):
-                miniset = sc_dataset[idx]
-                n_A = miniset['n_A']
+                # miniset = sc_dataset[idx]
+                # n_A = miniset['n_A']
                 
+                # # Get gene expression
+                # indices_A = miniset['global_indices_A'][:n_A]
+                # gene_expr = sc_gene_expr_cpu[indices_A].to(self.device)
+
+                miniset = sc_dataset[idx]
+                n = miniset['n']
+
                 # Get gene expression
-                indices_A = miniset['global_indices_A'][:n_A]
-                gene_expr = sc_gene_expr_cpu[indices_A].to(self.device)
+                indices = miniset['global_indices'][:n]
+                gene_expr = sc_gene_expr[indices].to(self.device)
+
                 
                 # Encode
                 Z = self.encoder(gene_expr)
-                mask = torch.ones(n_A, dtype=torch.bool, device=self.device)
+                mask = torch.ones(n, dtype=torch.bool, device=self.device)
                 
                 # Context
                 Z_batch = Z.unsqueeze(0)
@@ -977,9 +1157,3 @@ class GEMSModel:
     # ==========================================================================
     # SC ENCODER FINE-TUNING v2
     # ==========================================================================
-    
-
-
-
-
-

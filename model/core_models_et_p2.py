@@ -10823,6 +10823,21 @@ def sample_sc_edm_patchwise(
     if DEBUG_FLAG:
         print(f"[ENC] Z_all shape={tuple(Z_all.shape)}")
 
+    # ===================================================================
+    # [GLOBAL-KNN-STAGE] Prepare fixed subset for stagewise kNN tracking
+    # ===================================================================
+    global_knn_stage_subset = None
+    global_knn_stage_results = {}
+    
+    if debug_knn and gt_coords is not None:
+        gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+        M_stage = min(n_sc, 2000)  # Fixed subset size
+        global_knn_stage_subset = torch.randperm(n_sc)[:M_stage]
+        global_knn_stage_gt = gt_coords_t[global_knn_stage_subset]
+        
+        if DEBUG_FLAG:
+            print(f"[GLOBAL-KNN-STAGE] Prepared fixed subset of {M_stage} cells for stagewise tracking")
+
 
     # ------------------------------------------------------------------
     # 2) Build k-NN index in Z-space for patch construction
@@ -10914,38 +10929,105 @@ def sample_sc_edm_patchwise(
         K = len(patch_indices)
         print(f"{pass_label}[PATCHWISE] Built {K} patches using ST-style stochastic sampling")
 
-        # ===================================================================
-        # [TEST3_SAMPLER_RANKS] Stochastic sampler rank statistics
-        # ===================================================================
-        if DEBUG_FLAG and len(sampler_rank_stats) > 0:
-            print("\n" + "="*70)
-            print(f"[TEST3_SAMPLER_RANKS] STOCHASTIC SAMPLER RANK ANALYSIS")
-            print("="*70)
+    # ===================================================================
+    # [TEST1-COVER] GT NEIGHBOR CO-OCCURRENCE UPPER BOUND
+    # ===================================================================
+    # Goal: Measure whether patching scheme allows recovering GT kNN.
+    # If median cover@k is low, global kNN cannot exceed that even with
+    # perfect stitching - the true neighbors were never co-sampled.
+    # ===================================================================
+    if debug_knn and gt_coords is not None:
+        print("\n" + "="*70)
+        print("[TEST1-COVER] GT NEIGHBOR CO-OCCURRENCE UPPER BOUND")
+        print("="*70)
+        
+        with torch.no_grad():
+            gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
             
-            mean_ranks = [s['mean_rank'] for s in sampler_rank_stats]
-            max_ranks = [s['max_rank'] for s in sampler_rank_stats]
-            p90_ranks = [s['p90_rank'] for s in sampler_rank_stats]
-            frac_beyond = [s['frac_beyond_patchsize'] for s in sampler_rank_stats]
-            tau_effs = [s['tau_eff'] for s in sampler_rank_stats]
+            # Use subset for efficiency
+            n_eval = min(n_sc, debug_global_subset)
+            eval_indices = torch.randperm(n_sc)[:n_eval].tolist()
             
-            print(f"  [TEST3_SAMPLER_RANKS] n_patches={len(sampler_rank_stats)}")
-            print(f"  [TEST3_SAMPLER_RANKS] mean_rank: mean={np.mean(mean_ranks):.1f} p50={np.median(mean_ranks):.1f} p90={np.percentile(mean_ranks, 90):.1f}")
-            print(f"  [TEST3_SAMPLER_RANKS] max_rank: mean={np.mean(max_ranks):.1f} p50={np.median(max_ranks):.1f} p90={np.percentile(max_ranks, 90):.1f}")
-            print(f"  [TEST3_SAMPLER_RANKS] p90_rank: mean={np.mean(p90_ranks):.1f} p50={np.median(p90_ranks):.1f}")
-            print(f"  [TEST3_SAMPLER_RANKS] frac_beyond_patchsize: mean={np.mean(frac_beyond)*100:.1f}% p50={np.median(frac_beyond)*100:.1f}%")
-            print(f"  [TEST3_SAMPLER_RANKS] tau_eff: mean={np.mean(tau_effs):.4f} p50={np.median(tau_effs):.4f}")
+            # Build GT kNN for eval cells
+            gt_subset = gt_coords_t[eval_indices]
+            D_gt = torch.cdist(gt_subset, gt_subset)
+            D_gt.fill_diagonal_(float('inf'))
+            
+            # For each k in k_list, compute GT neighbors
+            max_k = max(debug_k_list)
+            _, gt_knn_idx = D_gt.topk(max_k, largest=False, dim=1)  # (n_eval, max_k)
+            
+            # Map eval_indices to their positions
+            eval_idx_to_pos = {gid: pos for pos, gid in enumerate(eval_indices)}
+            
+            # Build co-occurrence set U(i) for each eval cell
+            # U(i) = union of all cells appearing in any patch with i
+            cover_scores = {k_val: [] for k_val in debug_k_list}
+            union_sizes = []
+            
+            for pos_i, gid_i in enumerate(eval_indices):
+                # Get all patches containing cell gid_i
+                patches_containing_i = memberships[gid_i]
+                
+                # Build U(i)
+                U_i = set()
+                for p_idx in patches_containing_i:
+                    U_i.update(patch_indices[p_idx].tolist())
+                U_i.discard(gid_i)  # Remove self
+                
+                union_sizes.append(len(U_i))
+                
+                # For each k, compute cover score
+                for k_val in debug_k_list:
+                    # GT neighbors of i (in eval-local indices)
+                    gt_neighbors_local = gt_knn_idx[pos_i, :k_val].tolist()
+                    # Map back to global indices
+                    gt_neighbors_global = [eval_indices[loc] for loc in gt_neighbors_local]
+                    
+                    # How many GT neighbors are in U(i)?
+                    n_covered = len(set(gt_neighbors_global) & U_i)
+                    cover_scores[k_val].append(n_covered / k_val)
+            
+            # Print results with proper tags
+            print(f"[TEST1-COVER] n_cells_evaluated={n_eval}")
+            
+            union_sizes_t = torch.tensor(union_sizes, dtype=torch.float32)
+            print(f"[TEST1-COVER] union_size |U(i)|: min={union_sizes_t.min().item():.0f} "
+                  f"p50={union_sizes_t.median().item():.0f} "
+                  f"max={union_sizes_t.max().item():.0f}")
+            
+            cover_counts_t = torch.tensor([len(memberships[i]) for i in eval_indices], dtype=torch.float32)
+            print(f"[TEST1-COVER] coverage_count: min={cover_counts_t.min().item():.0f} "
+                  f"p50={cover_counts_t.median().item():.0f} "
+                  f"max={cover_counts_t.max().item():.0f}")
+            
+            for k_val in debug_k_list:
+                scores = torch.tensor(cover_scores[k_val])
+                p10 = scores.quantile(0.1).item()
+                p50 = scores.median().item()
+                p90 = scores.quantile(0.9).item()
+                mean_score = scores.mean().item()
+                
+                print(f"[TEST1-COVER] k={k_val}: mean={mean_score:.3f}, p10={p10:.3f}, p50={p50:.3f}, p90={p90:.3f}")
             
             # Interpretation
-            if np.mean(frac_beyond) < 0.02:
-                print(f"  [TEST3_SAMPLER_RANKS] ⚠️ WARNING: <2% sampled beyond patch_size - sampler is effectively hard-kNN!")
-                print(f"  [TEST3_SAMPLER_RANKS] → Consider increasing stochastic_tau or pool_mult")
-            elif np.mean(frac_beyond) > 0.3:
-                print(f"  [TEST3_SAMPLER_RANKS] ⚠️ WARNING: >30% sampled beyond patch_size - patches may be too spread")
-                print(f"  [TEST3_SAMPLER_RANKS] → Consider decreasing stochastic_tau")
-            else:
-                print(f"  [TEST3_SAMPLER_RANKS] ✓ Sampler is exploring beyond hard-kNN ({np.mean(frac_beyond)*100:.1f}% beyond patch_size)")
+            k_main = debug_k_list[0]  # Usually 10
+            main_cover = torch.tensor(cover_scores[k_main]).median().item()
             
-            print("="*70 + "\n")
+            if main_cover < 0.5:
+                print(f"\n[TEST1-COVER] ⚠️ WARNING: Median cover@{k_main} = {main_cover:.2f} < 0.5")
+                print(f"    → HARD STRUCTURAL CEILING: Many GT neighbors never co-sampled!")
+                print(f"    → Global kNN overlap CANNOT exceed ~{main_cover:.2f} no matter how good stitching is")
+                print(f"    → ACTION: Increase patch_size, coverage_per_cell, or change patch construction")
+            elif main_cover < 0.8:
+                print(f"\n[TEST1-COVER] ⚠️ MODERATE: Median cover@{k_main} = {main_cover:.2f}")
+                print(f"    → Some ceiling from patch design, but room for improvement via stitching")
+            else:
+                print(f"\n[TEST1-COVER] ✓ GOOD: Median cover@{k_main} = {main_cover:.2f} >= 0.8")
+                print(f"    → Patch design allows most GT neighbors to be co-sampled")
+                print(f"    → If final kNN is still low, problem is model/inference, not patch design")
+        
+        print("="*70 + "\n")
 
 
         # Ensure connectivity via bridging (if enabled)
@@ -11449,6 +11531,127 @@ def sample_sc_edm_patchwise(
         print("="*70 + "\n")
 
 
+    # ===================================================================
+    # [TEST3-STABILITY] NEIGHBORHOOD STABILITY ACROSS PATCHES (Context Dependence)
+    # ===================================================================
+    # Goal: Test if generator's local neighbor ordering changes when different
+    # cells are present (context dependence). Low stability means the generator
+    # produces different neighborhoods for the same cell depending on context.
+    # ===================================================================
+    if debug_knn and gt_coords is not None and K > 1:
+        print("\n" + "="*70)
+        print("[TEST3-STABILITY] NEIGHBORHOOD STABILITY ACROSS PATCHES")
+        print("="*70)
+        
+        with torch.no_grad():
+            k_base = 10  # k for neighbor comparison
+            pairs_tested = 0
+            cells_tested = set()
+            jaccard_list = []
+            overlap_list = []
+            
+            # Find cells appearing in >=2 patches
+            multi_patch_cells = [i for i in range(n_sc) if len(memberships[i]) >= 2]
+            
+            # Sample up to 500 cells for efficiency
+            sample_cells = multi_patch_cells[:min(500, len(multi_patch_cells))]
+            
+            for cell_i in sample_cells:
+                patches_with_i = memberships[cell_i]
+                if len(patches_with_i) < 2:
+                    continue
+                
+                # Test up to 3 random pairs of patches for this cell
+                import itertools
+                patch_pairs = list(itertools.combinations(patches_with_i, 2))[:3]
+                
+                for p_idx, q_idx in patch_pairs:
+                    # Get cell sets for each patch
+                    S_p = set(patch_indices[p_idx].tolist())
+                    S_q = set(patch_indices[q_idx].tolist())
+                    
+                    # Intersection (cells in both patches, excluding cell_i)
+                    S_intersect = (S_p & S_q) - {cell_i}
+                    
+                    if len(S_intersect) < k_base + 5:
+                        continue  # Not enough shared cells
+                    
+                    S_intersect_list = list(S_intersect)
+                    
+                    # Build position lookup for each patch
+                    pos_p = {int(cid): idx for idx, cid in enumerate(patch_indices[p_idx].tolist())}
+                    pos_q = {int(cid): idx for idx, cid in enumerate(patch_indices[q_idx].tolist())}
+                    
+                    # Position of cell_i in each patch
+                    local_i_p = pos_p[cell_i]
+                    local_i_q = pos_q[cell_i]
+                    
+                    # Get coords for cell_i and intersection cells in patch p
+                    V_p = patch_coords[p_idx]  # (m_p, D_latent)
+                    coord_i_p = V_p[local_i_p]  # (D_latent,)
+                    
+                    # Coords for intersection cells in patch p
+                    local_intersect_p = [pos_p[c] for c in S_intersect_list]
+                    coords_intersect_p = V_p[local_intersect_p]  # (n_intersect, D_latent)
+                    
+                    # Distances from cell_i to intersection cells in patch p
+                    dists_p = torch.norm(coords_intersect_p - coord_i_p.unsqueeze(0), dim=1)
+                    _, topk_p = dists_p.topk(k_base, largest=False)
+                    neighbors_p = set([S_intersect_list[idx] for idx in topk_p.tolist()])
+                    
+                    # Same for patch q
+                    V_q = patch_coords[q_idx]
+                    coord_i_q = V_q[local_i_q]
+                    local_intersect_q = [pos_q[c] for c in S_intersect_list]
+                    coords_intersect_q = V_q[local_intersect_q]
+                    dists_q = torch.norm(coords_intersect_q - coord_i_q.unsqueeze(0), dim=1)
+                    _, topk_q = dists_q.topk(k_base, largest=False)
+                    neighbors_q = set([S_intersect_list[idx] for idx in topk_q.tolist()])
+                    
+                    # Compute Jaccard and overlap
+                    intersection = neighbors_p & neighbors_q
+                    union = neighbors_p | neighbors_q
+                    jaccard = len(intersection) / len(union) if len(union) > 0 else 0
+                    overlap_frac = len(intersection) / k_base
+                    
+                    jaccard_list.append(jaccard)
+                    overlap_list.append(overlap_frac)
+                    pairs_tested += 1
+                    cells_tested.add(cell_i)
+            
+            if jaccard_list:
+                jaccard_t = torch.tensor(jaccard_list)
+                overlap_t = torch.tensor(overlap_list)
+                
+                print(f"[TEST3-STABILITY] pairs_tested={pairs_tested} cells_tested={len(cells_tested)}")
+                print(f"[TEST3-STABILITY] Jaccard@{k_base}: "
+                      f"p10={jaccard_t.quantile(0.1).item():.3f} "
+                      f"p50={jaccard_t.median().item():.3f} "
+                      f"p90={jaccard_t.quantile(0.9).item():.3f}")
+                print(f"[TEST3-STABILITY] overlap@{k_base}: "
+                      f"p10={overlap_t.quantile(0.1).item():.3f} "
+                      f"p50={overlap_t.median().item():.3f} "
+                      f"p90={overlap_t.quantile(0.9).item():.3f}")
+                
+                # Interpretation
+                median_jaccard = jaccard_t.median().item()
+                if median_jaccard < 0.4:
+                    print(f"\n[TEST3-STABILITY] ⚠️ LOW STABILITY: p50 Jaccard@{k_base} = {median_jaccard:.2f} < 0.4")
+                    print(f"    → Generator's local ordering is CONTEXT-DEPENDENT")
+                    print(f"    → Same cell gets different neighbors depending on which cells are present")
+                    print(f"    → Stitching CANNOT fix this - it's a diffusion model limitation")
+                elif median_jaccard < 0.6:
+                    print(f"\n[TEST3-STABILITY] MODERATE: p50 Jaccard@{k_base} = {median_jaccard:.2f}")
+                    print(f"    → Some context dependence, but may still stitch reasonably")
+                else:
+                    print(f"\n[TEST3-STABILITY] ✓ GOOD: p50 Jaccard@{k_base} = {median_jaccard:.2f} >= 0.6")
+                    print(f"    → Generator is fairly consistent across contexts")
+                    print(f"    → If final kNN is low, problem is likely in stitching")
+            else:
+                print(f"[TEST3-STABILITY] ⚠️ Could not test any pairs (not enough overlap)")
+        
+        print("="*70 + "\n")
+
     # ------------------------------------------------------------------
     # DEBUG: Save patch coords (AFTER all patches sampled, BEFORE alignment)
     # ------------------------------------------------------------------
@@ -11755,6 +11958,27 @@ def sample_sc_edm_patchwise(
             f"→ rescaled to {rms_final:.3f} (target={rms_target:.3f}, scale={scale_factor:.3f})")
 
     # ===================================================================
+    # [GLOBAL-KNN-STAGE] Stage 1: After initial weighted mean (before PGSO)
+    # ===================================================================
+    if debug_knn and gt_coords is not None and global_knn_stage_subset is not None:
+        with torch.no_grad():
+            X_init_subset = X_global[global_knn_stage_subset, :2].float()  # Use 2D
+            
+            init_knn_scores = {}
+            for k_val in debug_k_list:
+                if len(global_knn_stage_subset) > k_val + 1:
+                    knn_pred, _ = _knn_indices_dists(X_init_subset, k_val)
+                    knn_gt, _ = _knn_indices_dists(global_knn_stage_gt, k_val)
+                    overlap = _knn_overlap_score(knn_pred, knn_gt)
+                    init_knn_scores[k_val] = overlap.mean().item()
+            
+            global_knn_stage_results['init'] = init_knn_scores
+            
+            if DEBUG_FLAG:
+                knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in init_knn_scores.items()])
+                print(f"[GLOBAL-KNN-STAGE] init (pre-PGSO): {knn_str}")
+
+    # ===================================================================
     # [TEST1] POST-ALIGN PRE-MERGE KNN DIAGNOSTIC HELPER
     # ===================================================================
     def compute_postalign_premerge_knn(
@@ -11919,6 +12143,113 @@ def sample_sc_edm_patchwise(
             print(f"    ⚠️ HIGH ANISOTROPY: Patches are near-1D in 2D space → rotation is ill-conditioned")
 
 
+    # ===================================================================
+    # [PATCH-KNN-VS-GT-2D] Patch kNN vs GT in PCA-projected 2D space
+    # ===================================================================
+    # Goal: Check if neighborhood info is lost at the 32D→2D projection step.
+    # If kNN is already ~0.36/0.50 in 2D (same as final), then PGSO cannot
+    # improve it - the problem is the 2D readout, not stitching.
+    # ===================================================================
+    if debug_knn and gt_coords is not None:
+        print("\n" + "="*70)
+        print("[PATCH-KNN-VS-GT-2D] PATCH kNN IN PCA-PROJECTED 2D SPACE")
+        print("="*70)
+        
+        with torch.no_grad():
+            gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+            
+            patch_knn_2d_overlap = {k_val: [] for k_val in debug_k_list}
+            
+            # Also compute 32D kNN for comparison (same patches)
+            patch_knn_32d_overlap = {k_val: [] for k_val in debug_k_list}
+            
+            n_patches_to_test = min(K, debug_max_patches)
+            
+            for k in range(n_patches_to_test):
+                S_k = patch_indices[k]
+                m_k = S_k.numel()
+                
+                if m_k < max(debug_k_list) + 5:
+                    continue
+                
+                # Get GT coords for this patch
+                gt_patch = gt_coords_t[S_k]  # (m_k, 2)
+                
+                # Get 2D coords (PCA-projected)
+                pred_patch_2d = patch_coords_2d[k].float().to(device)  # (m_k, 2)
+                
+                # Get 32D coords (original)
+                pred_patch_32d = patch_coords[k].float().to(device)  # (m_k, D_latent)
+                
+                for k_val in debug_k_list:
+                    if m_k > k_val + 1:
+                        # kNN in 2D projected space
+                        knn_pred_2d, _ = _knn_indices_dists(pred_patch_2d, k_val)
+                        knn_gt, _ = _knn_indices_dists(gt_patch, k_val)
+                        overlap_2d = _knn_overlap_score(knn_pred_2d, knn_gt)
+                        patch_knn_2d_overlap[k_val].append(overlap_2d.mean().item())
+                        
+                        # kNN in 32D space (for comparison)
+                        knn_pred_32d, _ = _knn_indices_dists(pred_patch_32d, k_val)
+                        overlap_32d = _knn_overlap_score(knn_pred_32d, knn_gt)
+                        patch_knn_32d_overlap[k_val].append(overlap_32d.mean().item())
+            
+            # Print results
+            print(f"[PATCH-KNN-VS-GT-2D] n_patches_tested={n_patches_to_test}")
+            print()
+            print("Comparing kNN overlap in 32D (original) vs 2D (PCA-projected):")
+            print()
+            
+            for k_val in debug_k_list:
+                if patch_knn_2d_overlap[k_val] and patch_knn_32d_overlap[k_val]:
+                    ov_2d = torch.tensor(patch_knn_2d_overlap[k_val])
+                    ov_32d = torch.tensor(patch_knn_32d_overlap[k_val])
+                    
+                    print(f"[PATCH-KNN-VS-GT-2D] k={k_val}: "
+                          f"mean={ov_2d.mean().item():.3f} "
+                          f"p10={ov_2d.quantile(0.1).item():.3f} "
+                          f"p50={ov_2d.median().item():.3f} "
+                          f"p90={ov_2d.quantile(0.9).item():.3f}")
+                    
+                    print(f"[PATCH-KNN-VS-GT-32D] k={k_val}: "
+                          f"mean={ov_32d.mean().item():.3f} "
+                          f"p10={ov_32d.quantile(0.1).item():.3f} "
+                          f"p50={ov_32d.median().item():.3f} "
+                          f"p90={ov_32d.quantile(0.9).item():.3f}")
+                    
+                    # Delta
+                    delta = ov_32d.mean().item() - ov_2d.mean().item()
+                    print(f"[PATCH-KNN-VS-GT] k={k_val} delta(32D-2D)={delta:+.3f}")
+                    print()
+            
+            # Interpretation
+            k_main = debug_k_list[0]
+            if patch_knn_2d_overlap[k_main]:
+                mean_2d = torch.tensor(patch_knn_2d_overlap[k_main]).mean().item()
+                mean_32d = torch.tensor(patch_knn_32d_overlap[k_main]).mean().item()
+                
+                delta_main = mean_32d - mean_2d
+                
+                if delta_main > 0.08:
+                    print(f"[PATCH-KNN-VS-GT-2D] ⚠️ SIGNIFICANT DROP: 32D→2D loses {delta_main:.2f} kNN overlap")
+                    print(f"    → PCA projection is discarding neighborhood-relevant dimensions")
+                    print(f"    → PGSO cannot recover this; need better 2D readout (e.g., ST-trained linear)")
+                elif delta_main > 0.03:
+                    print(f"[PATCH-KNN-VS-GT-2D] MODERATE DROP: 32D→2D loses {delta_main:.2f} kNN overlap")
+                    print(f"    → Some info lost in projection, but may not be dominant issue")
+                else:
+                    print(f"[PATCH-KNN-VS-GT-2D] ✓ MINIMAL DROP: 32D and 2D give similar kNN ({delta_main:+.2f})")
+                    print(f"    → Projection is not the bottleneck")
+                
+                # Check if 2D is already at final level
+                # (We'll compare with global final kNN in Test B)
+                print()
+                print(f"[PATCH-KNN-VS-GT-2D] 2D patch kNN@{k_main} = {mean_2d:.3f}")
+                print(f"    → Compare this to [GLOBAL-KNN-STAGE] and final kNN to see if PGSO helps or hurts")
+        
+        print("="*70 + "\n")
+
+
     # Build overlap graph edges
     print(f"[PGSO-A] Computing pairwise Procrustes on overlapping patches...")
     edges = []  # List of (a, b, R_ab, s_ab, t_ab, weight, n_overlap)
@@ -11963,6 +12294,153 @@ def sample_sc_edm_patchwise(
                 'weight': weight, 'n_overlap': len(shared),
                 'residual': residual.item()
             })
+
+    # ===================================================================
+    # [EDGE-MODEL] DIAGNOSTIC 6: Similarity vs Affine fit comparison
+    # ===================================================================
+    # Goal: Check if similarity transform is too restrictive for overlaps.
+    # If affine dramatically reduces residuals, per-patch relationship has
+    # shear/anisotropic scaling that Sim(2) cannot capture.
+    # ===================================================================
+    if DEBUG_FLAG and len(edges) > 0:
+        print("\n" + "="*70)
+        print("[EDGE-MODEL] DIAGNOSTIC 6: SIMILARITY vs AFFINE FIT")
+        print("="*70)
+        
+        def weighted_affine_2d(X_src, X_tgt, weights=None):
+            """
+            Compute affine transform (A, t) mapping X_src -> X_tgt.
+            Convention: X_tgt ≈ X_src @ A.T + t  (row-vector convention)
+            A is 2x2 (can have shear/anisotropic scaling), t is 2D translation.
+            
+            Returns: A (2,2), t (2,), residual (scalar)
+            """
+            n = X_src.shape[0]
+            if weights is None:
+                weights = torch.ones(n, 1, device=X_src.device)
+            else:
+                weights = weights.view(-1, 1)
+            
+            w_sum = weights.sum()
+            mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
+            mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
+            
+            Xc = X_src - mu_src
+            Yc = X_tgt - mu_tgt
+            
+            w_sqrt = weights.sqrt()
+            Xc_w = Xc * w_sqrt
+            Yc_w = Yc * w_sqrt
+            
+            # Solve for A: Yc ≈ Xc @ A.T  =>  Yc.T ≈ A @ Xc.T
+            # Using least squares: A = (Yc.T @ Xc) @ inv(Xc.T @ Xc)
+            XtX = Xc_w.T @ Xc_w  # (2, 2)
+            YtX = Yc_w.T @ Xc_w  # (2, 2)
+            
+            # Regularize to avoid singular matrix
+            XtX_reg = XtX + 1e-6 * torch.eye(2, device=X_src.device)
+            A = YtX @ torch.linalg.inv(XtX_reg)  # (2, 2)
+            
+            # Translation: t = mu_tgt - mu_src @ A.T
+            t = (mu_tgt - mu_src @ A.T).squeeze(0)
+            
+            # Residual
+            X_hat = X_src @ A.T + t
+            residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
+            
+            return A, t, residual
+        
+        residual_sim_list = []
+        residual_aff_list = []
+        delta_list = []
+        shear_list = []  # Measure how "non-similarity" the affine is
+        
+        # Sample edges for analysis
+        edges_to_test = edges[:min(100, len(edges))]
+        
+        for e in edges_to_test:
+            a, b = e['a'], e['b']
+            shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
+            
+            if len(shared_list) < 20:
+                continue
+            
+            # Get positions in each patch
+            pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
+            pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
+            
+            idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
+            idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
+            
+            V_shared_a = patch_coords_2d[a][idx_a]  # (n_shared, 2)
+            V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
+            
+            # Similarity fit (already have this from edge computation)
+            residual_sim = e['residual']
+            residual_sim_list.append(residual_sim)
+            
+            # Affine fit
+            A_aff, t_aff, residual_aff = weighted_affine_2d(V_shared_a, V_shared_b)
+            residual_aff_list.append(residual_aff.item())
+            
+            # Delta
+            delta = residual_sim - residual_aff.item()
+            delta_list.append(delta)
+            
+            # Measure "shear" in affine transform
+            # For similarity: A = s * R, so A.T @ A = s^2 * I
+            # Shear = deviation from this pattern
+            AtA = A_aff.T @ A_aff
+            # Eigenvalues of AtA: for pure similarity they should be equal
+            eigs_AtA = torch.linalg.eigvalsh(AtA)
+            shear_ratio = (eigs_AtA.max() / eigs_AtA.min().clamp(min=1e-8)).item()
+            shear_list.append(shear_ratio)
+        
+        if residual_sim_list:
+            res_sim = torch.tensor(residual_sim_list)
+            res_aff = torch.tensor(residual_aff_list)
+            delta_t = torch.tensor(delta_list)
+            shear_t = torch.tensor(shear_list)
+            
+            print(f"[EDGE-MODEL] n_edges_tested={len(residual_sim_list)}")
+            print(f"[EDGE-MODEL] residual_sim: "
+                  f"p10={res_sim.quantile(0.1).item():.4f} "
+                  f"p50={res_sim.median().item():.4f} "
+                  f"p90={res_sim.quantile(0.9).item():.4f}")
+            print(f"[EDGE-MODEL] residual_aff: "
+                  f"p10={res_aff.quantile(0.1).item():.4f} "
+                  f"p50={res_aff.median().item():.4f} "
+                  f"p90={res_aff.quantile(0.9).item():.4f}")
+            print(f"[EDGE-MODEL] delta(sim-aff): "
+                  f"p10={delta_t.quantile(0.1).item():.4f} "
+                  f"p50={delta_t.median().item():.4f} "
+                  f"p90={delta_t.quantile(0.9).item():.4f}")
+            print(f"[EDGE-MODEL] affine_shear_ratio (1.0=pure similarity): "
+                  f"p10={shear_t.quantile(0.1).item():.2f} "
+                  f"p50={shear_t.median().item():.2f} "
+                  f"p90={shear_t.quantile(0.9).item():.2f}")
+            
+            # Interpretation
+            median_delta = delta_t.median().item()
+            median_sim = res_sim.median().item()
+            improvement_pct = (median_delta / median_sim * 100) if median_sim > 0 else 0
+            
+            if improvement_pct > 30:
+                print(f"\n[EDGE-MODEL] ⚠️ AFFINE HELPS SIGNIFICANTLY: {improvement_pct:.0f}% residual reduction")
+                print(f"    → Per-patch relationship has shear/anisotropic scaling")
+                print(f"    → Sim(2) PGSO cannot capture this; consider affine transforms")
+            elif improvement_pct > 15:
+                print(f"\n[EDGE-MODEL] MODERATE: Affine reduces residual by {improvement_pct:.0f}%")
+                print(f"    → Some non-similarity distortion, but Sim(2) may still work")
+            else:
+                print(f"\n[EDGE-MODEL] ✓ SIMILARITY IS ADEQUATE: Affine only reduces residual by {improvement_pct:.0f}%")
+                print(f"    → Issue is not transform model; problem is elsewhere")
+            
+            if shear_t.median() > 1.5:
+                print(f"    → Affine transforms have significant shear (ratio p50={shear_t.median().item():.2f})")
+        
+        print("="*70 + "\n")
+
 
     n_edges_raw = len(edges)
     
@@ -12528,6 +13006,289 @@ def sample_sc_edm_patchwise(
         print(f"[PGSO-D] Coverage: min={coverage_counts.min():.0f} p50={coverage_counts.median():.0f} max={coverage_counts.max():.0f}")
 
     # ===================================================================
+    # [GLOBAL-KNN-STAGE] Stage 2: After PGSO merge (before refinement)
+    # ===================================================================
+    if debug_knn and gt_coords is not None and global_knn_stage_subset is not None:
+        with torch.no_grad():
+            X_pgso_subset = X_global[global_knn_stage_subset, :2].float()  # Use 2D
+            
+            pgso_knn_scores = {}
+            for k_val in debug_k_list:
+                if len(global_knn_stage_subset) > k_val + 1:
+                    knn_pred, _ = _knn_indices_dists(X_pgso_subset, k_val)
+                    knn_gt, _ = _knn_indices_dists(global_knn_stage_gt, k_val)
+                    overlap = _knn_overlap_score(knn_pred, knn_gt)
+                    pgso_knn_scores[k_val] = overlap.mean().item()
+            
+            global_knn_stage_results['pgso'] = pgso_knn_scores
+            
+            if DEBUG_FLAG:
+                knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in pgso_knn_scores.items()])
+                print(f"[GLOBAL-KNN-STAGE] pgso (post-merge, pre-refine): {knn_str}")
+
+
+    # ===================================================================
+    # [MERGE-AB] DIAGNOSTIC 5: Merge strategy A/B comparison
+    # ===================================================================
+    # Goal: Test if merge-induced compression is the issue.
+    # Compare: weighted mean (baseline), pick-best, median
+    # If pick-best/median improves kNN and r_ratio, problem is averaging.
+    # ===================================================================
+    if debug_knn and gt_coords is not None:
+        print("\n" + "="*70)
+        print("[MERGE-AB] DIAGNOSTIC 5: MERGE STRATEGY COMPARISON")
+        print("="*70)
+        
+        with torch.no_grad():
+            gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+            
+            # ---------------------------------------------------------------
+            # Merge variant 1: WEIGHTED MEAN (baseline - already computed as X_global)
+            # ---------------------------------------------------------------
+            X_mean = X_global[:, :2].clone()  # Use 2D coords
+            
+            # ---------------------------------------------------------------
+            # Merge variant 2: PICK-BEST (take coord from patch with max centrality)
+            # ---------------------------------------------------------------
+            X_pickbest = torch.zeros(n_sc, 2, dtype=torch.float32, device=device)
+            best_weight = torch.zeros(n_sc, dtype=torch.float32, device=device)
+            
+            for k in range(K):
+                S_k = patch_indices[k].to(device)
+                X_hat_k = patch_coords_transformed[k].to(device)
+                V_k_2d = patch_coords_2d[k].to(device)
+                
+                # Centrality weights
+                center_k = V_k_2d.mean(dim=0, keepdim=True)
+                dists = torch.norm(V_k_2d - center_k, dim=1)
+                max_d = dists.max().clamp_min(1e-6)
+                weights_k = 1.0 - (dists / (max_d * 1.2))
+                weights_k = weights_k.clamp(min=0.01)
+                
+                # For each cell, keep coord if this patch has higher weight
+                for local_idx, global_idx in enumerate(S_k.tolist()):
+                    w = weights_k[local_idx].item()
+                    if w > best_weight[global_idx].item():
+                        best_weight[global_idx] = w
+                        X_pickbest[global_idx] = X_hat_k[local_idx]
+            
+            # Recenter and rescale pickbest
+            X_pickbest = X_pickbest - X_pickbest.mean(dim=0, keepdim=True)
+            rms_pb = X_pickbest.pow(2).mean().sqrt()
+            X_pickbest = X_pickbest * (rms_target / (rms_pb + 1e-8))
+            
+            # ---------------------------------------------------------------
+            # Merge variant 3: COORDINATE-WISE MEDIAN
+            # ---------------------------------------------------------------
+            X_median = torch.zeros(n_sc, 2, dtype=torch.float32, device=device)
+            
+            for cell_i in range(n_sc):
+                patches_with_i = memberships[cell_i]
+                if len(patches_with_i) == 0:
+                    continue
+                
+                coords_i = []
+                for p_idx in patches_with_i:
+                    patch_cell_list = patch_indices[p_idx].tolist()
+                    if cell_i in patch_cell_list:
+                        local_pos = patch_cell_list.index(cell_i)
+                        coord_from_patch = patch_coords_transformed[p_idx][local_pos]
+                        coords_i.append(coord_from_patch)
+                
+                if coords_i:
+                    coords_i_stack = torch.stack(coords_i).to(device)  # (n_patches, 2)
+                    # Coordinate-wise median
+                    X_median[cell_i] = coords_i_stack.median(dim=0).values
+            
+            # Recenter and rescale median
+            X_median = X_median - X_median.mean(dim=0, keepdim=True)
+            rms_med = X_median.pow(2).mean().sqrt()
+            X_median = X_median * (rms_target / (rms_med + 1e-8))
+            
+            # ---------------------------------------------------------------
+            # Compute metrics for each merge variant
+            # ---------------------------------------------------------------
+            merge_variants = {
+                'mean': X_mean,
+                'pickbest': X_pickbest,
+                'median': X_median,
+            }
+            
+            # Use subset for efficiency
+            M_merge = min(n_sc, debug_global_subset)
+            subset_idx = torch.randperm(n_sc)[:M_merge]
+            gt_subset = gt_coords_t[subset_idx]
+            
+            for name, X_var in merge_variants.items():
+                X_subset = X_var[subset_idx].float()
+                
+                # kNN overlap
+                knn_scores = {}
+                for k_val in debug_k_list:
+                    if M_merge > k_val + 1:
+                        knn_pred, _ = _knn_indices_dists(X_subset, k_val)
+                        knn_gt, _ = _knn_indices_dists(gt_subset, k_val)
+                        overlap = _knn_overlap_score(knn_pred, knn_gt)
+                        knn_scores[k_val] = overlap.mean().item()
+                
+                # Local density ratio (r_pr/r_gt at k=10)
+                k_density = 10
+                D_gt = torch.cdist(gt_subset, gt_subset)
+                D_gt.fill_diagonal_(float('inf'))
+                d_gt_sorted, _ = D_gt.topk(k_density, largest=False, dim=1)
+                r_gt_k = d_gt_sorted[:, -1]
+                
+                D_pr = torch.cdist(X_subset, X_subset)
+                D_pr.fill_diagonal_(float('inf'))
+                d_pr_sorted, _ = D_pr.topk(k_density, largest=False, dim=1)
+                r_pr_k = d_pr_sorted[:, -1]
+                
+                ratio = r_pr_k / r_gt_k.clamp(min=1e-8)
+                r_ratio_p50 = ratio.median().item()
+                
+                knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in knn_scores.items()])
+                print(f"[MERGE-AB] {name}_merge: {knn_str} r_ratio_p50={r_ratio_p50:.3f}")
+            
+            # Interpretation
+            print()
+            mean_knn10 = knn_scores.get(debug_k_list[0], 0) if 'mean' in merge_variants else 0
+            
+            # Re-extract metrics for comparison (need to recompute for mean)
+            X_mean_sub = merge_variants['mean'][subset_idx].float()
+            D_pr_mean = torch.cdist(X_mean_sub, X_mean_sub)
+            D_pr_mean.fill_diagonal_(float('inf'))
+            d_pr_sorted_mean, _ = D_pr_mean.topk(k_density, largest=False, dim=1)
+            r_pr_k_mean = d_pr_sorted_mean[:, -1]
+            ratio_mean = r_pr_k_mean / r_gt_k.clamp(min=1e-8)
+            r_ratio_mean = ratio_mean.median().item()
+            
+            X_pb_sub = merge_variants['pickbest'][subset_idx].float()
+            D_pr_pb = torch.cdist(X_pb_sub, X_pb_sub)
+            D_pr_pb.fill_diagonal_(float('inf'))
+            d_pr_sorted_pb, _ = D_pr_pb.topk(k_density, largest=False, dim=1)
+            r_pr_k_pb = d_pr_sorted_pb[:, -1]
+            ratio_pb = r_pr_k_pb / r_gt_k.clamp(min=1e-8)
+            r_ratio_pb = ratio_pb.median().item()
+            
+            # Compute kNN for mean and pickbest
+            knn_mean_10 = 0
+            knn_pb_10 = 0
+            k_main = debug_k_list[0]
+            if M_merge > k_main + 1:
+                knn_pred_mean, _ = _knn_indices_dists(X_mean_sub, k_main)
+                knn_pred_pb, _ = _knn_indices_dists(X_pb_sub, k_main)
+                knn_gt_sub, _ = _knn_indices_dists(gt_subset, k_main)
+                knn_mean_10 = _knn_overlap_score(knn_pred_mean, knn_gt_sub).mean().item()
+                knn_pb_10 = _knn_overlap_score(knn_pred_pb, knn_gt_sub).mean().item()
+            
+            delta_knn = knn_pb_10 - knn_mean_10
+            delta_r = r_ratio_pb - r_ratio_mean
+            
+            if delta_r > 0.1 and delta_knn > 0.02:
+                print(f"[MERGE-AB] ⚠️ PICK-BEST HELPS: r_ratio +{delta_r:.2f}, kNN@{k_main} +{delta_knn:.3f}")
+                print(f"    → Averaging inconsistent estimates is compressing local structure")
+                print(f"    → Consider: pick-best merge, or post-merge decompression correction")
+            elif delta_r > 0.05:
+                print(f"[MERGE-AB] MODERATE: Pick-best improves r_ratio by {delta_r:.2f}")
+                print(f"    → Some compression from averaging, but may not be main issue")
+            else:
+                print(f"[MERGE-AB] ✓ MERGE STRATEGY HAS MINIMAL EFFECT")
+                print(f"    → Compression is already baked into per-patch geometry")
+                print(f"    → Problem is upstream: diffusion output, not merge")
+        
+        print("="*70 + "\n")
+
+
+    # ===================================================================
+    # [TEST2-SCATTER] STITCH NOISE PER CELL (Post-transform, Pre-merge)
+    # ===================================================================
+    # Goal: For cells appearing in multiple patches, measure how much their
+    # predicted coordinates disagree AFTER transforms but BEFORE merge.
+    # Large scatter = stitching disagreement is the culprit.
+    # ===================================================================
+    if debug_knn and gt_coords is not None:
+        print("\n" + "="*70)
+        print("[TEST2-SCATTER] STITCH NOISE PER CELL (Post-transform, Pre-merge)")
+        print("="*70)
+        
+        with torch.no_grad():
+            # Find cells with coverage >= 3
+            high_cov_cells = [i for i in range(n_sc) if len(memberships[i]) >= 3]
+            
+            if len(high_cov_cells) >= 50:
+                scatter_list = []
+                cov_list = []
+                
+                # Sample for efficiency
+                sample_cells = high_cov_cells[:min(1000, len(high_cov_cells))]
+                
+                for cell_i in sample_cells:
+                    patches_with_i = memberships[cell_i]
+                    n_patches_i = len(patches_with_i)
+                    
+                    # Collect coords for cell_i from each patch (post-transform)
+                    coords_i = []
+                    for p_idx in patches_with_i:
+                        # Find position of cell_i in patch p_idx
+                        patch_cell_list = patch_indices[p_idx].tolist()
+                        if cell_i in patch_cell_list:
+                            local_pos = patch_cell_list.index(cell_i)
+                            coord_from_patch = patch_coords_transformed[p_idx][local_pos]
+                            coords_i.append(coord_from_patch)
+                    
+                    if len(coords_i) >= 3:
+                        coords_i_stack = torch.stack(coords_i)  # (n_patches_i, 2)
+                        mean_coord = coords_i_stack.mean(dim=0)
+                        distances_to_mean = torch.norm(coords_i_stack - mean_coord.unsqueeze(0), dim=1)
+                        scatter_i = distances_to_mean.median().item()
+                        
+                        scatter_list.append(scatter_i)
+                        cov_list.append(n_patches_i)
+                
+                if scatter_list:
+                    scatter_t = torch.tensor(scatter_list)
+                    cov_t = torch.tensor(cov_list, dtype=torch.float32)
+                    
+                    print(f"[TEST2-SCATTER] n_cells_used={len(scatter_list)}")
+                    print(f"[TEST2-SCATTER] scatter: "
+                          f"p10={scatter_t.quantile(0.1).item():.4f} "
+                          f"p50={scatter_t.median().item():.4f} "
+                          f"p90={scatter_t.quantile(0.9).item():.4f}")
+                    
+                    # Scatter by coverage bucket
+                    for cov_thresh in [3, 5]:
+                        mask = cov_t >= cov_thresh
+                        if mask.sum() >= 10:
+                            scatter_cov = scatter_t[mask]
+                            print(f"[TEST2-SCATTER] scatter_by_coverage: cov>={cov_thresh} "
+                                  f"n={mask.sum().item()} p50={scatter_cov.median().item():.4f}")
+                    
+                    # Scatter as fraction of RMS
+                    scatter_norm = scatter_t.median().item() / rms_target
+                    print(f"[TEST2-SCATTER] scatter / RMS = {scatter_norm:.3f}")
+                    
+                    # Interpretation
+                    if scatter_norm < 0.05:
+                        print(f"\n[TEST2-SCATTER] ✓ SMALL: Scatter < 5% of RMS")
+                        print(f"    → Stitching disagreement is NOT the main issue")
+                        print(f"    → If kNN is still bad, problem is model's global neighbor ordering")
+                    elif scatter_norm < 0.15:
+                        print(f"\n[TEST2-SCATTER] MODERATE: Scatter = {scatter_norm*100:.0f}% of RMS")
+                        print(f"    → Some stitching noise, may be contributing to kNN error")
+                    else:
+                        print(f"\n[TEST2-SCATTER] ⚠️ LARGE: Scatter = {scatter_norm*100:.0f}% of RMS")
+                        print(f"    → Stitching disagreement is significant")
+                        print(f"    → Patch alignment may be failing")
+                    
+                    # Optional: Correlation with kNN error
+                    # (We'd need to compute per-cell kNN error here, which is expensive)
+                    # Skipping for now to keep it simple
+            else:
+                print(f"[TEST2-SCATTER] ⚠️ Only {len(high_cov_cells)} cells with coverage>=3 (need 50+)")
+        
+        print("="*70 + "\n")
+
+    # ===================================================================
     # [PGSO-REFINE] Post-PGSO refinement: FULL SIMILARITY (bundle adjustment)
     # 
     # Rationale: Edge-based pose graph can be consistent but still fail
@@ -12541,7 +13302,15 @@ def sample_sc_edm_patchwise(
     # Guardrail: For near-1D patches (high anisotropy), freeze rotation
     # to prevent instability.
     # ===================================================================
-    pgso_refine_iters = int(n_align_iters) if n_align_iters > 1 else 0
+    # pgso_refine_iters = int(n_align_iters) if n_align_iters > 1 else 0
+
+    # [DEBUG-ARGS] Ensure n_align_iters is always an int (Fix B from ChatGPT)
+    n_align_iters = int(n_align_iters)
+    pgso_refine_iters = n_align_iters if n_align_iters > 1 else 0
+    
+    if DEBUG_FLAG:
+        print(f"[DEBUG-ARGS] n_align_iters={n_align_iters} (int), pgso_refine_iters={pgso_refine_iters}")
+
     
     # Anisotropy threshold: if patch eig_ratio > this, freeze rotation
     ANISO_FREEZE_ROTATION_THRESH = 50.0
@@ -12555,6 +13324,9 @@ def sample_sc_edm_patchwise(
     # Track metrics across iterations
     refine_coord_mismatches = []
     refine_procrustes_residuals = []
+    refine_knn_scores = {k: [] for k in debug_k_list} if debug_knn else {}
+    test4_subset_indices = None  # Will be set on first iteration
+
     
     for refine_iter in range(pgso_refine_iters):
         # ===============================================================
@@ -12712,18 +13484,230 @@ def sample_sc_edm_patchwise(
         refine_procrustes_residuals.append(iter_residuals_t.median().item())
         
         # ===============================================================
+        # [TEST4-REFINE] Track kNN vs GT each refinement iteration
+        # ===============================================================
+        iter_knn_scores = {}
+        if debug_knn and gt_coords is not None:
+            with torch.no_grad():
+                gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+                
+                # Use fixed subset for consistency across iterations
+                M_test4 = min(n_sc, 2000)
+                if refine_iter == 0:
+                    # Store subset indices for reuse
+                    test4_subset_indices = torch.randperm(n_sc)[:M_test4]
+                
+                X_test4 = X_global[test4_subset_indices, :2].float()  # Use only 2D coords (Fix A)
+                gt_test4 = gt_coords_t[test4_subset_indices]
+                
+                for k_val in debug_k_list:
+                    if M_test4 > k_val + 1:
+                        knn_pred, _ = _knn_indices_dists(X_test4, k_val)
+                        knn_gt, _ = _knn_indices_dists(gt_test4, k_val)
+                        overlap = _knn_overlap_score(knn_pred, knn_gt)
+                        iter_knn_scores[k_val] = overlap.mean().item()
+        
+        # ===============================================================
         # Print progress
         # ===============================================================
         if DEBUG_FLAG and (refine_iter < 5 or refine_iter == pgso_refine_iters - 1 or (refine_iter + 1) % 5 == 0):
             coord_str = f"{coord_mismatch_norm:.3f}" if iter_coord_mismatches else "N/A"
+            knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in iter_knn_scores.items()]) if iter_knn_scores else ""
+            print(f"  [TEST4-REFINE] iter={refine_iter} coord_mismatch/RMS={coord_str} {knn_str}")
             print(f"  [PGSO-REFINE] iter={refine_iter}: "
                   f"Procrustes_resid_p50={iter_residuals_t.median().item():.4f} "
                   f"coord_mismatch/RMS={coord_str} "
                   f"frozen_rot={n_frozen_rot}/{K} frozen_scale={n_frozen_scale}/{K}")
-    
+
+        # Collect kNN scores for summary
+        if debug_knn and iter_knn_scores:
+            for k_val, score in iter_knn_scores.items():
+                refine_knn_scores[k_val].append(score)
+
+
+    # ===================================================================
+    # [TEST2-SCATTER-POSTREFINE] Scatter AFTER refinement
+    # ===================================================================
+    # Goal: Check if refinement reduced per-cell scatter.
+    # If scatter unchanged, mismatch is non-rigid / not capturable by Sim(2).
+    # ===================================================================
+    if pgso_refine_iters > 0 and debug_knn and gt_coords is not None:
+        print("\n" + "="*70)
+        print("[TEST2-SCATTER-POSTREFINE] SCATTER AFTER REFINEMENT")
+        print("="*70)
+        
+        with torch.no_grad():
+            # Find cells with coverage >= 3
+            high_cov_cells = [i for i in range(n_sc) if len(memberships[i]) >= 3]
+            
+            if len(high_cov_cells) >= 50:
+                scatter_list_post = []
+                
+                # Sample for efficiency
+                sample_cells = high_cov_cells[:min(1000, len(high_cov_cells))]
+                
+                for cell_i in sample_cells:
+                    patches_with_i = memberships[cell_i]
+                    
+                    # Collect coords for cell_i from each patch (post-refine transforms)
+                    coords_i = []
+                    for p_idx in patches_with_i:
+                        patch_cell_list = patch_indices[p_idx].tolist()
+                        if cell_i in patch_cell_list:
+                            local_pos = patch_cell_list.index(cell_i)
+                            # Use the updated patch_coords_transformed from refinement
+                            coord_from_patch = patch_coords_transformed[p_idx][local_pos]
+                            coords_i.append(coord_from_patch)
+                    
+                    if len(coords_i) >= 3:
+                        coords_i_stack = torch.stack(coords_i)  # (n_patches_i, 2)
+                        mean_coord = coords_i_stack.mean(dim=0)
+                        distances_to_mean = torch.norm(coords_i_stack - mean_coord.unsqueeze(0), dim=1)
+                        scatter_i = distances_to_mean.median().item()
+                        scatter_list_post.append(scatter_i)
+                
+                if scatter_list_post:
+                    scatter_post_t = torch.tensor(scatter_list_post)
+                    
+                    print(f"[TEST2-SCATTER-POSTREFINE] n_cells_used={len(scatter_list_post)}")
+                    print(f"[TEST2-SCATTER-POSTREFINE] scatter: "
+                          f"p10={scatter_post_t.quantile(0.1).item():.4f} "
+                          f"p50={scatter_post_t.median().item():.4f} "
+                          f"p90={scatter_post_t.quantile(0.9).item():.4f}")
+                    
+                    scatter_norm_post = scatter_post_t.median().item() / rms_target
+                    print(f"[TEST2-SCATTER-POSTREFINE] scatter / RMS = {scatter_norm_post:.3f}")
+                    
+                    # Compare to pre-refine scatter (if available)
+                    # The pre-refine scatter was stored in the original TEST2-SCATTER
+                    # We need to compare
+                    print(f"\n[TEST2-SCATTER-POSTREFINE] Compare to pre-refine:")
+                    print(f"    → Check [TEST2-SCATTER] above for pre-refine value")
+                    
+                    if scatter_norm_post < 0.1:
+                        print(f"    ✓ Post-refine scatter is small (<10% RMS)")
+                    else:
+                        print(f"    ⚠️ Post-refine scatter still significant ({scatter_norm_post*100:.0f}% RMS)")
+                        print(f"       → Refinement did NOT eliminate per-cell disagreement")
+                        print(f"       → Mismatch may be non-rigid (need affine or local warps)")
+            else:
+                print(f"[TEST2-SCATTER-POSTREFINE] ⚠️ Not enough high-coverage cells")
+        
+        print("="*70 + "\n")
+
+    # ===================================================================
+    # [GLOBAL-KNN-STAGE] Stage 3: After refinement (final)
+    # ===================================================================
+    if debug_knn and gt_coords is not None and global_knn_stage_subset is not None:
+        with torch.no_grad():
+            X_refine_subset = X_global[global_knn_stage_subset, :2].float()  # Use 2D
+            
+            stage3_knn_scores = {}
+            for k_val in debug_k_list:
+                if len(global_knn_stage_subset) > k_val + 1:
+                    knn_pred, _ = _knn_indices_dists(X_refine_subset, k_val)
+                    knn_gt, _ = _knn_indices_dists(global_knn_stage_gt, k_val)
+                    overlap = _knn_overlap_score(knn_pred, knn_gt)
+                    stage3_knn_scores[k_val] = overlap.mean().item()
+            
+            global_knn_stage_results['refine'] = stage3_knn_scores
+            
+            if DEBUG_FLAG:
+                knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in stage3_knn_scores.items()])
+                print(f"[GLOBAL-KNN-STAGE] refine (post-refine): {knn_str}")
+
+        
+        # ===============================================================
+        # [GLOBAL-KNN-STAGE] SUMMARY: Compare all stages
+        # ===============================================================
+        print("\n" + "="*70)
+        print("[GLOBAL-KNN-STAGE] STAGEWISE kNN SUMMARY")
+        print("="*70)
+        
+        for k_val in debug_k_list:
+            init_score = global_knn_stage_results.get('init', {}).get(k_val, float('nan'))
+            pgso_score = global_knn_stage_results.get('pgso', {}).get(k_val, float('nan'))
+            refine_score = global_knn_stage_results.get('refine', {}).get(k_val, float('nan'))
+            
+            delta_pgso = pgso_score - init_score
+            delta_refine = refine_score - pgso_score
+            delta_total = refine_score - init_score
+            
+            print(f"[GLOBAL-KNN-STAGE] k={k_val}:")
+            print(f"    init={init_score:.3f} → pgso={pgso_score:.3f} → refine={refine_score:.3f}")
+            print(f"    Δ(init→pgso)={delta_pgso:+.3f}, Δ(pgso→refine)={delta_refine:+.3f}, Δ(total)={delta_total:+.3f}")
+        
+        # Interpretation
+        k_main = debug_k_list[0]
+        init_main = global_knn_stage_results.get('init', {}).get(k_main, 0)
+        pgso_main = global_knn_stage_results.get('pgso', {}).get(k_main, 0)
+        refine_main = global_knn_stage_results.get('refine', {}).get(k_main, 0)
+        
+        print()
+        
+        # Check if refinement was actually run
+        if pgso_refine_iters == 0:
+            print(f"[GLOBAL-KNN-STAGE] Note: n_align_iters<=1, so no refinement was run (refine=pgso)")
+            refine_main = pgso_main  # They're the same
+        
+        if abs(pgso_main - init_main) < 0.02 and abs(refine_main - pgso_main) < 0.02:
+            print(f"[GLOBAL-KNN-STAGE] ⚠️ kNN@{k_main} is FLAT across all stages ({init_main:.3f}→{refine_main:.3f})")
+            print(f"    → Neither PGSO nor refinement improves kNN vs GT")
+            print(f"    → The problem is UPSTREAM: either 32D→2D projection or generator output")
+            print(f"    → Check [PATCH-KNN-VS-GT-2D] to see if projection is the issue")
+        elif init_main < 0.40 and abs(refine_main - init_main) < 0.03:
+            print(f"[GLOBAL-KNN-STAGE] ⚠️ kNN@{k_main} starts low ({init_main:.3f}) and stays low")
+            print(f"    → Initial embedding already has wrong neighborhood structure")
+            print(f"    → PGSO and refinement cannot recover what was never there")
+        elif pgso_main < init_main - 0.03:
+            print(f"[GLOBAL-KNN-STAGE] ⚠️ PGSO HURTS: kNN@{k_main} drops from {init_main:.3f} to {pgso_main:.3f}")
+            print(f"    → Pose-graph stitching is damaging neighborhood structure")
+        elif refine_main > pgso_main + 0.03:
+            print(f"[GLOBAL-KNN-STAGE] ✓ REFINE HELPS: kNN@{k_main} improves from {pgso_main:.3f} to {refine_main:.3f}")
+        else:
+            print(f"[GLOBAL-KNN-STAGE] Stages have minimal effect on kNN@{k_main}")
+            print(f"    → Issue is likely in the 2D readout or generator geometry")
+        
+        print("="*70 + "\n")
+
+ 
     # ===============================================================
     # Post-refinement diagnostics
     # ===============================================================
+    if pgso_refine_iters > 0 and DEBUG_FLAG:
+        # [TEST4-REFINE-SUMMARY] Did refinement improve kNN vs GT?
+        if debug_knn and refine_knn_scores:
+            print(f"\n[TEST4-REFINE-SUMMARY] kNN vs GT across refinement:")
+            for k_val in debug_k_list:
+                if k_val in refine_knn_scores and len(refine_knn_scores[k_val]) >= 2:
+                    scores = refine_knn_scores[k_val]
+                    delta = scores[-1] - scores[0]
+                    best_iter = int(np.argmax(scores))
+                    print(f"  [TEST4-REFINE-SUMMARY] kNN@{k_val}: "
+                          f"{scores[0]:.3f} → {scores[-1]:.3f} (Δ={delta:+.3f})")
+                    print(f"    best_iter_by_knn{k_val}={best_iter}, best_score={max(scores):.3f}")
+                    
+                    if delta > 0.02:
+                        print(f"    ✓ Refinement IMPROVED kNN@{k_val}")
+                    elif delta < -0.02:
+                        print(f"    ⚠️ Refinement HURT kNN@{k_val}")
+                    else:
+                        print(f"    → Refinement had minimal effect on kNN@{k_val}")
+            
+            # Compare coord mismatch improvement vs kNN improvement
+            if len(refine_coord_mismatches) >= 2 and any(len(v) >= 2 for v in refine_knn_scores.values()):
+                delta_coord = refine_coord_mismatches[0] - refine_coord_mismatches[-1]
+                k_main = debug_k_list[0]
+                delta_knn = refine_knn_scores[k_main][-1] - refine_knn_scores[k_main][0] if k_main in refine_knn_scores else 0
+                
+                print(f"\n  [TEST4-REFINE-SUMMARY] delta_coord_mismatch={delta_coord:.3f}")
+                if delta_coord > 0.05 and delta_knn < 0.01:
+                    print(f"    ⚠️ DIAGNOSTIC: Coord mismatch improved but kNN didn't")
+                    print(f"       → Refinement is enforcing overlap agreement, NOT recovering true neighbors")
+                    print(f"       → The ceiling is from patching/model, not stitching")
+        
+        # Check if solution collapsed (existing code follows)
+
     if pgso_refine_iters > 0 and DEBUG_FLAG:
         # Check if solution collapsed
         cov_check = torch.cov(X_global[:, :2].T)
@@ -12994,17 +13978,24 @@ def sample_sc_edm_patchwise(
               f"max={D_sample.max():.3f}")
 
 
-        coords_rms = X_full.pow(2).mean().sqrt().item()
-        print(f"[GLOBAL] coords_rms={coords_rms:.3f}")
+        # [DEBUG-SHAPE-2D] Compute stats on ACTUAL 2D coords, not padded D_latent tensor
+        # (Fix A from ChatGPT: avoid misleading RMS/covariance on zero-padded dims)
+        X_2d = X_full[:, :2]  # Extract actual 2D coordinates
+        coords_rms_2d = X_2d.pow(2).mean().sqrt().item()
+        print(f"[DEBUG-SHAPE-2D] coords_rms (2D only)={coords_rms_2d:.3f}")
+        
+        cov_2d = torch.cov(X_2d.float().T)
+        eigs_2d = torch.linalg.eigvalsh(cov_2d)
+        ratio_2d = float(eigs_2d.max() / (eigs_2d.min().clamp(min=1e-8)))
+        print(f"[DEBUG-SHAPE-2D] coord_cov eigs (2D): "
+              f"min={eigs_2d.min():.3e} "
+              f"max={eigs_2d.max():.3e} "
+              f"ratio={ratio_2d:.1f}")
+        
+        # Also print full D_latent stats for reference (but mark clearly)
+        coords_rms_full = X_full.pow(2).mean().sqrt().item()
+        print(f"[GLOBAL] coords_rms (full D={X_full.shape[1]}, mostly zeros)={coords_rms_full:.3f}")
 
-
-        cov = torch.cov(X_full.float().T)
-        eigs = torch.linalg.eigvalsh(cov)
-        ratio = float(eigs.max() / (eigs.min().clamp(min=1e-8)))
-        print(f"[GLOBAL] coord_cov eigs: "
-              f"min={eigs.min():.3e} "
-              f"max={eigs.max():.3e} "
-              f"ratio={ratio:.1f}")
 
 
     if return_coords:
