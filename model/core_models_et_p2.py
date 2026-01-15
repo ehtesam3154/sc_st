@@ -11401,28 +11401,35 @@ def sample_sc_edm_patchwise(
         patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords_full])
         print(f"[ANCHOR] Patch RMS: p50={patch_rms_list.median().item():.3f}")
 
-        # -------------------------------------------------------------------
-        # Project patch coords for seq-align (2D PCA per patch if needed)
-        # -------------------------------------------------------------------
-        def _project_patch_to_seq_dim(V_full: torch.Tensor, seq_dim: int) -> torch.Tensor:
-            if seq_dim == V_full.shape[1]:
-                return V_full
-            if seq_dim != 2:
-                raise ValueError(f"seq_dim must be 2 or full dim, got {seq_dim}")
 
-            V_centered = V_full - V_full.mean(dim=0, keepdim=True)
-            cov = V_centered.T @ V_centered / V_centered.shape[0]
-            eigs, vecs = torch.linalg.eigh(cov)
-            pca_basis = vecs[:, -2:].flip(dims=[1])
-            return V_centered @ pca_basis
-
+        # -------------------------------------------------------------------
+        # Project patch coords for seq-align (GLOBAL 2D PCA basis if needed)
+        # -------------------------------------------------------------------
         if seq_dim == D_latent:
             patch_coords_seq = patch_coords_full
         else:
-            patch_coords_seq = [
-                _project_patch_to_seq_dim(pc.to(device), seq_dim).detach().cpu()
-                for pc in patch_coords_full
-            ]
+            # Build ONE shared PCA basis across patches
+            # (use a random subset to keep memory sane)
+            max_points_for_pca = 20000
+            all_coords = torch.cat([pc for pc in patch_coords_full], dim=0)  # (sum_m, D_latent)
+            if all_coords.shape[0] > max_points_for_pca:
+                idx = torch.randperm(all_coords.shape[0])[:max_points_for_pca]
+                all_coords = all_coords[idx]
+
+            all_coords = all_coords.to(device)
+            all_centered = all_coords - all_coords.mean(dim=0, keepdim=True)
+            cov = all_centered.T @ all_centered / all_centered.shape[0]
+            eigs, vecs = torch.linalg.eigh(cov)
+            pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2)
+
+            # Apply shared basis to each patch
+            patch_coords_seq = []
+            for pc in patch_coords_full:
+                pc_d = pc.to(device)
+                pc_centered = pc_d - pc_d.mean(dim=0, keepdim=True)
+                pc_2d = pc_centered @ pca_basis
+                patch_coords_seq.append(pc_2d.detach().cpu())
+
         
         # -------------------------------------------------------------------
         # Build overlap graph for BFS ordering
