@@ -10346,6 +10346,7 @@ def sample_sc_edm_patchwise(
     anchor_min_overlap_start: int = 35,
     anchor_min_overlap_floor: int = 20,
     commit_frac: float = 0.75,
+    seq_align_dim: int = 2,
 ) -> Dict[str, torch.Tensor]:
 
     """
@@ -11277,9 +11278,16 @@ def sample_sc_edm_patchwise(
         from collections import deque
         
         # -------------------------------------------------------------------
-        # C0) Data structures - FULL D_latent (not 2D!)
+        # C0) Data structures - seq-align dimension (2D for seq_align_only)
         # -------------------------------------------------------------------
-        X_placed = torch.full((n_sc, D_latent), float('nan'), dtype=torch.float32, device=device)
+        if anchor_sampling_mode == "seq_align_only":
+            seq_dim = int(seq_align_dim)
+        else:
+            seq_dim = D_latent
+        if seq_dim != 2 and seq_dim != D_latent:
+            raise ValueError(f"seq_align_dim must be 2 or D_latent ({D_latent}), got {seq_dim}")
+
+        X_placed = torch.full((n_sc, seq_dim), float('nan'), dtype=torch.float32, device=device)
         placed = torch.zeros(n_sc, dtype=torch.bool, device=device)
         W_cell = torch.zeros(n_sc, dtype=torch.float32, device=device)
         placed_by_patch = torch.full((n_sc,), -1, dtype=torch.long, device=device)
@@ -11392,6 +11400,29 @@ def sample_sc_edm_patchwise(
         # Compute patch RMS stats
         patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords_full])
         print(f"[ANCHOR] Patch RMS: p50={patch_rms_list.median().item():.3f}")
+
+        # -------------------------------------------------------------------
+        # Project patch coords for seq-align (2D PCA per patch if needed)
+        # -------------------------------------------------------------------
+        def _project_patch_to_seq_dim(V_full: torch.Tensor, seq_dim: int) -> torch.Tensor:
+            if seq_dim == V_full.shape[1]:
+                return V_full
+            if seq_dim != 2:
+                raise ValueError(f"seq_dim must be 2 or full dim, got {seq_dim}")
+
+            V_centered = V_full - V_full.mean(dim=0, keepdim=True)
+            cov = V_centered.T @ V_centered / V_centered.shape[0]
+            eigs, vecs = torch.linalg.eigh(cov)
+            pca_basis = vecs[:, -2:].flip(dims=[1])
+            return V_centered @ pca_basis
+
+        if seq_dim == D_latent:
+            patch_coords_seq = patch_coords_full
+        else:
+            patch_coords_seq = [
+                _project_patch_to_seq_dim(pc.to(device), seq_dim).detach().cpu()
+                for pc in patch_coords_full
+            ]
         
         # -------------------------------------------------------------------
         # Build overlap graph for BFS ordering
@@ -11485,6 +11516,48 @@ def sample_sc_edm_patchwise(
             residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
             
             return R, s, t, residual
+
+        def weighted_procrustes_2d(X_src, X_tgt, weights=None):
+            """
+            Compute similarity transform (R, s, t) mapping X_src -> X_tgt in 2D.
+            Convention: X_tgt ≈ s * (X_src @ R.T) + t  (row-vector convention)
+            """
+            n = X_src.shape[0]
+            if weights is None:
+                weights = torch.ones(n, 1, device=X_src.device)
+            else:
+                weights = weights.view(-1, 1)
+
+            w_sum = weights.sum()
+            mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
+            mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
+
+            Xc = X_src - mu_src
+            Yc = X_tgt - mu_tgt
+
+            w_sqrt = weights.sqrt()
+            Xc_w = Xc * w_sqrt
+            Yc_w = Yc * w_sqrt
+
+            C = Yc_w.T @ Xc_w  # (2, 2)
+
+            U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
+            R = U @ Vh
+
+            if torch.det(R) < 0:
+                U[:, -1] *= -1
+                R = U @ Vh
+
+            numer = S_vals.sum()
+            denom = (Xc_w ** 2).sum().clamp_min(1e-8)
+            s = numer / denom
+
+            t = (mu_tgt - s * (mu_src @ R.T)).squeeze(0)
+
+            X_hat = s * (X_src @ R.T) + t
+            residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
+
+            return R, s, t, residual
         
         while len(processed) < K:
             if not queue:
@@ -11524,8 +11597,8 @@ def sample_sc_edm_patchwise(
             m_k = S_k.numel()
             S_k_list = S_k.tolist()
             
-            # Get patch coords (full D_latent)
-            V_k = patch_coords_full[k].to(device)  # (m_k, D_latent)
+            # Get patch coords for seq-align
+            V_k = patch_coords_seq[k].to(device)  # (m_k, seq_dim)
             
             # Identify anchors
             anchor_mask = placed[S_k]
@@ -11574,8 +11647,9 @@ def sample_sc_edm_patchwise(
                 
                 # Get anchor coords (local and global)
                 anchor_local_idx = [S_k_list.index(g) for g in A_k]
-                V_anchor_local = V_k[anchor_local_idx]  # (n_anchors, D_latent)
-                X_anchor_global = X_placed[A_k]  # (n_anchors, D_latent)
+                V_anchor_local = V_k[anchor_local_idx]  # (n_anchors, seq_dim)
+                X_anchor_global = X_placed[A_k]  # (n_anchors, seq_dim)
+
                 
                 # Fit similarity transform: V_anchor_local -> X_anchor_global
                 # Compute centrality weights for anchors
@@ -11584,15 +11658,21 @@ def sample_sc_edm_patchwise(
                 max_d_anchor = dists_anchor.max().clamp_min(1e-6)
                 w_anchor = (1.0 - dists_anchor / (1.2 * max_d_anchor)).clamp(min=0.01)
                 
-                R_align, s_align, t_align, rmse_align = weighted_procrustes_full_d(
-                    V_anchor_local, X_anchor_global, w_anchor
-                )
+
+                if seq_dim == 2:
+                    R_align, s_align, t_align, rmse_align = weighted_procrustes_2d(
+                        V_anchor_local, X_anchor_global, w_anchor
+                    )
+                else:
+                    R_align, s_align, t_align, rmse_align = weighted_procrustes_full_d(
+                        V_anchor_local, X_anchor_global, w_anchor
+                    )
                 
                 # Safety clamp scale
                 s_align = s_align.clamp(0.5, 2.0)
                 
                 # Apply transform to ALL points in patch
-                V_aligned = s_align * (V_k @ R_align.T) + t_align  # (m_k, D_latent)
+                V_aligned = s_align * (V_k @ R_align.T) + t_align  # (m_k, seq_dim)
                 
                 if len(processed) <= 5:
                     print(f"[SEQ-ALIGN] patch={k} nA={n_anchors} nU={n_new} rmse={rmse_align.item():.4f} s={s_align.item():.3f}")
@@ -11663,7 +11743,7 @@ def sample_sc_edm_patchwise(
                     # Align this patch and place the cell
                     S_p = patch_indices[best_patch]
                     S_p_list = S_p.tolist()
-                    V_p = patch_coords_full[best_patch].to(device)
+                    V_p = patch_coords_seq[best_patch].to(device)
                     
                     # Get anchors
                     anchor_mask_p = placed[S_p]
@@ -11673,7 +11753,10 @@ def sample_sc_edm_patchwise(
                     V_anchor_local = V_p[anchor_local_idx]
                     X_anchor_global = X_placed[A_p]
                     
-                    R_align, s_align, t_align, _ = weighted_procrustes_full_d(V_anchor_local, X_anchor_global)
+                    if seq_dim == 2:
+                        R_align, s_align, t_align, _ = weighted_procrustes_2d(V_anchor_local, X_anchor_global)
+                    else:
+                        R_align, s_align, t_align, _ = weighted_procrustes_full_d(V_anchor_local, X_anchor_global)
                     s_align = s_align.clamp(0.5, 2.0)
                     
                     V_aligned = s_align * (V_p @ R_align.T) + t_align
@@ -11689,7 +11772,7 @@ def sample_sc_edm_patchwise(
                     # Not enough anchors, use centroid + offset
                     S_p = patch_indices[best_patch]
                     S_p_list = S_p.tolist()
-                    V_p = patch_coords_full[best_patch].to(device)
+                    V_p = patch_coords_seq[best_patch].to(device)
                     local_i = S_p_list.index(cell_i)
                     
                     # Place relative to global centroid
@@ -11728,28 +11811,27 @@ def sample_sc_edm_patchwise(
         print(f"\n[ANCHOR-FINAL] placed={placed.sum().item()}/{n_sc} total")
         
         # -------------------------------------------------------------------
-        # C10) Output coords via PCA (NOT classical MDS!)
+        # C10) Output coords for both PCA-2D and EDM+MDS (baseline style)
         # -------------------------------------------------------------------
         print(f"\n[ANCHOR-PCA] Computing 2D coords via PCA...")
-        
-        # PCA to 2D
         X_centered = X_placed - X_placed.mean(dim=0, keepdim=True)
-        cov = X_centered.T @ X_centered / n_sc
-        eigs, vecs = torch.linalg.eigh(cov)
         
-        # Top 2 eigenvectors (eigh returns ascending order)
-        pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2)
-        
-        coords_2d = X_centered @ pca_basis  # (n_sc, 2)
-        
-        # Explained variance
-        total_var = eigs.sum().item()
-        top2_var = eigs[-2:].sum().item()
-        explained_var = top2_var / (total_var + 1e-8)
-        print(f"[ANCHOR-PCA] explained_var_top2={explained_var:.3f}")
-        
-        coords_canon = uet.canonicalize_coords(coords_2d.detach().cpu()).detach().cpu()
-        coords_2d_cpu = coords_2d.detach().cpu()
+        if X_centered.shape[1] > 2:
+            cov = X_centered.T @ X_centered / n_sc
+            eigs, vecs = torch.linalg.eigh(cov)
+            pca_basis = vecs[:, -2:].flip(dims=[1])  # (seq_dim, 2)
+            coords_pca = X_centered @ pca_basis  # (n_sc, 2)
+
+            total_var = eigs.sum().item()
+            top2_var = eigs[-2:].sum().item()
+            explained_var = top2_var / (total_var + 1e-8)
+            print(f"[ANCHOR-PCA] explained_var_top2={explained_var:.3f}")
+        else:
+            coords_pca = X_centered
+            print("[ANCHOR-PCA] seq_dim=2, skipping PCA projection")
+
+        coords_pca_cpu = coords_pca.detach().cpu()
+        coords_pca_canon = uet.canonicalize_coords(coords_pca_cpu).detach().cpu()
         
         # -------------------------------------------------------------------
         # Compute EDM from full D coords
@@ -11768,7 +11850,7 @@ def sample_sc_edm_patchwise(
             print(f"[ANCHOR] Scaled EDM: current_p95={current_p95:.3f} -> target={target_st_p95:.3f}")
         
         # -------------------------------------------------------------------
-        # kNN evaluation vs GT
+        # kNN evaluation vs GT (PCA vs EDM+MDS)
         # -------------------------------------------------------------------
         if debug_knn and gt_coords is not None:
             print("\n" + "="*70)
@@ -11779,34 +11861,66 @@ def sample_sc_edm_patchwise(
                 gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
                 
                 # Use PCA 2D coords for kNN
-                coords_2d_device = coords_2d.to(device)
+                coords_pca_device = coords_pca.to(device)
                 
                 M = min(n_sc, debug_global_subset)
                 subset_idx = torch.randperm(n_sc)[:M]
                 
-                pred_subset = coords_2d_device[subset_idx]
+                pred_subset_pca = coords_pca_device[subset_idx]
                 gt_subset = gt_coords_t[subset_idx]
                 
                 for k_val in debug_k_list:
                     if M > k_val + 1:
-                        knn_pred, _ = _knn_indices_dists(pred_subset, k_val)
+                        knn_pred, _ = _knn_indices_dists(pred_subset_pca, k_val)
                         knn_gt, _ = _knn_indices_dists(gt_subset, k_val)
                         overlap = _knn_overlap_score(knn_pred, knn_gt)
                         
-                        print(f"[ANCHOR-KNN] kNN@{k_val}: mean={overlap.mean().item():.3f} "
+                        print(f"[SEQ-EVAL][PCA2D] kNN@{k_val}: mean={overlap.mean().item():.3f} "
+                              f"p10={overlap.quantile(0.1).item():.3f} "
+                              f"p50={overlap.median().item():.3f} "
+                              f"p90={overlap.quantile(0.9).item():.3f}")
+
+                # EDM+MDS eval
+                # EDM+MDS eval
+                N = D_edm_anchor.shape[0]
+                Jn = torch.eye(N, device=D_edm_anchor.device) - torch.ones(N, N, device=D_edm_anchor.device) / N
+                B = -0.5 * (Jn @ (D_edm_anchor ** 2) @ Jn)
+                coords_mds = uet.classical_mds(B, d_out=2)
+                coords_mds_canon = uet.canonicalize_coords(coords_mds.detach().cpu()).detach().cpu()
+
+
+                coords_mds_device = coords_mds.to(device)
+                pred_subset_mds = coords_mds_device[subset_idx]
+
+                for k_val in debug_k_list:
+                    if M > k_val + 1:
+                        knn_pred, _ = _knn_indices_dists(pred_subset_mds, k_val)
+                        knn_gt, _ = _knn_indices_dists(gt_subset, k_val)
+                        overlap = _knn_overlap_score(knn_pred, knn_gt)
+
+                        print(f"[SEQ-EVAL][EDM+MDS] kNN@{k_val}: mean={overlap.mean().item():.3f} "
                               f"p10={overlap.quantile(0.1).item():.3f} "
                               f"p50={overlap.median().item():.3f} "
                               f"p90={overlap.quantile(0.9).item():.3f}")
             
             print("="*70 + "\n")
-        
+
+        # Compute MDS coords for output (baseline style)
+        N = D_edm_anchor.shape[0]
+        Jn = torch.eye(N, device=D_edm_anchor.device) - torch.ones(N, N, device=D_edm_anchor.device) / N
+        B = -0.5 * (Jn @ (D_edm_anchor ** 2) @ Jn)
+        coords_mds = uet.classical_mds(B, d_out=2)
+        coords_mds_canon = uet.canonicalize_coords(coords_mds.detach().cpu()).detach().cpu()
+     
         # -------------------------------------------------------------------
         # Build result dict
         # -------------------------------------------------------------------
         result_anchor: Dict[str, torch.Tensor] = {
             "D_edm": D_edm_anchor,
-            "coords": coords_2d_cpu,
-            "coords_canon": coords_canon,
+            "coords": coords_mds.detach().cpu(),
+            "coords_canon": coords_mds_canon,
+            "coords_pca": coords_pca_cpu,
+            "coords_pca_canon": coords_pca_canon,
         }
         
         # Cleanup
