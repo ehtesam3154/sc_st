@@ -710,14 +710,24 @@ class GEMSModel:
         local_refine_lr: float = 0.01,
         local_refine_anchor_weight: float = 0.1,
         # --- DGSO: Distance-Graph Stitch Optimization ---
+        # --- DGSO-v2: Distance-Graph Stitch Optimization ---
         enable_dgso: bool = False,
         dgso_k_edge: int = 15,
         dgso_iters: int = 1000,
         dgso_lr: float = 1e-2,
         dgso_batch_size: int = 100000,
         dgso_huber_delta: float = 0.1,
-        dgso_anchor_lambda: float = 0.01,
+        dgso_anchor_lambda: float = 1.0,  # CHANGED: full trust region
         dgso_log_every: int = 100,
+        # --- DGSO-v2 NEW PARAMS ---
+        dgso_m_min: int = 3,              # min measurements per edge to keep
+        dgso_tau_spread: float = 0.30,    # max rel_spread to keep edge
+        dgso_spread_penalty_alpha: float = 10.0,  # penalize high-spread edges
+        dgso_dist_band: Tuple[float, float] = (0.05, 0.95),  # distance quantile band
+        dgso_radius_lambda: float = 0.1,  # anti-collapse radius term weight
+        dgso_two_phase: bool = True,      # two-phase schedule (stabilize then refine)
+        dgso_phase1_iters: int = 200,     # phase 1 iterations (high anchor)
+        dgso_phase1_anchor_mult: float = 10.0,  # anchor multiplier for phase 1
     ) -> Dict[str, torch.Tensor]:
 
         """
@@ -807,6 +817,7 @@ class GEMSModel:
             local_refine_lr=local_refine_lr,
             local_refine_anchor_weight=local_refine_anchor_weight,
             # --- DGSO params ---
+            # --- DGSO-v2 params ---
             enable_dgso=enable_dgso,
             dgso_k_edge=dgso_k_edge,
             dgso_iters=dgso_iters,
@@ -815,6 +826,14 @@ class GEMSModel:
             dgso_huber_delta=dgso_huber_delta,
             dgso_anchor_lambda=dgso_anchor_lambda,
             dgso_log_every=dgso_log_every,
+            dgso_m_min=dgso_m_min,
+            dgso_tau_spread=dgso_tau_spread,
+            dgso_spread_penalty_alpha=dgso_spread_penalty_alpha,
+            dgso_dist_band=dgso_dist_band,
+            dgso_radius_lambda=dgso_radius_lambda,
+            dgso_two_phase=dgso_two_phase,
+            dgso_phase1_iters=dgso_phase1_iters,
+            dgso_phase1_anchor_mult=dgso_phase1_anchor_mult,
         )
         return res
 

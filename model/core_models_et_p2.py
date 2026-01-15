@@ -10323,16 +10323,25 @@ def sample_sc_edm_patchwise(
     local_refine_lr: float = 0.01,
     local_refine_anchor_weight: float = 0.1,
     # --- DGSO: Distance-Graph Stitch Optimization ---
+    # --- DGSO-v2: Distance-Graph Stitch Optimization ---
     enable_dgso: bool = False,
     dgso_k_edge: int = 15,
     dgso_iters: int = 1000,
     dgso_lr: float = 1e-2,
     dgso_batch_size: int = 100000,
     dgso_huber_delta: float = 0.1,
-    dgso_anchor_lambda: float = 0.01,
+    dgso_anchor_lambda: float = 1.0,
     dgso_log_every: int = 100,
+    # --- DGSO-v2 NEW PARAMS ---
+    dgso_m_min: int = 3,
+    dgso_tau_spread: float = 0.30,
+    dgso_spread_penalty_alpha: float = 10.0,
+    dgso_dist_band: Tuple[float, float] = (0.05, 0.95),
+    dgso_radius_lambda: float = 0.1,
+    dgso_two_phase: bool = True,
+    dgso_phase1_iters: int = 200,
+    dgso_phase1_anchor_mult: float = 10.0,
 ) -> Dict[str, torch.Tensor]:
-
 
 
     """
@@ -13211,331 +13220,6 @@ def sample_sc_edm_patchwise(
 
 
     # ===================================================================
-    # [DGSO] Distance-Graph Stitch Optimization
-    # 
-    # Goal: Enforce local edge-length constraints from patches globally.
-    # Instead of minimizing overlap point L2, minimize stress objective
-    # on a sparse edge set built from per-patch kNN edges.
-    #
-    # L(X) = sum_{(i,j) in E} w_ij * rho(|X_i - X_j| - d_ij)
-    #
-    # where d_ij is the target distance (weighted median from patches),
-    # w_ij is the aggregated edge weight, and rho is Huber penalty.
-    # ===================================================================
-    if enable_dgso:
-        print("\n" + "="*70)
-        print("[DGSO] DISTANCE-GRAPH STITCH OPTIMIZATION")
-        print("="*70)
-        
-        # ---------------------------------------------------------------
-        # STEP 1A: Extract kNN edges from each patch
-        # ---------------------------------------------------------------
-        print(f"\n[DGSO-EDGES] Extracting kNN edges from {min(K, debug_max_patches)} patches, k_edge={dgso_k_edge}...")
-        
-        from collections import defaultdict
-        
-        # Store edge measurements: edge_measurements[(i,j)] = list of (distance, weight)
-        edge_measurements = defaultdict(list)
-        n_patches_used = min(K, debug_max_patches)
-        n_edges_directed = 0
-        
-        for k in range(n_patches_used):
-            S_k = patch_indices[k]
-            V_k_2d = patch_coords_2d[k]  # (m_k, 2)
-            m_k = V_k_2d.shape[0]
-            
-            if m_k < dgso_k_edge + 1:
-                continue
-            
-            # Compute centrality weights for this patch (reuse same formula as merge)
-            center_k = V_k_2d.mean(dim=0, keepdim=True)
-            dists_to_center = torch.norm(V_k_2d - center_k, dim=1)
-            max_d = dists_to_center.max().clamp_min(1e-6)
-            centrality_k = 1.0 - (dists_to_center / (max_d * 1.2))
-            centrality_k = centrality_k.clamp(min=0.01)
-            
-            # Compute pairwise distances within patch
-            D_patch = torch.cdist(V_k_2d, V_k_2d)  # (m_k, m_k)
-            D_patch.fill_diagonal_(float('inf'))
-            
-            # Get kNN for each point in patch
-            _, knn_local = D_patch.topk(dgso_k_edge, largest=False, dim=1)  # (m_k, k_edge)
-            
-            # Extract edges
-            S_k_list = S_k.tolist()
-            for local_i in range(m_k):
-                global_i = S_k_list[local_i]
-                c_i = centrality_k[local_i].item()
-                
-                for knn_j in range(dgso_k_edge):
-                    local_j = knn_local[local_i, knn_j].item()
-                    global_j = S_k_list[local_j]
-                    
-                    if global_i == global_j:
-                        continue
-                    
-                    # Store as undirected edge (min, max ordering)
-                    edge_key = (min(global_i, global_j), max(global_i, global_j))
-                    d_ij = D_patch[local_i, local_j].item()
-                    c_j = centrality_k[local_j].item()
-                    w_ij = c_i * c_j  # Edge weight = product of centralities
-                    
-                    edge_measurements[edge_key].append((d_ij, w_ij))
-                    n_edges_directed += 1
-        
-        n_pairs_unique = len(edge_measurements)
-        
-        # Compute stats on measurements per pair
-        meas_counts = [len(v) for v in edge_measurements.values()]
-        meas_counts_t = torch.tensor(meas_counts, dtype=torch.float32)
-        
-        print(f"[DGSO-EDGES] n_patches_used={n_patches_used} k_edge={dgso_k_edge}")
-        print(f"[DGSO-EDGES] n_edges_directed={n_edges_directed} n_pairs_unique={n_pairs_unique}")
-        print(f"[DGSO-EDGES] measurements_per_pair: p50={meas_counts_t.median().item():.0f} "
-              f"p90={meas_counts_t.quantile(0.9).item():.0f} max={meas_counts_t.max().item():.0f}")
-        
-        # ---------------------------------------------------------------
-        # STEP 1B: Aggregate edges using weighted median
-        # ---------------------------------------------------------------
-        print(f"\n[DGSO-EDGES] Aggregating edge distances (weighted median)...")
-        
-        edge_list = []  # List of (i, j, d_ij, w_ij)
-        
-        for (i, j), measurements in edge_measurements.items():
-            if len(measurements) == 0:
-                continue
-            
-            dists = torch.tensor([m[0] for m in measurements])
-            weights = torch.tensor([m[1] for m in measurements])
-            
-            # Weighted median approximation: sort by distance, find median weight position
-            sort_idx = torch.argsort(dists)
-            dists_sorted = dists[sort_idx]
-            weights_sorted = weights[sort_idx]
-            
-            cum_w = weights_sorted.cumsum(dim=0)
-            total_w = cum_w[-1]
-            median_idx = (cum_w >= total_w / 2).nonzero(as_tuple=True)[0][0].item()
-            d_wmed = dists_sorted[median_idx].item()
-            
-            # Aggregated weight = sum of all weights
-            w_agg = weights.sum().item()
-            
-            edge_list.append((i, j, d_wmed, w_agg))
-        
-        n_edges_final = len(edge_list)
-        
-        # Convert to tensors
-        edge_src = torch.tensor([e[0] for e in edge_list], dtype=torch.long, device=device)
-        edge_dst = torch.tensor([e[1] for e in edge_list], dtype=torch.long, device=device)
-        edge_target_d = torch.tensor([e[2] for e in edge_list], dtype=torch.float32, device=device)
-        edge_weights = torch.tensor([e[3] for e in edge_list], dtype=torch.float32, device=device)
-        
-        # Normalize weights to sum to 1 (for numerical stability)
-        edge_weights = edge_weights / edge_weights.sum()
-        
-        # Stats on target distances and weights
-        print(f"[DGSO-EDGES] d_ij stats: p10={edge_target_d.quantile(0.1).item():.4f} "
-              f"p50={edge_target_d.median().item():.4f} "
-              f"p90={edge_target_d.quantile(0.9).item():.4f}")
-        print(f"[DGSO-EDGES] w_ij stats (normalized): p10={edge_weights.quantile(0.1).item():.6f} "
-              f"p50={edge_weights.median().item():.6f} "
-              f"p90={edge_weights.quantile(0.9).item():.6f}")
-        
-        multi_meas_frac = (meas_counts_t > 1).float().mean().item()
-        print(f"[DGSO-EDGES] multi_measured_pair_fraction={multi_meas_frac:.3f}")
-        
-        # Sample check: print a few random edge measurements
-        if DEBUG_FLAG and n_pairs_unique > 0:
-            sample_edges = list(edge_measurements.items())[:5]
-            print(f"\n[DGSO-EDGES-CHECK] Sample edge measurements:")
-            for (ei, ej), meas in sample_edges:
-                dists = [m[0] for m in meas]
-                d_min, d_max = min(dists), max(dists)
-                # Find the weighted median for this edge
-                idx_in_list = next(k for k, e in enumerate(edge_list) if e[0] == ei and e[1] == ej)
-                d_wmed = edge_list[idx_in_list][2]
-                print(f"  pair({ei},{ej}) n_meas={len(meas)} d_wmed={d_wmed:.4f} d_min={d_min:.4f} d_max={d_max:.4f}")
-        
-        # ---------------------------------------------------------------
-        # STEP 2: Optimize global coordinates with mini-batch stress
-        # ---------------------------------------------------------------
-        if n_edges_final < 100:
-            print(f"[DGSO] WARNING: Only {n_edges_final} edges, skipping optimization")
-        else:
-            print(f"\n[DGSO-OPT] Starting stress optimization with {n_edges_final} edges...")
-            print(f"[DGSO-OPT] iters={dgso_iters} lr={dgso_lr} batch_size={dgso_batch_size}")
-            print(f"[DGSO-OPT] huber_delta={dgso_huber_delta} anchor_lambda={dgso_anchor_lambda}")
-            
-            # Initialize X from current global (2D)
-            X_dgso = X_global[:, :2].clone().detach().to(device).requires_grad_(True)
-            X_init = X_global[:, :2].clone().detach().to(device)  # Anchor
-            
-            # Select anchor subset (random 128 points)
-            n_anchor = min(128, n_sc)
-            anchor_idx = torch.randperm(n_sc, device=device)[:n_anchor]
-            
-            optimizer = torch.optim.Adam([X_dgso], lr=dgso_lr)
-            
-            # Huber loss function
-            def huber_loss(r, delta):
-                abs_r = torch.abs(r)
-                return torch.where(
-                    abs_r <= delta,
-                    0.5 * r**2,
-                    delta * (abs_r - 0.5 * delta)
-                )
-            
-            # For tracking
-            dgso_knn_history = {k: [] for k in debug_k_list} if debug_knn else {}
-            dgso_loss_history = []
-            
-            # Fixed subset for kNN tracking (same as stagewise tracking)
-            if debug_knn and gt_coords is not None:
-                dgso_knn_subset = global_knn_stage_subset if global_knn_stage_subset is not None else torch.randperm(n_sc)[:min(n_sc, debug_global_subset)]
-                dgso_knn_gt = gt_coords[dgso_knn_subset].float().to(device)
-            
-            for iter_idx in range(dgso_iters):
-                optimizer.zero_grad()
-                
-                # Mini-batch sampling
-                if n_edges_final <= dgso_batch_size:
-                    batch_idx = torch.arange(n_edges_final, device=device)
-                else:
-                    batch_idx = torch.randperm(n_edges_final, device=device)[:dgso_batch_size]
-                
-                # Get batch edges
-                src_batch = edge_src[batch_idx]
-                dst_batch = edge_dst[batch_idx]
-                d_target_batch = edge_target_d[batch_idx]
-                w_batch = edge_weights[batch_idx]
-                
-                # Compute predicted distances
-                d_pred_batch = torch.norm(X_dgso[src_batch] - X_dgso[dst_batch], dim=1)
-                
-                # Residuals
-                r_batch = d_pred_batch - d_target_batch
-                
-                # Weighted Huber loss
-                huber_vals = huber_loss(r_batch, dgso_huber_delta)
-                loss_edge = (w_batch * huber_vals).sum() / w_batch.sum()
-                
-                # Anchor loss (keep close to initialization)
-                loss_anchor = ((X_dgso[anchor_idx] - X_init[anchor_idx])**2).mean()
-                
-                # Total loss
-                loss = loss_edge + dgso_anchor_lambda * loss_anchor
-                
-                loss.backward()
-                optimizer.step()
-                
-                # Gauge-fix: recenter and rescale
-                with torch.no_grad():
-                    X_dgso.data = X_dgso.data - X_dgso.data.mean(dim=0, keepdim=True)
-                    rms_current = X_dgso.data.pow(2).mean().sqrt()
-                    X_dgso.data = X_dgso.data * (rms_target / (rms_current + 1e-8))
-                
-                # Logging
-                if iter_idx % dgso_log_every == 0 or iter_idx == dgso_iters - 1:
-                    dgso_loss_history.append(loss.item())
-                    
-                    # Compute shape stats
-                    with torch.no_grad():
-                        cov_dgso = torch.cov(X_dgso.T)
-                        eigs_dgso = torch.linalg.eigvalsh(cov_dgso)
-                        eig_ratio_dgso = (eigs_dgso.max() / eigs_dgso.min().clamp(min=1e-8)).item()
-                        rms_dgso = X_dgso.pow(2).mean().sqrt().item()
-                        
-                        # Edge residual stats (on held-out sample)
-                        sample_size = min(10000, n_edges_final)
-                        sample_idx = torch.randperm(n_edges_final, device=device)[:sample_size]
-                        d_pred_sample = torch.norm(X_dgso[edge_src[sample_idx]] - X_dgso[edge_dst[sample_idx]], dim=1)
-                        resid_sample = torch.abs(d_pred_sample - edge_target_d[sample_idx])
-                    
-                    print(f"[DGSO-OPT] iter={iter_idx}: loss={loss.item():.4f} "
-                          f"loss_edge={loss_edge.item():.4f} loss_anchor={loss_anchor.item():.4f}")
-                    print(f"[DGSO-OPT]   rms={rms_dgso:.4f} eig_ratio={eig_ratio_dgso:.1f}")
-                    print(f"[DGSO-OPT]   edge_abs_resid: p50={resid_sample.median().item():.4f} "
-                          f"p90={resid_sample.quantile(0.9).item():.4f}")
-                    
-                    # kNN tracking
-                    if debug_knn and gt_coords is not None:
-                        with torch.no_grad():
-                            X_dgso_subset = X_dgso[dgso_knn_subset]
-                            
-                            for k_val in debug_k_list:
-                                if len(dgso_knn_subset) > k_val + 1:
-                                    knn_pred, _ = _knn_indices_dists(X_dgso_subset, k_val)
-                                    knn_gt, _ = _knn_indices_dists(dgso_knn_gt, k_val)
-                                    overlap = _knn_overlap_score(knn_pred, knn_gt)
-                                    dgso_knn_history[k_val].append(overlap.mean().item())
-                            
-                            knn_str = " ".join([f"kNN@{k}={dgso_knn_history[k][-1]:.3f}" for k in debug_k_list if dgso_knn_history[k]])
-                            print(f"[DGSO-KNN] iter={iter_idx}: {knn_str}")
-                    
-                    # Check for failure (eig_ratio explosion)
-                    if eig_ratio_dgso > 200:
-                        print(f"[DGSO-FAIL] eig_ratio={eig_ratio_dgso:.1f} > 200, stopping early")
-                        break
-                
-                # Check for no improvement
-                if iter_idx > 300 and len(dgso_loss_history) > 3:
-                    recent_losses = dgso_loss_history[-3:]
-                    if abs(recent_losses[-1] - recent_losses[0]) < 1e-6:
-                        print(f"[DGSO-NOIMPROVE] Loss plateaued, stopping early at iter={iter_idx}")
-                        break
-            
-            # Update X_global with DGSO result
-            with torch.no_grad():
-                X_global[:, :2] = X_dgso.detach()
-            
-            print(f"\n[DGSO-OPT] Optimization complete")
-            
-            # ---------------------------------------------------------------
-            # STEP 3: Update stagewise tracking
-            # ---------------------------------------------------------------
-            if debug_knn and gt_coords is not None and global_knn_stage_subset is not None:
-                with torch.no_grad():
-                    X_dgso_subset = X_global[global_knn_stage_subset, :2].float()
-                    
-                    dgso_knn_scores = {}
-                    for k_val in debug_k_list:
-                        if len(global_knn_stage_subset) > k_val + 1:
-                            knn_pred, _ = _knn_indices_dists(X_dgso_subset, k_val)
-                            knn_gt, _ = _knn_indices_dists(global_knn_stage_gt, k_val)
-                            overlap = _knn_overlap_score(knn_pred, knn_gt)
-                            dgso_knn_scores[k_val] = overlap.mean().item()
-                    
-                    global_knn_stage_results['dgso'] = dgso_knn_scores
-                    
-                    knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in dgso_knn_scores.items()])
-                    print(f"[GLOBAL-KNN-STAGE] dgso (post-distance-refine): {knn_str}")
-                    
-                    # Compute deltas
-                    if 'pgso' in global_knn_stage_results:
-                        k_main = debug_k_list[0]
-                        pgso_main = global_knn_stage_results['pgso'].get(k_main, 0)
-                        dgso_main = dgso_knn_scores.get(k_main, 0)
-                        delta_pgso_dgso = dgso_main - pgso_main
-                        
-                        init_main = global_knn_stage_results.get('init', {}).get(k_main, 0)
-                        delta_total = dgso_main - init_main
-                        
-                        print(f"[GLOBAL-KNN-STAGE] Δ(pgso→dgso) kNN@{k_main}={delta_pgso_dgso:+.3f}")
-                        print(f"[GLOBAL-KNN-STAGE] Δ(total) kNN@{k_main}={delta_total:+.3f}")
-                        
-                        if delta_pgso_dgso > 0.05:
-                            print(f"[GLOBAL-KNN-STAGE] ✓ DGSO HELPS: Improved kNN by {delta_pgso_dgso:.3f}")
-                        elif delta_pgso_dgso < -0.02:
-                            print(f"[GLOBAL-KNN-STAGE] ⚠️ DGSO HURTS: Decreased kNN by {abs(delta_pgso_dgso):.3f}")
-                        else:
-                            print(f"[GLOBAL-KNN-STAGE] → DGSO has minimal effect on kNN")
-        
-        print("="*70 + "\n")
-
-
-
-    # ===================================================================
     # [TEST2-SCATTER] STITCH NOISE PER CELL (Post-transform, Pre-merge)
     # ===================================================================
     # Goal: For cells appearing in multiple patches, measure how much their
@@ -13861,6 +13545,551 @@ def sample_sc_edm_patchwise(
                 refine_knn_scores[k_val].append(score)
 
 
+
+    # ===================================================================
+    # ===================================================================
+    # [DGSO-v2] Distance-Graph Stitch Optimization (Consensus + Filtering + Trust Region)
+    #
+    # Key improvements over v1:
+    # 1. Use POST-TRANSFORM coords (patch_coords_transformed) for distance measurement
+    # 2. Compute disagreement score per pair and filter high-disagreement edges
+    # 3. Weight edges by trust (penalize high spread)
+    # 4. Full trust region anchor (ALL points, not subset)
+    # 5. Anti-collapse local radius term
+    # 6. Early stopping fail-safes
+    #
+    # Objective:
+    # L(X) = sum_{(i,j) in E_keep} w_ij * rho(|X_i - X_j| - d_bar_ij)
+    #      + lambda_all * (1/N) * sum_i |X_i - X0_i|^2
+    #      + lambda_rad * (1/N) * sum_i rho(r_i(X) - r_bar_i)
+    # ===================================================================
+    if enable_dgso:
+        print("\n" + "="*70)
+        print("[DGSO-v2] DISTANCE-GRAPH STITCH OPTIMIZATION")
+        print("="*70)
+        
+        # ---------------------------------------------------------------
+        # STEP 0: Extract kNN edges using POST-TRANSFORM coords
+        # (This fixes the scale inconsistency issue from v1)
+        # ---------------------------------------------------------------
+        print(f"\n[DGSO-V2-MEAS] Extracting kNN edges from {min(K, debug_max_patches)} patches, k_edge={dgso_k_edge}...")
+        print(f"[DGSO-V2-MEAS] Using POST-TRANSFORM coordinates (scale-consistent)")
+        
+        from collections import defaultdict
+        
+        # Store edge measurements: edge_measurements[(i,j)] = list of (distance, weight)
+        edge_measurements = defaultdict(list)
+        n_patches_used = min(K, debug_max_patches)
+        n_edges_directed = 0
+        
+        # For comparison logging
+        meas_compare_samples = []
+        
+        for k in range(n_patches_used):
+            S_k = patch_indices[k]
+            # USE TRANSFORMED COORDS (post-PGSO) instead of raw patch_coords_2d
+            V_k_transformed = patch_coords_transformed[k].to(device)  # (m_k, 2)
+            m_k = V_k_transformed.shape[0]
+            
+            if m_k < dgso_k_edge + 1:
+                continue
+            
+            # Compute centrality weights for this patch
+            center_k = V_k_transformed.mean(dim=0, keepdim=True)
+            dists_to_center = torch.norm(V_k_transformed - center_k, dim=1)
+            max_d = dists_to_center.max().clamp_min(1e-6)
+            centrality_k = 1.0 - (dists_to_center / (max_d * 1.2))
+            centrality_k = centrality_k.clamp(min=0.01)
+            
+            # Compute pairwise distances within patch (POST-TRANSFORM)
+            D_patch = torch.cdist(V_k_transformed, V_k_transformed)  # (m_k, m_k)
+            D_patch.fill_diagonal_(float('inf'))
+            
+            # Get kNN for each point in patch
+            _, knn_local = D_patch.topk(dgso_k_edge, largest=False, dim=1)  # (m_k, k_edge)
+            
+            # Also compute raw distances for comparison (first patch only)
+            if k == 0 and DEBUG_FLAG:
+                V_k_raw = patch_coords_2d[k].to(device)
+                D_patch_raw = torch.cdist(V_k_raw, V_k_raw)
+            
+            # Extract edges
+            S_k_list = S_k.tolist()
+            for local_i in range(m_k):
+                global_i = S_k_list[local_i]
+                c_i = centrality_k[local_i].item()
+                
+                for knn_j in range(dgso_k_edge):
+                    local_j = knn_local[local_i, knn_j].item()
+                    global_j = S_k_list[local_j]
+                    
+                    if global_i == global_j:
+                        continue
+                    
+                    # Store as undirected edge (min, max ordering)
+                    edge_key = (min(global_i, global_j), max(global_i, global_j))
+                    d_ij = D_patch[local_i, local_j].item()
+                    c_j = centrality_k[local_j].item()
+                    w_ij = c_i * c_j  # Edge weight = product of centralities
+                    
+                    edge_measurements[edge_key].append((d_ij, w_ij))
+                    n_edges_directed += 1
+                    
+                    # Sample for comparison (first 5 edges of first patch)
+                    if k == 0 and len(meas_compare_samples) < 5 and DEBUG_FLAG:
+                        d_raw = D_patch_raw[local_i, local_j].item()
+                        meas_compare_samples.append((edge_key, d_ij, d_raw))
+        
+        n_pairs_unique = len(edge_measurements)
+        
+        # Compute stats on measurements per pair
+        meas_counts = [len(v) for v in edge_measurements.values()]
+        meas_counts_t = torch.tensor(meas_counts, dtype=torch.float32)
+        
+        print(f"[DGSO-V2-MEAS] n_patches_used={n_patches_used} k_edge={dgso_k_edge}")
+        print(f"[DGSO-V2-MEAS] n_edges_directed={n_edges_directed} n_pairs_unique={n_pairs_unique}")
+        print(f"[DGSO-V2-MEAS] measurements_per_pair: p50={meas_counts_t.median().item():.0f} "
+              f"p90={meas_counts_t.quantile(0.9).item():.0f} max={meas_counts_t.max().item():.0f}")
+        
+        # Debug: compare raw vs transformed distances
+        if DEBUG_FLAG and meas_compare_samples:
+            print(f"\n[DGSO-V2-MEAS-COMPARE] Raw vs Transformed distances (sample):")
+            for (ei, ej), d_trans, d_raw in meas_compare_samples:
+                ratio = d_trans / (d_raw + 1e-8)
+                print(f"  pair({ei},{ej}): d_transformed={d_trans:.4f} d_raw={d_raw:.4f} ratio={ratio:.3f}")
+        
+        # ---------------------------------------------------------------
+        # STEP 1: Build consensus distance AND disagreement score per pair
+        # ---------------------------------------------------------------
+        print(f"\n[DGSO-V2-DISPERSION] Computing consensus and disagreement per edge...")
+        
+        edge_stats_list = []  # List of (i, j, d_bar, w_sum, M, rel_spread, q10, q50, q90)
+        
+        for (i, j), measurements in edge_measurements.items():
+            M = len(measurements)
+            if M == 0:
+                continue
+            
+            dists = torch.tensor([m[0] for m in measurements])
+            weights = torch.tensor([m[1] for m in measurements])
+            
+            # Weighted median (consensus distance)
+            sort_idx = torch.argsort(dists)
+            dists_sorted = dists[sort_idx]
+            weights_sorted = weights[sort_idx]
+            
+            cum_w = weights_sorted.cumsum(dim=0)
+            total_w = cum_w[-1]
+            median_idx = (cum_w >= total_w / 2).nonzero(as_tuple=True)[0][0].item()
+            d_bar = dists_sorted[median_idx].item()
+            
+            # Compute weighted quantiles for disagreement
+            q10_idx = (cum_w >= total_w * 0.1).nonzero(as_tuple=True)[0]
+            q90_idx = (cum_w >= total_w * 0.9).nonzero(as_tuple=True)[0]
+            
+            q10 = dists_sorted[q10_idx[0].item()].item() if len(q10_idx) > 0 else dists_sorted[0].item()
+            q50 = d_bar
+            q90 = dists_sorted[q90_idx[0].item()].item() if len(q90_idx) > 0 else dists_sorted[-1].item()
+            
+            # Relative spread = (q90 - q10) / (q50 + eps)
+            rel_spread = (q90 - q10) / (q50 + 1e-8)
+            
+            # Sum of weights
+            w_sum = weights.sum().item()
+            
+            edge_stats_list.append((i, j, d_bar, w_sum, M, rel_spread, q10, q50, q90))
+        
+        # Convert to tensors for analysis
+        rel_spreads = torch.tensor([e[5] for e in edge_stats_list])
+        meas_counts_full = torch.tensor([e[4] for e in edge_stats_list], dtype=torch.float32)
+        d_bars = torch.tensor([e[2] for e in edge_stats_list])
+        
+        print(f"[DGSO-V2-DISPERSION] rel_spread: p10={rel_spreads.quantile(0.1).item():.3f} "
+              f"p50={rel_spreads.median().item():.3f} p90={rel_spreads.quantile(0.9).item():.3f}")
+        print(f"[DGSO-V2-DISPERSION] M (meas count): p50={meas_counts_full.median().item():.0f} "
+              f"p90={meas_counts_full.quantile(0.9).item():.0f} max={meas_counts_full.max().item():.0f}")
+        
+        # Print worst edges by rel_spread
+        if DEBUG_FLAG:
+            sorted_by_spread = sorted(edge_stats_list, key=lambda x: x[5], reverse=True)
+            print(f"\n[DGSO-V2-DISPERSION-WORST] Top 10 worst edges by rel_spread:")
+            for idx, (ei, ej, d_bar, w_sum, M, rel_sp, q10, q50, q90) in enumerate(sorted_by_spread[:10]):
+                print(f"  pair({ei},{ej}): M={M} q10={q10:.4f} q50={q50:.4f} q90={q90:.4f} rel_spread={rel_sp:.3f}")
+        
+        # ---------------------------------------------------------------
+        # STEP 2: Filter edges hard
+        # ---------------------------------------------------------------
+        print(f"\n[DGSO-V2-FILTER] Filtering edges (M_min={dgso_m_min}, tau_spread={dgso_tau_spread})...")
+        
+        # Compute distance band thresholds
+        d_band_low = d_bars.quantile(dgso_dist_band[0]).item()
+        d_band_high = d_bars.quantile(dgso_dist_band[1]).item()
+        
+        n_removed_m = 0
+        n_removed_spread = 0
+        n_removed_dist = 0
+        edge_list_filtered = []
+        
+        for (i, j, d_bar, w_sum, M, rel_spread, q10, q50, q90) in edge_stats_list:
+            # Filter 1: Require minimum measurements
+            if M < dgso_m_min:
+                n_removed_m += 1
+                continue
+            
+            # Filter 2: Require low disagreement
+            if rel_spread > dgso_tau_spread:
+                n_removed_spread += 1
+                continue
+            
+            # Filter 3: Distance within band (avoid pathological tiny/huge edges)
+            if d_bar < d_band_low or d_bar > d_band_high:
+                n_removed_dist += 1
+                continue
+            
+            edge_list_filtered.append((i, j, d_bar, w_sum, M, rel_spread))
+        
+        n_edges_before = len(edge_stats_list)
+        n_edges_after = len(edge_list_filtered)
+        
+        print(f"[DGSO-V2-FILTER] before={n_edges_before} after={n_edges_after}")
+        print(f"[DGSO-V2-FILTER-BREAKDOWN] removed by M<{dgso_m_min}: {n_removed_m}")
+        print(f"[DGSO-V2-FILTER-BREAKDOWN] removed by rel_spread>{dgso_tau_spread}: {n_removed_spread}")
+        print(f"[DGSO-V2-FILTER-BREAKDOWN] removed by distance_out_of_band: {n_removed_dist}")
+        
+        if n_edges_after > 0:
+            kept_d_bars = torch.tensor([e[2] for e in edge_list_filtered])
+            kept_spreads = torch.tensor([e[5] for e in edge_list_filtered])
+            kept_M = torch.tensor([e[4] for e in edge_list_filtered], dtype=torch.float32)
+            
+            print(f"[DGSO-V2-FILTER-KEPT-STATS] d_bar: p10={kept_d_bars.quantile(0.1).item():.4f} "
+                  f"p50={kept_d_bars.median().item():.4f} p90={kept_d_bars.quantile(0.9).item():.4f}")
+            print(f"[DGSO-V2-FILTER-KEPT-STATS] rel_spread: p10={kept_spreads.quantile(0.1).item():.3f} "
+                  f"p50={kept_spreads.median().item():.3f} p90={kept_spreads.quantile(0.9).item():.3f}")
+            print(f"[DGSO-V2-FILTER-KEPT-STATS] M: p10={kept_M.quantile(0.1).item():.0f} "
+                  f"p50={kept_M.median().item():.0f} p90={kept_M.quantile(0.9).item():.0f}")
+        
+        # ---------------------------------------------------------------
+        # STEP 3: Compute trust-weighted edge weights
+        # w_final = w_sum * exp(-alpha * rel_spread^2)
+        # ---------------------------------------------------------------
+        print(f"\n[DGSO-V2-WEIGHTS] Computing trust-weighted edge weights (alpha={dgso_spread_penalty_alpha})...")
+        
+        edge_list_final = []
+        for (i, j, d_bar, w_sum, M, rel_spread) in edge_list_filtered:
+            # Trust penalty: edges with high spread get downweighted
+            trust_factor = torch.exp(torch.tensor(-dgso_spread_penalty_alpha * rel_spread**2)).item()
+            w_final = w_sum * trust_factor
+            edge_list_final.append((i, j, d_bar, w_final))
+        
+        n_edges_final = len(edge_list_final)
+        
+        if n_edges_final > 0:
+            # Convert to tensors
+            edge_src = torch.tensor([e[0] for e in edge_list_final], dtype=torch.long, device=device)
+            edge_dst = torch.tensor([e[1] for e in edge_list_final], dtype=torch.long, device=device)
+            edge_target_d = torch.tensor([e[2] for e in edge_list_final], dtype=torch.float32, device=device)
+            edge_weights = torch.tensor([e[3] for e in edge_list_final], dtype=torch.float32, device=device)
+            
+            # Normalize weights
+            edge_weights = edge_weights / edge_weights.sum()
+            
+            w_raw = torch.tensor([e[3] for e in edge_list_filtered], dtype=torch.float32)
+            w_final_t = torch.tensor([e[3] for e in edge_list_final], dtype=torch.float32)
+            
+            print(f"[DGSO-V2-WEIGHTS] w_raw: p10={w_raw.quantile(0.1).item():.4f} "
+                  f"p50={w_raw.median().item():.4f} p90={w_raw.quantile(0.9).item():.4f}")
+            print(f"[DGSO-V2-WEIGHTS] w_final (normalized): p10={edge_weights.quantile(0.1).item():.6f} "
+                  f"p50={edge_weights.median().item():.6f} p90={edge_weights.quantile(0.9).item():.6f}")
+            
+            # Check correlation (should be somewhat negative if spread penalty works)
+            if len(kept_spreads) > 10:
+                from scipy.stats import pearsonr
+                corr, _ = pearsonr(kept_spreads.numpy(), w_final_t.numpy())
+                print(f"[DGSO-V2-WEIGHTS-CORR] corr(w_final, rel_spread)={corr:.3f}")
+        
+        # ---------------------------------------------------------------
+        # STEP 4: Build neighbor sets for radius term
+        # ---------------------------------------------------------------
+        if n_edges_final > 100 and dgso_radius_lambda > 0:
+            print(f"\n[DGSO-V2-RADIUS] Building neighbor sets for anti-collapse term...")
+            
+            # Build adjacency from edges
+            from collections import defaultdict
+            neighbors = defaultdict(list)
+            neighbor_dists = defaultdict(list)
+            neighbor_weights = defaultdict(list)
+            
+            for idx, (i, j, d_bar, w_final) in enumerate(edge_list_final):
+                neighbors[i].append(j)
+                neighbors[j].append(i)
+                neighbor_dists[i].append(d_bar)
+                neighbor_dists[j].append(d_bar)
+                neighbor_weights[i].append(w_final)
+                neighbor_weights[j].append(w_final)
+            
+            # Compute target radius per node (weighted median of neighbor distances)
+            target_radius = torch.zeros(n_sc, device=device)
+            has_neighbors = torch.zeros(n_sc, dtype=torch.bool, device=device)
+            
+            for node_i in neighbors:
+                dists_i = torch.tensor(neighbor_dists[node_i])
+                weights_i = torch.tensor(neighbor_weights[node_i])
+                
+                if len(dists_i) > 0:
+                    # Weighted median
+                    sort_idx = torch.argsort(dists_i)
+                    dists_sorted = dists_i[sort_idx]
+                    weights_sorted = weights_i[sort_idx]
+                    cum_w = weights_sorted.cumsum(dim=0)
+                    total_w = cum_w[-1]
+                    median_idx = (cum_w >= total_w / 2).nonzero(as_tuple=True)[0][0].item()
+                    target_radius[node_i] = dists_sorted[median_idx].item()
+                    has_neighbors[node_i] = True
+            
+            n_with_neighbors = has_neighbors.sum().item()
+            print(f"[DGSO-V2-RADIUS] Nodes with neighbors: {n_with_neighbors}/{n_sc}")
+            print(f"[DGSO-V2-RADIUS] target_radius: p10={target_radius[has_neighbors].quantile(0.1).item():.4f} "
+                  f"p50={target_radius[has_neighbors].median().item():.4f} "
+                  f"p90={target_radius[has_neighbors].quantile(0.9).item():.4f}")
+        else:
+            dgso_radius_lambda = 0  # Disable if not enough edges
+            has_neighbors = None
+        
+        # ---------------------------------------------------------------
+        # STEP 5: Optimization with full trust region + two-phase schedule
+        # ---------------------------------------------------------------
+        if n_edges_final < 100:
+            print(f"[DGSO-v2] WARNING: Only {n_edges_final} edges after filtering, skipping optimization")
+        else:
+            print(f"\n[DGSO-V2-OPT] Starting optimization with {n_edges_final} trusted edges...")
+            print(f"[DGSO-V2-OPT] iters={dgso_iters} lr={dgso_lr} batch_size={dgso_batch_size}")
+            print(f"[DGSO-V2-OPT] huber_delta={dgso_huber_delta} anchor_lambda={dgso_anchor_lambda}")
+            print(f"[DGSO-V2-OPT] radius_lambda={dgso_radius_lambda}")
+            if dgso_two_phase:
+                print(f"[DGSO-V2-OPT] TWO-PHASE: phase1={dgso_phase1_iters} iters @ {dgso_phase1_anchor_mult}x anchor")
+            
+            # Initialize X from current global (2D) - this is X^(0)
+            X_dgso = X_global[:, :2].clone().detach().to(device).requires_grad_(True)
+            X_init = X_global[:, :2].clone().detach().to(device)  # Trust region anchor (ALL points)
+            
+            optimizer = torch.optim.Adam([X_dgso], lr=dgso_lr)
+            
+            # Huber loss function
+            def huber_loss(r, delta):
+                abs_r = torch.abs(r)
+                return torch.where(
+                    abs_r <= delta,
+                    0.5 * r**2,
+                    delta * (abs_r - 0.5 * delta)
+                )
+            
+            # For tracking
+            dgso_knn_history = {k: [] for k in debug_k_list} if debug_knn else {}
+            dgso_loss_history = []
+            dgso_knn_at_iter0 = None
+            
+            # Fixed subset for kNN tracking
+            if debug_knn and gt_coords is not None:
+                dgso_knn_subset = global_knn_stage_subset if global_knn_stage_subset is not None else torch.randperm(n_sc)[:min(n_sc, debug_global_subset)]
+                dgso_knn_gt = gt_coords[dgso_knn_subset].float().to(device)
+            
+            # Track displacement
+            max_displacement_threshold = 0.2 * rms_target
+            
+            for iter_idx in range(dgso_iters):
+                optimizer.zero_grad()
+                
+                # Two-phase anchor schedule
+                if dgso_two_phase and iter_idx < dgso_phase1_iters:
+                    current_anchor_lambda = dgso_anchor_lambda * dgso_phase1_anchor_mult
+                else:
+                    current_anchor_lambda = dgso_anchor_lambda
+                
+                # Mini-batch sampling
+                if n_edges_final <= dgso_batch_size:
+                    batch_idx = torch.arange(n_edges_final, device=device)
+                else:
+                    batch_idx = torch.randperm(n_edges_final, device=device)[:dgso_batch_size]
+                
+                # Get batch edges
+                src_batch = edge_src[batch_idx]
+                dst_batch = edge_dst[batch_idx]
+                d_target_batch = edge_target_d[batch_idx]
+                w_batch = edge_weights[batch_idx]
+                
+                # Compute predicted distances
+                d_pred_batch = torch.norm(X_dgso[src_batch] - X_dgso[dst_batch], dim=1)
+                
+                # Residuals
+                r_batch = d_pred_batch - d_target_batch
+                
+                # Weighted Huber loss (edge stress)
+                huber_vals = huber_loss(r_batch, dgso_huber_delta)
+                loss_edge = (w_batch * huber_vals).sum() / w_batch.sum()
+                
+                # FULL trust region anchor (ALL points, not subset!)
+                displacement = X_dgso - X_init
+                loss_anchor = (displacement**2).mean()
+                
+                # Anti-collapse radius term
+                loss_radius = torch.tensor(0.0, device=device)
+                if dgso_radius_lambda > 0 and has_neighbors is not None:
+                    # Compute current radius per node
+                    with torch.no_grad():
+                        nodes_with_nbrs = has_neighbors.nonzero(as_tuple=True)[0]
+                        if len(nodes_with_nbrs) > 0:
+                            radius_residuals = []
+                            for node_i in nodes_with_nbrs[:1000].tolist():  # Sample for efficiency
+                                nbrs_i = neighbors[node_i]
+                                if len(nbrs_i) > 0:
+                                    nbrs_tensor = torch.tensor(nbrs_i, device=device)
+                                    dists_to_nbrs = torch.norm(X_dgso[node_i] - X_dgso[nbrs_tensor], dim=1)
+                                    r_i_current = dists_to_nbrs.median()
+                                    r_i_target = target_radius[node_i]
+                                    radius_residuals.append((r_i_current - r_i_target).abs())
+                            
+                            if radius_residuals:
+                                loss_radius = torch.stack(radius_residuals).mean()
+                
+                # Total loss
+                loss = loss_edge + current_anchor_lambda * loss_anchor + dgso_radius_lambda * loss_radius
+                
+                loss.backward()
+                optimizer.step()
+                
+                # Gauge-fix: recenter and rescale
+                with torch.no_grad():
+                    X_dgso.data = X_dgso.data - X_dgso.data.mean(dim=0, keepdim=True)
+                    rms_current = X_dgso.data.pow(2).mean().sqrt()
+                    X_dgso.data = X_dgso.data * (rms_target / (rms_current + 1e-8))
+                
+                # Logging
+                if iter_idx % dgso_log_every == 0 or iter_idx == dgso_iters - 1:
+                    dgso_loss_history.append(loss.item())
+                    
+                    # Compute shape stats and displacement
+                    with torch.no_grad():
+                        cov_dgso = torch.cov(X_dgso.T)
+                        eigs_dgso = torch.linalg.eigvalsh(cov_dgso)
+                        eig_ratio_dgso = (eigs_dgso.max() / eigs_dgso.min().clamp(min=1e-8)).item()
+                        rms_dgso = X_dgso.pow(2).mean().sqrt().item()
+                        
+                        # RMS displacement from X0
+                        displacement_rms = ((X_dgso - X_init)**2).mean().sqrt().item()
+                        
+                        # Edge residual stats
+                        sample_size = min(10000, n_edges_final)
+                        sample_idx = torch.randperm(n_edges_final, device=device)[:sample_size]
+                        d_pred_sample = torch.norm(X_dgso[edge_src[sample_idx]] - X_dgso[edge_dst[sample_idx]], dim=1)
+                        resid_sample = torch.abs(d_pred_sample - edge_target_d[sample_idx])
+                    
+                    phase_str = "P1" if dgso_two_phase and iter_idx < dgso_phase1_iters else "P2"
+                    print(f"[DGSO-V2-OPT] [{phase_str}] iter={iter_idx}: loss={loss.item():.4f} "
+                          f"loss_edge={loss_edge.item():.4f} loss_anchor={loss_anchor.item():.4f}")
+                    print(f"[DGSO-V2-OPT]   rms={rms_dgso:.4f} eig_ratio={eig_ratio_dgso:.1f} ||X-X0||_RMS={displacement_rms:.4f}")
+                    print(f"[DGSO-V2-OPT]   edge_abs_resid: p50={resid_sample.median().item():.4f} "
+                          f"p90={resid_sample.quantile(0.9).item():.4f}")
+                    
+                    # kNN tracking
+                    if debug_knn and gt_coords is not None:
+                        with torch.no_grad():
+                            X_dgso_subset = X_dgso[dgso_knn_subset]
+                            
+                            for k_val in debug_k_list:
+                                if len(dgso_knn_subset) > k_val + 1:
+                                    knn_pred, _ = _knn_indices_dists(X_dgso_subset, k_val)
+                                    knn_gt, _ = _knn_indices_dists(dgso_knn_gt, k_val)
+                                    overlap = _knn_overlap_score(knn_pred, knn_gt)
+                                    dgso_knn_history[k_val].append(overlap.mean().item())
+                            
+                            knn_str = " ".join([f"kNN@{k}={dgso_knn_history[k][-1]:.3f}" for k in debug_k_list if dgso_knn_history[k]])
+                            print(f"[DGSO-V2-KNN] iter={iter_idx}: {knn_str}")
+                            
+                            # Store iter 0 kNN for fail-safe
+                            if iter_idx == 0:
+                                dgso_knn_at_iter0 = {k: dgso_knn_history[k][-1] for k in debug_k_list if dgso_knn_history[k]}
+                    
+                    # ---------------------------------------------------------------
+                    # FAIL-SAFES (Step 6)
+                    # ---------------------------------------------------------------
+                    
+                    # Check 1: eig_ratio explosion (shape collapse)
+                    if eig_ratio_dgso > 200:
+                        print(f"[DGSO-V2-STOP] eig_ratio={eig_ratio_dgso:.1f} > 200, stopping early")
+                        break
+                    
+                    # Check 2: displacement exceeded threshold
+                    if displacement_rms > max_displacement_threshold:
+                        print(f"[DGSO-V2-STOP] ||X-X0||_RMS={displacement_rms:.4f} > {max_displacement_threshold:.4f}, stopping early")
+                        break
+                    
+                    # Check 3: kNN dropped too much from iter 0 (if GT available)
+                    if debug_knn and gt_coords is not None and dgso_knn_at_iter0 is not None and iter_idx > 0:
+                        k_main = debug_k_list[0]
+                        if k_main in dgso_knn_history and len(dgso_knn_history[k_main]) > 0:
+                            current_knn = dgso_knn_history[k_main][-1]
+                            iter0_knn = dgso_knn_at_iter0.get(k_main, current_knn)
+                            knn_drop = iter0_knn - current_knn
+                            if knn_drop > 0.05:
+                                print(f"[DGSO-V2-STOP] kNN@{k_main} dropped by {knn_drop:.3f} (from {iter0_knn:.3f} to {current_knn:.3f}), stopping early")
+                                break
+                
+                # Check for no improvement (convergence)
+                if iter_idx > 300 and len(dgso_loss_history) > 3:
+                    recent_losses = dgso_loss_history[-3:]
+                    if abs(recent_losses[-1] - recent_losses[0]) < 1e-6:
+                        print(f"[DGSO-V2-NOIMPROVE] Loss plateaued, stopping early at iter={iter_idx}")
+                        break
+            
+            # Update X_global with DGSO result
+            with torch.no_grad():
+                X_global[:, :2] = X_dgso.detach()
+            
+            print(f"\n[DGSO-V2-OPT] Optimization complete")
+            
+            # ---------------------------------------------------------------
+            # Update stagewise tracking
+            # ---------------------------------------------------------------
+            if debug_knn and gt_coords is not None and global_knn_stage_subset is not None:
+                with torch.no_grad():
+                    X_dgso_subset = X_global[global_knn_stage_subset, :2].float()
+                    
+                    dgso_knn_scores = {}
+                    for k_val in debug_k_list:
+                        if len(global_knn_stage_subset) > k_val + 1:
+                            knn_pred, _ = _knn_indices_dists(X_dgso_subset, k_val)
+                            knn_gt, _ = _knn_indices_dists(global_knn_stage_gt, k_val)
+                            overlap = _knn_overlap_score(knn_pred, knn_gt)
+                            dgso_knn_scores[k_val] = overlap.mean().item()
+                    
+                    global_knn_stage_results['dgso'] = dgso_knn_scores
+                    
+                    knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in dgso_knn_scores.items()])
+                    print(f"[GLOBAL-KNN-STAGE] dgso-v2 (post-distance-refine): {knn_str}")
+                    
+                    # Compute deltas
+                    if 'pgso' in global_knn_stage_results:
+                        k_main = debug_k_list[0]
+                        pgso_main = global_knn_stage_results['pgso'].get(k_main, 0)
+                        dgso_main = dgso_knn_scores.get(k_main, 0)
+                        delta_pgso_dgso = dgso_main - pgso_main
+                        
+                        init_main = global_knn_stage_results.get('init', {}).get(k_main, 0)
+                        delta_total = dgso_main - init_main
+                        
+                        print(f"[GLOBAL-KNN-STAGE] Δ(pgso→dgso-v2) kNN@{k_main}={delta_pgso_dgso:+.3f}")
+                        print(f"[GLOBAL-KNN-STAGE] Δ(total) kNN@{k_main}={delta_total:+.3f}")
+                        
+                        if delta_pgso_dgso > 0.02:
+                            print(f"[GLOBAL-KNN-STAGE] ✓ DGSO-v2 HELPS: Improved kNN by {delta_pgso_dgso:.3f}")
+                        elif delta_pgso_dgso < -0.02:
+                            print(f"[GLOBAL-KNN-STAGE] ⚠️ DGSO-v2 HURTS: Decreased kNN by {abs(delta_pgso_dgso):.3f}")
+                            print(f"    → Consider: tighter filtering (lower tau_spread) or higher anchor_lambda")
+                        else:
+                            print(f"[GLOBAL-KNN-STAGE] → DGSO-v2 has minimal effect (Δ={delta_pgso_dgso:+.3f})")
+                            print(f"    → Stitching may not be the main bottleneck")
+        
+        print("="*70 + "\n")
     # ===================================================================
     # [TEST2-SCATTER-POSTREFINE] Scatter AFTER refinement
     # ===================================================================
