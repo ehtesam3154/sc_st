@@ -725,10 +725,16 @@ class GEMSModel:
         dgso_spread_penalty_alpha: float = 10.0,  # penalize high-spread edges
         dgso_dist_band: Tuple[float, float] = (0.05, 0.95),  # distance quantile band
         dgso_radius_lambda: float = 0.1,  # anti-collapse radius term weight
-        dgso_two_phase: bool = True,      # two-phase schedule (stabilize then refine)
-        dgso_phase1_iters: int = 200,     # phase 1 iterations (high anchor)
-        dgso_phase1_anchor_mult: float = 10.0,  # anchor multiplier for phase 1
+        dgso_two_phase: bool = True,
+        dgso_phase1_iters: int = 200,
+        dgso_phase1_anchor_mult: float = 10.0,
+        # --- ANCHORED SEQUENTIAL SAMPLING ---
+        anchor_sampling_mode: str = "off",  # "off", "seq_align_only", "edm_anchor_local"
+        anchor_min_overlap_start: int = 35,
+        anchor_min_overlap_floor: int = 20,
+        commit_frac: float = 0.75,
     ) -> Dict[str, torch.Tensor]:
+
 
         """
         SC inference using patch-based global alignment (no masked/frozen points).
@@ -834,6 +840,11 @@ class GEMSModel:
             dgso_two_phase=dgso_two_phase,
             dgso_phase1_iters=dgso_phase1_iters,
             dgso_phase1_anchor_mult=dgso_phase1_anchor_mult,
+            # --- ANCHORED SEQUENTIAL SAMPLING ---
+            anchor_sampling_mode=anchor_sampling_mode,
+            anchor_min_overlap_start=anchor_min_overlap_start,
+            anchor_min_overlap_floor=anchor_min_overlap_floor,
+            commit_frac=commit_frac,
         )
         return res
 
