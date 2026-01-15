@@ -11261,6 +11261,8 @@ def sample_sc_edm_patchwise(
 
 
     # ===================================================================
+    # ===================================================================
+    # ===================================================================
     # ANCHORED SEQUENTIAL SAMPLING MODE (NEW)
     # ===================================================================
     # ===================================================================
@@ -11273,6 +11275,7 @@ def sample_sc_edm_patchwise(
         print("="*70)
         print(f"[ANCHOR] anchor_min_overlap_start={anchor_min_overlap_start}, floor={anchor_min_overlap_floor}")
         print(f"[ANCHOR] commit_frac={commit_frac}")
+        print(f"[ANCHOR] seq_align_dim={seq_align_dim}")
         
         import networkx as nx
         from collections import deque
@@ -11304,7 +11307,8 @@ def sample_sc_edm_patchwise(
             for k in tqdm(range(K), desc="Sampling patches (full D)"):
                 S_k = patch_indices[k]
                 m_k = S_k.numel()
-                Z_k = Z_all[S_k].to(device)
+                S_k_cpu = S_k.cpu() if torch.is_tensor(S_k) else S_k
+                Z_k = Z_all[S_k_cpu].to(device)
                 
                 Z_k_batched = Z_k.unsqueeze(0)
                 mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
@@ -11400,36 +11404,29 @@ def sample_sc_edm_patchwise(
         # Compute patch RMS stats
         patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords_full])
         print(f"[ANCHOR] Patch RMS: p50={patch_rms_list.median().item():.3f}")
-
-
+        
         # -------------------------------------------------------------------
-        # Project patch coords for seq-align (GLOBAL 2D PCA basis if needed)
+        # Project patch coords for seq-align (2D PCA per patch if needed)
         # -------------------------------------------------------------------
+        def _project_patch_to_seq_dim(V_full: torch.Tensor, seq_dim: int) -> torch.Tensor:
+            if seq_dim == V_full.shape[1]:
+                return V_full
+            if seq_dim != 2:
+                raise ValueError(f"seq_dim must be 2 or full dim, got {seq_dim}")
+
+            V_centered = V_full - V_full.mean(dim=0, keepdim=True)
+            cov = V_centered.T @ V_centered / V_centered.shape[0]
+            eigs, vecs = torch.linalg.eigh(cov)
+            pca_basis = vecs[:, -2:].flip(dims=[1])
+            return V_centered @ pca_basis
+
         if seq_dim == D_latent:
             patch_coords_seq = patch_coords_full
         else:
-            # Build ONE shared PCA basis across patches
-            # (use a random subset to keep memory sane)
-            max_points_for_pca = 20000
-            all_coords = torch.cat([pc for pc in patch_coords_full], dim=0)  # (sum_m, D_latent)
-            if all_coords.shape[0] > max_points_for_pca:
-                idx = torch.randperm(all_coords.shape[0])[:max_points_for_pca]
-                all_coords = all_coords[idx]
-
-            all_coords = all_coords.to(device)
-            all_centered = all_coords - all_coords.mean(dim=0, keepdim=True)
-            cov = all_centered.T @ all_centered / all_centered.shape[0]
-            eigs, vecs = torch.linalg.eigh(cov)
-            pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2)
-
-            # Apply shared basis to each patch
-            patch_coords_seq = []
-            for pc in patch_coords_full:
-                pc_d = pc.to(device)
-                pc_centered = pc_d - pc_d.mean(dim=0, keepdim=True)
-                pc_2d = pc_centered @ pca_basis
-                patch_coords_seq.append(pc_2d.detach().cpu())
-
+            patch_coords_seq = [
+                _project_patch_to_seq_dim(pc.to(device), seq_dim).detach().cpu()
+                for pc in patch_coords_full
+            ]
         
         # -------------------------------------------------------------------
         # Build overlap graph for BFS ordering
@@ -11650,69 +11647,222 @@ def sample_sc_edm_patchwise(
                 print(f"[ANCHOR-ROOT] patch={k} m={m_k} rms={rms_root:.3f} aniso_ratio={aniso_root:.1f} placed={placed.sum().item()}")
             
             else:
-                # NON-ROOT PATCH: align to placed anchors
+                # NON-ROOT PATCH: seq-align or anchored EDM
                 
                 # Get anchor coords (local and global)
                 anchor_local_idx = [S_k_list.index(g) for g in A_k]
-                V_anchor_local = V_k[anchor_local_idx]  # (n_anchors, seq_dim)
-                X_anchor_global = X_placed[A_k]  # (n_anchors, seq_dim)
-
+                X_anchor_global = X_placed[A_k]  # (n_anchors, seq_dim or D_latent)
                 
-                # Fit similarity transform: V_anchor_local -> X_anchor_global
-                # Compute centrality weights for anchors
-                center_local = V_anchor_local.mean(dim=0, keepdim=True)
-                dists_anchor = (V_anchor_local - center_local).norm(dim=1)
-                max_d_anchor = dists_anchor.max().clamp_min(1e-6)
-                w_anchor = (1.0 - dists_anchor / (1.2 * max_d_anchor)).clamp(min=0.01)
-                
-
-                if seq_dim == 2:
-                    R_align, s_align, t_align, rmse_align = weighted_procrustes_2d(
-                        V_anchor_local, X_anchor_global, w_anchor
-                    )
-                else:
-                    R_align, s_align, t_align, rmse_align = weighted_procrustes_full_d(
-                        V_anchor_local, X_anchor_global, w_anchor
-                    )
-                
-                # Safety clamp scale
-                s_align = s_align.clamp(0.5, 2.0)
-                
-                # Apply transform to ALL points in patch
-                V_aligned = s_align * (V_k @ R_align.T) + t_align  # (m_k, seq_dim)
-                
-                if len(processed) <= 5:
-                    print(f"[SEQ-ALIGN] patch={k} nA={n_anchors} nU={n_new} rmse={rmse_align.item():.4f} s={s_align.item():.3f}")
-                
-                # Compute centrality weights for commitment
-                center_aligned = V_aligned.mean(dim=0, keepdim=True)
-                dists_aligned = (V_aligned - center_aligned).norm(dim=1)
-                max_d_aligned = dists_aligned.max().clamp_min(1e-6)
-                w_all = (1.0 - dists_aligned / (1.2 * max_d_aligned)).clamp(min=0.01)
-                
-                # Commit new cells (top commit_frac by centrality weight)
-                if n_new > 0:
-                    new_local_idx = [S_k_list.index(g) for g in U_k]
-                    new_weights = w_all[new_local_idx]
+                if anchor_sampling_mode == "seq_align_only":
+                    V_anchor_local = V_k[anchor_local_idx]  # (n_anchors, seq_dim)
                     
-                    n_to_commit = max(1, int(commit_frac * n_new))
-                    _, commit_order = new_weights.topk(min(n_to_commit, len(new_weights)), largest=True)
+                    # Fit similarity transform: V_anchor_local -> X_anchor_global
+                    # Compute centrality weights for anchors
+                    center_local = V_anchor_local.mean(dim=0, keepdim=True)
+                    dists_anchor = (V_anchor_local - center_local).norm(dim=1)
+                    max_d_anchor = dists_anchor.max().clamp_min(1e-6)
+                    w_anchor = (1.0 - dists_anchor / (1.2 * max_d_anchor)).clamp(min=0.01)
                     
-                    cells_to_commit = [U_k[commit_order[i].item()] for i in range(len(commit_order))]
+                    if seq_dim == 2:
+                        R_align, s_align, t_align, rmse_align = weighted_procrustes_2d(
+                            V_anchor_local, X_anchor_global, w_anchor
+                        )
+                    else:
+                        R_align, s_align, t_align, rmse_align = weighted_procrustes_full_d(
+                            V_anchor_local, X_anchor_global, w_anchor
+                        )
                     
-                    for global_i in cells_to_commit:
-                        local_i = S_k_list.index(global_i)
-                        X_placed[global_i] = V_aligned[local_i]
-                        placed[global_i] = True
-                        W_cell[global_i] = w_all[local_i]
-                        placed_by_patch[global_i] = k
+                    # Safety clamp scale
+                    s_align = s_align.clamp(0.5, 2.0)
+                    
+                    # Apply transform to ALL points in patch
+                    V_aligned = s_align * (V_k @ R_align.T) + t_align  # (m_k, seq_dim)
                     
                     if len(processed) <= 5:
-                        w_commit = new_weights[commit_order[:len(cells_to_commit)]]
-                        w_skip_idx = [i for i in range(len(U_k)) if U_k[i] not in cells_to_commit]
-                        w_skip = new_weights[w_skip_idx] if w_skip_idx else torch.tensor([0.0])
-                        print(f"[ANCHOR-COMMIT] n_new={n_new} commit={len(cells_to_commit)} skip={n_new-len(cells_to_commit)} "
-                              f"w_commit_p50={w_commit.median().item():.3f} w_skip_p50={w_skip.median().item():.3f}")
+                        print(f"[SEQ-ALIGN] patch={k} nA={n_anchors} nU={n_new} rmse={rmse_align.item():.4f} s={s_align.item():.3f}")
+                    
+                    # Compute centrality weights for commitment
+                    center_aligned = V_aligned.mean(dim=0, keepdim=True)
+                    dists_aligned = (V_aligned - center_aligned).norm(dim=1)
+                    max_d_aligned = dists_aligned.max().clamp_min(1e-6)
+                    w_all = (1.0 - dists_aligned / (1.2 * max_d_aligned)).clamp(min=0.01)
+                    
+                    # Commit new cells (top commit_frac by centrality weight)
+                    if n_new > 0:
+                        new_local_idx = [S_k_list.index(g) for g in U_k]
+                        new_weights = w_all[new_local_idx]
+                        
+                        n_to_commit = max(1, int(commit_frac * n_new))
+                        _, commit_order = new_weights.topk(min(n_to_commit, len(new_weights)), largest=True)
+                        
+                        cells_to_commit = [U_k[commit_order[i].item()] for i in range(len(commit_order))]
+                        
+                        for global_i in cells_to_commit:
+                            local_i = S_k_list.index(global_i)
+                            X_placed[global_i] = V_aligned[local_i]
+                            placed[global_i] = True
+                            W_cell[global_i] = w_all[local_i]
+                            placed_by_patch[global_i] = k
+                        
+                        if len(processed) <= 5:
+                            w_commit = new_weights[commit_order[:len(cells_to_commit)]]
+                            w_skip_idx = [i for i in range(len(U_k)) if U_k[i] not in cells_to_commit]
+                            w_skip = new_weights[w_skip_idx] if w_skip_idx else torch.tensor([0.0])
+                            print(f"[ANCHOR-COMMIT] n_new={n_new} commit={len(cells_to_commit)} skip={n_new-len(cells_to_commit)} "
+                                  f"w_commit_p50={w_commit.median().item():.3f} w_skip_p50={w_skip.median().item():.3f}")
+
+                else:
+                    # EDM ANCHOR GLOBAL: denoise patch in GLOBAL frame with clamped anchors
+
+                    # anchors in global coords (same scale as X_placed)
+                    X_anchor_global = X_placed[A_k]  # (nA, D_latent)
+                    anchor_idx_t = torch.tensor(anchor_local_idx, device=device, dtype=torch.long)
+
+                    if len(processed) <= 3:
+                        print(f"[EDM-ANCHOR-GLOBAL] patch={k} nA={n_anchors}")
+
+                    # Recompute H_k for this patch
+                    S_k_cpu = S_k.cpu() if torch.is_tensor(S_k) else S_k
+                    Z_k = Z_all[S_k_cpu].to(device)
+                    Z_k_batched = Z_k.unsqueeze(0)
+                    mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
+                    H_k = context_encoder(Z_k_batched, mask_k)
+
+                    if coral_params is not None:
+                        from core_models_et_p3 import GEMSModel
+                        H_k = GEMSModel.apply_coral_transform(
+                            H_k,
+                            mu_sc=coral_params['mu_sc'],
+                            A=coral_params['A'],
+                            B=coral_params['B'],
+                            mu_st=coral_params['mu_st']
+                        )
+
+                    # Generator proposal (GLOBAL)
+                    V_gen = generator(H_k, mask_k)  # (1, m_k, D_latent)
+
+                    # Optional pre-align in GLOBAL space using anchors on CLEAN generator output
+                    V_gen_anchor = V_gen.squeeze(0)[anchor_idx_t]
+                    if V_gen_anchor.shape[0] >= 3:
+                        R_pre, s_pre, t_pre, rmse_pre = weighted_procrustes_full_d(V_gen_anchor, X_anchor_global)
+                        s_pre = s_pre.clamp(0.5, 2.0)
+                        V_gen = s_pre * (V_gen @ R_pre.T) + t_pre
+                        if len(processed) <= 3:
+                            print(f"[EDM-ANCHOR-PROCR] patch={k} rmse={rmse_pre.item():.4f} s={s_pre.item():.3f}")
+
+                    # Initialize GLOBAL state with noise
+                    V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
+                    V_t = V_t * mask_k.unsqueeze(-1).float()
+
+                    # Anchor noise (fixed for this patch)
+                    eps_A = torch.randn((n_anchors, D_latent), device=device)
+                    sigma0 = sigmas[0]
+
+                    # Set anchors to noisy targets at sigma0
+                    V_t[0, anchor_idx_t] = X_anchor_global + sigma0 * eps_A
+
+                    # EDM sampling with anchor clamp in GLOBAL frame
+                    for i in range(len(sigmas) - 1):
+                        sigma = sigmas[i]
+                        sigma_next = sigmas[i + 1]
+                        sigma_b = sigma.view(1)
+
+                        x0_c = score_net.forward_edm(V_t, sigma_b, H_k, mask_k, sigma_data, self_cond=None)
+
+                        if guidance_scale != 1.0:
+                            H_null = torch.zeros_like(H_k)
+                            x0_u = score_net.forward_edm(V_t, sigma_b, H_null, mask_k, sigma_data, self_cond=None)
+
+                            guidance_eff = _sigma_guidance_eff(float(sigma), guidance_scale)
+
+                            diff = x0_c - x0_u
+                            diff_norm = diff.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                            x0_u_norm = x0_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                            wnorm_scale = (x0_u_norm / diff_norm).clamp(max=1.0)
+
+                            x0 = x0_u + guidance_eff * wnorm_scale * diff
+                        else:
+                            x0 = x0_c
+
+                        d = (V_t - x0) / sigma.clamp_min(1e-8)
+                        V_euler = V_t + (sigma_next - sigma) * d
+
+                        if sigma_next > 0:
+                            x0_next_c = score_net.forward_edm(V_euler, sigma_next.view(1), H_k, mask_k, sigma_data, self_cond=None)
+                            if guidance_scale != 1.0:
+                                x0_next_u = score_net.forward_edm(V_euler, sigma_next.view(1), H_null, mask_k, sigma_data, self_cond=None)
+
+                                guidance_eff_next = _sigma_guidance_eff(float(sigma_next), guidance_scale)
+
+                                diff_next = x0_next_c - x0_next_u
+                                diff_next_norm = diff_next.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                                x0_next_u_norm = x0_next_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                                wnorm_scale_next = (x0_next_u_norm / diff_next_norm).clamp(max=1.0)
+
+                                x0_next = x0_next_u + guidance_eff_next * wnorm_scale_next * diff_next
+                            else:
+                                x0_next = x0_next_c
+
+                            d2 = (V_euler - x0_next) / sigma_next.clamp_min(1e-8)
+                            V_t = V_t + (sigma_next - sigma) * 0.5 * (d + d2)
+                        else:
+                            V_t = V_euler
+
+                        V_t = V_t * mask_k.unsqueeze(-1).float()
+
+                        if eta > 0 and sigma_next > 0:
+                            noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma**2, min=0))
+                            V_t = V_t + noise_scale * torch.randn_like(V_t)
+
+                        # Clamp anchors to noisy target at sigma_next (GLOBAL)
+                        target = X_anchor_global + sigma_next * eps_A
+
+                        # IMPORTANT: compute error BEFORE clamping (otherwise always 0)
+                        if len(processed) <= 3 and i < 5:
+                            err_pre = (V_t[0, anchor_idx_t] - target).norm(dim=1)
+                            print(f"[EDM-ANCHOR-CLAMP] step={i} sigma_next={float(sigma_next):.4f} "
+                                  f"max_pre={err_pre.max().item():.4e} rms_pre={err_pre.pow(2).mean().sqrt().item():.4e}")
+
+                        V_t[0, anchor_idx_t] = target
+
+                    # Final clamp at sigma=0 (GLOBAL)
+                    V_t[0, anchor_idx_t] = X_anchor_global
+
+                    V_final_global = V_t.squeeze(0)
+                    if len(processed) <= 3:
+                        anchor_rmse = (V_final_global[anchor_idx_t] - X_anchor_global).pow(2).mean().sqrt().item()
+                        print(f"[EDM-ANCHOR-END] patch={k} anchor_rmse_global={anchor_rmse:.4f}")
+
+                    # Compute centrality weights for commitment
+                    center_aligned = V_final_global.mean(dim=0, keepdim=True)
+                    dists_aligned = (V_final_global - center_aligned).norm(dim=1)
+                    max_d_aligned = dists_aligned.max().clamp_min(1e-6)
+                    w_all = (1.0 - dists_aligned / (1.2 * max_d_aligned)).clamp(min=0.01)
+
+                    # Commit new cells (top commit_frac by centrality weight)
+                    if n_new > 0:
+                        new_local_idx = [S_k_list.index(g) for g in U_k]
+                        new_weights = w_all[new_local_idx]
+
+                        n_to_commit = max(1, int(commit_frac * n_new))
+                        _, commit_order = new_weights.topk(min(n_to_commit, len(new_weights)), largest=True)
+
+                        cells_to_commit = [U_k[commit_order[i].item()] for i in range(len(commit_order))]
+
+                        for global_i in cells_to_commit:
+                            local_i = S_k_list.index(global_i)
+                            X_placed[global_i] = V_final_global[local_i]
+                            placed[global_i] = True
+                            W_cell[global_i] = w_all[local_i]
+                            placed_by_patch[global_i] = k
+
+                        if len(processed) <= 5:
+                            w_commit = new_weights[commit_order[:len(cells_to_commit)]]
+                            w_skip_idx = [i for i in range(len(U_k)) if U_k[i] not in cells_to_commit]
+                            w_skip = new_weights[w_skip_idx] if w_skip_idx else torch.tensor([0.0])
+                            print(f"[EDM-ANCHOR-COMMIT] n_new={n_new} commit={len(cells_to_commit)} skip={n_new-len(cells_to_commit)} "
+                                  f"w_commit_p50={w_commit.median().item():.3f} w_skip_p50={w_skip.median().item():.3f}")
+
             
             # Add neighbors to queue
             for nbr in G_overlap.neighbors(k):
@@ -11821,8 +11971,8 @@ def sample_sc_edm_patchwise(
         # C10) Output coords for both PCA-2D and EDM+MDS (baseline style)
         # -------------------------------------------------------------------
         print(f"\n[ANCHOR-PCA] Computing 2D coords via PCA...")
+
         X_centered = X_placed - X_placed.mean(dim=0, keepdim=True)
-        
         if X_centered.shape[1] > 2:
             cov = X_centered.T @ X_centered / n_sc
             eigs, vecs = torch.linalg.eigh(cov)
@@ -11888,13 +12038,11 @@ def sample_sc_edm_patchwise(
                               f"p90={overlap.quantile(0.9).item():.3f}")
 
                 # EDM+MDS eval
-                # EDM+MDS eval
                 N = D_edm_anchor.shape[0]
                 Jn = torch.eye(N, device=D_edm_anchor.device) - torch.ones(N, N, device=D_edm_anchor.device) / N
                 B = -0.5 * (Jn @ (D_edm_anchor ** 2) @ Jn)
                 coords_mds = uet.classical_mds(B, d_out=2)
                 coords_mds_canon = uet.canonicalize_coords(coords_mds.detach().cpu()).detach().cpu()
-
 
                 coords_mds_device = coords_mds.to(device)
                 pred_subset_mds = coords_mds_device[subset_idx]
@@ -11918,7 +12066,7 @@ def sample_sc_edm_patchwise(
         B = -0.5 * (Jn @ (D_edm_anchor ** 2) @ Jn)
         coords_mds = uet.classical_mds(B, d_out=2)
         coords_mds_canon = uet.canonicalize_coords(coords_mds.detach().cpu()).detach().cpu()
-     
+        
         # -------------------------------------------------------------------
         # Build result dict
         # -------------------------------------------------------------------
@@ -11941,6 +12089,8 @@ def sample_sc_edm_patchwise(
         print("=" * 72 + "\n")
         
         return result_anchor
+
+
     
     # ===================================================================
     # ORIGINAL NON-ANCHORED MODE (existing code below)
@@ -12118,10 +12268,6 @@ def sample_sc_edm_patchwise(
             f"debug_patch_coords_seed.pt",
         )
         print(f"[DEBUG] Saved patch coords to debug_patch_coords_seed.pt\n")
-
-
-
-
 
 
     # ===================================================================
