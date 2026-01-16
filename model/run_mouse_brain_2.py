@@ -134,8 +134,11 @@ def parse_args():
                         help='Minimum unknown points to use anchor_geom')
     parser.add_argument('--anchor_geom_debug_every', type=int, default=200,
                         help='Debug logging interval for anchor geometry')
+    # ========== INFERENCE MODE ==========
+    parser.add_argument('--inference_mode', type=str, default='unanchored',
+                        choices=['unanchored', 'anchored'],
+                        help='Inference mode: unanchored (legacy) or anchored (new sequential)')
 
-    
     return parser.parse_args()
 
 

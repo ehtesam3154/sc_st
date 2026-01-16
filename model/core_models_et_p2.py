@@ -10554,6 +10554,7 @@ def sample_sc_edm_patchwise(
     anchor_min_overlap_floor: int = 20,
     commit_frac: float = 0.75,
     seq_align_dim: int = 2,
+    inference_mode: str = "unanchored",  # "unanchored" or "anchored"
 ) -> Dict[str, torch.Tensor]:
 
     """
@@ -10581,7 +10582,18 @@ def sample_sc_edm_patchwise(
 
     import random
 
-
+    # ===================================================================
+    # INFERENCE MODE ROUTING
+    # ===================================================================
+    print(f"\n[INFER-MODE] inference_mode={inference_mode} anchor_sampling_mode={anchor_sampling_mode}")
+    
+    # Auto-switch anchor_sampling_mode based on inference_mode
+    if inference_mode == "anchored" and anchor_sampling_mode == "off":
+        anchor_sampling_mode = "edm_anchor_local"
+        print(f"[INFER-MODE] Auto-enabled anchor_sampling_mode={anchor_sampling_mode}")
+    elif inference_mode == "unanchored" and anchor_sampling_mode != "off":
+        print(f"[INFER-MODE] WARNING: inference_mode=unanchored but anchor_sampling_mode={anchor_sampling_mode}")
+        print(f"[INFER-MODE] Using anchor_sampling_mode as specified (overrides inference_mode)")
 
 
     # ===================================================================
@@ -11511,14 +11523,28 @@ def sample_sc_edm_patchwise(
         patch_coords_full: List[torch.Tensor] = []  # Store full D_latent coords
         
         with torch.no_grad():
+            # ========== NEW: Check if context_encoder expects anchor channel ==========
+            expected_in_ctx = getattr(context_encoder, "input_dim", None)
+            if expected_in_ctx is None and hasattr(context_encoder, 'input_proj'):
+                expected_in_ctx = context_encoder.input_proj.in_features
+            
             for k in tqdm(range(K), desc="Sampling patches (full D)"):
                 S_k = patch_indices[k]
                 m_k = S_k.numel()
                 S_k_cpu = S_k.cpu() if torch.is_tensor(S_k) else S_k
                 Z_k = Z_all[S_k_cpu].to(device)
                 
-                Z_k_batched = Z_k.unsqueeze(0)
+                Z_k_batched = Z_k.unsqueeze(0)  # (1, m_k, h_dim)
                 mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
+                
+                # ========== NEW: Add zero anchor channel if expected ==========
+                # For initial sampling, no anchors are known yet, so all zeros
+                if expected_in_ctx is not None and expected_in_ctx == Z_k_batched.shape[-1] + 1:
+                    zeros_anchor = torch.zeros(1, m_k, 1, device=device, dtype=Z_k_batched.dtype)
+                    Z_k_batched = torch.cat([Z_k_batched, zeros_anchor], dim=-1)
+                    if k == 0:
+                        print(f"[ANCHOR-CHAN] Initial sampling: appended zero anchor channel")
+                
                 H_k = context_encoder(Z_k_batched, mask_k)
                 
                 # CORAL transform if enabled
@@ -11920,20 +11946,58 @@ def sample_sc_edm_patchwise(
 
                 else:
                     # EDM ANCHOR GLOBAL: denoise patch in GLOBAL frame with clamped anchors
-
+                    # ========== NEW FLAGS FOR BACKWARD COMPATIBILITY ==========
+                    use_clean_anchor_clamp = True  # Set False for old sigma-noised behavior
+                    use_anchor_aware_cfg = True    # Set False for old H_null=zeros behavior
+                    
                     # anchors in global coords (same scale as X_placed)
                     X_anchor_global = X_placed[A_k]  # (nA, D_latent)
                     anchor_idx_t = torch.tensor(anchor_local_idx, device=device, dtype=torch.long)
 
                     if len(processed) <= 3:
-                        print(f"[EDM-ANCHOR-GLOBAL] patch={k} nA={n_anchors}")
+                        print(f"[EDM-ANCHOR-GLOBAL] patch={k} nA={n_anchors} nU={n_new} "
+                              f"use_clean_clamp={use_clean_anchor_clamp} anchor_cfg={use_anchor_aware_cfg}")
 
                     # Recompute H_k for this patch
                     S_k_cpu = S_k.cpu() if torch.is_tensor(S_k) else S_k
                     Z_k = Z_all[S_k_cpu].to(device)
-                    Z_k_batched = Z_k.unsqueeze(0)
+                    Z_k_batched = Z_k.unsqueeze(0)  # (1, m_k, h_dim)
                     mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
+                    
+                    # ========== NEW: Add anchor channel if context_encoder expects it ==========
+                    expected_in = getattr(context_encoder, "input_dim", None)
+                    if expected_in is None:
+                        # Try to infer from input_proj
+                        if hasattr(context_encoder, 'input_proj'):
+                            expected_in = context_encoder.input_proj.in_features
+                    
+                    # Build anchor conditioning mask
+                    anchor_cond_mask_k = torch.zeros(1, m_k, dtype=torch.bool, device=device)
+                    anchor_cond_mask_k[0, anchor_idx_t] = True
+                    
+                    # Append anchor channel if needed
+                    if expected_in is not None and expected_in == Z_k_batched.shape[-1] + 1:
+                        anchor_channel = anchor_cond_mask_k.float().unsqueeze(-1)  # (1, m_k, 1)
+                        Z_k_batched = torch.cat([Z_k_batched, anchor_channel], dim=-1)
+                        if len(processed) <= 3:
+                            print(f"[ANCHOR-CHAN] appended anchor channel, Z_k shape={Z_k_batched.shape}, nA_marked={anchor_channel.sum().item():.0f}")
+                    
                     H_k = context_encoder(Z_k_batched, mask_k)
+                    
+                    # ========== NEW: Build anchor-aware unconditional context for CFG ==========
+                    H_uncond = None
+                    if use_anchor_aware_cfg and guidance_scale != 1.0:
+                        # Zero out gene embedding portion, keep anchor channel
+                        Z_uncond = Z_k_batched.clone()
+                        if expected_in is not None and expected_in == Z_k.shape[-1] + 1:
+                            # Z_uncond has anchor channel at last dim
+                            Z_uncond[..., :-1] = 0  # Zero gene embeddings, keep anchor
+                        else:
+                            Z_uncond = torch.zeros_like(Z_k_batched)
+                        H_uncond = context_encoder(Z_uncond, mask_k)
+                        if len(processed) <= 3:
+                            print(f"[ANCHOR-CFG] computed anchor-aware H_uncond")
+
 
                     if coral_params is not None:
                         from core_models_et_p3 import GEMSModel
@@ -11944,6 +12008,15 @@ def sample_sc_edm_patchwise(
                             B=coral_params['B'],
                             mu_st=coral_params['mu_st']
                         )
+                        # Also transform H_uncond if it exists
+                        if H_uncond is not None:
+                            H_uncond = GEMSModel.apply_coral_transform(
+                                H_uncond,
+                                mu_sc=coral_params['mu_sc'],
+                                A=coral_params['A'],
+                                B=coral_params['B'],
+                                mu_st=coral_params['mu_st']
+                            )
 
                     # Generator proposal (GLOBAL)
                     V_gen = generator(H_k, mask_k)  # (1, m_k, D_latent)
@@ -11957,9 +12030,30 @@ def sample_sc_edm_patchwise(
                         if len(processed) <= 3:
                             print(f"[EDM-ANCHOR-PROCR] patch={k} rmse={rmse_pre.item():.4f} s={s_pre.item():.3f}")
 
-                    # Initialize GLOBAL state with noise
-                    V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
+                    # ========== UNKNOWN MASK for selective updates ==========
+                    unknown_mask_k = mask_k.clone()
+                    unknown_mask_k[0, anchor_idx_t] = False
+                    unknown_3d = unknown_mask_k.unsqueeze(-1).float()  # (1, m_k, 1)
+
+                    # Initialize GLOBAL state with noise (ONLY on unknown points)
+                    V_t = V_gen.clone()
+                    noise_init = torch.randn_like(V_gen) * sigmas[0]
+                    V_t = V_t + noise_init * unknown_3d  # Only add noise to unknown
                     V_t = V_t * mask_k.unsqueeze(-1).float()
+                    
+                    # ========== NEW: Clean anchor clamping (matches anchored training) ==========
+                    if use_clean_anchor_clamp:
+                        # Clamp anchors to CLEAN global coords (not sigma-noised)
+                        V_t[0, anchor_idx_t] = X_anchor_global
+                        if len(processed) <= 3:
+                            print(f"[ANCHOR-CLAMP] using CLEAN anchor coords (matches training)")
+                    else:
+                        # Legacy: sigma-noised targets (RePaint style)
+                        eps_A = torch.randn((n_anchors, D_latent), device=device)
+                        sigma0 = sigmas[0]
+                        V_t[0, anchor_idx_t] = X_anchor_global + sigma0 * eps_A
+                        if len(processed) <= 3:
+                            print(f"[ANCHOR-CLAMP] using NOISY anchor targets (legacy)")
 
                     # Anchor noise (fixed for this patch)
                     eps_A = torch.randn((n_anchors, D_latent), device=device)
@@ -11977,7 +12071,11 @@ def sample_sc_edm_patchwise(
                         x0_c = score_net.forward_edm(V_t, sigma_b, H_k, mask_k, sigma_data, self_cond=None)
 
                         if guidance_scale != 1.0:
-                            H_null = torch.zeros_like(H_k)
+                            # ========== NEW: Anchor-aware CFG ==========
+                            if use_anchor_aware_cfg and H_uncond is not None:
+                                H_null = H_uncond
+                            else:
+                                H_null = torch.zeros_like(H_k)
                             x0_u = score_net.forward_edm(V_t, sigma_b, H_null, mask_k, sigma_data, self_cond=None)
 
                             guidance_eff = _sigma_guidance_eff(float(sigma), guidance_scale)
@@ -11992,7 +12090,12 @@ def sample_sc_edm_patchwise(
                             x0 = x0_c
 
                         d = (V_t - x0) / sigma.clamp_min(1e-8)
-                        V_euler = V_t + (sigma_next - sigma) * d
+                        
+                        # ========== NEW: Apply Euler update ONLY on unknown points ==========
+                        V_euler = V_t + (sigma_next - sigma) * d * unknown_3d
+                        # Clamp anchors to clean coords
+                        if use_clean_anchor_clamp:
+                            V_euler[0, anchor_idx_t] = X_anchor_global
 
                         if sigma_next > 0:
                             x0_next_c = score_net.forward_edm(V_euler, sigma_next.view(1), H_k, mask_k, sigma_data, self_cond=None)
@@ -12011,7 +12114,8 @@ def sample_sc_edm_patchwise(
                                 x0_next = x0_next_c
 
                             d2 = (V_euler - x0_next) / sigma_next.clamp_min(1e-8)
-                            V_t = V_t + (sigma_next - sigma) * 0.5 * (d + d2)
+                            # ========== NEW: Apply Heun update ONLY on unknown points ==========
+                            V_t = V_t + (sigma_next - sigma) * 0.5 * (d + d2) * unknown_3d
                         else:
                             V_t = V_euler
 
@@ -12019,18 +12123,29 @@ def sample_sc_edm_patchwise(
 
                         if eta > 0 and sigma_next > 0:
                             noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma**2, min=0))
-                            V_t = V_t + noise_scale * torch.randn_like(V_t)
+                            # ========== NEW: Stochastic noise ONLY on unknown points ==========
+                            V_t = V_t + noise_scale * torch.randn_like(V_t) * unknown_3d
 
-                        # Clamp anchors to noisy target at sigma_next (GLOBAL)
-                        target = X_anchor_global + sigma_next * eps_A
+                        # ========== NEW: Clean anchor clamping ==========
+                        if use_clean_anchor_clamp:
+                            target = X_anchor_global  # Clean coords
+                        else:
+                            # Legacy noisy target
+                            target = X_anchor_global + sigma_next * eps_A
 
-                        # IMPORTANT: compute error BEFORE clamping (otherwise always 0)
+                        # Debug: compute error BEFORE clamping
                         if len(processed) <= 3 and i < 5:
                             err_pre = (V_t[0, anchor_idx_t] - target).norm(dim=1)
-                            print(f"[EDM-ANCHOR-CLAMP] step={i} sigma_next={float(sigma_next):.4f} "
-                                  f"max_pre={err_pre.max().item():.4e} rms_pre={err_pre.pow(2).mean().sqrt().item():.4e}")
+                            # With unknown_3d masking, anchors should NOT have moved
+                            anchor_drift = err_pre.max().item() if err_pre.numel() > 0 else 0.0
+                            print(f"[ANCHOR-CLAMP] step={i} sigma_next={float(sigma_next):.4f} "
+                                  f"anchor_drift={anchor_drift:.4e} (should be ~0 with freeze)")
 
                         V_t[0, anchor_idx_t] = target
+
+                    # Final clamp at sigma=0 (GLOBAL) - always clean
+                    V_t[0, anchor_idx_t] = X_anchor_global
+
 
                     # Final clamp at sigma=0 (GLOBAL)
                     V_t[0, anchor_idx_t] = X_anchor_global
@@ -12069,8 +12184,7 @@ def sample_sc_edm_patchwise(
                             w_skip = new_weights[w_skip_idx] if w_skip_idx else torch.tensor([0.0])
                             print(f"[EDM-ANCHOR-COMMIT] n_new={n_new} commit={len(cells_to_commit)} skip={n_new-len(cells_to_commit)} "
                                   f"w_commit_p50={w_commit.median().item():.3f} w_skip_p50={w_skip.median().item():.3f}")
-
-            
+      
             # Add neighbors to queue
             for nbr in G_overlap.neighbors(k):
                 if nbr not in processed:
@@ -12341,7 +12455,7 @@ def sample_sc_edm_patchwise(
     # cells are present (context dependence). Low stability means the generator
     # produces different neighborhoods for the same cell depending on context.
     # ===================================================================
-    if debug_knn and gt_coords is not None and K > 1:
+    if debug_knn and gt_coords is not None and K > 1 and len(patch_coords) > 0:
         print("\n" + "="*70)
         print("[TEST3-STABILITY] NEIGHBORHOOD STABILITY ACROSS PATCHES")
         print("="*70)

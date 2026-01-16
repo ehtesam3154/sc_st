@@ -822,6 +822,8 @@ class GEMSModel:
         anchor_min_overlap_floor: int = 20,
         commit_frac: float = 0.75,
         seq_align_dim: int = 2,
+        # --- INFERENCE MODE ---
+        inference_mode: str = "unanchored",  # "unanchored" or "anchored"
     ) -> Dict[str, torch.Tensor]:
 
 
@@ -935,6 +937,7 @@ class GEMSModel:
             anchor_min_overlap_floor=anchor_min_overlap_floor,
             commit_frac=commit_frac,
             seq_align_dim=seq_align_dim,
+            inference_mode=inference_mode,
         )
         return res
 
