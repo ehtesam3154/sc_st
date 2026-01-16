@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument('--stageA_epochs', type=int, default=1000)
     parser.add_argument('--stageC_epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--outdir', type=str, default='gems_mousebrain_output')
     parser.add_argument('--num_st_samples', type=int, default=4000)  # ADD THIS
     parser.add_argument('--num_sc_samples', type=int, default=9000)  # ADD THIS
@@ -79,6 +79,28 @@ def parse_args():
 
     parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
                         help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
+    
+    # ========== COMPETITOR TRAINING FLAGS (ChatGPT hypothesis test) ==========
+    parser.add_argument('--compete_train', action=argparse.BooleanOptionalAction, default=False,
+                        help='Enable competitor training (expand candidate pool)')
+    parser.add_argument('--compete_n_extra', type=int, default=128,
+                        help='Total extra points to add beyond core patch')
+    parser.add_argument('--compete_n_rand', type=int, default=64,
+                        help='Number of random distractors from outside patch')
+    parser.add_argument('--compete_n_hard', type=int, default=64,
+                        help='Number of hard negatives (expression-similar distractors)')
+    parser.add_argument('--compete_use_pos_closure', action=argparse.BooleanOptionalAction, default=True,
+                        help='Include GT spatial neighbors missing from core patch')
+    parser.add_argument('--compete_k_pos', type=int, default=10,
+                        help='Number of GT spatial neighbors to try to include per core point')
+    parser.add_argument('--compete_expr_knn_k', type=int, default=50,
+                        help='Top-K expression neighbors for hard negative pool')
+    parser.add_argument('--compete_anchor_only', action=argparse.BooleanOptionalAction, default=True,
+                        help='Restrict NCA loss anchors to core points only')
+    parser.add_argument('--compete_diag_every', type=int, default=200,
+                        help='Steps between competitor diagnostic prints')
+
+
 
     
     return parser.parse_args()
@@ -353,8 +375,8 @@ def main(args=None):
         batch_size=stageC_batch,
         lr=lr,
         n_timesteps=500,
-        sigma_min=0.002,
-        sigma_max=80.0,
+        sigma_min=0.02,
+        sigma_max=3.0,
         outf=outdir,
         fabric=fabric,
         precision=precision,
@@ -364,9 +386,20 @@ def main(args=None):
         early_stop_patience=args.early_stop_patience,
         early_stop_threshold=args.early_stop_threshold,
         # NEW: Context augmentation
-        z_noise_std=0.02,       # Small noise (1-5% of feature RMS)
-        z_dropout_rate=0.1,     # 10% feature dropout
-        aug_prob=0.5,           # Apply to 50% of batches
+        z_noise_std=0.0,       # Small noise (1-5% of feature RMS)
+        z_dropout_rate=0.0,     # 10% feature dropout
+        aug_prob=0.0,           # Apply to 50% of batches
+        # ---- ADD THESE LINES at the end of train_stageC() call ----
+        # COMPETITOR TRAINING (ChatGPT A/B test)
+        compete_train=args.compete_train,
+        compete_n_extra=args.compete_n_extra,
+        compete_n_rand=args.compete_n_rand,
+        compete_n_hard=args.compete_n_hard,
+        compete_use_pos_closure=args.compete_use_pos_closure,
+        compete_k_pos=args.compete_k_pos,
+        compete_expr_knn_k=args.compete_expr_knn_k,
+        compete_anchor_only=args.compete_anchor_only,
+        compete_diag_every=args.compete_diag_every,
     )
     
     fabric.barrier()
@@ -445,22 +478,6 @@ def main(args=None):
                 print("\n" + "="*70)
                 print("PHASE 2 SKIPPED - Copying Phase 1 checkpoint")
                 print("="*70)
-                
-                # checkpoint_path = os.path.join(outdir, "phase2_sc_finetuned_checkpoint.pt")
-                # checkpoint = {
-                #     'encoder': model.encoder.state_dict(),
-                #     'context_encoder': model.context_encoder.module.state_dict() if hasattr(model.context_encoder, 'module') else model.context_encoder.state_dict(),
-                #     'generator': model.generator.module.state_dict() if hasattr(model.generator, 'module') else model.generator.state_dict(),
-                #     'score_net': model.score_net.module.state_dict() if hasattr(model.score_net, 'module') else model.score_net.state_dict(),
-                #     'E_ST_best': E_ST_best,
-                #     'epochs_finetune': 0,
-                #     'lr_finetune': lr / 3.0,
-                #     'history_st': history_st,
-                #     'history_sc': history_st,
-                # }
-                # torch.save(checkpoint, checkpoint_path)
-                # print(f"✓ Saved checkpoint (copy of Phase 1): {checkpoint_path}")
-            
             fabric.barrier()
         else:
             # Lower learning rate for fine-tuning
@@ -498,8 +515,8 @@ def main(args=None):
                 batch_size=stageC_batch,
                 lr=lr_finetune,
                 n_timesteps=500,
-                sigma_min=0.002,
-                sigma_max=80.0,
+                sigma_min=0.02,
+                sigma_max=3.0,
                 outf=outdir,
                 fabric=fabric,
                 precision=precision,
