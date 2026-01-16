@@ -5163,3 +5163,32 @@ def anchor_mask_stats(
         'frac_anchor_min': frac.min().item(),
         'frac_anchor_max': frac.max().item(),
     }
+
+# ==================== ANCHOR-AWARE STRUCTURE LOSS HELPERS ====================
+
+def clamp_anchors_for_loss(V_pred, V_tgt, anchor_mask, mask):
+    """
+    Clamp anchor points in V_pred to their clean target values.
+    Used for structure losses (Gram, Edge, NCA, etc.) so anchor points
+    cannot move due to those losses.
+    
+    Args:
+        V_pred: (B, N, D) predicted coordinates
+        V_tgt: (B, N, D) target coordinates (must be centered same as V_pred)
+        anchor_mask: (B, N) bool/float, 1 = anchor point
+        mask: (B, N) bool/float, 1 = valid point
+    
+    Returns:
+        V_clamped: (B, N, D) with anchors replaced by target values
+    """
+    if anchor_mask is None:
+        return V_pred
+    
+    anchor_mask_3d = anchor_mask.unsqueeze(-1).float()  # (B, N, 1)
+    mask_3d = mask.unsqueeze(-1).float()
+    
+    # Clamp: anchor points get target values, others keep prediction
+    V_clamped = (1.0 - anchor_mask_3d) * V_pred + anchor_mask_3d * V_tgt
+    V_clamped = V_clamped * mask_3d  # Re-apply padding mask
+    
+    return V_clamped

@@ -123,9 +123,21 @@ def parse_args():
                         help='Steps to linearly ramp anchored probability (0=no warmup)')
     parser.add_argument('--anchor_debug_every', type=int, default=200,
                         help='Steps between anchor debug prints')
+    
+    # ========== ANCHOR GEOMETRY LOSSES ==========
+    parser.add_argument('--anchor_geom_losses', action=argparse.BooleanOptionalAction, default=True,
+                        help='Apply anchor-clamping to structure losses (default: True)')
+    parser.add_argument('--anchor_geom_mode', type=str, default='clamp_only',
+                        choices=['clamp_only', 'clamp_and_mask'],
+                        help='Anchor geometry mode (clamp_only recommended)')
+    parser.add_argument('--anchor_geom_min_unknown', type=int, default=8,
+                        help='Minimum unknown points to use anchor_geom')
+    parser.add_argument('--anchor_geom_debug_every', type=int, default=200,
+                        help='Debug logging interval for anchor geometry')
 
     
     return parser.parse_args()
+
 
 
 def load_mouse_data():
@@ -222,8 +234,13 @@ def main(args=None):
         self_conditioning=args.self_conditioning,
         sc_feat_mode=args.sc_feat_mode,
         landmarks_L=args.landmarks_L,
-        anchor_train=args.anchor_train,  # NEW: pass anchor flag
+        anchor_train=args.anchor_train,
+        anchor_geom_losses=args.anchor_geom_losses,
+        anchor_geom_mode=args.anchor_geom_mode,
+        anchor_geom_min_unknown=args.anchor_geom_min_unknown,
+        anchor_geom_debug_every=args.anchor_geom_debug_every,
     )
+
 
 
     # ---------- Stage A & B on rank-0 only ----------

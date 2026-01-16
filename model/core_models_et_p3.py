@@ -71,6 +71,11 @@ class GEMSModel:
         landmarks_L: int = 32,
         # ========== NEW: Anchored training params ==========
         anchor_train: bool = False,
+        # ========== ANCHOR GEOMETRY LOSSES ==========
+        anchor_geom_losses: bool = True,
+        anchor_geom_mode: str = "clamp_only",
+        anchor_geom_min_unknown: int = 8,
+        anchor_geom_debug_every: int = 200,
     ):
         """
         Args:
@@ -108,11 +113,21 @@ class GEMSModel:
             },
             'anchor': {
                 'anchor_train': anchor_train,
+                'anchor_geom_losses': anchor_geom_losses,
+                'anchor_geom_mode': anchor_geom_mode,
+                'anchor_geom_min_unknown': anchor_geom_min_unknown,
+                'anchor_geom_debug_every': anchor_geom_debug_every,
             }
+
         }
         
         # Store anchor_train for later use
         self.anchor_train = anchor_train
+        self.anchor_geom_losses = anchor_geom_losses
+        self.anchor_geom_mode = anchor_geom_mode
+        self.anchor_geom_min_unknown = anchor_geom_min_unknown
+        self.anchor_geom_debug_every = anchor_geom_debug_every
+
 
 
         # EMA copies (will be populated if loaded from checkpoint or after training)
@@ -325,6 +340,11 @@ class GEMSModel:
         anchor_pointweight_nca: bool = True,
         anchor_debug_every: int = 200,
         anchor_warmup_steps: int = 0,
+        # ========== ANCHOR GEOMETRY LOSSES ==========
+        anchor_geom_losses: bool = None,  # None = use model default
+        anchor_geom_mode: str = None,
+        anchor_geom_min_unknown: int = None,
+        anchor_geom_debug_every: int = None,
     ):
 
         """
@@ -349,6 +369,24 @@ class GEMSModel:
         # ST dataset (conditional - can be None if num_st_samples=0)
         # Use model's anchor_train if not explicitly provided
         effective_anchor_train = anchor_train if anchor_train is not None else self.anchor_train
+
+        # Use model defaults for anchor_geom params if not explicitly provided
+        effective_anchor_geom_losses = anchor_geom_losses if anchor_geom_losses is not None else self.anchor_geom_losses
+        effective_anchor_geom_mode = anchor_geom_mode if anchor_geom_mode is not None else self.anchor_geom_mode
+        effective_anchor_geom_min_unknown = anchor_geom_min_unknown if anchor_geom_min_unknown is not None else self.anchor_geom_min_unknown
+        effective_anchor_geom_debug_every = anchor_geom_debug_every if anchor_geom_debug_every is not None else self.anchor_geom_debug_every
+
+
+        
+        # ========== VALIDATION: Ensure anchor_train matches model configuration ==========
+        if effective_anchor_train and not self.anchor_train:
+            raise ValueError(
+                f"Cannot enable anchor_train in train_stageC when model was constructed with "
+                f"anchor_train=False. The context encoder expects input dim={self.context_encoder.input_dim} "
+                f"but anchored training requires input dim={self.context_encoder.input_dim + 1}. "
+                f"Reconstruct the model with anchor_train=True."
+            )
+
         
         if num_st_samples > 0:
             st_dataset = STSetDataset(
@@ -462,7 +500,13 @@ class GEMSModel:
             anchor_pointweight_nca=anchor_pointweight_nca,
             anchor_debug_every=anchor_debug_every,
             anchor_warmup_steps=anchor_warmup_steps,
+            # ========== ANCHOR GEOMETRY LOSSES ==========
+            anchor_geom_losses=effective_anchor_geom_losses,
+            anchor_geom_mode=effective_anchor_geom_mode,
+            anchor_geom_min_unknown=effective_anchor_geom_min_unknown,
+            anchor_geom_debug_every=effective_anchor_geom_debug_every,
         )
+
 
         # Store sigma_data for inference
         # if 'sigma_data' in history:

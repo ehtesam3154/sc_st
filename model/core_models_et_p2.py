@@ -230,9 +230,20 @@ class SetEncoderContext(nn.Module):
             Z_set = torch.cat([Z_set, zeros], dim=-1)
             
             if not self._logged_pad_warning:
-                print(f"[ANCHOR-CONTEXT] padded_missing_anchor_channel=1 "
-                      f"(input_dim={input_dim_actual}, expected={self.input_dim})")
+                # Only log on rank 0 to avoid DDP spam
+                should_log = True
+                try:
+                    import torch.distributed as dist
+                    if dist.is_initialized():
+                        should_log = (dist.get_rank() == 0)
+                except:
+                    pass
+                
+                if should_log:
+                    print(f"[ANCHOR-CONTEXT] padded_missing_anchor_channel=1 "
+                          f"(input_dim={input_dim_actual}, expected={self.input_dim})")
                 self._logged_pad_warning = True
+
                 
         elif input_dim_actual != self.input_dim:
             raise ValueError(
@@ -2280,7 +2291,11 @@ def train_stageC_diffusion_generator(
     anchor_pointweight_nca: bool = True,
     anchor_debug_every: int = 200,
     anchor_warmup_steps: int = 0,
-
+    # ========== ANCHOR GEOMETRY LOSSES (structure loss anchor-awareness) ==========
+    anchor_geom_losses: bool = True,  # Default ON when anchor_train is ON
+    anchor_geom_mode: str = "clamp_only",  # "clamp_only" or "clamp_and_mask"
+    anchor_geom_min_unknown: int = 8,
+    anchor_geom_debug_every: int = 200,
 ):
     
     # Initialize debug tracking
@@ -2991,6 +3006,13 @@ def train_stageC_diffusion_generator(
         print(f"  anchor_mask_score_loss: {anchor_mask_score_loss}")
         print(f"  anchor_warmup_steps: {anchor_warmup_steps}")
     
+    # Log active losses at startup (rank-0 only)
+    if fabric is None or fabric.is_global_zero:
+        active_losses = {k: v for k, v in WEIGHTS.items() if v != 0}
+        print(f"\n[ANCHOR-GEOM] active_losses (weight>0): {list(active_losses.keys())}")
+        print(f"[ANCHOR-GEOM] anchor_train={anchor_train} anchor_geom_losses={anchor_geom_losses}")
+        if anchor_train and anchor_geom_losses:
+            print(f"[ANCHOR-GEOM] mode={anchor_geom_mode} min_unknown={anchor_geom_min_unknown}")
 
 
 
@@ -3343,8 +3365,13 @@ def train_stageC_diffusion_generator(
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
 
+            n_list = batch['n']
+            batch_size_real = Z_set.shape[0]
             
-            # ========== NEW: Anchored training - extract and process anchor mask ==========
+            D_latent = score_net.D_latent
+
+            
+            # ========== Extract anchor_cond_mask BEFORE any processing ==========
             if anchor_train and not is_sc:
                 anchor_cond_mask = batch.get('anchor_cond_mask', torch.zeros_like(mask)).to(device)
                 # Ensure anchor_cond_mask respects padding
@@ -3358,12 +3385,8 @@ def train_stageC_diffusion_generator(
                     if torch.rand(1).item() > p_anchor_effective:
                         anchor_cond_mask = torch.zeros_like(anchor_cond_mask)
                 
-                # Augment Z_set with anchor channel: (B, N, h_dim) -> (B, N, h_dim+1)
-                anchor_channel = anchor_cond_mask.float().unsqueeze(-1)  # (B, N, 1)
-                Z_set = torch.cat([Z_set, anchor_channel], dim=-1)
-                
                 # Track statistics
-                batch_is_anchored = anchor_cond_mask.any(dim=1).sum().item()  # batches with any anchors
+                batch_is_anchored = anchor_cond_mask.any(dim=1).sum().item()
                 anchor_state['total_anchored_batches'] += batch_is_anchored
                 anchor_state['total_unanchored_batches'] += (batch_size_real - batch_is_anchored)
                 
@@ -3377,19 +3400,19 @@ def train_stageC_diffusion_generator(
             else:
                 anchor_cond_mask = None
 
-            # Apply context augmentation stochastically
+            # Apply context augmentation stochastically (ONLY to base Z_set, NOT anchor channel)
             if torch.rand(1).item() < aug_prob:
                 Z_set = apply_context_augmentation(
                     Z_set, mask, 
                     noise_std=z_noise_std, 
                     dropout_rate=z_dropout_rate
                 )
-
-
-            n_list = batch['n']
-            batch_size_real = Z_set.shape[0]
             
-            D_latent = score_net.D_latent
+            # ========== Append anchor channel AFTER augmentation ==========
+            # This ensures the anchor indicator is NOT corrupted by noise/dropout
+            if anchor_train and anchor_cond_mask is not None and not is_sc:
+                anchor_channel = anchor_cond_mask.float().unsqueeze(-1)  # (B, N, 1)
+                Z_set = torch.cat([Z_set, anchor_channel], dim=-1)
        
             # ===== FORWARD PASS WITH AMP =====
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
@@ -4816,6 +4839,53 @@ def train_stageC_diffusion_generator(
                     edges_used_for_knn = edges_used
                     neighbor_frac_for_knn = neighbor_frac
 
+                    # ========== ANCHOR-AWARE STRUCTURE TENSORS ==========
+                    # Clamp anchor points in structure tensors so they cannot move from structure losses
+                    if anchor_train and anchor_geom_losses and anchor_cond_mask is not None and (not is_sc):
+                        # Compute unknown mask
+                        unknown_mask = mask & (~anchor_cond_mask.bool())
+                        n_unknown = unknown_mask.sum(dim=1)
+                        
+                        # Only use anchor_geom if we have enough unknown points
+                        use_anchor_geom = (n_unknown.median() >= anchor_geom_min_unknown) and anchor_cond_mask.any()
+                        
+                        if use_anchor_geom:
+                            # Center the target in the same frame as V_geom for proper clamping
+                            V_target_centered, _ = uet.center_only(V_target.float(), mask)
+                            V_target_centered = V_target_centered * m_float
+                            
+                            # Create anchor-clamped versions of structure tensors
+                            # V_geom_L: for Gram, Edge, NCA (structure losses)
+                            V_geom_L = uet.clamp_anchors_for_loss(V_geom, V_target_centered, anchor_cond_mask, mask)
+                            
+                            # V_hat_centered_L: for knn_scale (raw scale loss needs clamping too)
+                            V_hat_centered_L = uet.clamp_anchors_for_loss(V_hat_centered, V_target_centered, anchor_cond_mask, mask)
+                            
+                            # Debug logging
+                            if global_step % anchor_geom_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                with torch.no_grad():
+                                    n_anchor_mean = anchor_cond_mask.float().sum(dim=1).mean().item()
+                                    n_unknown_mean = unknown_mask.float().sum(dim=1).mean().item()
+                                    
+                                    # Verify anchor clamping worked (error should be ~0)
+                                    anchor_mask_3d = anchor_cond_mask.unsqueeze(-1)
+                                    max_anchor_err_geom = (V_geom_L - V_target_centered).abs()[anchor_mask_3d.expand_as(V_geom_L)].max().item() if anchor_cond_mask.any() else 0.0
+                                    max_anchor_err_scale = (V_hat_centered_L - V_target_centered).abs()[anchor_mask_3d.expand_as(V_hat_centered_L)].max().item() if anchor_cond_mask.any() else 0.0
+                                    
+                                    print(f"\n{uet.ANCHOR_TAG} [GEOM] step={global_step}")
+                                    print(f"  anchors_mean={n_anchor_mean:.1f} unknown_mean={n_unknown_mean:.1f} use_anchor_geom={use_anchor_geom}")
+                                    print(f"  V_geom_L max_anchor_err={max_anchor_err_geom:.6f} (should be ~0)")
+                                    print(f"  V_hat_centered_L max_anchor_err={max_anchor_err_scale:.6f} (should be ~0)")
+                        else:
+                            # Not enough unknown points, use original tensors
+                            V_geom_L = V_geom
+                            V_hat_centered_L = V_hat_centered
+                            use_anchor_geom = False
+                    else:
+                        # No anchor training, use original tensors
+                        V_geom_L = V_geom
+                        V_hat_centered_L = V_hat_centered
+                        use_anchor_geom = False
 
                     
                     # --- POST-CLAMP DIAGNOSTIC (ChatGPT updated) ---
@@ -4930,7 +5000,7 @@ def train_stageC_diffusion_generator(
 
             # --- PATCH 7: Low-rank subspace penalty ---
             if not is_sc and WEIGHTS.get('subspace', 0) > 0:
-                L_subspace = uet.variance_outside_topk(V_geom, mask, k=2)
+                L_subspace = uet.variance_outside_topk(V_geom_L, mask, k=2)
             else:
                 L_subspace = torch.tensor(0.0, device=device)
 
@@ -5195,7 +5265,7 @@ def train_stageC_diffusion_generator(
                                   f"ratio={tr_Gt_new.item()/tr_Gt_old.item():.4f}")
                     
                     # Build predicted Gram *with* true scale
-                    Gp_raw = V_geom @ V_geom.transpose(1, 2)          # (B,N,N)
+                    Gp_raw = V_geom_L @ V_geom_L.transpose(1, 2)          # (B,N,N)
                     
                     # --- PATCH 6: Diagonal distribution loss (per-point norm matching) ---
                     diag_p = torch.diagonal(Gp_raw, dim1=-2, dim2=-1)  # (B,N)
@@ -5707,7 +5777,7 @@ def train_stageC_diffusion_generator(
                         
                         # Compute NCA loss with point weighting
                         L_knn_per = uet.knn_nca_loss(
-                            V_geom,              # Clamped structure tensor
+                            V_geom_L,              # Clamped structure tensor
                             V_target.float(),    # Raw target
                             mask, 
                             k=15, 
@@ -5893,7 +5963,7 @@ def train_stageC_diffusion_generator(
                         # CHANGE 5: Use V_hat_centered (RAW, NOT clamped V_geom)
                         # This is critical - knn_scale needs to see actual scale error to teach it
                         L_knn_scale_per = uet.knn_scale_loss(
-                            V_hat_centered,  # RAW centered - this is the KEY difference
+                            V_hat_centered_L,  # RAW centered - this is the KEY difference
                             V_target.float(),
                             mask,
                             knn_indices=knn_spatial_batch,
@@ -6123,7 +6193,7 @@ def train_stageC_diffusion_generator(
                         # Using clamped V_geom removes systematic scale bias from gradients
                         # Scale learning happens via knn_scale on V_hat_centered
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=V_geom,  # Clamped structure tensor, NOT raw x0_pred
+                            V_pred=V_geom_L,  # Clamped structure tensor, NOT raw x0_pred
                             V_tgt=V_target.float(),
                             knn_idx=knn_indices_batch,
                             mask=mask
@@ -6834,18 +6904,28 @@ def train_stageC_diffusion_generator(
                         else:
                             V_gen_geo = V_gen_centered
 
+                        # ========== ANCHOR-CLAMP GENERATOR TENSORS ==========
+                        if anchor_train and anchor_geom_losses and anchor_cond_mask is not None and use_anchor_geom:
+                            V_target_centered_gen, _ = uet.center_only(V_target.float(), mask)
+                            V_target_centered_gen = V_target_centered_gen * mask.float().unsqueeze(-1)
+                            V_gen_geo_L = uet.clamp_anchors_for_loss(V_gen_geo, V_target_centered_gen, anchor_cond_mask, mask)
+                            V_gen_centered_L = uet.clamp_anchors_for_loss(V_gen_centered, V_target_centered_gen, anchor_cond_mask, mask)
+                        else:
+                            V_gen_geo_L = V_gen_geo
+                            V_gen_centered_L = V_gen_centered
                         
                         # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
-                        # Use CLAMPED V_gen_geo for alignment (removes scale mismatch)
-                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_geo, V_target_batch, mask)
-                        # Use RAW V_gen_centered for scale loss (supervises the model)
-                        L_gen_scale = uet.rms_log_loss(V_gen_centered, V_target_batch, mask)
+                        # Use anchor-clamped V_gen_geo_L for alignment
+                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_geo_L, V_target_batch, mask)
+                        # Use anchor-clamped V_gen_centered_L for scale loss
+                        L_gen_scale = uet.rms_log_loss(V_gen_centered_L, V_target_batch, mask)
                         
                         # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
                         # This ensures generator learns correct local neighborhood distances
                         if knn_spatial_for_gen is not None:
                             L_gen_scale_local = uet.knn_scale_loss(
-                                V_gen_centered,  # Raw (unclamped) generator output
+                                V_gen_centered_L,  # Anchor-clamped generator output
+
                                 V_target_batch,
                                 mask,
                                 knn_indices=knn_spatial_for_gen,
