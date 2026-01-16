@@ -4937,3 +4937,229 @@ def compute_probe_metrics(V_pred: torch.Tensor,
             pass
     
     return results
+
+
+# ==============================================================================
+# ANCHORED DIFFUSION HELPERS (ChatGPT/Claude anchored training implementation)
+# ==============================================================================
+
+ANCHOR_TAG = "[ANCHOR-TRAIN]"
+
+def sample_anchor_mask_ball(
+    y_xy: torch.Tensor,
+    eligible: torch.Tensor,
+    n_anchor: int,
+    seed_idx: Optional[int] = None
+) -> Tuple[torch.Tensor, int]:
+    """
+    Sample anchor mask using ball (spatial neighborhood) method.
+    
+    Args:
+        y_xy: (N, 2) 2D coordinates
+        eligible: (N,) bool mask of eligible points for anchor selection
+        n_anchor: number of anchors to select
+        seed_idx: optional seed index (if None, randomly selected)
+    
+    Returns:
+        anchor_mask: (N,) bool mask
+        seed_idx: the seed index used
+    """
+    device = y_xy.device
+    N = y_xy.shape[0]
+    
+    eligible_indices = torch.where(eligible)[0]
+    n_eligible = eligible_indices.numel()
+    
+    if n_eligible == 0 or n_anchor == 0:
+        return torch.zeros(N, dtype=torch.bool, device=device), -1
+    
+    # Choose seed among eligible points
+    if seed_idx is None or seed_idx < 0 or not eligible[seed_idx]:
+        local_seed = torch.randint(0, n_eligible, (1,), device=device).item()
+        seed_idx = eligible_indices[local_seed].item()
+    
+    # Compute distances from seed to all points
+    seed_coords = y_xy[seed_idx:seed_idx+1]  # (1, 2)
+    dists = torch.cdist(seed_coords, y_xy).squeeze(0)  # (N,)
+    
+    # Only consider eligible points
+    dists_eligible = dists.clone()
+    dists_eligible[~eligible] = float('inf')
+    
+    # Get nearest n_anchor points
+    n_anchor_actual = min(n_anchor, n_eligible)
+    _, nearest_indices = torch.topk(dists_eligible, n_anchor_actual, largest=False)
+    
+    anchor_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    anchor_mask[nearest_indices] = True
+    
+    return anchor_mask, seed_idx
+
+
+def sample_anchor_mask_uniform(
+    eligible: torch.Tensor,
+    n_anchor: int
+) -> torch.Tensor:
+    """
+    Sample anchor mask uniformly at random from eligible points.
+    
+    Args:
+        eligible: (N,) bool mask of eligible points
+        n_anchor: number of anchors to select
+    
+    Returns:
+        anchor_mask: (N,) bool mask
+    """
+    device = eligible.device
+    N = eligible.numel()
+    
+    eligible_indices = torch.where(eligible)[0]
+    n_eligible = eligible_indices.numel()
+    
+    if n_eligible == 0 or n_anchor == 0:
+        return torch.zeros(N, dtype=torch.bool, device=device)
+    
+    n_anchor_actual = min(n_anchor, n_eligible)
+    perm = torch.randperm(n_eligible, device=device)[:n_anchor_actual]
+    selected = eligible_indices[perm]
+    
+    anchor_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    anchor_mask[selected] = True
+    
+    return anchor_mask
+
+
+def sample_anchor_mask_knn_bfs(
+    knn: torch.Tensor,
+    eligible: torch.Tensor,
+    n_anchor: int,
+    seed_idx: Optional[int] = None
+) -> Tuple[torch.Tensor, int]:
+    """
+    Sample anchor mask using BFS on local kNN adjacency.
+    
+    Args:
+        knn: (N, K) kNN indices (-1 for invalid)
+        eligible: (N,) bool mask of eligible points
+        n_anchor: number of anchors to select
+        seed_idx: optional seed index
+    
+    Returns:
+        anchor_mask: (N,) bool mask
+        seed_idx: the seed index used
+    """
+    device = knn.device
+    N = knn.shape[0]
+    
+    eligible_indices = torch.where(eligible)[0]
+    n_eligible = eligible_indices.numel()
+    
+    if n_eligible == 0 or n_anchor == 0:
+        return torch.zeros(N, dtype=torch.bool, device=device), -1
+    
+    # Choose seed among eligible points
+    if seed_idx is None or seed_idx < 0 or not eligible[seed_idx]:
+        local_seed = torch.randint(0, n_eligible, (1,), device=device).item()
+        seed_idx = eligible_indices[local_seed].item()
+    
+    # BFS from seed
+    visited = torch.zeros(N, dtype=torch.bool, device=device)
+    visited[seed_idx] = True
+    queue = [seed_idx]
+    anchors = [seed_idx]
+    
+    while len(anchors) < n_anchor and queue:
+        current = queue.pop(0)
+        neighbors = knn[current]
+        
+        for nb in neighbors.tolist():
+            if nb < 0 or nb >= N:
+                continue
+            if visited[nb]:
+                continue
+            if not eligible[nb]:
+                continue
+                
+            visited[nb] = True
+            queue.append(nb)
+            anchors.append(nb)
+            
+            if len(anchors) >= n_anchor:
+                break
+    
+    anchor_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    anchor_mask[torch.tensor(anchors, dtype=torch.long, device=device)] = True
+    
+    return anchor_mask, seed_idx
+
+
+def apply_anchor_clamp(
+    V_t: torch.Tensor,
+    V_target: torch.Tensor,
+    anchor_cond_mask: torch.Tensor,
+    mask: torch.Tensor
+) -> torch.Tensor:
+    """
+    Hard clamp anchor positions in noisy input to their clean values.
+    
+    Args:
+        V_t: (B, N, D) noisy input
+        V_target: (B, N, D) clean target coordinates
+        anchor_cond_mask: (B, N) bool mask of anchor points
+        mask: (B, N) bool mask of valid points
+    
+    Returns:
+        V_t_clamped: (B, N, D) with anchors replaced by clean values
+    """
+    # Ensure anchor_cond_mask respects padding mask
+    effective_anchor = anchor_cond_mask & mask
+    
+    # Create expansion for broadcasting: (B, N) -> (B, N, 1)
+    anchor_3d = effective_anchor.unsqueeze(-1).float()
+    
+    # Clamp: V_t * (1 - anchor) + V_target * anchor
+    V_t_clamped = V_t * (1.0 - anchor_3d) + V_target * anchor_3d
+    
+    # Apply padding mask
+    V_t_clamped = V_t_clamped * mask.unsqueeze(-1).float()
+    
+    return V_t_clamped
+
+
+def anchor_mask_stats(
+    anchor_cond_mask: torch.Tensor,
+    mask: torch.Tensor
+) -> Dict[str, float]:
+    """
+    Compute statistics about anchor masks for logging.
+    
+    Args:
+        anchor_cond_mask: (B, N) bool mask
+        mask: (B, N) bool mask of valid points
+    
+    Returns:
+        dict with statistics
+    """
+    B = mask.shape[0]
+    
+    # Per-sample counts
+    n_valid = mask.sum(dim=1).float()  # (B,)
+    n_anchor = (anchor_cond_mask & mask).sum(dim=1).float()  # (B,)
+    n_unknown = n_valid - n_anchor
+    
+    # Fraction per sample
+    frac = n_anchor / n_valid.clamp(min=1)
+    
+    return {
+        'n_valid_mean': n_valid.mean().item(),
+        'n_valid_min': n_valid.min().item(),
+        'n_valid_max': n_valid.max().item(),
+        'n_anchor_mean': n_anchor.mean().item(),
+        'n_anchor_min': n_anchor.min().item(),
+        'n_anchor_max': n_anchor.max().item(),
+        'n_anchor_median': n_anchor.median().item(),
+        'n_unknown_mean': n_unknown.mean().item(),
+        'frac_anchor_mean': frac.mean().item(),
+        'frac_anchor_min': frac.min().item(),
+        'frac_anchor_max': frac.max().item(),
+    }

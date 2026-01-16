@@ -543,7 +543,18 @@ class STSetDataset(Dataset):
         compete_k_pos: int = 10,
         compete_expr_knn_k: int = 50,
         compete_anchor_only: bool = True,
+        # ========== NEW: Anchored training params ==========
+        anchor_train: bool = False,
+        anchor_p_uncond: float = 0.50,
+        anchor_frac_min: float = 0.10,
+        anchor_frac_max: float = 0.30,
+        anchor_min: int = 8,
+        anchor_max: int = 96,
+        anchor_mode: str = "ball",
+        anchor_exclude_landmarks: bool = True,
+        debug_anchor_dataset: bool = False,
     ):
+
         self.targets_dict = targets_dict
         self.encoder = encoder
         self.st_gene_expr_dict = st_gene_expr_dict
@@ -570,8 +581,20 @@ class STSetDataset(Dataset):
         self.compete_expr_knn_k = compete_expr_knn_k
         self.compete_anchor_only = compete_anchor_only
         
+        # ========== NEW: Store anchored training params ==========
+        self.anchor_train = anchor_train
+        self.anchor_p_uncond = anchor_p_uncond
+        self.anchor_frac_min = anchor_frac_min
+        self.anchor_frac_max = anchor_frac_max
+        self.anchor_min = anchor_min
+        self.anchor_max = anchor_max
+        self.anchor_mode = anchor_mode
+        self.anchor_exclude_landmarks = anchor_exclude_landmarks
+        self.debug_anchor_dataset = debug_anchor_dataset
+        
         # Precompute encoder embeddings for all slides
         self.Z_dict = {}
+
         self.expr_knn_indices = {}  # NEW: expression-based kNN for hard negatives
         
         with torch.no_grad():
@@ -802,10 +825,74 @@ class STSetDataset(Dataset):
         }
 
         # ------------------------------------------------------------------
-        # Rest of data extraction (same as before)
+        # Extract embeddings + coords for this FINAL index set
+        # (needed for anchor sampling below and for downstream targets)
         # ------------------------------------------------------------------
-        Z_set = self.Z_dict[slide_id][indices]
-        y_hat_subset = targets.y_hat[indices]
+        Z_set = self.Z_dict[slide_id][indices]          # (n_total_final, h_dim)
+        y_hat_subset = targets.y_hat[indices]           # (n_total_final, d)
+
+        # ========== NEW: Generate anchor_cond_mask for anchored training ==========
+        n_total_final = indices.numel()
+        anchor_cond_mask = torch.zeros(n_total_final, dtype=torch.bool)
+        anchor_cond_debug = {
+            'mode': 'none',
+            'n_anchor': 0,
+            'n_total': n_total_final,
+            'n_landmarks': int(is_landmark.sum().item()) if is_landmark is not None else 0,
+            'seed_idx': -1,
+        }
+
+        if self.anchor_train:
+            # Decide: anchored vs unanchored for this sample
+            u = torch.rand(1).item()
+
+            if u < self.anchor_p_uncond:
+                # Unanchored: all points unknown
+                anchor_cond_debug['mode'] = 'uncond'
+            else:
+                # Anchored: sample some points as anchors
+                eligible = torch.ones(n_total_final, dtype=torch.bool)
+                if self.anchor_exclude_landmarks and is_landmark is not None:
+                    eligible &= (~is_landmark)
+
+                n_eligible = int(eligible.sum().item())
+                if n_eligible > 0:
+                    frac = torch.empty(1).uniform_(self.anchor_frac_min, self.anchor_frac_max).item()
+                    n_anchor_raw = int(round(frac * n_eligible))
+                    n_anchor = max(self.anchor_min, min(self.anchor_max, n_anchor_raw, n_eligible))
+
+                    # Ball mode uses 2D coords (or full coords if <2 dims)
+                    y_xy = y_hat_subset[:, :2] if y_hat_subset.shape[1] >= 2 else y_hat_subset
+
+                    # kNN BFS mode uses knn_spatial_local which is already defined above
+                    knn_for_bfs = knn_spatial_local
+
+                    if self.anchor_mode == "ball":
+                        anchor_cond_mask, seed_idx = uet.sample_anchor_mask_ball(y_xy, eligible, n_anchor)
+                        anchor_cond_debug['seed_idx'] = int(seed_idx)
+                    elif self.anchor_mode == "uniform":
+                        anchor_cond_mask = uet.sample_anchor_mask_uniform(eligible, n_anchor)
+                    elif self.anchor_mode == "knn_bfs":
+                        # If knn_for_bfs is not usable, fall back to uniform
+                        if knn_for_bfs is not None and knn_for_bfs.numel() > 0:
+                            anchor_cond_mask, seed_idx = uet.sample_anchor_mask_knn_bfs(
+                                knn_for_bfs, eligible, n_anchor
+                            )
+                            anchor_cond_debug['seed_idx'] = int(seed_idx)
+                        else:
+                            anchor_cond_mask = uet.sample_anchor_mask_uniform(eligible, n_anchor)
+                    else:
+                        # Fallback
+                        anchor_cond_mask = uet.sample_anchor_mask_uniform(eligible, n_anchor)
+
+                    anchor_cond_debug['mode'] = self.anchor_mode
+                    anchor_cond_debug['n_anchor'] = int(anchor_cond_mask.sum().item())
+
+            if self.debug_anchor_dataset and idx < 3:
+                print(f"[ANCHOR-DATASET] idx={idx} mode={anchor_cond_debug['mode']} "
+                    f"n_anchor={anchor_cond_debug['n_anchor']}/{n_total_final} "
+                    f"n_landmarks={anchor_cond_debug['n_landmarks']}")
+
 
         y_hat_centered = y_hat_subset - y_hat_subset.mean(dim=0, keepdim=True)
         G_subset = y_hat_centered @ y_hat_centered.t()
@@ -875,7 +962,11 @@ class STSetDataset(Dataset):
             'anchor_mask': anchor_mask,
             'global_indices': indices,
             'compete_debug': compete_debug,
+            # ========== NEW: Anchored training fields ==========
+            'anchor_cond_mask': anchor_cond_mask,
+            'anchor_cond_debug': anchor_cond_debug,
         }
+
 
 
             
@@ -914,7 +1005,10 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     anchor_mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
     global_indices_batch = torch.full((batch_size, n_max), -1, dtype=torch.long, device=device)
     compete_debug_batch = []
-
+    
+    # ========== NEW: Anchored training batch tensors ==========
+    anchor_cond_mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
+    anchor_cond_debug_batch = []
 
 
     for i, item in enumerate(batch):
@@ -948,8 +1042,14 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         
         if 'compete_debug' in item:
             compete_debug_batch.append(item['compete_debug'])
+        
+        # ========== NEW: Anchored training fields ==========
+        if 'anchor_cond_mask' in item:
+            anchor_cond_mask_batch[i, :n] = item['anchor_cond_mask'][:n]
+        
+        if 'anchor_cond_debug' in item:
+            anchor_cond_debug_batch.append(item['anchor_cond_debug'])
 
-    
 
     return {
         'Z_set': Z_batch,
@@ -972,6 +1072,9 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'anchor_mask': anchor_mask_batch,
         'global_indices': global_indices_batch,
         'compete_debug': compete_debug_batch,
+        # ========== NEW: Anchored training fields ==========
+        'anchor_cond_mask': anchor_cond_mask_batch,
+        'anchor_cond_debug': anchor_cond_debug_batch,
     }
 
 # class SCSetDataset(Dataset):

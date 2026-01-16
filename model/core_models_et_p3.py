@@ -68,8 +68,9 @@ class GEMSModel:
         self_conditioning: bool = True,
         sc_feat_mode: str = "concat",
         lambda_cone: float = 1e-3,
-        landmarks_L: int = 32
-
+        landmarks_L: int = 32,
+        # ========== NEW: Anchored training params ==========
+        anchor_train: bool = False,
     ):
         """
         Args:
@@ -104,8 +105,15 @@ class GEMSModel:
             },
             'dataset': {
                 'landmarks_L': landmarks_L,
+            },
+            'anchor': {
+                'anchor_train': anchor_train,
             }
         }
+        
+        # Store anchor_train for later use
+        self.anchor_train = anchor_train
+
 
         # EMA copies (will be populated if loaded from checkpoint or after training)
         self.score_net_ema = None
@@ -122,8 +130,10 @@ class GEMSModel:
         h_dim = n_embedding[-1]
         self.context_encoder = SetEncoderContext(
             h_dim=h_dim, c_dim=c_dim, n_heads=n_heads, 
-            n_blocks=3, isab_m=isab_m
+            n_blocks=3, isab_m=isab_m,
+            anchor_train=anchor_train,  # NEW: pass anchor flag
         ).to(device)
+
         
         self.generator = MetricSetGenerator(
             c_dim=c_dim, D_latent=D_latent, n_heads=n_heads,
@@ -301,8 +311,22 @@ class GEMSModel:
         compete_expr_knn_k: int = 50,
         compete_anchor_only: bool = True,
         compete_diag_every: int = 200,
-
+        # ========== NEW: Anchored training params ==========
+        anchor_train: bool = None,  # None = use model default
+        anchor_p_uncond: float = 0.50,
+        anchor_frac_min: float = 0.10,
+        anchor_frac_max: float = 0.30,
+        anchor_min: int = 8,
+        anchor_max: int = 96,
+        anchor_mode: str = "ball",
+        anchor_exclude_landmarks: bool = True,
+        anchor_clamp_clean: bool = True,
+        anchor_mask_score_loss: bool = True,
+        anchor_pointweight_nca: bool = True,
+        anchor_debug_every: int = 200,
+        anchor_warmup_steps: int = 0,
     ):
+
         """
         Train diffusion generator with mixed ST/SC regimen.
         """
@@ -323,6 +347,9 @@ class GEMSModel:
         sc_gene_expr_cpu = sc_gene_expr.cpu() if torch.is_tensor(sc_gene_expr) else sc_gene_expr
 
         # ST dataset (conditional - can be None if num_st_samples=0)
+        # Use model's anchor_train if not explicitly provided
+        effective_anchor_train = anchor_train if anchor_train is not None else self.anchor_train
+        
         if num_st_samples > 0:
             st_dataset = STSetDataset(
                 targets_dict=self.targets_dict,
@@ -346,7 +373,17 @@ class GEMSModel:
                 compete_k_pos=compete_k_pos,
                 compete_expr_knn_k=compete_expr_knn_k,
                 compete_anchor_only=compete_anchor_only,
+                # ========== NEW: Anchored training params ==========
+                anchor_train=effective_anchor_train,
+                anchor_p_uncond=anchor_p_uncond,
+                anchor_frac_min=anchor_frac_min,
+                anchor_frac_max=anchor_frac_max,
+                anchor_min=anchor_min,
+                anchor_max=anchor_max,
+                anchor_mode=anchor_mode,
+                anchor_exclude_landmarks=anchor_exclude_landmarks,
             )
+
         else:
             st_dataset = None
                 
@@ -417,7 +454,14 @@ class GEMSModel:
             compete_expr_knn_k=compete_expr_knn_k,
             compete_anchor_only=compete_anchor_only,
             compete_diag_every=compete_diag_every,
-
+            # ========== NEW: Anchored training params ==========
+            anchor_train=effective_anchor_train,
+            anchor_p_uncond=anchor_p_uncond,
+            anchor_clamp_clean=anchor_clamp_clean,
+            anchor_mask_score_loss=anchor_mask_score_loss,
+            anchor_pointweight_nca=anchor_pointweight_nca,
+            anchor_debug_every=anchor_debug_every,
+            anchor_warmup_steps=anchor_warmup_steps,
         )
 
         # Store sigma_data for inference

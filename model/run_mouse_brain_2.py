@@ -100,10 +100,33 @@ def parse_args():
     parser.add_argument('--compete_diag_every', type=int, default=200,
                         help='Steps between competitor diagnostic prints')
 
-
+    # ========== NEW: Anchored training flags ==========
+    parser.add_argument('--anchor_train', action=argparse.BooleanOptionalAction, default=False,
+                        help='Enable anchored conditional training')
+    parser.add_argument('--anchor_p_uncond', type=float, default=0.50,
+                        help='Fraction of batches with zero anchors (preserves unconditional capability)')
+    parser.add_argument('--anchor_frac_min', type=float, default=0.10,
+                        help='Min fraction of points to use as anchors')
+    parser.add_argument('--anchor_frac_max', type=float, default=0.30,
+                        help='Max fraction of points to use as anchors')
+    parser.add_argument('--anchor_min', type=int, default=8,
+                        help='Minimum number of anchor points')
+    parser.add_argument('--anchor_max', type=int, default=96,
+                        help='Maximum number of anchor points')
+    parser.add_argument('--anchor_mode', type=str, default='ball', choices=['ball', 'uniform', 'knn_bfs'],
+                        help='Anchor sampling mode')
+    parser.add_argument('--anchor_clamp_clean', action=argparse.BooleanOptionalAction, default=True,
+                        help='Clamp anchor positions to clean values in noisy input')
+    parser.add_argument('--anchor_mask_score_loss', action=argparse.BooleanOptionalAction, default=True,
+                        help='Mask score loss to unknown points only')
+    parser.add_argument('--anchor_warmup_steps', type=int, default=0,
+                        help='Steps to linearly ramp anchored probability (0=no warmup)')
+    parser.add_argument('--anchor_debug_every', type=int, default=200,
+                        help='Steps between anchor debug prints')
 
     
     return parser.parse_args()
+
 
 def load_mouse_data():
     # ST1 as training ST data (with coordinates)
@@ -166,6 +189,11 @@ def main(args=None):
     stageC_batch = args.batch_size
     lr = args.lr
     outdir = args.outdir
+    # NEW: Auto-switch to anchored output directory if anchor training enabled
+    if args.anchor_train and 'anchored' not in outdir:
+        outdir = outdir.replace('gems_mousebrain_output', 'gems_mousebrain_output_anchored')
+        print(f"[ANCHOR-TRAIN] Auto-switching output dir to: {outdir}")
+
 
     fabric = Fabric(accelerator="gpu", devices=devices, strategy="ddp", precision=precision)
     fabric.launch()
@@ -194,7 +222,9 @@ def main(args=None):
         self_conditioning=args.self_conditioning,
         sc_feat_mode=args.sc_feat_mode,
         landmarks_L=args.landmarks_L,
+        anchor_train=args.anchor_train,  # NEW: pass anchor flag
     )
+
 
     # ---------- Stage A & B on rank-0 only ----------
     if fabric.is_global_zero:
@@ -400,6 +430,18 @@ def main(args=None):
         compete_expr_knn_k=args.compete_expr_knn_k,
         compete_anchor_only=args.compete_anchor_only,
         compete_diag_every=args.compete_diag_every,
+        # ========== NEW: Anchored training params ==========
+        anchor_train=args.anchor_train,
+        anchor_p_uncond=args.anchor_p_uncond,
+        anchor_frac_min=args.anchor_frac_min,
+        anchor_frac_max=args.anchor_frac_max,
+        anchor_min=args.anchor_min,
+        anchor_max=args.anchor_max,
+        anchor_mode=args.anchor_mode,
+        anchor_clamp_clean=args.anchor_clamp_clean,
+        anchor_mask_score_loss=args.anchor_mask_score_loss,
+        anchor_warmup_steps=args.anchor_warmup_steps,
+        anchor_debug_every=args.anchor_debug_every,
     )
     
     fabric.barrier()

@@ -168,6 +168,8 @@ class SetEncoderContext(nn.Module):
     
     Takes set of embeddings Z_set and produces context H.
     Uses ISAB blocks for O(mn) complexity.
+    
+    NEW: Supports optional anchor channel (h_dim+1 input) for anchored training.
     """
     
     def __init__(
@@ -177,23 +179,31 @@ class SetEncoderContext(nn.Module):
         n_heads: int = 4,
         n_blocks: int = 3,
         isab_m: int = 64,
-        ln: bool = True
+        ln: bool = True,
+        anchor_train: bool = False,  # NEW: if True, expect h_dim+1 input
     ):
         """
         Args:
-            h_dim: input embedding dimension
+            h_dim: input embedding dimension (base, without anchor channel)
             c_dim: output context dimension
             n_heads: number of attention heads
             n_blocks: number of ISAB blocks
             isab_m: number of inducing points in ISAB
             ln: use layer normalization
+            anchor_train: if True, input projection accepts h_dim+1
         """
         super().__init__()
         self.h_dim = h_dim
         self.c_dim = c_dim
+        self.anchor_train = anchor_train
         
-        # Input projection
-        self.input_proj = nn.Linear(h_dim, c_dim)
+        # Input projection - handle anchor channel
+        input_dim = h_dim + 1 if anchor_train else h_dim
+        self.input_dim = input_dim
+        self.input_proj = nn.Linear(input_dim, c_dim)
+        
+        # Track if we've logged the padding warning
+        self._logged_pad_warning = False
         
         # Stack of ISAB blocks
         self.isab_blocks = nn.ModuleList([
@@ -204,13 +214,31 @@ class SetEncoderContext(nn.Module):
     def forward(self, Z_set: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            Z_set: (batch, n, h_dim) set of embeddings
+            Z_set: (batch, n, h_dim) or (batch, n, h_dim+1) set of embeddings
             mask: (batch, n) boolean mask (True = valid)
             
         Returns:
             H: (batch, n, c_dim) context features
         """
-        batch_size, n, _ = Z_set.shape
+        batch_size, n, input_dim_actual = Z_set.shape
+        
+        # ========== NEW: Handle missing anchor channel (for backward compatibility) ==========
+        if input_dim_actual == self.input_dim - 1:
+            # Input is missing anchor channel - pad with zeros
+            # This allows old sampling code to work with anchored checkpoints
+            zeros = torch.zeros(batch_size, n, 1, device=Z_set.device, dtype=Z_set.dtype)
+            Z_set = torch.cat([Z_set, zeros], dim=-1)
+            
+            if not self._logged_pad_warning:
+                print(f"[ANCHOR-CONTEXT] padded_missing_anchor_channel=1 "
+                      f"(input_dim={input_dim_actual}, expected={self.input_dim})")
+                self._logged_pad_warning = True
+                
+        elif input_dim_actual != self.input_dim:
+            raise ValueError(
+                f"SetEncoderContext: expected input dim {self.input_dim} or {self.input_dim-1}, "
+                f"got {input_dim_actual}"
+            )
         
         # Project to context dimension
         H = self.input_proj(Z_set)  # (batch, n, c_dim)
@@ -222,7 +250,7 @@ class SetEncoderContext(nn.Module):
 
         
         return H
-    
+
 
 # core_models_et_p2.py
 import torch
@@ -2244,6 +2272,15 @@ def train_stageC_diffusion_generator(
     compete_expr_knn_k: int = 50,
     compete_anchor_only: bool = True,
     compete_diag_every: int = 200,
+    # ========== NEW: Anchored training params ==========
+    anchor_train: bool = False,
+    anchor_p_uncond: float = 0.50,
+    anchor_clamp_clean: bool = True,
+    anchor_mask_score_loss: bool = True,
+    anchor_pointweight_nca: bool = True,
+    anchor_debug_every: int = 200,
+    anchor_warmup_steps: int = 0,
+
 ):
     
     # Initialize debug tracking
@@ -2940,6 +2977,20 @@ def train_stageC_diffusion_generator(
     PROBE_SAMPLE_RHO = 7.0  # Karras schedule
     PROBE_SAMPLE_TRACE_SIGMAS = [3.0, 2.3, 1.5, 0.8, 0.2]  # Sigmas to log during trajectory
 
+    # ========== NEW: Anchored training state ==========
+    anchor_state = {
+        'enabled': anchor_train,
+        'total_anchored_batches': 0,
+        'total_unanchored_batches': 0,
+    }
+    
+    if anchor_train and (fabric is None or fabric.is_global_zero):
+        print(f"\n{uet.ANCHOR_TAG} Anchored training ENABLED")
+        print(f"  anchor_p_uncond: {anchor_p_uncond}")
+        print(f"  anchor_clamp_clean: {anchor_clamp_clean}")
+        print(f"  anchor_mask_score_loss: {anchor_mask_score_loss}")
+        print(f"  anchor_warmup_steps: {anchor_warmup_steps}")
+    
 
 
 
@@ -3292,6 +3343,40 @@ def train_stageC_diffusion_generator(
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
 
+            
+            # ========== NEW: Anchored training - extract and process anchor mask ==========
+            if anchor_train and not is_sc:
+                anchor_cond_mask = batch.get('anchor_cond_mask', torch.zeros_like(mask)).to(device)
+                # Ensure anchor_cond_mask respects padding
+                anchor_cond_mask = anchor_cond_mask & mask
+                
+                # Apply warmup: linearly ramp anchored probability
+                if anchor_warmup_steps > 0:
+                    warmup_progress = min(1.0, global_step / anchor_warmup_steps)
+                    p_anchor_effective = (1.0 - anchor_p_uncond) * warmup_progress
+                    # With probability (1 - p_anchor_effective), force unanchored
+                    if torch.rand(1).item() > p_anchor_effective:
+                        anchor_cond_mask = torch.zeros_like(anchor_cond_mask)
+                
+                # Augment Z_set with anchor channel: (B, N, h_dim) -> (B, N, h_dim+1)
+                anchor_channel = anchor_cond_mask.float().unsqueeze(-1)  # (B, N, 1)
+                Z_set = torch.cat([Z_set, anchor_channel], dim=-1)
+                
+                # Track statistics
+                batch_is_anchored = anchor_cond_mask.any(dim=1).sum().item()  # batches with any anchors
+                anchor_state['total_anchored_batches'] += batch_is_anchored
+                anchor_state['total_unanchored_batches'] += (batch_size_real - batch_is_anchored)
+                
+                # Debug logging
+                if global_step % anchor_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                    stats = uet.anchor_mask_stats(anchor_cond_mask, mask)
+                    print(f"\n{uet.ANCHOR_TAG} step={global_step}")
+                    print(f"  [ANCHOR-BATCH] n_anchor_mean={stats['n_anchor_mean']:.1f} "
+                            f"frac_mean={stats['frac_anchor_mean']:.2%} "
+                            f"n_unknown_mean={stats['n_unknown_mean']:.1f}")
+            else:
+                anchor_cond_mask = None
+
             # Apply context augmentation stochastically
             if torch.rand(1).item() < aug_prob:
                 Z_set = apply_context_augmentation(
@@ -3581,6 +3666,21 @@ def train_stageC_diffusion_generator(
                 # eps = eps * mask.unsqueeze(-1).float()
                 V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
                 V_t = V_t * mask.unsqueeze(-1).float()
+                
+                # ========== NEW: Anchored training - clamp anchor positions to clean values ==========
+                if anchor_train and anchor_clamp_clean and anchor_cond_mask is not None and not is_sc:
+                    V_t = uet.apply_anchor_clamp(V_t, V_target, anchor_cond_mask, mask)
+                    
+                    # Debug: verify clamp worked
+                    if global_step % anchor_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            if anchor_cond_mask.any():
+                                anchor_diff = (V_t - V_target).abs()
+                                anchor_positions = anchor_cond_mask.unsqueeze(-1).expand_as(V_t)
+                                max_anchor_diff = anchor_diff[anchor_positions].max().item()
+                                sigma_median = sigma_t.median().item()
+                                print(f"  [ANCHOR-NOISE] sigma_p50={sigma_median:.4f} "
+                                      f"max_abs_anchor_diff={max_anchor_diff:.6f} (should be ~0)")
 
                 # ✅ SAVE THE ORIGINAL for diagnostics
                 V_target_orig = V_target.clone().detach()
@@ -4165,12 +4265,39 @@ def train_stageC_diffusion_generator(
                     target_fp32 = target_x0.float()
 
                     # Masked MSE (B, N) mean over latent dims
+                    # Masked MSE (B, N) mean over latent dims
                     err2_node = (x0_pred_fp32 - target_fp32).pow(2).mean(dim=-1)  # (B, N)
 
+                    # ========== NEW: Anchored training - mask score loss to unknown points ==========
+                    mask_score = mask_fp32
+                    if anchor_train and anchor_mask_score_loss and anchor_cond_mask is not None and not is_sc:
+                        anchor_cond_mask_fp32 = anchor_cond_mask.float()
+                        mask_score = mask_fp32 * (1.0 - anchor_cond_mask_fp32)
+                        
+                        # Debug: track anchor vs unknown MSE
+                        if global_step % anchor_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                            with torch.no_grad():
+                                den_valid = mask_fp32.sum(dim=1).clamp_min(1.0)
+                                den_unknown = mask_score.sum(dim=1).clamp_min(1.0)
+                                
+                                # MSE on anchors only
+                                mask_anchor = mask_fp32 * anchor_cond_mask_fp32
+                                den_anchor = mask_anchor.sum(dim=1).clamp_min(1.0)
+                                mse_anchor = (err2_node * mask_anchor).sum(dim=1) / den_anchor
+                                
+                                # MSE on unknown only
+                                mse_unknown = (err2_node * mask_score).sum(dim=1) / den_unknown
+                                
+                                print(f"  [ANCHOR-SCORE] den_valid_mean={den_valid.mean():.1f} "
+                                      f"den_unknown_mean={den_unknown.mean():.1f}")
+                                print(f"  [ANCHOR-ERR] mse_anchor={mse_anchor.mean():.6f} "
+                                      f"mse_unknown={mse_unknown.mean():.6f} "
+                                      f"(anchor should be tiny)")
+
                     # --- IMPORTANT: per-sample normalization (avoid variable-n set size bias) ---
-                    # --- IMPORTANT: per-sample normalization (avoid variable-n set size bias) ---
-                    den = mask_fp32.sum(dim=1).clamp_min(1.0)                         # (B,)
-                    err2_sample = (err2_node * mask_fp32).sum(dim=1) / den            # (B,)
+                    den = mask_score.sum(dim=1).clamp_min(1.0)                         # (B,)
+                    err2_sample = (err2_node * mask_score).sum(dim=1) / den            # (B,)
+
                     # ==============================================================================
                     # A/B 2: SCORE LOSS WEIGHTING EXPERIMENTS
                     # ==============================================================================
