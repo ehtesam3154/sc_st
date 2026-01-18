@@ -225,7 +225,7 @@ def main(args=None):
         D_latent=32,
         c_dim=256,
         n_heads=4,
-        isab_m=64,
+        isab_m=256,
         device=str(fabric.device),
         use_canonicalize=args.use_canonicalize,
         use_dist_bias=args.use_dist_bias,
@@ -243,7 +243,6 @@ def main(args=None):
         anchor_geom_min_unknown=args.anchor_geom_min_unknown,
         anchor_geom_debug_every=args.anchor_geom_debug_every,
     )
-
 
 
     # ---------- Stage A & B on rank-0 only ----------
@@ -418,7 +417,7 @@ def main(args=None):
     history_st = model.train_stageC(
         st_gene_expr_dict=st_gene_expr_dict,
         sc_gene_expr=sc_expr,
-        n_min=96, n_max=384,
+        n_min=96, n_max=448,
         num_st_samples=args.num_st_samples,
         num_sc_samples=0,  # DISABLE SC in phase 1
         n_epochs=stageC_epochs,
@@ -632,6 +631,37 @@ def main(args=None):
 
     if not fabric.is_global_zero:
         return
+    
+    # ========== CRITICAL: Clean DDP exit for non-rank-0 ==========
+    if not fabric.is_global_zero:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        import sys
+        sys.exit(0)  # Fully exit, don't just return
+
+    # ========== CRITICAL: Destroy DDP on rank-0 before inference ==========
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        print("[DEBUG Rank-0] Destroyed DDP process group")
+    
+    # Clear CUDA cache
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    print(f"[DEBUG Rank-0] GPU memory after DDP cleanup: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
+    # Unwrap ALL DDP modules
+    if hasattr(model.encoder, 'module'):
+        model.encoder = model.encoder.module
+    if hasattr(model.context_encoder, 'module'):
+        model.context_encoder = model.context_encoder.module
+    if hasattr(model.score_net, 'module'):
+        model.score_net = model.score_net.module
+    if hasattr(model.generator, 'module'):
+        model.generator = model.generator.module
+    print("[DEBUG Rank-0] All modules unwrapped from DDP")
+
 
     # ---------- Inference (rank-0 only, single GPU) ----------
     if fabric.is_global_zero:
@@ -661,7 +691,25 @@ def main(args=None):
 
         ensure_disk_space(outdir, min_gb=1.0)
 
+        # ===================================================================
+        # LOAD AND NORMALIZE GT COORDS FOR DEBUG KNN TRACKING
+        # ===================================================================
+        gt_coords_raw = scadata.obsm['spatial_gt']
+        gt_coords_tensor = torch.tensor(gt_coords_raw, dtype=torch.float32, device=fabric.device)
+        slide_ids_gt = torch.zeros(gt_coords_tensor.shape[0], dtype=torch.long, device=fabric.device)
+        
+        gt_coords_norm, gt_mu, gt_scale = uet.canonicalize_st_coords_per_slide(
+            gt_coords_tensor, slide_ids_gt
+        )
+        
+        print(f"✓ GT coords normalized: scale={gt_scale[0].item():.4f}")
+        print(f"✓ GT coords RMS: {gt_coords_norm.pow(2).mean().sqrt().item():.4f}")
+        gt_coords_np = gt_coords_norm.cpu().numpy()
+        print(f"✓ GT coords range: X=[{gt_coords_np[:,0].min():.3f}, {gt_coords_np[:,0].max():.3f}], "
+              f"Y=[{gt_coords_np[:,1].min():.3f}, {gt_coords_np[:,1].max():.3f}]")
+
         print("\n=== Inference (rank-0) with Multi-Sample Ranking ===")
+
 
         # ===== COMPUTE CORAL PARAMETERS =====
         print("\n" + "="*70)
@@ -696,49 +744,63 @@ def main(args=None):
 
             import utils_et as uet
 
-            for k in range(K_samples):
-                print(f"\n  Generating sample {k+1}/{K_samples}...")
-                
-                # Set different seed for each sample
-                torch.manual_seed(42 + k)
+            with torch.no_grad():
+                for k in range(K_samples):
+                    print(f"\n  Generating sample {k+1}/{K_samples}...")
+                    
+                    # Set different seed for each sample
+                    torch.manual_seed(42 + k)
 
-                n_cells = sc_expr.shape[0]
+                    n_cells = sc_expr.shape[0]
 
-                # After loading checkpoint, restore EDM params to model
-                if 'sigma_data' in checkpoint:
-                    model.sigma_data = checkpoint['sigma_data']
-                if 'sigma_min' in checkpoint:
-                    model.sigma_min = checkpoint['sigma_min']
-                if 'sigma_max' in checkpoint:
-                    model.sigma_max = checkpoint['sigma_max']
+                    # After loading checkpoint, restore EDM params to model
+                    if 'sigma_data' in checkpoint:
+                        model.sigma_data = checkpoint['sigma_data']
+                    if 'sigma_min' in checkpoint:
+                        model.sigma_min = checkpoint['sigma_min']
+                    if 'sigma_max' in checkpoint:
+                        model.sigma_max = checkpoint['sigma_max']
 
-                sample_results = model.infer_sc_patchwise(
-                    sc_gene_expr=sc_expr,
-                    n_timesteps_sample=500,
-                    return_coords=True,
-                    # patch_size=512,          # was batch_size; also your Stage D batch size
-                    patch_size=256,
-                    coverage_per_cell=5.0,   # you can tune 3–6
-                    n_align_iters=10,        # can tune 5–15
-                    eta=0.0,
-                    guidance_scale=2.0,
-                    # sigma_min=0.01,
-                    # sigma_max=3.0,
-                )
-                
-                # Compute EDM cone penalty as quality score (lower is better)
-                coords_sample = sample_results['coords_canon']
-                mask = torch.ones(coords_sample.shape[0], dtype=torch.bool, device=coords_sample.device)
-                cone_penalty = uet.edm_cone_penalty_from_V(
-                    coords_sample.unsqueeze(0), 
-                    mask.unsqueeze(0)
-                ).item()
-                # cone_penalty = uet.edm_cone_penalty_from_V(coords_sample.unsqueeze(0), mask.unsqueeze(0))
-                
-                all_results.append(sample_results)
-                all_scores.append(cone_penalty)
-                
-                print(f"  Sample {k+1} EDM cone penalty: {cone_penalty:.6f}")
+
+                    sample_results = model.infer_sc_patchwise(
+                        sc_gene_expr=sc_expr,
+                        n_timesteps_sample=600,
+                        return_coords=True,
+                        patch_size=192,
+                        coverage_per_cell=6.0,
+                        n_align_iters=15,
+                        eta=0.0,
+                        guidance_scale=2.0,
+                        gt_coords=gt_coords_norm,
+                        debug_knn=True,
+                        debug_max_patches=15,
+                        debug_k_list=(10, 20),
+                        pool_mult=2.0,
+                        stochastic_tau=0.8,
+                        tau_mode="adaptive_kth",
+                        ensure_connected=True,
+                        local_refine=False,
+                        # ========== NEW PARAMETERS ==========
+                        inference_mode="anchored",  # NEW: Use this instead of anchor_sampling_mode
+                        anchor_sampling_mode="align_vote_only",  # Still specify the specific anchored method
+                        commit_frac=0.6,
+                        seq_align_dim=32,
+                        )
+
+                    
+                    # Compute EDM cone penalty as quality score (lower is better)
+                    coords_sample = sample_results['coords_canon']
+                    mask = torch.ones(coords_sample.shape[0], dtype=torch.bool, device=coords_sample.device)
+                    cone_penalty = uet.edm_cone_penalty_from_V(
+                        coords_sample.unsqueeze(0), 
+                        mask.unsqueeze(0)
+                    ).item()
+                    # cone_penalty = uet.edm_cone_penalty_from_V(coords_sample.unsqueeze(0), mask.unsqueeze(0))
+                    
+                    all_results.append(sample_results)
+                    all_scores.append(cone_penalty)
+                    
+                    print(f"  Sample {k+1} EDM cone penalty: {cone_penalty:.6f}")
 
             # Select best sample (lowest penalty)
             best_idx = int(np.argmin(all_scores))
@@ -764,228 +826,228 @@ def main(args=None):
         # ============================================================================
         # SINGLE-PATCH INFERENCE (for comparison with patchwise)
         # ============================================================================
-        print("\n" + "="*70)
-        print("SINGLE-PATCH SC INFERENCE (NO STITCHING)")
-        print("="*70)
+        # print("\n" + "="*70)
+        # print("SINGLE-PATCH SC INFERENCE (NO STITCHING)")
+        # print("="*70)
         
-        torch.manual_seed(42)  # Same seed as patchwise for fair comparison
+        # torch.manual_seed(42)  # Same seed as patchwise for fair comparison
         
-        # Compute ST p95 target (same as patchwise)
-        st_coords = stadata.obsm['spatial']
-        D_st = torch.cdist(
-            torch.tensor(st_coords, dtype=torch.float32),
-            torch.tensor(st_coords, dtype=torch.float32)
-        )
-        target_st_p95 = D_st[torch.triu(torch.ones_like(D_st, dtype=torch.bool), diagonal=1)].quantile(0.95).item()
+        # # Compute ST p95 target (same as patchwise)
+        # st_coords = stadata.obsm['spatial']
+        # D_st = torch.cdist(
+        #     torch.tensor(st_coords, dtype=torch.float32),
+        #     torch.tensor(st_coords, dtype=torch.float32)
+        # )
+        # target_st_p95 = D_st[torch.triu(torch.ones_like(D_st, dtype=torch.bool), diagonal=1)].quantile(0.95).item()
         
-        results_single = model.infer_sc_single_patch(
-            sc_gene_expr=sc_expr,
-            n_timesteps_sample=500,
-            sigma_min=0.01,
-            sigma_max=3.0,
-            guidance_scale=2.0,
-            eta=0.0,
-            target_st_p95=target_st_p95,
-            return_coords=True,
-            DEBUG_FLAG=True,
-        )
+        # results_single = model.infer_sc_single_patch(
+        #     sc_gene_expr=sc_expr,
+        #     n_timesteps_sample=500,
+        #     sigma_min=0.01,
+        #     sigma_max=3.0,
+        #     guidance_scale=2.0,
+        #     eta=0.0,
+        #     target_st_p95=target_st_p95,
+        #     return_coords=True,
+        #     DEBUG_FLAG=True,
+        # )
         
-        # Extract results
-        D_edm_single = results_single['D_edm'].cpu().numpy()
-        coords_single = results_single['coords'].cpu().numpy()
-        coords_canon_single = results_single['coords_canon'].cpu().numpy()
+        # # Extract results
+        # D_edm_single = results_single['D_edm'].cpu().numpy()
+        # coords_single = results_single['coords'].cpu().numpy()
+        # coords_canon_single = results_single['coords_canon'].cpu().numpy()
         
-        print(f"\n✓ Single-patch inference complete!")
-        print(f"  D_edm shape: {D_edm_single.shape}")
-        print(f"  Coordinates shape: {coords_canon_single.shape}")
+        # print(f"\n✓ Single-patch inference complete!")
+        # print(f"  D_edm shape: {D_edm_single.shape}")
+        # print(f"  Coordinates shape: {coords_canon_single.shape}")
         
-        # ============================================================================
-        # SAVE SINGLE-PATCH RESULTS
-        # ============================================================================
-        results_single_filename = f"sc_inference_SINGLE_PATCH_{timestamp}.pt"
-        results_single_path = os.path.join(outdir, results_single_filename)
-        torch.save(results_single, results_single_path)
-        print(f"✓ Saved single-patch results: {results_single_path}")
+        # # ============================================================================
+        # # SAVE SINGLE-PATCH RESULTS
+        # # ============================================================================
+        # results_single_filename = f"sc_inference_SINGLE_PATCH_{timestamp}.pt"
+        # results_single_path = os.path.join(outdir, results_single_filename)
+        # torch.save(results_single, results_single_path)
+        # print(f"✓ Saved single-patch results: {results_single_path}")
         
-        # Save processed results
-        results_single_processed = {
-            'D_edm': D_edm_single,
-            'coords': coords_single,
-            'coords_canon': coords_canon_single,
-            'n_cells': coords_canon_single.shape[0],
-            'timestamp': timestamp,
-            'method': 'single_patch',
-            'model_config': {
-                'n_genes': model.n_genes,
-                'D_latent': model.D_latent,
-                'c_dim': model.c_dim,
-            }
-        }
-        processed_single_filename = f"sc_inference_SINGLE_PATCH_processed_{timestamp}.pt"
-        processed_single_path = os.path.join(outdir, processed_single_filename)
-        torch.save(results_single_processed, processed_single_path)
-        print(f"✓ Saved processed single-patch results: {processed_single_path}")
+        # # Save processed results
+        # results_single_processed = {
+        #     'D_edm': D_edm_single,
+        #     'coords': coords_single,
+        #     'coords_canon': coords_canon_single,
+        #     'n_cells': coords_canon_single.shape[0],
+        #     'timestamp': timestamp,
+        #     'method': 'single_patch',
+        #     'model_config': {
+        #         'n_genes': model.n_genes,
+        #         'D_latent': model.D_latent,
+        #         'c_dim': model.c_dim,
+        #     }
+        # }
+        # processed_single_filename = f"sc_inference_SINGLE_PATCH_processed_{timestamp}.pt"
+        # processed_single_path = os.path.join(outdir, processed_single_filename)
+        # torch.save(results_single_processed, processed_single_path)
+        # print(f"✓ Saved processed single-patch results: {processed_single_path}")
         
-        # ============================================================================
-        # VISUALIZE SINGLE-PATCH RESULTS
-        # ============================================================================
-        print("\n=== Creating single-patch visualizations ===")
+        # # ============================================================================
+        # # VISUALIZE SINGLE-PATCH RESULTS
+        # # ============================================================================
+        # print("\n=== Creating single-patch visualizations ===")
         
-        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+        # fig, axes = plt.subplots(1, 2, figsize=(18, 8))
         
-        # Plot 1: Single-patch coordinates colored by cell type
-        if 'celltype' in scadata.obs.columns:
-            cell_types = scadata.obs['celltype']
-            unique_types = cell_types.unique()
-            colors = sns.color_palette("husl", len(unique_types))
-            color_map = dict(zip(unique_types, colors))
+        # # Plot 1: Single-patch coordinates colored by cell type
+        # if 'celltype' in scadata.obs.columns:
+        #     cell_types = scadata.obs['celltype']
+        #     unique_types = cell_types.unique()
+        #     colors = sns.color_palette("husl", len(unique_types))
+        #     color_map = dict(zip(unique_types, colors))
             
-            for ct in unique_types:
-                mask = (cell_types == ct).values
-                axes[0].scatter(
-                    coords_canon_single[mask, 0], 
-                    coords_canon_single[mask, 1],
-                    s=3, 
-                    alpha=0.7, 
-                    label=ct,
-                    c=[color_map[ct]]
-                )
+        #     for ct in unique_types:
+        #         mask = (cell_types == ct).values
+        #         axes[0].scatter(
+        #             coords_canon_single[mask, 0], 
+        #             coords_canon_single[mask, 1],
+        #             s=3, 
+        #             alpha=0.7, 
+        #             label=ct,
+        #             c=[color_map[ct]]
+        #         )
             
-            axes[0].set_title('Single-Patch Coordinates (by cell type)', fontsize=16, fontweight='bold')
-            axes[0].set_xlabel('Dim 1', fontsize=12)
-            axes[0].set_ylabel('Dim 2', fontsize=12)
-            axes[0].legend(markerscale=3, fontsize=10, loc='best', framealpha=0.9)
-            axes[0].grid(True, alpha=0.3)
-        else:
-            axes[0].scatter(coords_canon_single[:, 0], coords_canon_single[:, 1], s=3, alpha=0.7, c='steelblue')
-            axes[0].set_title('Single-Patch Coordinates', fontsize=16, fontweight='bold')
-            axes[0].set_xlabel('Dim 1', fontsize=12)
-            axes[0].set_ylabel('Dim 2', fontsize=12)
-            axes[0].grid(True, alpha=0.3)
+        #     axes[0].set_title('Single-Patch Coordinates (by cell type)', fontsize=16, fontweight='bold')
+        #     axes[0].set_xlabel('Dim 1', fontsize=12)
+        #     axes[0].set_ylabel('Dim 2', fontsize=12)
+        #     axes[0].legend(markerscale=3, fontsize=10, loc='best', framealpha=0.9)
+        #     axes[0].grid(True, alpha=0.3)
+        # else:
+        #     axes[0].scatter(coords_canon_single[:, 0], coords_canon_single[:, 1], s=3, alpha=0.7, c='steelblue')
+        #     axes[0].set_title('Single-Patch Coordinates', fontsize=16, fontweight='bold')
+        #     axes[0].set_xlabel('Dim 1', fontsize=12)
+        #     axes[0].set_ylabel('Dim 2', fontsize=12)
+        #     axes[0].grid(True, alpha=0.3)
         
-        axes[0].axis('equal')
+        # axes[0].axis('equal')
         
-        # Plot 2: Distance distribution
-        upper_tri_idx = np.triu_indices_from(D_edm_single, k=1)
-        distances_single = D_edm_single[upper_tri_idx]
+        # # Plot 2: Distance distribution
+        # upper_tri_idx = np.triu_indices_from(D_edm_single, k=1)
+        # distances_single = D_edm_single[upper_tri_idx]
         
-        axes[1].hist(distances_single, bins=100, alpha=0.7, edgecolor='black', color='green')
-        axes[1].set_title('Pairwise Distance Distribution (Single-Patch)', fontsize=16, fontweight='bold')
-        axes[1].set_xlabel('Distance', fontsize=12)
-        axes[1].set_ylabel('Count', fontsize=12)
-        axes[1].axvline(distances_single.mean(), color='r', linestyle='--', linewidth=2, 
-                       label=f'Mean: {distances_single.mean():.2f}')
-        axes[1].axvline(np.median(distances_single), color='b', linestyle='--', linewidth=2, 
-                       label=f'Median: {np.median(distances_single):.2f}')
-        axes[1].legend(fontsize=10)
-        axes[1].grid(True, alpha=0.3, axis='y')
+        # axes[1].hist(distances_single, bins=100, alpha=0.7, edgecolor='black', color='green')
+        # axes[1].set_title('Pairwise Distance Distribution (Single-Patch)', fontsize=16, fontweight='bold')
+        # axes[1].set_xlabel('Distance', fontsize=12)
+        # axes[1].set_ylabel('Count', fontsize=12)
+        # axes[1].axvline(distances_single.mean(), color='r', linestyle='--', linewidth=2, 
+        #                label=f'Mean: {distances_single.mean():.2f}')
+        # axes[1].axvline(np.median(distances_single), color='b', linestyle='--', linewidth=2, 
+        #                label=f'Median: {np.median(distances_single):.2f}')
+        # axes[1].legend(fontsize=10)
+        # axes[1].grid(True, alpha=0.3, axis='y')
         
-        plt.tight_layout()
+        # plt.tight_layout()
         
-        plot_single_filename = f"gems_inference_SINGLE_PATCH_{timestamp}.png"
-        plot_single_path = os.path.join(outdir, plot_single_filename)
-        plt.savefig(plot_single_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Saved single-patch plot: {plot_single_path}")
-        plt.close()
+        # plot_single_filename = f"gems_inference_SINGLE_PATCH_{timestamp}.png"
+        # plot_single_path = os.path.join(outdir, plot_single_filename)
+        # plt.savefig(plot_single_path, dpi=300, bbox_inches='tight')
+        # print(f"✓ Saved single-patch plot: {plot_single_path}")
+        # plt.close()
         
-        # ============================================================================
-        # COMPARISON PLOT: Patchwise vs Single-Patch
-        # ============================================================================
-        print("\n=== Creating comparison plot ===")
+        # # ============================================================================
+        # # COMPARISON PLOT: Patchwise vs Single-Patch
+        # # ============================================================================
+        # print("\n=== Creating comparison plot ===")
         
-        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+        # fig, axes = plt.subplots(1, 2, figsize=(18, 8))
         
-        # Patchwise (left)
-        if 'celltype' in scadata.obs.columns:
-            for ct in unique_types:
-                mask = (cell_types == ct).values
-                axes[0].scatter(
-                    coords_canon[mask, 0], 
-                    coords_canon[mask, 1],
-                    s=3, alpha=0.7, label=ct, c=[color_map[ct]]
-                )
-            axes[0].legend(markerscale=3, fontsize=8, loc='best', framealpha=0.9)
-        else:
-            axes[0].scatter(coords_canon[:, 0], coords_canon[:, 1], s=3, alpha=0.7, c='steelblue')
+        # # Patchwise (left)
+        # if 'celltype' in scadata.obs.columns:
+        #     for ct in unique_types:
+        #         mask = (cell_types == ct).values
+        #         axes[0].scatter(
+        #             coords_canon[mask, 0], 
+        #             coords_canon[mask, 1],
+        #             s=3, alpha=0.7, label=ct, c=[color_map[ct]]
+        #         )
+        #     axes[0].legend(markerscale=3, fontsize=8, loc='best', framealpha=0.9)
+        # else:
+        #     axes[0].scatter(coords_canon[:, 0], coords_canon[:, 1], s=3, alpha=0.7, c='steelblue')
         
-        axes[0].set_title('PATCHWISE (with alignment)', fontsize=16, fontweight='bold')
-        axes[0].set_xlabel('Dim 1', fontsize=12)
-        axes[0].set_ylabel('Dim 2', fontsize=12)
-        axes[0].grid(True, alpha=0.3)
-        axes[0].axis('equal')
+        # axes[0].set_title('PATCHWISE (with alignment)', fontsize=16, fontweight='bold')
+        # axes[0].set_xlabel('Dim 1', fontsize=12)
+        # axes[0].set_ylabel('Dim 2', fontsize=12)
+        # axes[0].grid(True, alpha=0.3)
+        # axes[0].axis('equal')
         
-        # Single-patch (right)
-        if 'celltype' in scadata.obs.columns:
-            for ct in unique_types:
-                mask = (cell_types == ct).values
-                axes[1].scatter(
-                    coords_canon_single[mask, 0], 
-                    coords_canon_single[mask, 1],
-                    s=3, alpha=0.7, label=ct, c=[color_map[ct]]
-                )
-            axes[1].legend(markerscale=3, fontsize=8, loc='best', framealpha=0.9)
-        else:
-            axes[1].scatter(coords_canon_single[:, 0], coords_canon_single[:, 1], s=3, alpha=0.7, c='green')
+        # # Single-patch (right)
+        # if 'celltype' in scadata.obs.columns:
+        #     for ct in unique_types:
+        #         mask = (cell_types == ct).values
+        #         axes[1].scatter(
+        #             coords_canon_single[mask, 0], 
+        #             coords_canon_single[mask, 1],
+        #             s=3, alpha=0.7, label=ct, c=[color_map[ct]]
+        #         )
+        #     axes[1].legend(markerscale=3, fontsize=8, loc='best', framealpha=0.9)
+        # else:
+        #     axes[1].scatter(coords_canon_single[:, 0], coords_canon_single[:, 1], s=3, alpha=0.7, c='green')
         
-        axes[1].set_title('SINGLE-PATCH (no alignment)', fontsize=16, fontweight='bold')
-        axes[1].set_xlabel('Dim 1', fontsize=12)
-        axes[1].set_ylabel('Dim 2', fontsize=12)
-        axes[1].grid(True, alpha=0.3)
-        axes[1].axis('equal')
+        # axes[1].set_title('SINGLE-PATCH (no alignment)', fontsize=16, fontweight='bold')
+        # axes[1].set_xlabel('Dim 1', fontsize=12)
+        # axes[1].set_ylabel('Dim 2', fontsize=12)
+        # axes[1].grid(True, alpha=0.3)
+        # axes[1].axis('equal')
         
-        plt.tight_layout()
+        # plt.tight_layout()
         
-        comparison_filename = f"gems_COMPARISON_patchwise_vs_single_{timestamp}.png"
-        comparison_path = os.path.join(outdir, comparison_filename)
-        plt.savefig(comparison_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Saved comparison plot: {comparison_path}")
-        plt.close()
+        # comparison_filename = f"gems_COMPARISON_patchwise_vs_single_{timestamp}.png"
+        # comparison_path = os.path.join(outdir, comparison_filename)
+        # plt.savefig(comparison_path, dpi=300, bbox_inches='tight')
+        # print(f"✓ Saved comparison plot: {comparison_path}")
+        # plt.close()
         
-        # ============================================================================
-        # COMPARISON STATISTICS
-        # ============================================================================
-        print("\n" + "="*70)
-        print("COMPARISON: PATCHWISE vs SINGLE-PATCH")
-        print("="*70)
+        # # ============================================================================
+        # # COMPARISON STATISTICS
+        # # ============================================================================
+        # print("\n" + "="*70)
+        # print("COMPARISON: PATCHWISE vs SINGLE-PATCH")
+        # print("="*70)
 
-        # Compute distances from D_edm (upper triangle)
-        upper_tri_idx = np.triu_indices_from(D_edm, k=1)
-        distances = D_edm[upper_tri_idx]
+        # # Compute distances from D_edm (upper triangle)
+        # upper_tri_idx = np.triu_indices_from(D_edm, k=1)
+        # distances = D_edm[upper_tri_idx]
 
-        print(f"\nPATCHWISE:")
-        print(f"  Coordinate range: [{coords_canon.min():.2f}, {coords_canon.max():.2f}]")
-        print(f"  Distance stats: mean={distances.mean():.4f}, median={np.median(distances):.4f}, std={distances.std():.4f}")
+        # print(f"\nPATCHWISE:")
+        # print(f"  Coordinate range: [{coords_canon.min():.2f}, {coords_canon.max():.2f}]")
+        # print(f"  Distance stats: mean={distances.mean():.4f}, median={np.median(distances):.4f}, std={distances.std():.4f}")
         
-        print(f"\nSINGLE-PATCH:")
-        print(f"  Coordinate range: [{coords_canon_single.min():.2f}, {coords_canon_single.max():.2f}]")
-        print(f"  Distance stats: mean={distances_single.mean():.4f}, median={np.median(distances_single):.4f}, std={distances_single.std():.4f}")
+        # # print(f"\nSINGLE-PATCH:")
+        # # print(f"  Coordinate range: [{coords_canon_single.min():.2f}, {coords_canon_single.max():.2f}]")
+        # # print(f"  Distance stats: mean={distances_single.mean():.4f}, median={np.median(distances_single):.4f}, std={distances_single.std():.4f}")
         
-        # Compute geometry metrics
-        def compute_geometry_metrics(coords):
-            """Compute dimensionality and anisotropy metrics."""
-            coords_centered = coords - coords.mean(axis=0)
-            cov = np.cov(coords_centered.T)
-            eigvals = np.linalg.eigvalsh(cov)
-            eigvals = np.sort(eigvals)[::-1]  # Descending order
+        # # Compute geometry metrics
+        # def compute_geometry_metrics(coords):
+        #     """Compute dimensionality and anisotropy metrics."""
+        #     coords_centered = coords - coords.mean(axis=0)
+        #     cov = np.cov(coords_centered.T)
+        #     eigvals = np.linalg.eigvalsh(cov)
+        #     eigvals = np.sort(eigvals)[::-1]  # Descending order
             
-            # Effective dimensionality (participation ratio)
-            dim_eff = (eigvals.sum() ** 2) / (eigvals ** 2).sum()
+        #     # Effective dimensionality (participation ratio)
+        #     dim_eff = (eigvals.sum() ** 2) / (eigvals ** 2).sum()
             
-            # Anisotropy ratio (top 2 eigenvalues)
-            if len(eigvals) >= 2:
-                aniso = eigvals[0] / (eigvals[1] + 1e-8)
-            else:
-                aniso = 1.0
+        #     # Anisotropy ratio (top 2 eigenvalues)
+        #     if len(eigvals) >= 2:
+        #         aniso = eigvals[0] / (eigvals[1] + 1e-8)
+        #     else:
+        #         aniso = 1.0
             
-            return dim_eff, aniso, eigvals
+        #     return dim_eff, aniso, eigvals
         
-        dim_pw, aniso_pw, eig_pw = compute_geometry_metrics(coords_canon)
-        dim_sp, aniso_sp, eig_sp = compute_geometry_metrics(coords_canon_single)
+        # dim_pw, aniso_pw, eig_pw = compute_geometry_metrics(coords_canon)
+        # dim_sp, aniso_sp, eig_sp = compute_geometry_metrics(coords_canon_single)
         
-        print(f"\nGEOMETRY METRICS:")
-        print(f"  Patchwise:    eff_dim={dim_pw:.2f}, anisotropy={aniso_pw:.2f}, top_eigs={eig_pw[:3]}")
-        print(f"  Single-patch: eff_dim={dim_sp:.2f}, anisotropy={aniso_sp:.2f}, top_eigs={eig_sp[:3]}")
-        print("="*70 + "\n")
+        # print(f"\nGEOMETRY METRICS:")
+        # print(f"  Patchwise:    eff_dim={dim_pw:.2f}, anisotropy={aniso_pw:.2f}, top_eigs={eig_pw[:3]}")
+        # print(f"  Single-patch: eff_dim={dim_sp:.2f}, anisotropy={aniso_sp:.2f}, top_eigs={eig_sp[:3]}")
+        # print("="*70 + "\n")
 
 
         if False:
