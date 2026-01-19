@@ -160,6 +160,59 @@ def _intersect1d_with_indices(a: torch.Tensor, b: torch.Tensor):
     return common, idx_a, idx_b
 
 
+def _validate_st_uid_uniqueness(batch: Dict, device: str = 'cuda'):
+    """
+    Smoke test: Verify ST UIDs are cross-slide unique.
+    Call once per epoch during training for sanity check.
+    """
+    if batch.get('is_sc', False):
+        return  # Skip SC batches
+    
+    global_indices = batch.get('global_indices', None)
+    if global_indices is None:
+        return
+    
+    overlap_info = batch.get('overlap_info', None)
+    if overlap_info is None:
+        return
+    
+    B, N = global_indices.shape
+    all_uids = []
+    slide_ids_per_uid = []
+    
+    for b in range(B):
+        mask = global_indices[b] >= 0
+        uids_b = global_indices[b][mask].tolist()
+        slide_b = overlap_info[b]['slide_id']
+        all_uids.extend(uids_b)
+        slide_ids_per_uid.extend([slide_b] * len(uids_b))
+    
+    if len(all_uids) == 0:
+        return
+    
+    all_uids = torch.tensor(all_uids, dtype=torch.int64, device=device)
+    slide_ids_per_uid = torch.tensor(slide_ids_per_uid, device=device)
+    
+    # Check uniqueness
+    unique_uids = torch.unique(all_uids)
+    n_dups = len(all_uids) - len(unique_uids)
+    if n_dups > 0:
+        raise AssertionError(f"[SPOT-IDENTITY] UID collision detected! {n_dups} duplicates in batch")
+    
+    # Check cross-slide disjointness
+    unique_slides = torch.unique(slide_ids_per_uid)
+    for i, slide_a in enumerate(unique_slides):
+        for slide_b in unique_slides[i+1:]:
+            uids_a = set(all_uids[slide_ids_per_uid == slide_a].tolist())
+            uids_b = set(all_uids[slide_ids_per_uid == slide_b].tolist())
+            intersection = uids_a & uids_b
+            if len(intersection) > 0:
+                raise AssertionError(
+                    f"[SPOT-IDENTITY] Cross-slide collision! "
+                    f"Slide {slide_a} and {slide_b} share {len(intersection)} UIDs: {list(intersection)[:5]}..."
+                )
+
+
 # ==============================================================================
 # STAGE C: SET-EQUIVARIANT CONTEXT ENCODER
 # ==============================================================================
@@ -2885,6 +2938,7 @@ def train_stageC_diffusion_generator(
         'topo': 0.0,
         'shape_spec': 0.0,
         'subspace': 0.5,       # NEW: add this key for Patch 7
+        'ctx_edge': 2.0
     }
 
 
@@ -2946,12 +3000,12 @@ def train_stageC_diffusion_generator(
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 
             'gram_learn': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],  # ADD THESE
+            'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],
             'dim': [], 'triangle': [], 'radial': [],
-            'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': []
+            'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': [],
+            'ctx_edge': [],  # NEW: context invariance loss
         }
     }
-
 
 
     # ========== EDM DEBUG STATE INITIALIZATION ==========
@@ -3358,6 +3412,11 @@ def train_stageC_diffusion_generator(
                         continue
             
             is_sc = batch.get('is_sc', False)
+            
+            # ========== SPOT IDENTITY: Validation (once per epoch) ==========
+            if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                _validate_st_uid_uniqueness(batch, device=device)
+
 
             if not is_sc:
                 st_batches += 1
@@ -3366,6 +3425,13 @@ def train_stageC_diffusion_generator(
                 
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
+
+            # Core membership mask (core points of the sampled ST miniset).
+            # This is distinct from anchor_cond_mask (conditioning anchors).
+            anchor_mask = batch.get('anchor_mask', None)
+            if anchor_mask is not None:
+                anchor_mask = anchor_mask.to(device).bool() & mask
+
 
             n_list = batch['n']
             batch_size_real = Z_set.shape[0]
@@ -3525,10 +3591,12 @@ def train_stageC_diffusion_generator(
                                 probe_state['knn_spatial'] = knn_spatial_probe
                                 
                                 # Get slide info if available
+                                # ========== SPOT IDENTITY: Probe uses spot_indices (within-slide) ==========
                                 if 'overlap_info' in batch:
                                     oi = batch['overlap_info'][best_idx]
                                     probe_state['slide_id'] = oi.get('slide_id', None)
-                                    probe_state['probe_indices'] = oi.get('indices', None)
+                                    probe_state['probe_spot_indices'] = oi.get('indices', None)  # Within-slide
+                                    probe_state['probe_uid'] = oi.get('global_uid', None)  # UIDs
                                 
                                 print(f"\n[PROBE-SNAP] step={global_step} n={probe_state['n_probe']} "
                                       f"n_valid={n_best} k_spatial={PROBE_K}")
@@ -4750,6 +4818,7 @@ def train_stageC_diffusion_generator(
             L_shape_spec = torch.tensor(0.0, device=device)  # NEW: Shape spectrum loss
             L_subspace = torch.tensor(0.0, device=device)
             L_gen_scale = torch.tensor(0.0, device=device)
+            L_ctx_edge = torch.tensor(0.0, device=device)  # NEW: context invariance
             # Safe loss wrapper - apply to ALL losses before using them
             L_gram = safe_loss(L_gram, "L_gram", max_val=50.0, global_step=global_step)
             L_gram_scale = safe_loss(L_gram_scale, "L_gram_scale", max_val=50.0, global_step=global_step)
@@ -5005,6 +5074,68 @@ def train_stageC_diffusion_generator(
                 L_subspace = uet.variance_outside_topk(V_geom_L, mask, k=2)
             else:
                 L_subspace = torch.tensor(0.0, device=device)
+
+            # ---------------------------------------------------------------
+            # NEW: Context invariance regularizer (core-edge stability)
+            # Same core points should predict the same local edge lengths
+            # even if we drop/change the surrounding context points.
+            # ---------------------------------------------------------------
+            knn_spatial = batch.get('knn_spatial', None)
+            if knn_spatial is not None:
+                knn_spatial = knn_spatial.to(device)
+            
+            if (not is_sc) and (knn_spatial is not None) and (anchor_mask is not None) and (WEIGHTS.get('ctx_edge', 0.0) > 0):
+                core_mask = anchor_mask & mask
+                extra_mask = mask & (~core_mask)
+
+                if extra_mask.any():
+                    with torch.no_grad():
+                        keep_p = 0.5
+                        rand = torch.rand_like(extra_mask.float())
+                        ctx_drop_mask = core_mask | (extra_mask & (rand < keep_p))
+
+                        # keep at least a few extras so the context is actually different
+                        min_extra = 8
+                        extra_kept = (ctx_drop_mask & extra_mask).sum(dim=1)
+                        need = (extra_mask.sum(dim=1) > 0) & (extra_kept < min_extra)
+                        if need.any():
+                            for b in need.nonzero(as_tuple=True)[0].tolist():
+                                extra_idx = extra_mask[b].nonzero(as_tuple=True)[0]
+                                take = extra_idx[:min_extra]
+                                ctx_drop_mask[b, take] = True
+
+                    # Forward pass with perturbed context (regularizer only: no self-cond)
+                    H_drop = context_encoder(Z_set, ctx_drop_mask)
+                    V_hat_drop = score_net.forward_edm(
+                        V_t, sigma_flat, H_drop, ctx_drop_mask, sigma_data,
+                        self_cond=None, return_debug=False
+                    )
+                    # forward_edm returns tensor directly when return_debug=False
+
+                    # fp32 stable centering on core
+                    with torch.autocast(device_type='cuda', enabled=False):
+                        V_full = V_hat_f32
+                        V_drop_f32 = V_hat_drop.float()
+
+                        core_f = core_mask.float().unsqueeze(-1)
+                        denom_c = core_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+                        mu_full = (V_full * core_f).sum(dim=1, keepdim=True) / denom_c
+                        mu_drop = (V_drop_f32 * core_f).sum(dim=1, keepdim=True) / denom_c
+
+                        V_full_c = (V_full - mu_full) * core_f
+                        V_drop_c = (V_drop_f32 - mu_drop) * core_f
+
+                        # low-sigma emphasis
+                        w_ctx = (sigma_data**2 / (sigma_flat**2 + sigma_data**2)).detach().float()
+
+                        L_ctx_edge = uet.edge_consistency_loss(
+                            V_full_c, V_drop_c, knn_spatial,
+                            mask=core_mask, anchor_mask=core_mask,
+                            sample_weight=w_ctx,
+                            eps=1e-8,
+                            huber_delta=0.25,
+                        )
 
 
             if not is_sc:
@@ -5816,15 +5947,18 @@ def train_stageC_diffusion_generator(
                 # ==============================================================================
                 # [COMPETITOR-DIAG] Training-time competitor diagnostics (ChatGPT requested)
                 # ==============================================================================
+                # ========== SPOT IDENTITY: Diagnostic updated to use spot_indices ==========
                 if compete_train and (global_step % compete_diag_every == 0) and (fabric is None or fabric.is_global_zero):
-                    if not is_sc and 'global_indices' in batch and 'anchor_mask' in batch:
+                    if not is_sc and 'spot_indices' in batch and 'anchor_mask' in batch:
                         with torch.no_grad():
-                            global_indices = batch['global_indices'].to(device)  # (B, N)
+                            spot_indices = batch['spot_indices'].to(device)  # (B, N) within-slide
+                            global_uid = batch['global_indices'].to(device)  # (B, N) int64 UIDs
                             anchor_mask_b = batch['anchor_mask'].to(device)  # (B, N)
                             
                             # Get slide's full GT kNN for coverage computation
-                            # (requires access to targets_dict through batch)
+                            # Use spot_indices to index into targets_dict (per-slide lookup)
                             coverage_k = 10
+
                             precision_k = 10
                             
                             coverage_scores = []
@@ -5835,7 +5969,9 @@ def train_stageC_diffusion_generator(
                             for b in range(min(B_diag, 4)):  # Sample up to 4 batches for speed
                                 m_b = mask[b]
                                 anchor_b = anchor_mask_b[b] & m_b
-                                global_idx_b = global_indices[b]
+                                spot_idx_b = spot_indices[b]  # ✅ Within-slide indices for GT lookup
+                                uid_b = global_uid[b]  # UIDs for cross-sample checks (if needed)
+                                slide_id_b = batch['overlap_info'][b]['slide_id']  # Extract slide
                                 
                                 if anchor_b.sum() < 3:
                                     continue
@@ -7416,8 +7552,8 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['edge'] * L_edge +
                     WEIGHTS['topo'] * L_topo +
                     WEIGHTS['shape_spec'] * L_shape_spec +
-                    WEIGHTS.get('subspace', 0) * L_subspace)  # PATCH 7
-
+                    WEIGHTS.get('subspace', 0) * L_subspace +  # PATCH 7
+                    WEIGHTS.get('ctx_edge', 0) * L_ctx_edge)   # NEW: context invariance
             
             # Add SC dimension prior if this is an SC batch
             if is_sc:
@@ -7905,7 +8041,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['gen_scale'] += L_gen_scale.item()
             epoch_losses['subspace'] += L_subspace.item()
             epoch_losses['gram_learn'] += L_gram_learn.item()  # FIX: Was missing!
-
+            epoch_losses['ctx_edge'] += L_ctx_edge.item()  # NEW: context invariance
 
 
             def _is_rank0():
@@ -8323,6 +8459,8 @@ def train_stageC_diffusion_generator(
                 avg_shape_spec = epoch_losses['shape_spec'] / max(n_batches, 1)
                 avg_gen_scale = epoch_losses['gen_scale'] / max(n_batches, 1)
                 avg_subspace = epoch_losses['subspace'] / max(n_batches, 1)
+                avg_ctx_edge = epoch_losses['ctx_edge'] / max(n_batches, 1)
+
 
                 print(f"[Epoch {epoch+1}] DETAILED LOSSES:")
                 print(f"  total={avg_total:.4f} | score={avg_score:.4f} | gram={avg_gram:.4f} | gram_scale={avg_gram_scale:.4f} | out_scale={avg_out_scale:.4f} | gram_learn={avg_gram_learn:.4f}") 
@@ -8487,8 +8625,9 @@ def train_stageC_diffusion_generator(
             WEIGHTS['shape_spec'] * epoch_losses['shape_spec'] +
             WEIGHTS['edge'] * epoch_losses['edge'] +
             WEIGHTS['topo'] * epoch_losses['topo'] +
-            + WEIGHTS['gen_scale'] * epoch_losses['gen_scale']
-            + WEIGHTS['subspace'] * epoch_losses['subspace']
+            WEIGHTS.get('gen_scale', 0) * epoch_losses['gen_scale'] +
+            WEIGHTS.get('subspace', 0) * epoch_losses['subspace'] +
+            WEIGHTS.get('ctx_edge', 0) * epoch_losses['ctx_edge']
         )
 
         # Override the history['epoch_avg']['total'] with correct value
@@ -8678,153 +8817,6 @@ def train_stageC_diffusion_generator(
     # return history if _is_rank0() else None
     return history
 
-
-# ==============================================================================
-# STAGE D: SC INFERENCE (SINGLE-PATCH MODE - NO STITCHING)
-# ==============================================================================
-
-def sample_sc_edm_single_patch(
-    sc_gene_expr: torch.Tensor,
-    encoder: "SharedEncoder",
-    context_encoder: "SetEncoderContext",
-    score_net: "DiffusionScoreNet",
-    target_st_p95: Optional[float] = None,
-    n_timesteps_sample: int = 500,
-    sigma_min: float = 0.01,
-    sigma_max: float = 3.0,
-    guidance_scale: float = 2.0,
-    eta: float = 0.0,
-    device: str = "cuda",
-    DEBUG_FLAG: bool = True,
-) -> Dict[str, torch.Tensor]:
-    """
-    Stage D: Single-patch SC inference (NO patchwise stitching).
-    
-    This is a reference implementation that treats all SC cells as one patch.
-    Useful for:
-    1. Debugging Stage C without patchwise alignment artifacts
-    2. Small datasets where patchwise isn't needed
-    3. Comparing patchwise vs single-patch geometry
-    
-    Returns:
-        Dictionary with:
-        - 'D_edm': (n_sc, n_sc) Euclidean distance matrix
-        - 'coords': (n_sc, D_latent) raw coordinates
-        - 'coords_canon': (n_sc, D_latent) canonicalized coordinates
-    """
-    import torch.nn.functional as F
-    import utils_et as uet
-    
-    print(f"\n{'='*72}")
-    print("STAGE D — SINGLE-PATCH SC INFERENCE (NO PATCHWISE STITCHING)")
-    print(f"{'='*72}")
-    
-    encoder.eval()
-    context_encoder.eval()
-    score_net.eval()
-    
-    n_sc = sc_gene_expr.shape[0]
-    D_latent = score_net.D_latent
-    
-    if DEBUG_FLAG:
-        print(f"[cfg] n_sc={n_sc}  D_latent={D_latent}")
-        print(f"[cfg] timesteps={n_timesteps_sample}  guidance_scale={guidance_scale}")
-        print(f"[cfg] sigma_min={sigma_min}  sigma_max={sigma_max}")
-    
-    # 1) Encode all SC cells
-    encode_bs = 1024
-    Z_chunks = []
-    for i in range(0, n_sc, encode_bs):
-        z = encoder(sc_gene_expr[i:i + encode_bs].to(device)).detach()
-        Z_chunks.append(z)
-    Z_all = torch.cat(Z_chunks, dim=0).to(device)  # (n_sc, h)
-    
-    if DEBUG_FLAG:
-        print(f"[ENC] Z_all shape={tuple(Z_all.shape)}")
-    
-    # 2) Build single-patch context
-    Z_set = Z_all.unsqueeze(0)  # (1, n_sc, h)
-    mask = torch.ones(1, n_sc, dtype=torch.bool, device=device)
-    H = context_encoder(Z_set, mask)  # (1, n_sc, c_dim)
-
-    # Apply CORAL if available
-    if hasattr(context_encoder, 'coral_transform') and context_encoder.coral_transform is not None:
-        H = context_encoder.coral_transform(H)
-    
-    # 3) Diffusion sampling
-    sigmas = torch.exp(torch.linspace(
-        torch.log(torch.tensor(sigma_max, device=device)),
-        torch.log(torch.tensor(sigma_min, device=device)),
-        n_timesteps_sample,
-        device=device,
-    ))
-    
-    V_t = torch.randn(1, n_sc, D_latent, device=device) * sigmas[0]
-    
-    if DEBUG_FLAG:
-        print(f"\n[SAMPLE] Starting diffusion with {n_timesteps_sample} steps...")
-    
-    with torch.no_grad():
-        for t_idx in range(n_timesteps_sample):
-            sigma_t = sigmas[t_idx]
-            t_norm = torch.tensor([[t_idx / float(n_timesteps_sample - 1)]], device=device)
-            
-            # Classifier-free guidance
-            H_null = torch.zeros_like(H)
-            eps_uncond = score_net(V_t, t_norm, H_null, mask)
-            eps_cond = score_net(V_t, t_norm, H, mask)
-            eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-            
-            if DEBUG_FLAG and t_idx % 100 == 0:
-                print(f"  [STEP] t={t_idx:3d}/{n_timesteps_sample} sigma={float(sigma_t):.4f}")
-            
-            # DDIM/EDM step
-            if t_idx < n_timesteps_sample - 1:
-                sigma_next = sigmas[t_idx + 1]
-                V_0_pred = V_t - sigma_t * eps
-                V_t = V_0_pred + (sigma_next / sigma_t) * (V_t - V_0_pred)
-                if eta > 0:
-                    noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma_t**2, min=0))
-                    V_t = V_t + noise_scale * torch.randn_like(V_t)
-            else:
-                V_t = V_t - sigma_t * eps
-    
-    # 4) Canonicalize: center only, no RMS scaling (match training)
-    V_final = V_t.squeeze(0)  # (n_sc, D_latent)
-    V_canon = V_final - V_final.mean(dim=0, keepdim=True)
-    
-    # 5) Compute EDM
-    D_edm = torch.cdist(V_canon, V_canon)  # (n_sc, n_sc)
-
-    triu_mask = torch.triu(torch.ones_like(D_edm, dtype=torch.bool), diagonal=1)
-
-    
-    # 6) Optional: rescale to ST p95
-    if target_st_p95 is not None:
-        current_p95 = D_edm[triu_mask].quantile(0.95).item()
-        scale_factor = target_st_p95 / (current_p95 + 1e-8)
-        D_edm = D_edm * scale_factor
-        V_canon = V_canon * scale_factor
-        
-        if DEBUG_FLAG:
-            print(f"\n[SCALE] Rescaled to match ST p95={target_st_p95:.4f} (factor={scale_factor:.4f})")
-    
-    # 7) Stats
-    if DEBUG_FLAG:
-        print(f"\n[RESULT] EDM shape: {tuple(D_edm.shape)}")
-        print(f"[RESULT] Coords RMS: {V_canon.pow(2).mean().sqrt().item():.4f}")
-        D_upper = D_edm[triu_mask]
-        print(f"[RESULT] Distance stats: "
-              f"p50={D_upper.quantile(0.50).item():.4f} "
-              f"p95={D_upper.quantile(0.95).item():.4f} "
-              f"max={D_upper.max().item():.4f}")
-        print(f"{'='*72}\n")
-    
-    return {
-        'D_edm': D_edm,
-        'coords': V_final,
-        'coords_canon': V_canon,
-    }
 
 
 # ==============================================================================

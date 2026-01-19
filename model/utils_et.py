@@ -5192,3 +5192,87 @@ def clamp_anchors_for_loss(V_pred, V_tgt, anchor_mask, mask):
     V_clamped = V_clamped * mask_3d  # Re-apply padding mask
     
     return V_clamped
+
+
+# ===================================================================
+# Context invariance / cross-context stability losses
+# ===================================================================
+def edge_consistency_loss(
+    V_a: torch.Tensor,
+    V_b: torch.Tensor,
+    knn_idx: torch.Tensor,
+    *,
+    mask: torch.Tensor = None,
+    anchor_mask: torch.Tensor = None,
+    sample_weight: torch.Tensor = None,
+    eps: float = 1e-8,
+    huber_delta: float = None,
+) -> torch.Tensor:
+    """
+    Compare predicted local edge lengths between two predictions.
+    Used for context invariance regularization.
+
+    V_a, V_b: (B, N, D) - two predictions to compare
+    knn_idx:  (B, N, K) integer indices into the N dimension.
+    mask:     (B, N) valid points
+    anchor_mask: (B, N) optional restriction (e.g., core points only)
+    sample_weight: (B,) weights per sample (e.g., low-sigma emphasis)
+    """
+    assert V_a.shape == V_b.shape
+    B, N, D = V_a.shape
+    K = knn_idx.shape[-1]
+    device = V_a.device
+    dtype = V_a.dtype
+
+    j_idx = knn_idx.clamp(min=0, max=N - 1)
+    flat_j = j_idx.reshape(B, -1)  # (B, N*K)
+
+    def _gather(V):
+        Vj = torch.gather(V, 1, flat_j.unsqueeze(-1).expand(B, N * K, D))
+        return Vj.reshape(B, N, K, D)
+
+    Va_i = V_a.unsqueeze(2).expand(B, N, K, D)
+    Vb_i = V_b.unsqueeze(2).expand(B, N, K, D)
+    Va_j = _gather(V_a)
+    Vb_j = _gather(V_b)
+
+    d2_a = (Va_i - Va_j).pow(2).sum(dim=-1).clamp(min=eps)
+    d2_b = (Vb_i - Vb_j).pow(2).sum(dim=-1).clamp(min=eps)
+
+    log_a = torch.log(d2_a)
+    log_b = torch.log(d2_b)
+    diff = log_a - log_b
+
+    if huber_delta is not None and huber_delta > 0:
+        absd = diff.abs()
+        loss_edge = torch.where(
+            absd < huber_delta,
+            0.5 * (diff ** 2) / huber_delta,
+            absd - 0.5 * huber_delta,
+        )
+    else:
+        loss_edge = diff ** 2
+
+    if mask is None:
+        mask_i = torch.ones((B, N), device=device, dtype=torch.bool)
+    else:
+        mask_i = mask.to(device=device, dtype=torch.bool)
+
+    mask_j = torch.gather(mask_i, 1, flat_j).reshape(B, N, K)
+    edge_ok = mask_i.unsqueeze(-1) & mask_j
+
+    if anchor_mask is not None:
+        am = anchor_mask.to(device=device, dtype=torch.bool)
+        am_j = torch.gather(am, 1, flat_j).reshape(B, N, K)
+        edge_ok = edge_ok & am.unsqueeze(-1) & am_j
+
+    w = 1.0
+    if sample_weight is not None:
+        sw = sample_weight.to(device=device, dtype=dtype)
+        if sw.dim() == 1:
+            sw = sw.view(B, 1, 1)
+        w = sw
+
+    loss_edge = loss_edge * edge_ok.to(dtype) * w
+    denom = (edge_ok.to(dtype) * w).sum().clamp(min=1.0)
+    return loss_edge.sum() / denom

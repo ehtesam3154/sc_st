@@ -26,6 +26,57 @@ from core_models_et_p2 import train_stageC_diffusion_generator
 import utils_et as uet
 import numpy as np
 
+
+# ==============================================================================
+# HELPER: AUTO-DETECT ANCHOR MODE FROM CHECKPOINT
+# ==============================================================================
+
+def infer_anchor_train_from_checkpoint(checkpoint: dict, base_h_dim: int = 128) -> bool:
+    """
+    Auto-detect whether a checkpoint was trained with anchor_train=True.
+    
+    Inspects the context_encoder's input_proj.weight shape:
+    - If shape[1] == base_h_dim + 1: anchor_train=True
+    - If shape[1] == base_h_dim: anchor_train=False
+    
+    Args:
+        checkpoint: Loaded checkpoint dict (must have 'context_encoder' key)
+        base_h_dim: Base embedding dimension (default 128 for [512,256,128] encoder)
+    
+    Returns:
+        bool: True if checkpoint was trained with anchored mode
+    
+    Raises:
+        ValueError: If input dimension doesn't match expected values
+    """
+    if 'context_encoder' not in checkpoint:
+        print("[ANCHOR-DETECT] No context_encoder in checkpoint, assuming anchor_train=False")
+        return False
+    
+    ctx_sd = checkpoint['context_encoder']
+    
+    if 'input_proj.weight' not in ctx_sd:
+        print("[ANCHOR-DETECT] No input_proj.weight in context_encoder, assuming anchor_train=False")
+        return False
+    
+    input_proj_weight = ctx_sd['input_proj.weight']
+    ckpt_in_features = input_proj_weight.shape[1]
+    
+    if ckpt_in_features == base_h_dim + 1:
+        print(f"[ANCHOR-DETECT] context_encoder.input_proj.in_features={ckpt_in_features} "
+              f"(base_h_dim={base_h_dim} + 1) => anchor_train=True")
+        return True
+    elif ckpt_in_features == base_h_dim:
+        print(f"[ANCHOR-DETECT] context_encoder.input_proj.in_features={ckpt_in_features} "
+              f"=> anchor_train=False")
+        return False
+    else:
+        raise ValueError(
+            f"[ANCHOR-DETECT] Unexpected input_proj.in_features={ckpt_in_features}. "
+            f"Expected {base_h_dim} (unanchored) or {base_h_dim + 1} (anchored). "
+            f"Check your encoder dimensions."
+        )
+
 # ==============================================================================
 # GEMS MODEL - MAIN ORCHESTRATOR
 # ==============================================================================
@@ -562,14 +613,51 @@ class GEMSModel:
         print(f"Model saved to {path}")
 
     
-    def load(self, path: str):
-        """Load all model components."""
+    def load(self, path: str, auto_detect_anchor: bool = True):
+        """
+        Load all model components with auto-detection of anchor mode.
+        
+        Args:
+            path: Path to checkpoint file
+            auto_detect_anchor: If True, auto-detect anchor_train from checkpoint
+                               and rebuild context_encoder if needed
+        """
         import copy
         checkpoint = torch.load(path, map_location=self.device)
+        
+        # ========== AUTO-DETECT ANCHOR MODE ==========
+        if auto_detect_anchor:
+            base_h_dim = self.n_embedding[-1]  # typically 128
+            ckpt_anchor_train = infer_anchor_train_from_checkpoint(checkpoint, base_h_dim)
+            
+            # Check if we need to rebuild context_encoder
+            if ckpt_anchor_train != self.anchor_train:
+                print(f"[ANCHOR-LOAD] Checkpoint anchor_train={ckpt_anchor_train} != "
+                      f"model anchor_train={self.anchor_train}")
+                print(f"[ANCHOR-LOAD] Rebuilding context_encoder with anchor_train={ckpt_anchor_train}")
+                
+                # Rebuild context_encoder with correct anchor_train
+                self.anchor_train = ckpt_anchor_train
+                self.cfg['anchor']['anchor_train'] = ckpt_anchor_train
+                
+                h_dim = self.n_embedding[-1]
+                self.context_encoder = SetEncoderContext(
+                    h_dim=h_dim,
+                    c_dim=self.c_dim,
+                    n_heads=self.n_heads,
+                    n_blocks=3,
+                    isab_m=self.isab_m,
+                    anchor_train=ckpt_anchor_train,
+                ).to(self.device)
+                
+                print(f"[ANCHOR-LOAD] Rebuilt context_encoder: input_dim={self.context_encoder.input_dim}")
+        
+        # Now load state dicts
         self.encoder.load_state_dict(checkpoint['encoder'])
         self.context_encoder.load_state_dict(checkpoint['context_encoder'])
         self.generator.load_state_dict(checkpoint['generator'])
         self.score_net.load_state_dict(checkpoint['score_net'])
+        
         if 'sigma_data' in checkpoint:
             self.sigma_data = checkpoint['sigma_data']
         if 'sigma_min' in checkpoint:
@@ -590,6 +678,7 @@ class GEMSModel:
             print("  Loaded score_net_ema")
         
         if 'context_encoder_ema' in checkpoint:
+            # Rebuild EMA context encoder with same anchor_train
             self.context_encoder_ema = copy.deepcopy(self.context_encoder).eval()
             for p in self.context_encoder_ema.parameters():
                 p.requires_grad_(False)
@@ -597,6 +686,8 @@ class GEMSModel:
             print("  Loaded context_encoder_ema")
             
         print(f"Model loaded from {path}")
+        print(f"  anchor_train={self.anchor_train}")
+
 
     
     # ==========================================================================
@@ -940,43 +1031,6 @@ class GEMSModel:
             inference_mode=inference_mode,
         )
         return res
-
-
-    def infer_sc_single_patch(
-        self,
-        sc_gene_expr: torch.Tensor,
-        n_timesteps_sample: int = 500,
-        sigma_min: float = 0.01,
-        sigma_max: float = 3.0,
-        guidance_scale: float = 2.0,
-        eta: float = 0.0,
-        target_st_p95: Optional[float] = None,
-        return_coords: bool = True,
-        DEBUG_FLAG: bool = True,
-    ):
-        """
-        Single-patch SC inference (no patchwise stitching).
-        Treats all SC cells as one batch - useful for small datasets and debugging.
-        """
-        from core_models_et_p2 import sample_sc_edm_single_patch
-        
-        result = sample_sc_edm_single_patch(
-            sc_gene_expr=sc_gene_expr,
-            encoder=self.encoder,
-            context_encoder=self.context_encoder,
-            score_net=self.score_net,
-            target_st_p95=target_st_p95,
-            n_timesteps_sample=n_timesteps_sample,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max,
-            guidance_scale=guidance_scale,
-            eta=eta,
-            device=self.device,
-            DEBUG_FLAG=DEBUG_FLAG,
-        )
-        
-        return result
-
 
     # ==========================================================================
     # CORAL TRANSFORMATION FOR SC INFERENCE

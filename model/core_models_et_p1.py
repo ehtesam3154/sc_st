@@ -943,6 +943,20 @@ class STSetDataset(Dataset):
             'n_total': n_total,
         }
 
+        # ========== SPOT IDENTITY HARDENING: Pack slide_id into global UID ==========
+        # uid = (slide_id << 32) + within_slide_idx (int64)
+        # This guarantees cross-slide uniqueness for any future intersection/cache operations.
+        # Decode: slide_id = uid >> 32, spot_idx = uid & 0xFFFFFFFF
+        
+        global_uid = (slide_id << 32) + indices.long()  # (n,) int64 UIDs
+        spot_indices = indices  # Keep within-slide indices for targets_dict lookup
+        
+        overlap_info = {
+            'slide_id': slide_id,
+            'indices': indices,  # Original within-slide indices
+            'global_uid': global_uid,  # NEW: Globally unique IDs
+        }
+
         return {
             'Z_set': Z_set,
             'is_landmark': is_landmark,
@@ -960,12 +974,37 @@ class STSetDataset(Dataset):
             'knn_spatial': knn_spatial_local,
             # ========== NEW: Competitor training fields ==========
             'anchor_mask': anchor_mask,
-            'global_indices': indices,
+            'global_indices': global_uid,  # ✅ NOW TRULY GLOBAL (int64 UIDs)
+            'spot_indices': spot_indices,  # NEW: Within-slide indices [0, m) for targets_dict
             'compete_debug': compete_debug,
             # ========== NEW: Anchored training fields ==========
             'anchor_cond_mask': anchor_cond_mask,
             'anchor_cond_debug': anchor_cond_debug,
         }
+
+        # return {
+        #     'Z_set': Z_set,
+        #     'is_landmark': is_landmark,
+        #     'V_target': V_target,
+        #     'G_target': G_subset,
+        #     'D_target': D_subset,
+        #     'H_target': H_subset,
+        #     'H_bins': bins,
+        #     'L_info': L_info,
+        #     'triplets': triplets_subset,
+        #     'n': len(indices),
+        #     'overlap_info': overlap_info,
+        #     'knn_indices': knn_local,
+        #     'topo_info': topo_info,
+        #     'knn_spatial': knn_spatial_local,
+        #     # ========== NEW: Competitor training fields ==========
+        #     'anchor_mask': anchor_mask,
+        #     'global_indices': indices,
+        #     'compete_debug': compete_debug,
+        #     # ========== NEW: Anchored training fields ==========
+        #     'anchor_cond_mask': anchor_cond_mask,
+        #     'anchor_cond_debug': anchor_cond_debug,
+        # }
 
 
 
@@ -1003,7 +1042,9 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
     # ========== NEW: Competitor training batch tensors ==========
     anchor_mask_batch = torch.zeros(batch_size, n_max, dtype=torch.bool, device=device)
-    global_indices_batch = torch.full((batch_size, n_max), -1, dtype=torch.long, device=device)
+    # ✅ HARDENING: global_indices now int64 (UIDs), spot_indices int64 (within-slide)
+    global_indices_batch = torch.full((batch_size, n_max), -1, dtype=torch.int64, device=device)
+    spot_indices_batch = torch.full((batch_size, n_max), -1, dtype=torch.int64, device=device)
     compete_debug_batch = []
     
     # ========== NEW: Anchored training batch tensors ==========
@@ -1032,16 +1073,33 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             knn_spatial_batch[i, :n, :] = item['knn_spatial'][:n, :]
 
         # ========== NEW: Competitor fields ==========
+        # if 'anchor_mask' in item:
+        #     anchor_mask_batch[i, :n] = item['anchor_mask'][:n]
+        # else:
+        #     anchor_mask_batch[i, :n] = True  # Default: all points are anchors
+        
+        # if 'global_indices' in item:
+        #     global_indices_batch[i, :n] = item['global_indices'][:n]
+        
+        # if 'compete_debug' in item:
+        #     compete_debug_batch.append(item['compete_debug'])
+
+        # ========== NEW: Competitor fields ==========
         if 'anchor_mask' in item:
             anchor_mask_batch[i, :n] = item['anchor_mask'][:n]
         else:
             anchor_mask_batch[i, :n] = True  # Default: all points are anchors
         
+        # ✅ HARDENING: Collate both UIDs and within-slide indices
         if 'global_indices' in item:
-            global_indices_batch[i, :n] = item['global_indices'][:n]
+            global_indices_batch[i, :n] = item['global_indices'][:n].long()  # int64 UIDs
+        
+        if 'spot_indices' in item:
+            spot_indices_batch[i, :n] = item['spot_indices'][:n].long()  # int64 within-slide
         
         if 'compete_debug' in item:
             compete_debug_batch.append(item['compete_debug'])
+
         
         # ========== NEW: Anchored training fields ==========
         if 'anchor_cond_mask' in item:
@@ -1070,7 +1128,8 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'knn_spatial': knn_spatial_batch,
         # ========== NEW: Competitor training fields ==========
         'anchor_mask': anchor_mask_batch,
-        'global_indices': global_indices_batch,
+        'global_indices': global_indices_batch,  # ✅ int64 UIDs (slide-aware)
+        'spot_indices': spot_indices_batch,      # NEW: Within-slide indices for targets_dict
         'compete_debug': compete_debug_batch,
         # ========== NEW: Anchored training fields ==========
         'anchor_cond_mask': anchor_cond_mask_batch,
