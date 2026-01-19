@@ -162,8 +162,15 @@ def _intersect1d_with_indices(a: torch.Tensor, b: torch.Tensor):
 
 def _validate_st_uid_uniqueness(batch: Dict, device: str = 'cuda'):
     """
-    Smoke test: Verify ST UIDs are cross-slide unique.
-    Call once per epoch during training for sanity check.
+    Smoke test: Verify ST UIDs are correct.
+    
+    Checks:
+    1. Within each miniset, UIDs should be unique (no duplicate spots in one patch)
+    2. Cross-slide disjointness: UIDs from different slides should not overlap
+       (verifies the (slide_id << 32) + idx packing is correct)
+    
+    NOTE: Duplicates ACROSS different minisets in the same batch are EXPECTED
+    because different patches can sample overlapping spots from the same slide.
     """
     if batch.get('is_sc', False):
         return  # Skip SC batches
@@ -176,41 +183,68 @@ def _validate_st_uid_uniqueness(batch: Dict, device: str = 'cuda'):
     if overlap_info is None:
         return
     
+    mask_batch = batch.get('mask', None)
     B, N = global_indices.shape
-    all_uids = []
-    slide_ids_per_uid = []
     
+    # ========== CHECK 1: Uniqueness WITHIN each miniset ==========
     for b in range(B):
-        mask = global_indices[b] >= 0
-        uids_b = global_indices[b][mask].tolist()
+        # Get valid (non-padding) UIDs for this miniset
+        if mask_batch is not None:
+            valid = mask_batch[b] & (global_indices[b] >= 0)
+        else:
+            valid = global_indices[b] >= 0
+        
+        uids_b = global_indices[b][valid]
+        
+        if uids_b.numel() == 0:
+            continue
+        
+        # Check for duplicates within this miniset
+        n_unique = uids_b.unique().numel()
+        n_total = uids_b.numel()
+        if n_unique != n_total:
+            n_dups = n_total - n_unique
+            raise AssertionError(
+                f"[SPOT-IDENTITY] Duplicate UID within miniset b={b}! "
+                f"{n_dups} duplicates (total={n_total}, unique={n_unique})"
+            )
+    
+    # ========== CHECK 2: Cross-slide disjointness (only if multiple slides) ==========
+    # Collect UIDs per slide (across all minisets)
+    uids_by_slide = {}
+    for b in range(B):
+        if mask_batch is not None:
+            valid = mask_batch[b] & (global_indices[b] >= 0)
+        else:
+            valid = global_indices[b] >= 0
+        
+        uids_b = global_indices[b][valid]
         slide_b = overlap_info[b]['slide_id']
-        all_uids.extend(uids_b)
-        slide_ids_per_uid.extend([slide_b] * len(uids_b))
+        
+        if slide_b not in uids_by_slide:
+            uids_by_slide[slide_b] = set()
+        uids_by_slide[slide_b].update(uids_b.tolist())
     
-    if len(all_uids) == 0:
-        return
+    # Only check cross-slide if we have multiple slides
+    slide_ids = list(uids_by_slide.keys())
+    if len(slide_ids) <= 1:
+        return  # Single slide - no cross-slide check needed
     
-    all_uids = torch.tensor(all_uids, dtype=torch.int64, device=device)
-    slide_ids_per_uid = torch.tensor(slide_ids_per_uid, device=device)
-    
-    # Check uniqueness
-    unique_uids = torch.unique(all_uids)
-    n_dups = len(all_uids) - len(unique_uids)
-    if n_dups > 0:
-        raise AssertionError(f"[SPOT-IDENTITY] UID collision detected! {n_dups} duplicates in batch")
-    
-    # Check cross-slide disjointness
-    unique_slides = torch.unique(slide_ids_per_uid)
-    for i, slide_a in enumerate(unique_slides):
-        for slide_b in unique_slides[i+1:]:
-            uids_a = set(all_uids[slide_ids_per_uid == slide_a].tolist())
-            uids_b = set(all_uids[slide_ids_per_uid == slide_b].tolist())
-            intersection = uids_a & uids_b
+    for i, slide_a in enumerate(slide_ids):
+        for slide_b in slide_ids[i+1:]:
+            intersection = uids_by_slide[slide_a] & uids_by_slide[slide_b]
             if len(intersection) > 0:
+                # Decode to check if this is a real collision or packing error
+                sample_uid = list(intersection)[0]
+                decoded_slide = sample_uid >> 32
+                decoded_idx = sample_uid & 0xFFFFFFFF
                 raise AssertionError(
                     f"[SPOT-IDENTITY] Cross-slide collision! "
-                    f"Slide {slide_a} and {slide_b} share {len(intersection)} UIDs: {list(intersection)[:5]}..."
+                    f"Slide {slide_a} and {slide_b} share {len(intersection)} UIDs. "
+                    f"Example UID={sample_uid} decodes to slide={decoded_slide}, idx={decoded_idx}. "
+                    f"This indicates a UID packing bug."
                 )
+
 
 
 # ==============================================================================
@@ -1035,12 +1069,18 @@ class DiffusionScoreNet(nn.Module):
             sigma_data: float,         # data std
             self_cond: torch.Tensor = None,
             return_debug: bool = False,
+            center_mask: torch.Tensor = None,  # NEW: optional mask for centering (fixes ctx-drop frame shift)
         ) -> torch.Tensor:
             """
             EDM-preconditioned forward pass.
             Returns denoised estimate x0_pred.
             
             D_θ(x, σ) = c_skip · x + c_out · F_θ(c_in · x; c_noise, H)
+            
+            Args:
+                center_mask: If provided, use this mask for centering instead of `mask`.
+                             This ensures consistent coordinate frames between normal and
+                             context-dropped forward passes.
             """
             B, N, D = x.shape
             
@@ -1060,7 +1100,10 @@ class DiffusionScoreNet(nn.Module):
             
             # --- FIX #1: Center in raw space BEFORE preconditioning ---
             # x_c is the raw centered geometry (units match V_target / st_dist_bin_edges)
-            x_c, mean_shift = uet.center_only(x, mask)  # (B, N, D)
+            # Use center_mask if provided (for ctx-drop consistency), otherwise use mask
+            mask_for_centering = center_mask if center_mask is not None else mask
+            x_c, mean_shift = uet.center_only(x, mask_for_centering)  # (B, N, D)
+
             
             # Scale input for network (preconditioned space)
             x_in = c_in * x_c
@@ -2939,6 +2982,22 @@ def train_stageC_diffusion_generator(
         'subspace': 0.5,       # NEW: add this key for Patch 7
         'ctx_edge': 2.0
     }
+
+    # ========== CONTEXT INVARIANCE LOSS CONFIG ==========
+    ENABLE_CTX_EDGE = True  # Master switch - set False to disable ctx loss entirely
+    CTX_WARMUP_STEPS = 2000  # Warmup steps before full ctx loss weight
+    CTX_SIGMA_GATE = 0.5  # Only apply ctx loss when sigma <= sigma_gate * sigma_data
+    CTX_KEEP_P = 0.8  # Fraction of extra points to keep (was 0.5, now milder)
+    CTX_MIN_EXTRA = 16  # Minimum extra points to keep (was 8, now more)
+    CTX_DEBUG_EVERY = 200  # Print debug info every N steps
+    
+    # Print ctx config once at startup
+    if fabric is None or fabric.is_global_zero:
+        print(f"\n[CTX-EDGE CONFIG] ENABLE_CTX_EDGE={ENABLE_CTX_EDGE}")
+        if ENABLE_CTX_EDGE:
+            print(f"  weight={WEIGHTS.get('ctx_edge', 0)}, warmup={CTX_WARMUP_STEPS}, "
+                  f"sigma_gate={CTX_SIGMA_GATE}, keep_p={CTX_KEEP_P}, min_extra={CTX_MIN_EXTRA}")
+
 
 
     # Heat warmup schedule
@@ -5079,43 +5138,90 @@ def train_stageC_diffusion_generator(
             # Same core points should predict the same local edge lengths
             # even if we drop/change the surrounding context points.
             # ---------------------------------------------------------------
+            # ---------------------------------------------------------------
+            # NEW: Context invariance regularizer (core-edge stability)
+            # Same core points should predict the same local edge lengths
+            # even if we drop/change the surrounding context points.
+            # 
+            # FIXES APPLIED:
+            # A) center_mask ensures both forwards use same coordinate frame
+            # B) core->core kNN avoids invalid edges to non-core points
+            # C) Binary sigma gate + warmup prevents early training degradation
+            # D) Milder context drop (keep_p=0.8, min_extra=16)
+            # ---------------------------------------------------------------
             knn_spatial = batch.get('knn_spatial', None)
             if knn_spatial is not None:
                 knn_spatial = knn_spatial.to(device)
             
-            if (not is_sc) and (knn_spatial is not None) and (anchor_mask is not None) and (WEIGHTS.get('ctx_edge', 0.0) > 0):
+            # Check master switch and conditions
+            ctx_edge_active = (
+                ENABLE_CTX_EDGE and 
+                (not is_sc) and 
+                (knn_spatial is not None) and 
+                (anchor_mask is not None) and 
+                (WEIGHTS.get('ctx_edge', 0.0) > 0)
+            )
+            
+            if ctx_edge_active:
                 core_mask = anchor_mask & mask
                 extra_mask = mask & (~core_mask)
+                
+                # Count for debug
+                n_core = core_mask.sum().item()
+                n_extra = extra_mask.sum().item()
 
-                if extra_mask.any():
+                if extra_mask.any() and n_core >= 8:
+                    # ----- BUILD CORE->CORE kNN -----
+                    # This ensures edge_consistency_loss only uses edges between core points
                     with torch.no_grad():
-                        keep_p = 0.5
+                        # Use V_target (ground truth latent coords) for kNN computation
+                        V_for_knn = V_target.float()  # (B, N, D)
+                        B_knn, N_knn, D_knn = V_for_knn.shape
+                        K_ctx = min(knn_spatial.shape[-1], 8)  # Use fewer neighbors for stability
+                        
+                        # Compute pairwise distances
+                        d_all = torch.cdist(V_for_knn, V_for_knn)  # (B, N, N)
+                        
+                        # Mask: only core->core edges are valid
+                        ok_mask = core_mask.unsqueeze(2) & core_mask.unsqueeze(1)  # (B, N, N)
+                        d_all = d_all + (~ok_mask).float() * 1e9  # Invalid edges get huge distance
+                        
+                        # Mask self-edges
+                        eye = torch.eye(N_knn, device=device).unsqueeze(0)
+                        d_all = d_all + eye * 1e9
+                        
+                        # Get k nearest core neighbors for each point
+                        knn_ctx = d_all.topk(k=K_ctx, largest=False).indices  # (B, N, K)
+                    
+                    # ----- CONTEXT DROPOUT -----
+                    with torch.no_grad():
                         rand = torch.rand_like(extra_mask.float())
-                        ctx_drop_mask = core_mask | (extra_mask & (rand < keep_p))
+                        ctx_drop_mask = core_mask | (extra_mask & (rand < CTX_KEEP_P))
 
-                        # keep at least a few extras so the context is actually different
-                        min_extra = 8
+                        # Ensure minimum extras are kept
                         extra_kept = (ctx_drop_mask & extra_mask).sum(dim=1)
-                        need = (extra_mask.sum(dim=1) > 0) & (extra_kept < min_extra)
+                        need = (extra_mask.sum(dim=1) > 0) & (extra_kept < CTX_MIN_EXTRA)
                         if need.any():
                             for b in need.nonzero(as_tuple=True)[0].tolist():
                                 extra_idx = extra_mask[b].nonzero(as_tuple=True)[0]
-                                take = extra_idx[:min_extra]
+                                take = extra_idx[:CTX_MIN_EXTRA]
                                 ctx_drop_mask[b, take] = True
 
-                    # Forward pass with perturbed context (regularizer only: no self-cond)
+                    # ----- FORWARD PASS WITH DROPPED CONTEXT -----
+                    # CRITICAL FIX: Pass center_mask=mask to ensure same coordinate frame
                     H_drop = context_encoder(Z_set, ctx_drop_mask)
                     V_hat_drop = score_net.forward_edm(
                         V_t, sigma_flat, H_drop, ctx_drop_mask, sigma_data,
-                        self_cond=None, return_debug=False
+                        self_cond=None, return_debug=False,
+                        center_mask=mask  # FIX: Use original mask for centering!
                     )
-                    # forward_edm returns tensor directly when return_debug=False
 
-                    # fp32 stable centering on core
+                    # ----- COMPUTE LOSS IN FP32 -----
                     with torch.autocast(device_type='cuda', enabled=False):
                         V_full = V_hat_f32
                         V_drop_f32 = V_hat_drop.float()
 
+                        # Center both on core points (same reference frame)
                         core_f = core_mask.float().unsqueeze(-1)
                         denom_c = core_f.sum(dim=1, keepdim=True).clamp(min=1.0)
 
@@ -5125,16 +5231,52 @@ def train_stageC_diffusion_generator(
                         V_full_c = (V_full - mu_full) * core_f
                         V_drop_c = (V_drop_f32 - mu_drop) * core_f
 
-                        # low-sigma emphasis
-                        w_ctx = (sigma_data**2 / (sigma_flat**2 + sigma_data**2)).detach().float()
+                        # ----- GATING: binary sigma gate + warmup -----
+                        sigma_gate_thresh = CTX_SIGMA_GATE * sigma_data
+                        sigma_ok = (sigma_flat <= sigma_gate_thresh).float()  # (B,1,1) or (B,)
+                        if sigma_ok.dim() == 3:
+                            sigma_ok = sigma_ok.squeeze(-1).squeeze(-1)  # (B,)
+                        
+                        warmup_mult = min(1.0, global_step / max(CTX_WARMUP_STEPS, 1))
+                        w_ctx = sigma_ok * warmup_mult  # (B,)
 
+                        # ----- COMPUTE EDGE CONSISTENCY LOSS -----
                         L_ctx_edge = uet.edge_consistency_loss(
-                            V_full_c, V_drop_c, knn_spatial,
+                            V_full_c, V_drop_c, knn_ctx,  # Use core->core kNN!
                             mask=core_mask, anchor_mask=core_mask,
                             sample_weight=w_ctx,
                             eps=1e-8,
                             huber_delta=0.25,
                         )
+                        
+                    # ----- DEBUG PRINTS -----
+                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                        sigma_med = sigma_flat.median().item()
+                        n_sigma_ok = sigma_ok.sum().item()
+                        print(f"[CTX] step={global_step} entered=True L_ctx_edge={L_ctx_edge.item():.6f} "
+                              f"w={WEIGHTS.get('ctx_edge',0):.1f} core={n_core:.0f} extra={n_extra:.0f} "
+                              f"sigma_med={sigma_med:.3f} n_sigma_ok={n_sigma_ok:.0f}/{sigma_ok.numel()} "
+                              f"warmup={warmup_mult:.2f}")
+                else:
+                    # Not enough points for ctx loss
+                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                        print(f"[CTX] step={global_step} SKIPPED: core={n_core:.0f} extra={n_extra:.0f} (need core>=8 and extra>0)")
+            else:
+                # Ctx loss disabled or conditions not met
+                if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                    reasons = []
+                    if not ENABLE_CTX_EDGE:
+                        reasons.append("ENABLE_CTX_EDGE=False")
+                    if is_sc:
+                        reasons.append("is_sc=True")
+                    if knn_spatial is None:
+                        reasons.append("knn_spatial=None")
+                    if anchor_mask is None:
+                        reasons.append("anchor_mask=None")
+                    if WEIGHTS.get('ctx_edge', 0.0) <= 0:
+                        reasons.append("weight=0")
+                    print(f"[CTX] step={global_step} entered=False reason={', '.join(reasons)}")
+
 
 
             if not is_sc:
@@ -5983,12 +6125,13 @@ def train_stageC_diffusion_generator(
                                     continue
                                 
                                 # Compute predicted kNN within batch
+                                # Compute predicted kNN within batch
                                 D_pred = torch.cdist(V_b, V_b)
                                 D_pred.fill_diagonal_(float('inf'))
                                 _, pred_knn = torch.topk(D_pred, k=coverage_k, largest=False)
                                 
-                                # Map to global indices
-                                local_to_global = global_idx_b[m_b]  # (n_valid,)
+                                # Map to global indices using uid_b (global UIDs)
+                                local_to_global = uid_b[m_b]  # (n_valid,) - FIX: was global_idx_b
                                 pred_knn_global = local_to_global[pred_knn]  # (n_valid, k)
                                 
                                 # For coverage: we need full slide GT neighbors
@@ -8468,7 +8611,8 @@ def train_stageC_diffusion_generator(
                 print(f"  edm_tail={avg_edm_tail:.4f} | gen_align={avg_gen_align:.4f}")
                 print(f"  dim={avg_dim:.4f} | triangle={avg_triangle:.4f} | radial={avg_radial:.4f}")
                 print(f"  edge={avg_edge:.4f} | topo={avg_topo:.4f} | shape_spec={avg_shape_spec:.4f}")
-                print(f"  gen_scale={avg_gen_scale:.4f} subspace={avg_subspace:.4f}")
+                print(f"  gen_scale={avg_gen_scale:.4f} subspace={avg_subspace:.4f} ctx_edge={avg_ctx_edge:.4f}")
+
 
 
             else:
@@ -8581,7 +8725,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale', 'ctx_edge'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
