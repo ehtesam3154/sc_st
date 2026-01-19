@@ -772,7 +772,8 @@ class DiffusionScoreNet(nn.Module):
         attn_cached: dict = None, return_dist_aux: bool = False,
         sigma_raw: torch.Tensor = None,
         x_raw: torch.Tensor = None,     # NEW: raw centered geometry (Fix #1)
-        c_in: torch.Tensor = None       # NEW: for self-cond feature scaling (Fix #3)
+        c_in: torch.Tensor = None,       # NEW: for self-cond feature scaling (Fix #3)
+        center_mask: torch.Tensor = None
         ) -> torch.Tensor:
         """
         Args:
@@ -792,9 +793,10 @@ class DiffusionScoreNet(nn.Module):
         B, N, D = V_t.shape
         
         if self.use_canonicalize:
-            V_in, _ = uet.center_only(V_t, mask)
+            mask_center = center_mask if center_mask is not None else mask
+            V_in, _ = uet.center_only(V_t, mask_center)
             if self_cond is not None:
-                self_cond_canon, _ = uet.center_only(self_cond, mask)
+                self_cond_canon, _ = uet.center_only(self_cond, mask_center)
             else:
                 self_cond_canon = None
         else:
@@ -973,7 +975,6 @@ class DiffusionScoreNet(nn.Module):
                             f"rms(V_coord)={rms_coord:.4f}, ratio={ratio:.4f} {status}")
 
 
-
         # Concatenate all features
         X = torch.cat(features, dim=-1)
         X = self.input_proj(X)
@@ -1122,7 +1123,8 @@ class DiffusionScoreNet(nn.Module):
                 self_cond=self_cond, 
                 sigma_raw=sigma,
                 x_raw=x_c,      # NEW: raw centered geometry for distance bias
-                c_in=c_in       # NEW: for consistent self-cond feature scaling
+                c_in=c_in,       # NEW: for consistent self-cond feature scaling
+                center_mask=mask_for_centering
             )
             
             # If forward returns tuple (for dist_aux), extract just the prediction
@@ -1151,7 +1153,7 @@ class DiffusionScoreNet(nn.Module):
                 return x0_pred, debug_dict
             return x0_pred
 
-    
+
 # ==============================================================================
 # STAGE C: TRAINING FUNCTION
 # ==============================================================================
@@ -2980,24 +2982,24 @@ def train_stageC_diffusion_generator(
         'topo': 0.0,
         'shape_spec': 0.0,
         'subspace': 0.5,       # NEW: add this key for Patch 7
-        'ctx_edge': 2.0
+        'ctx_edge': 0.05
     }
 
     # ========== CONTEXT INVARIANCE LOSS CONFIG ==========
     ENABLE_CTX_EDGE = True  # Master switch - set False to disable ctx loss entirely
     CTX_WARMUP_STEPS = 2000  # Warmup steps before full ctx loss weight
-    CTX_SIGMA_GATE = 0.5  # Only apply ctx loss when sigma <= sigma_gate * sigma_data
+    CTX_SNR_THRESH = 0.20  # SNR gate: only apply when snr_w >= this (try 0.10-0.30)
     CTX_KEEP_P = 0.8  # Fraction of extra points to keep (was 0.5, now milder)
     CTX_MIN_EXTRA = 16  # Minimum extra points to keep (was 8, now more)
-    CTX_DEBUG_EVERY = 200  # Print debug info every N steps
+    CTX_DEBUG_EVERY = 300  # Print debug info every N steps
+    CTX_K = 8  # Number of neighbors for core->core kNN
     
     # Print ctx config once at startup
     if fabric is None or fabric.is_global_zero:
         print(f"\n[CTX-EDGE CONFIG] ENABLE_CTX_EDGE={ENABLE_CTX_EDGE}")
         if ENABLE_CTX_EDGE:
             print(f"  weight={WEIGHTS.get('ctx_edge', 0)}, warmup={CTX_WARMUP_STEPS}, "
-                  f"sigma_gate={CTX_SIGMA_GATE}, keep_p={CTX_KEEP_P}, min_extra={CTX_MIN_EXTRA}")
-
+                  f"snr_thresh={CTX_SNR_THRESH}, keep_p={CTX_KEEP_P}, min_extra={CTX_MIN_EXTRA}, K={CTX_K}")
 
 
     # Heat warmup schedule
@@ -5138,16 +5140,12 @@ def train_stageC_diffusion_generator(
             # Same core points should predict the same local edge lengths
             # even if we drop/change the surrounding context points.
             # ---------------------------------------------------------------
-            # ---------------------------------------------------------------
-            # NEW: Context invariance regularizer (core-edge stability)
-            # Same core points should predict the same local edge lengths
-            # even if we drop/change the surrounding context points.
-            # 
             # FIXES APPLIED:
             # A) center_mask ensures both forwards use same coordinate frame
             # B) core->core kNN avoids invalid edges to non-core points
-            # C) Binary sigma gate + warmup prevents early training degradation
+            # C) SNR-based gating (not sigma_data which can be tiny)
             # D) Milder context drop (keep_p=0.8, min_extra=16)
+            # E) Comprehensive debug tags for verification
             # ---------------------------------------------------------------
             knn_spatial = batch.get('knn_spatial', None)
             if knn_spatial is not None:
@@ -5167,31 +5165,45 @@ def train_stageC_diffusion_generator(
                 extra_mask = mask & (~core_mask)
                 
                 # Count for debug
-                n_core = core_mask.sum().item()
-                n_extra = extra_mask.sum().item()
+                n_core = int(core_mask.sum().item())
+                n_extra = int(extra_mask.sum().item())
+                B_ctx = mask.shape[0]
 
                 if extra_mask.any() and n_core >= 8:
                     # ----- BUILD CORE->CORE kNN -----
-                    # This ensures edge_consistency_loss only uses edges between core points
                     with torch.no_grad():
-                        # Use V_target (ground truth latent coords) for kNN computation
                         V_for_knn = V_target.float()  # (B, N, D)
                         B_knn, N_knn, D_knn = V_for_knn.shape
-                        K_ctx = min(knn_spatial.shape[-1], 8)  # Use fewer neighbors for stability
+                        K_ctx = min(CTX_K, n_core // B_ctx - 1) if n_core > B_ctx else CTX_K
+                        K_ctx = max(K_ctx, 4)  # At least 4 neighbors
                         
                         # Compute pairwise distances
                         d_all = torch.cdist(V_for_knn, V_for_knn)  # (B, N, N)
                         
                         # Mask: only core->core edges are valid
                         ok_mask = core_mask.unsqueeze(2) & core_mask.unsqueeze(1)  # (B, N, N)
-                        d_all = d_all + (~ok_mask).float() * 1e9  # Invalid edges get huge distance
+                        d_all = d_all + (~ok_mask).float() * 1e9
                         
                         # Mask self-edges
                         eye = torch.eye(N_knn, device=device).unsqueeze(0)
                         d_all = d_all + eye * 1e9
                         
-                        # Get k nearest core neighbors for each point
+                        # Get k nearest core neighbors
                         knn_ctx = d_all.topk(k=K_ctx, largest=False).indices  # (B, N, K)
+                    
+                    # ----- [KNN-CTX] DEBUG: Verify core->core edges -----
+                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            flat_j = knn_ctx.reshape(B_ctx, -1)
+                            # Clamp indices to valid range before gather
+                            flat_j_safe = flat_j.clamp(0, core_mask.shape[1] - 1)
+                            core_j = torch.gather(core_mask, 1, flat_j_safe).reshape(B_ctx, N_knn, K_ctx)
+                            frac_core_neighbors = (core_j[core_mask].float().mean().item()
+                                                   if core_mask.any() else 0.0)
+                            core_counts = core_mask.sum(dim=1)
+                            min_core = int(core_counts.min().item())
+                            print(f"[KNN-CTX] step={global_step} K={K_ctx} "
+                                  f"frac_core_neighbors={frac_core_neighbors:.4f} min_core_per_sample={min_core}")
                     
                     # ----- CONTEXT DROPOUT -----
                     with torch.no_grad():
@@ -5206,9 +5218,19 @@ def train_stageC_diffusion_generator(
                                 extra_idx = extra_mask[b].nonzero(as_tuple=True)[0]
                                 take = extra_idx[:CTX_MIN_EXTRA]
                                 ctx_drop_mask[b, take] = True
+                    
+                    # ----- [DROP] DEBUG: Verify dropout changes context -----
+                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            extra_total = extra_mask.sum(dim=1).float()
+                            extra_kept_cnt = (ctx_drop_mask & extra_mask).sum(dim=1).float()
+                            keep_frac = (extra_kept_cnt / extra_total.clamp(min=1)).median().item()
+                            print(f"[DROP] step={global_step} keep_p={CTX_KEEP_P:.2f} "
+                                  f"keep_frac_med={keep_frac:.3f} "
+                                  f"extra_kept_med={extra_kept_cnt.median().item():.1f}/"
+                                  f"{extra_total.median().item():.1f}")
 
                     # ----- FORWARD PASS WITH DROPPED CONTEXT -----
-                    # CRITICAL FIX: Pass center_mask=mask to ensure same coordinate frame
                     H_drop = context_encoder(Z_set, ctx_drop_mask)
                     V_hat_drop = score_net.forward_edm(
                         V_t, sigma_flat, H_drop, ctx_drop_mask, sigma_data,
@@ -5220,6 +5242,47 @@ def train_stageC_diffusion_generator(
                     with torch.autocast(device_type='cuda', enabled=False):
                         V_full = V_hat_f32
                         V_drop_f32 = V_hat_drop.float()
+                        
+                        # ----- [CENTER] DEBUG: Verify coordinate frame consistency -----
+                        # ----- [CENTER] DEBUG: Verify coordinate frame consistency (absolute + relative) -----
+                        if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                            mf = mask.float().unsqueeze(-1)        # (B,N,1)
+                            cf = core_mask.float().unsqueeze(-1)   # (B,N,1)
+
+                            denom_m = mf.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B,1,1)
+                            denom_c = cf.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B,1,1)
+
+                            mu_full_m = (V_full * mf).sum(dim=1, keepdim=True) / denom_m
+                            mu_drop_m = (V_drop_f32 * mf).sum(dim=1, keepdim=True) / denom_m
+                            mu_full_c = (V_full * cf).sum(dim=1, keepdim=True) / denom_c
+                            mu_drop_c = (V_drop_f32 * cf).sum(dim=1, keepdim=True) / denom_c
+
+                            # Absolute mean-shift per sample
+                            dm_vec = (mu_full_m - mu_drop_m).norm(dim=-1).squeeze(1)  # (B,)
+                            dc_vec = (mu_full_c - mu_drop_c).norm(dim=-1).squeeze(1)  # (B,)
+
+                            # Coordinate scale (RMS) in the same frame (centered by full-pass mean)
+                            mf_sum = mf.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
+                            cf_sum = cf.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
+
+                            V_full_m0 = (V_full - mu_full_m) * mf
+                            V_full_c0 = (V_full - mu_full_c) * cf
+
+                            rms_m = torch.sqrt(V_full_m0.pow(2).sum(dim=(1, 2)) / mf_sum)  # (B,)
+                            rms_c = torch.sqrt(V_full_c0.pow(2).sum(dim=(1, 2)) / cf_sum)  # (B,)
+
+                            # Relative drift ratios (dimensionless)
+                            ratio_m = dm_vec / (rms_m + 1e-8)
+                            ratio_c = dc_vec / (rms_c + 1e-8)
+
+                            print(
+                                f"[CENTER] step={global_step} "
+                                f"|Δmu_mask| mean={dm_vec.mean().item():.6f} med={dm_vec.median().item():.6f} "
+                                f"|Δmu_core| mean={dc_vec.mean().item():.6f} med={dc_vec.median().item():.6f} "
+                                f"rms_mask med={rms_m.median().item():.4f} rms_core med={rms_c.median().item():.4f} "
+                                f"ratio_mask med={ratio_m.median().item():.4f} max={ratio_m.max().item():.4f} "
+                                f"ratio_core med={ratio_c.median().item():.4f} max={ratio_c.max().item():.4f}"
+                            )
 
                         # Center both on core points (same reference frame)
                         core_f = core_mask.float().unsqueeze(-1)
@@ -5231,36 +5294,71 @@ def train_stageC_diffusion_generator(
                         V_full_c = (V_full - mu_full) * core_f
                         V_drop_c = (V_drop_f32 - mu_drop) * core_f
 
-                        # ----- GATING: binary sigma gate + warmup -----
-                        sigma_gate_thresh = CTX_SIGMA_GATE * sigma_data
-                        sigma_ok = (sigma_flat <= sigma_gate_thresh).float()  # (B,1,1) or (B,)
-                        if sigma_ok.dim() == 3:
-                            sigma_ok = sigma_ok.squeeze(-1).squeeze(-1)  # (B,)
+                        # ----- SNR-BASED GATING (robust to tiny sigma_data) -----
+                        # snr_w = sigma_data^2 / (sigma^2 + sigma_data^2)
+                        # High snr_w = low noise (sigma near 0), low snr_w = high noise
+                        sigma_sq = sigma_flat.squeeze() ** 2 if sigma_flat.dim() > 1 else sigma_flat ** 2
+                        snr_w = (sigma_data**2 / (sigma_sq + sigma_data**2)).detach().float()
+                        if snr_w.dim() == 0:
+                            snr_w = snr_w.unsqueeze(0)
                         
+                        # Gate: only apply ctx loss when SNR is high enough (low noise)
+                        w_ctx = (snr_w >= CTX_SNR_THRESH).float()
+                        
+                        # Apply warmup
                         warmup_mult = min(1.0, global_step / max(CTX_WARMUP_STEPS, 1))
-                        w_ctx = sigma_ok * warmup_mult  # (B,)
+                        w_ctx = w_ctx * warmup_mult
+
+                        # ----- [CTX-GATE] DEBUG: Verify gating is sane -----
+                        if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                            sigma_med = sigma_flat.median().item() if sigma_flat.numel() > 0 else 0.0
+                            snr_med = snr_w.median().item() if snr_w.numel() > 0 else 0.0
+                            n_on = int((w_ctx > 0).sum().item())
+                            print(f"[CTX-GATE] step={global_step} sigma_data={sigma_data:.5f} "
+                                  f"sigma_med={sigma_med:.4f} snr_med={snr_med:.4f} "
+                                  f"snr_thresh={CTX_SNR_THRESH:.2f} n_on={n_on}/{B_ctx} warm={warmup_mult:.2f}")
 
                         # ----- COMPUTE EDGE CONSISTENCY LOSS -----
                         L_ctx_edge = uet.edge_consistency_loss(
-                            V_full_c, V_drop_c, knn_ctx,  # Use core->core kNN!
+                            V_full_c, V_drop_c, knn_ctx,
                             mask=core_mask, anchor_mask=core_mask,
                             sample_weight=w_ctx,
                             eps=1e-8,
                             huber_delta=0.25,
                         )
                         
-                    # ----- DEBUG PRINTS -----
+                        # ----- [CTX-EDGE-STATS] DEBUG: Show magnitude of penalized discrepancy -----
+                        if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                            with torch.no_grad():
+                                b0 = 0
+                                core_idx = core_mask[b0].nonzero(as_tuple=True)[0]
+                                if core_idx.numel() > 0:
+                                    sel = core_idx[:min(64, core_idx.numel())]
+                                    j = knn_ctx[b0, sel]  # (S, K)
+                                    j = j.clamp(0, V_full_c.shape[1] - 1)  # Safety clamp
+                                    Va = V_full_c[b0, sel]               # (S, D)
+                                    Vb = V_drop_c[b0, sel]               # (S, D)
+                                    Va_j = V_full_c[b0, j]               # (S, K, D)
+                                    Vb_j = V_drop_c[b0, j]               # (S, K, D)
+                                    da = ((Va[:, None, :] - Va_j)**2).sum(-1).clamp_min(1e-8).log()
+                                    db = ((Vb[:, None, :] - Vb_j)**2).sum(-1).clamp_min(1e-8).log()
+                                    diff = (da - db).abs()
+                                    print(f"[CTX-EDGE-STATS] step={global_step} |logd_a-logd_b| "
+                                          f"mean={diff.mean().item():.4f} p90={diff.quantile(0.9).item():.4f} "
+                                          f"max={diff.max().item():.4f}")
+                        
+                    # ----- [CTX] MAIN DEBUG PRINT -----
                     if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                        sigma_med = sigma_flat.median().item()
-                        n_sigma_ok = sigma_ok.sum().item()
+                        ctx_w = float(WEIGHTS.get('ctx_edge', 0.0))
+                        n_on = int((w_ctx > 0).sum().item())
                         print(f"[CTX] step={global_step} entered=True L_ctx_edge={L_ctx_edge.item():.6f} "
-                              f"w={WEIGHTS.get('ctx_edge',0):.1f} core={n_core:.0f} extra={n_extra:.0f} "
-                              f"sigma_med={sigma_med:.3f} n_sigma_ok={n_sigma_ok:.0f}/{sigma_ok.numel()} "
-                              f"warmup={warmup_mult:.2f}")
+                              f"ctx_w={ctx_w:.4f} core={n_core} extra={n_extra} "
+                              f"n_on={n_on}/{B_ctx} warm={warmup_mult:.2f}")
                 else:
                     # Not enough points for ctx loss
                     if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                        print(f"[CTX] step={global_step} SKIPPED: core={n_core:.0f} extra={n_extra:.0f} (need core>=8 and extra>0)")
+                        print(f"[CTX] step={global_step} SKIPPED: core={n_core} extra={n_extra} "
+                              f"(need core>=8 and extra>0)")
             else:
                 # Ctx loss disabled or conditions not met
                 if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
@@ -5276,6 +5374,7 @@ def train_stageC_diffusion_generator(
                     if WEIGHTS.get('ctx_edge', 0.0) <= 0:
                         reasons.append("weight=0")
                     print(f"[CTX] step={global_step} entered=False reason={', '.join(reasons)}")
+
 
 
 

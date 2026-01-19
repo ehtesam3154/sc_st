@@ -982,32 +982,6 @@ class STSetDataset(Dataset):
             'anchor_cond_debug': anchor_cond_debug,
         }
 
-        # return {
-        #     'Z_set': Z_set,
-        #     'is_landmark': is_landmark,
-        #     'V_target': V_target,
-        #     'G_target': G_subset,
-        #     'D_target': D_subset,
-        #     'H_target': H_subset,
-        #     'H_bins': bins,
-        #     'L_info': L_info,
-        #     'triplets': triplets_subset,
-        #     'n': len(indices),
-        #     'overlap_info': overlap_info,
-        #     'knn_indices': knn_local,
-        #     'topo_info': topo_info,
-        #     'knn_spatial': knn_spatial_local,
-        #     # ========== NEW: Competitor training fields ==========
-        #     'anchor_mask': anchor_mask,
-        #     'global_indices': indices,
-        #     'compete_debug': compete_debug,
-        #     # ========== NEW: Anchored training fields ==========
-        #     'anchor_cond_mask': anchor_cond_mask,
-        #     'anchor_cond_debug': anchor_cond_debug,
-        # }
-
-
-
             
 def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
