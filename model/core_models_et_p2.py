@@ -1025,7 +1025,6 @@ class DiffusionScoreNet(nn.Module):
             return eps_hat, {'dist_logits': dist_logits, 'bin_ids': bin_ids}
         
         return eps_hat
-
     
     def forward_edm(
             self,
@@ -1036,12 +1035,18 @@ class DiffusionScoreNet(nn.Module):
             sigma_data: float,         # data std
             self_cond: torch.Tensor = None,
             return_debug: bool = False,
+            center_mask: torch.Tensor = None,  # NEW: optional mask for centering (ctx loss fix)
         ) -> torch.Tensor:
             """
             EDM-preconditioned forward pass.
             Returns denoised estimate x0_pred.
             
             D_θ(x, σ) = c_skip · x + c_out · F_θ(c_in · x; c_noise, H)
+            
+            Args:
+                center_mask: If provided, use this mask for centering instead of `mask`.
+                             This ensures the same coordinate frame when comparing
+                             normal vs context-dropped predictions.
             """
             B, N, D = x.shape
             
@@ -1061,7 +1066,9 @@ class DiffusionScoreNet(nn.Module):
             
             # --- FIX #1: Center in raw space BEFORE preconditioning ---
             # x_c is the raw centered geometry (units match V_target / st_dist_bin_edges)
-            x_c, mean_shift = uet.center_only(x, mask)  # (B, N, D)
+            # Use center_mask if provided (for ctx loss coordinate frame consistency)
+            mask_for_center = mask if center_mask is None else center_mask
+            x_c, mean_shift = uet.center_only(x, mask_for_center)  # (B, N, D)
             
             # Scale input for network (preconditioned space)
             x_in = c_in * x_c
