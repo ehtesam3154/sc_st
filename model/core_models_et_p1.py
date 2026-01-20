@@ -84,7 +84,29 @@ def train_encoder(
     ratio_end: float = 1.0,
     mmdbatch: float = 0.1,
     device: str = 'cuda',
-    outf: str = 'output'
+    outf: str = 'output',
+    # NEW: Local miniset sampling (Stage A/C consistency)
+    local_miniset_mode: bool = False,
+    n_min: int = 128,
+    n_max: int = 384,
+    pool_mult: float = 4.0,
+    stochastic_tau: float = 1.0,
+    # NEW: Slide-invariance regularization
+    slide_align_mode: str = 'none',  # 'none', 'coral', 'mmd', 'infonce'
+    slide_align_weight: float = 1.0,
+    # NEW: InfoNCE parameters
+    infonce_tau: float = 0.07,
+    infonce_match: str = 'expr',  # 'expr' or 'embed'
+    infonce_topk: int = 1,
+    infonce_sym: bool = True,
+    # NEW: MNN + alignment scheduling
+    infonce_smin: float = 0.75,   # cosine sim threshold for MNN pairs
+    align_warmup: int = 200,      # epochs before alignment starts
+    align_ramp: int = 200,        # epochs to ramp alignment weight
+
+    # NEW: Optional SC-related losses
+    use_circle: bool = True,
+    use_mmd_sc: bool = True,
 ):
     """
     Train the shared encoder (Stage A).
@@ -168,10 +190,251 @@ def train_encoder(
     nettrue = A_target
     
     # Training loop
+    # Precompute per-slide index lists for local sampling
+    if local_miniset_mode:
+        unique_slides = torch.unique(slide_ids)
+        slide_index_lists = {}
+        for s in unique_slides:
+            slide_index_lists[int(s.item())] = torch.where(slide_ids == s)[0]
+        print(f"[LOCAL-MINISET] Enabled with {len(unique_slides)} slides")
+
+
+    # ---------------------------------------------------------------
+    # [INFO-NCE PRECOMP] Mutual NN matches across the first 2 slides
+    # ---------------------------------------------------------------
+    mnn_pairs = None  # list of (i0_global, j1_global)
+
+    mnn_slides = None
+    mnn_map0 = None  # global0 -> global1
+    mnn_map1 = None  # global1 -> global0
+
+    if slide_align_mode == 'infonce' and slide_ids is not None:
+        all_slides = list(slide_index_lists.keys()) if local_miniset_mode else sorted(torch.unique(slide_ids).tolist())
+        if len(all_slides) >= 2:
+            s0, s1 = all_slides[0], all_slides[1]
+            mnn_slides = (s0, s1)
+            I0 = slide_index_lists[s0] if local_miniset_mode else torch.where(slide_ids == s0)[0]
+            I1 = slide_index_lists[s1] if local_miniset_mode else torch.where(slide_ids == s1)[0]
+
+            with torch.no_grad():
+                X0 = F.normalize(st_gene_expr[I0].to(device), dim=1)
+                X1 = F.normalize(st_gene_expr[I1].to(device), dim=1)
+                S = X0 @ X1.T  # (n0, n1)
+
+                nn01 = S.argmax(dim=1)            # (n0,)
+                nn10 = S.argmax(dim=0)            # (n1,)
+                mnn_mask = (nn10[nn01] == torch.arange(nn01.shape[0], device=device))
+
+                conf = S[torch.arange(S.shape[0], device=device), nn01]
+                mnn_mask = mnn_mask & (conf >= infonce_smin)
+
+                i0_local = torch.where(mnn_mask)[0]
+                j1_local = nn01[i0_local]
+
+                if i0_local.numel() > 0:
+                    i0_global = I0[i0_local].detach().cpu()
+                    j1_global = I1[j1_local].detach().cpu()
+                    mnn_pairs = torch.stack([i0_global, j1_global], dim=1)  # (n_pairs, 2)
+                    
+                    # Build maps once
+                    pairs_list = mnn_pairs.tolist()
+                    mnn_map0 = {a: b for a, b in pairs_list}
+                    mnn_map1 = {b: a for a, b in pairs_list}
+
+                    print(f"[STAGEA-INFO] MNN pairs: {mnn_pairs.shape[0]} (smin={infonce_smin})")
+                else:
+                    print(f"[STAGEA-INFO] MNN pairs: 0 (smin={infonce_smin})")
+
+
+    
+    # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
     for epoch in range(n_epochs):
-        # Sample batches
-        idx_st = torch.randperm(st_gene_expr.shape[0], device=device)[:batch_size]
+        # ===================================================================
+        # SAMPLE ST BATCH (local miniset mode or global random)
+        # ===================================================================
+        if local_miniset_mode:
+            # Initialize idx_st_list to avoid accidental reference
+            idx_st_list = None
+            
+            # Sample patches from 2 slides for slide alignment
+            if slide_align_mode != 'none' and len(slide_index_lists) >= 2:
+                # Half batch from each slide
+                half_batch = batch_size // 2
+                
+                # Randomly choose 2 distinct slides each epoch
+                all_slides = list(slide_index_lists.keys())
+
+                if slide_align_mode == 'infonce':
+                    # MUST use the same two slides used to build mnn_pairs
+                    if mnn_slides is None:
+                        slides_sampled = all_slides[:2]
+                    else:
+                        slides_sampled = [mnn_slides[0], mnn_slides[1]]
+                else:
+                    if len(all_slides) > 2:
+                        slides_sampled = np.random.choice(all_slides, size=2, replace=False).tolist()
+                    else:
+                        slides_sampled = all_slides
+                
+                idx_st_list = []
+
+
+                # If InfoNCE: pick a matched anchor pair and force centers
+                forced_centers = None
+                if slide_align_mode == 'infonce' and mnn_pairs is not None and mnn_pairs.shape[0] > 0 and mnn_slides is not None:
+                    pair = mnn_pairs[torch.randint(0, mnn_pairs.shape[0], (1,)).item()]
+                    forced_centers = {
+                        mnn_slides[0]: int(pair[0].item()),
+                        mnn_slides[1]: int(pair[1].item()),
+                    }
+
+
+                
+                for s in slides_sampled:
+                    I_s = slide_index_lists[s]
+                    n_s = len(I_s)
+                    
+                    # Sample CORE size (leave room for distractors)
+                    n_rand = min(32, half_batch // 4)  # Reserve ~25% for distractors
+                    n_core_max = min(n_max, half_batch - n_rand, n_s)
+                    n_core = np.random.randint(n_min, n_core_max + 1)
+                    
+                    # Sample center
+                    if forced_centers is not None and s in forced_centers:
+                        # find local index of forced global center
+                        center_global = forced_centers[s]
+                        center_local = (I_s == center_global).nonzero(as_tuple=False)
+                        if center_local.numel() == 0:
+                            center_local = np.random.randint(0, n_s)
+                            center_global = I_s[center_local].item()
+                        else:
+                            center_local = int(center_local[0].item())
+                    else:
+                        center_local = np.random.randint(0, n_s)
+                        center_global = I_s[center_local].item()
+
+                    
+                    # Get distances from center to all in slide
+                    coords_slide = st_coords_norm[I_s]
+                    center_coord = st_coords_norm[center_global]
+                    dists = torch.norm(coords_slide - center_coord, dim=1)
+                    
+                    # Build pool
+                    K_pool = min(int(pool_mult * n_core), n_s - 1)
+                    K_pool = max(K_pool, n_core - 1)
+                    
+                    # Sort by distance (exclude self)
+                    dists_no_self = dists.clone()
+                    dists_no_self[center_local] = float('inf')
+                    sorted_idx = torch.argsort(dists_no_self)
+                    pool_local = sorted_idx[:K_pool]
+                    pool_dists = dists_no_self[pool_local]
+                    
+                    # Sample neighbors from FULL POOL (FIX 1)
+                    n_neighbors = min(n_core - 1, len(pool_local))
+                    if n_neighbors > 0:
+                        weights = torch.softmax(-pool_dists / stochastic_tau, dim=0)  # Full pool!
+                        sampled_local = torch.multinomial(weights, n_neighbors, replacement=False)
+                        neighbors_local = pool_local[sampled_local]
+                        core_local = torch.cat([torch.tensor([center_local], device=device), neighbors_local])
+                    else:
+                        core_local = torch.tensor([center_local], device=device)
+                    
+                    core_global = I_s[core_local]
+                    
+                    # Add DISTRACTORS (FIX 2)
+                    core_set = set(core_local.cpu().tolist())
+                    available = [i for i in range(n_s) if i not in core_set]
+                    n_distract = min(n_rand, len(available))
+                    
+                    if n_distract > 0:
+                        distract_idx = np.random.choice(available, size=n_distract, replace=False)
+                        distract_global = I_s[torch.tensor(distract_idx, device=device)]
+                        patch_global = torch.cat([core_global, distract_global])
+                    else:
+                        patch_global = core_global
+                    
+                    # Pad to half_batch if still short
+                    if len(patch_global) < half_batch:
+                        remaining = half_batch - len(patch_global)
+                        extra_available = [i for i in range(n_s) if i not in set(patch_global.cpu().tolist())]
+                        if len(extra_available) >= remaining:
+                            extra_idx = np.random.choice(extra_available, size=remaining, replace=False)
+                            extra_global = I_s[torch.tensor(extra_idx, device=device)]
+                            patch_global = torch.cat([patch_global, extra_global])
+                    
+                    idx_st_list.append(patch_global[:half_batch])
+
+                
+                idx_st = torch.cat(idx_st_list)
+                
+            else:
+                # Single slide or no alignment: sample one patch
+                s = np.random.choice(list(slide_index_lists.keys()))
+                I_s = slide_index_lists[s]
+                n_s = len(I_s)
+                
+                # Sample CORE size (leave room for distractors)
+                n_rand = min(64, batch_size // 4)
+                n_core_max = min(n_max, batch_size - n_rand, n_s)
+                n_core = np.random.randint(n_min, n_core_max + 1)
+                
+                center_local = np.random.randint(0, n_s)
+                center_global = I_s[center_local].item()
+                
+                coords_slide = st_coords_norm[I_s]
+                center_coord = st_coords_norm[center_global]
+                dists = torch.norm(coords_slide - center_coord, dim=1)
+                
+                K_pool = min(int(pool_mult * n_core), n_s - 1)
+                K_pool = max(K_pool, n_core - 1)
+                
+                dists_no_self = dists.clone()
+                dists_no_self[center_local] = float('inf')
+                sorted_idx = torch.argsort(dists_no_self)
+                pool_local = sorted_idx[:K_pool]
+                pool_dists = dists_no_self[pool_local]
+                
+                # Sample neighbors from FULL POOL
+                n_neighbors = min(n_core - 1, len(pool_local))
+                if n_neighbors > 0:
+                    weights = torch.softmax(-pool_dists / stochastic_tau, dim=0)
+                    sampled_local = torch.multinomial(weights, n_neighbors, replacement=False)
+                    neighbors_local = pool_local[sampled_local]
+                    core_local = torch.cat([torch.tensor([center_local], device=device), neighbors_local])
+                else:
+                    core_local = torch.tensor([center_local], device=device)
+                
+                core_global = I_s[core_local]
+                
+                # Add DISTRACTORS
+                core_set = set(core_local.cpu().tolist())
+                available = [i for i in range(n_s) if i not in core_set]
+                n_distract = min(n_rand, len(available))
+                
+                if n_distract > 0:
+                    distract_idx = np.random.choice(available, size=n_distract, replace=False)
+                    distract_global = I_s[torch.tensor(distract_idx, device=device)]
+                    patch_global = torch.cat([core_global, distract_global])
+                else:
+                    patch_global = core_global
+                
+                # Pad to batch_size if still short
+                if len(patch_global) < batch_size:
+                    remaining = batch_size - len(patch_global)
+                    extra_available = [i for i in range(n_s) if i not in set(patch_global.cpu().tolist())]
+                    if len(extra_available) >= remaining:
+                        extra_idx = np.random.choice(extra_available, size=remaining, replace=False)
+                        extra_global = I_s[torch.tensor(extra_idx, device=device)]
+                        patch_global = torch.cat([patch_global, extra_global])
+                
+                idx_st = patch_global[:batch_size]
+
+        else:
+            # Original: global random sampling
+            idx_st = torch.randperm(st_gene_expr.shape[0], device=device)[:batch_size]
+        
         idx_sc = torch.randperm(sc_gene_expr.shape[0], device=device)[:batch_size]
         
         X_st_batch = st_gene_expr[idx_st]
@@ -182,61 +445,225 @@ def train_encoder(
         Z_sc = model(X_sc_batch)
                
         #loss 1: rbf adjacency prediction (with slide mask)
-        netpred = Z_st @ Z_st.t()
-        A_target_batch = A_target[idx_st][:, idx_st]
-        slide_mask_batch = slide_mask[idx_st][:, idx_st]
-
-        #apply mask to both prediction and target
-        netpred_masked = netpred * slide_mask_batch.float()
-        A_target_masked = A_target_batch * slide_mask_batch.float()
-
-        #normalize (row-wise) where mask is activae
-        row_sums = A_target_masked.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        A_target_masked = A_target_masked / row_sums
-
-        # loss_pred = F.cross_entropy(netpred_masked, A_target_masked, reduction='mean')
-        logits = netpred_masked / 0.1
-        log_probs = F.log_softmax(logits, dim=1)
-        loss_pred = F.kl_div(log_probs, A_target_masked, reduction='batchmean')
+        # Loss 1: RBF adjacency prediction (on-the-fly for local patches)
+        if local_miniset_mode:
+            # Compute target q from patch coordinates on-the-fly
+            coords_batch = st_coords_norm[idx_st]
+            D_batch = torch.cdist(coords_batch, coords_batch)
+            q_target = torch.exp(-D_batch**2 / (2 * sigma**2))
+            
+            # Mask diagonal and normalize
+            slide_mask_batch = slide_mask[idx_st][:, idx_st]
+            q_target = q_target * slide_mask_batch.float()
+            q_target.fill_diagonal_(0.0)
+            row_sums = q_target.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            q_target = q_target / row_sums
+        else:
+            # Use precomputed A_target
+            A_target_batch = A_target[idx_st][:, idx_st]
+            slide_mask_batch = slide_mask[idx_st][:, idx_st]
+            
+            q_target = A_target_batch * slide_mask_batch.float()
+            row_sums = q_target.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            q_target = q_target / row_sums
         
-        #loss 2: circular coupling
+        # Predict p from embeddings
+        temp = 0.1
+        netpred = Z_st @ Z_st.t()
+        logits = netpred / temp
+        logits = logits.masked_fill(~slide_mask_batch, -1e9)
+        
+        log_probs = F.log_softmax(logits, dim=1)
+        loss_pred = F.kl_div(log_probs, q_target, reduction='batchmean')
+
+        
+        # Loss 2: circular coupling (with slide mask)
         # Get all embeddings
-        Z_st_all = model(st_gene_expr)
-        Z_sc_all = model(sc_gene_expr)
+        # Loss 2: circular coupling (optional)
+        if use_circle:
+            Z_st_all = model(st_gene_expr)
+            Z_sc_all = model(sc_gene_expr)
 
-        # ST batch → SC → ST batch mapping
-        st2sc = F.softmax(Z_st @ Z_sc_all.t(), dim=1)
-        sc2st = F.softmax(Z_sc_all @ Z_st.t(), dim=1)
-        st2st_unnorm = st2sc @ sc2st
-        st2st = torch.log(st2st_unnorm + 1e-7)
+            st2sc = F.softmax(Z_st @ Z_sc_all.t(), dim=1)
+            sc2st = F.softmax(Z_sc_all @ Z_st.t(), dim=1)
+            st2st_unnorm = st2sc @ sc2st
+            
+            st2st_unnorm = st2st_unnorm * slide_mask_batch.float()
+            st2st_unnorm = st2st_unnorm / (st2st_unnorm.sum(dim=1, keepdim=True) + 1e-8)
+            st2st = torch.log(st2st_unnorm + 1e-7)
 
-        # Get target and RE-NORMALIZE for batch
-        nettrue_batch = nettrue[idx_st][:, idx_st]
-        nettrue_batch = nettrue_batch / (nettrue_batch.sum(dim=1, keepdim=True) + 1e-8)  # ✅ ADD THIS LINE
+            if local_miniset_mode:
+                nettrue_batch = q_target
+            else:
+                nettrue_batch = nettrue[idx_st][:, idx_st]
+                nettrue_batch = nettrue_batch * slide_mask_batch.float()
+                nettrue_batch = nettrue_batch / (nettrue_batch.sum(dim=1, keepdim=True) + 1e-8)
 
-        loss_circle = F.kl_div(st2st, nettrue_batch, reduction='none').sum(1).mean()
+            loss_circle = F.kl_div(st2st, nettrue_batch, reduction='none').sum(1).mean()
+        else:
+            loss_circle = torch.tensor(0.0, device=device)
+
+
         
         # Loss 3: MMD
-        n_mmd = int(mmdbatch * min(Z_st.shape[0], Z_sc.shape[0]))
-        if n_mmd > 1:
-            idx_mmd_st = torch.randperm(Z_st.shape[0], device=device)[:n_mmd]
-            idx_mmd_sc = torch.randperm(Z_sc.shape[0], device=device)[:n_mmd]
-            
-            K_st = torch.exp(-torch.cdist(Z_st[idx_mmd_st], Z_st[idx_mmd_st])**2 / 0.1)
-            K_sc = torch.exp(-torch.cdist(Z_sc[idx_mmd_sc], Z_sc[idx_mmd_sc])**2 / 0.1)
-            K_st_sc = torch.exp(-torch.cdist(Z_st[idx_mmd_st], Z_sc[idx_mmd_sc])**2 / 0.1)
-            
-            mmd = K_st.mean() + K_sc.mean() - 2 * K_st_sc.mean()
-            loss_mmd = torch.clamp(mmd, min=0)
+        # Loss 3: MMD (ST-SC alignment, optional)
+        if use_mmd_sc:
+            n_mmd = int(mmdbatch * min(Z_st.shape[0], Z_sc.shape[0]))
+            if n_mmd > 1:
+                idx_mmd_st = torch.randperm(Z_st.shape[0], device=device)[:n_mmd]
+                idx_mmd_sc = torch.randperm(Z_sc.shape[0], device=device)[:n_mmd]
+                
+                K_st = torch.exp(-torch.cdist(Z_st[idx_mmd_st], Z_st[idx_mmd_st])**2 / 0.1)
+                K_sc = torch.exp(-torch.cdist(Z_sc[idx_mmd_sc], Z_sc[idx_mmd_sc])**2 / 0.1)
+                K_st_sc = torch.exp(-torch.cdist(Z_st[idx_mmd_st], Z_sc[idx_mmd_sc])**2 / 0.1)
+                
+                mmd = K_st.mean() + K_sc.mean() - 2 * K_st_sc.mean()
+                loss_mmd = torch.clamp(mmd, min=0)
+            else:
+                loss_mmd = torch.tensor(0.0, device=device)
         else:
             loss_mmd = torch.tensor(0.0, device=device)
         
+        # Loss 4: Slide-invariance alignment (InfoNCE / CORAL / MMD between slides)
+        if slide_align_mode != 'none' and local_miniset_mode and idx_st_list is not None and len(idx_st_list) == 2:
+            # Split embeddings and expressions by slide
+            half_batch = batch_size // 2
+            X0 = X_st_batch[:half_batch]
+            X1 = X_st_batch[half_batch:]
+            Z0 = Z_st[:half_batch]
+            Z1 = Z_st[half_batch:]
+            
+            if slide_align_mode == 'infonce':
+                loss_align = torch.tensor(0.0, device=device)
+
+                if mnn_map0 is None or mnn_map1 is None:
+                    loss_align = torch.tensor(0.0, device=device)
+                else:
+                    # Build in-batch targets using precomputed MNN maps
+                    idx0_global = idx_st[:half_batch]
+                    idx1_global = idx_st[half_batch:]
+
+                    targets01 = []
+                    rows0 = []
+                    for i in range(half_batch):
+                        g0 = int(idx0_global[i].item())
+                        g1 = mnn_map0.get(g0, None)
+                        if g1 is None:
+                            continue
+                        pos = (idx1_global == g1).nonzero(as_tuple=False)
+                        if pos.numel() == 0:
+                            continue
+                        rows0.append(i)
+                        targets01.append(int(pos[0].item()))
+
+                    if len(rows0) >= 8:
+                        valid0 = torch.tensor(rows0, device=device, dtype=torch.long)
+                        pos01 = torch.tensor(targets01, device=device, dtype=torch.long)
+
+                        Z0n = F.normalize(Z0, dim=1)
+                        Z1n = F.normalize(Z1, dim=1)
+
+                        L01_full = (Z0n @ Z1n.T) / infonce_tau          # (half, half)
+                        L01 = L01_full[valid0]                          # (n_valid0, half)
+                        loss01 = F.cross_entropy(L01, pos01)
+
+                        loss_align = loss01
+
+                        # Optional symmetric direction using reverse MNN map
+                        acc10 = None
+                        if infonce_sym:
+                            targets10 = []
+                            rows1 = []
+                            for j in range(half_batch):
+                                g1 = int(idx1_global[j].item())
+                                g0 = mnn_map1.get(g1, None)
+                                if g0 is None:
+                                    continue
+                                pos = (idx0_global == g0).nonzero(as_tuple=False)
+                                if pos.numel() == 0:
+                                    continue
+                                rows1.append(j)
+                                targets10.append(int(pos[0].item()))
+
+                            if len(rows1) >= 8:
+                                valid1 = torch.tensor(rows1, device=device, dtype=torch.long)
+                                pos10 = torch.tensor(targets10, device=device, dtype=torch.long)
+
+                                L10_full = (Z1n @ Z0n.T) / infonce_tau      # (half, half)
+                                L10 = L10_full[valid1]                      # (n_valid1, half)
+                                loss10 = F.cross_entropy(L10, pos10)
+
+                                loss_align = 0.5 * (loss01 + loss10)
+
+                        # Debug every 100 epochs (no undefined Sx)
+                        if epoch % 100 == 0:
+                            with torch.no_grad():
+                                pred01 = L01.argmax(dim=1)
+                                acc01 = (pred01 == pos01).float().mean().item()
+
+                                # expression similarity for matched pairs (in-batch)
+                                X0n_dbg = F.normalize(X0, dim=1)
+                                X1n_dbg = F.normalize(X1, dim=1)
+                                Sx = X0n_dbg @ X1n_dbg.T  # (half, half)
+
+                                mean_cos_x = Sx[valid0, pos01].mean().item()
+                                mean_cos_z = (Z0n[valid0] * Z1n[pos01]).sum(dim=1).mean().item()
+
+                                if infonce_sym and 'L10' in locals():
+                                    pred10 = L10.argmax(dim=1)
+                                    acc10 = (pred10 == pos10).float().mean().item()
+                                    acc_mean = 0.5 * (acc01 + acc10)
+                                else:
+                                    acc_mean = acc01
+
+                                print(
+                                    f"[STAGEA-INFO] InfoNCE: loss={loss_align.item():.4f} "
+                                    f"acc={acc_mean:.3f} npos={valid0.numel()} "
+                                    f"cos_expr={mean_cos_x:.3f} cos_embed={mean_cos_z:.3f}"
+                                )
+                    else:
+                        loss_align = torch.tensor(0.0, device=device)
+            
+            elif slide_align_mode == 'coral':
+                # CORAL: match mean and covariance
+                mu0 = Z0.mean(dim=0)
+                mu1 = Z1.mean(dim=0)
+                
+                Z0_c = Z0 - mu0
+                Z1_c = Z1 - mu1
+                
+                cov0 = (Z0_c.T @ Z0_c) / (Z0_c.shape[0] - 1)
+                cov1 = (Z1_c.T @ Z1_c) / (Z1_c.shape[0] - 1)
+                
+                loss_align = (mu0 - mu1).pow(2).sum() + (cov0 - cov1).pow(2).sum()
+                
+            elif slide_align_mode == 'mmd':
+                # MMD between two slides
+                K_00 = torch.exp(-torch.cdist(Z0, Z0)**2 / 0.1)
+                K_11 = torch.exp(-torch.cdist(Z1, Z1)**2 / 0.1)
+                K_01 = torch.exp(-torch.cdist(Z0, Z1)**2 / 0.1)
+                
+                mmd_align = K_00.mean() + K_11.mean() - 2 * K_01.mean()
+                loss_align = torch.clamp(mmd_align, min=0)
+            else:
+                loss_align = torch.tensor(0.0, device=device)
+        else:
+            loss_align = torch.tensor(0.0, device=device)
+
+        
         # Total loss
-        # ratio = min(1.0, epoch / (n_epochs * 0.2))  # Warmup for circular coupling
-        # ratio = min(1.0, epoch / (n_epochs * 0.8))  # Warmup for circular coupling
+        # Total loss
         ratio = ratio_start + (ratio_end - ratio_start) * min(epoch / (n_epochs * 0.8), 1.0)
-        # loss = loss_pred + alpha * ratio * loss_circle + 0.1 * loss_mmd
-        loss = loss_pred + alpha * loss_mmd + ratio * loss_circle
+        
+        # Warmup alignment so adjacency learns first
+        if slide_align_mode != 'none' and loss_align.item() > 0:
+            align_w = slide_align_weight * float(np.clip((epoch - align_warmup) / max(1, align_ramp), 0.0, 1.0))
+        else:
+            align_w = 0.0
+
+        loss = loss_pred + alpha * loss_mmd + ratio * loss_circle + align_w * loss_align
+
+
         
         # Backward
         optimizer.zero_grad()
@@ -247,13 +674,41 @@ def train_encoder(
         
         # Logging
         if epoch % 100 == 0:
-            print(f"Epoch {epoch}/{n_epochs} | Loss: {loss.item():.4f} | "
-                  f"Pred: {loss_pred.item():.4f} | Circle: {loss_circle.item():.4f} | "
-                  f"MMD: {loss_mmd.item():.4f}")
+            log_str = f"Epoch {epoch}/{n_epochs} | Loss: {loss.item():.4f} | Pred: {loss_pred.item():.4f}"
+            if use_circle:
+                log_str += f" | Circle: {loss_circle.item():.4f}"
+            if use_mmd_sc:
+                log_str += f" | MMD: {loss_mmd.item():.4f}"
+            if slide_align_mode != 'none' and loss_align.item() > 0:
+                log_str += f" | Align({slide_align_mode}): {loss_align.item():.4f}"
+            if local_miniset_mode:
+                log_str += f" | n_patch={len(idx_st)}"
+            print(log_str)
+
+
+        
+        # Debug: sanity check slide masking (print rarely)
+        if epoch % 200 == 0:
+            with torch.no_grad():
+                # Compute unmasked probability distribution for adjacency loss
+                logits_raw = (Z_st @ Z_st.t()) / temp
+                probs_raw = F.softmax(logits_raw, dim=1)
+                
+                # Compute masked probability distribution
+                logits_masked = logits_raw.masked_fill(~slide_mask_batch, -1e9)
+                probs_masked = F.softmax(logits_masked, dim=1)
+                
+                # Probability mass on invalid (cross-slide) entries
+                invalid_mask = ~slide_mask_batch
+                mass_invalid_before = (probs_raw * invalid_mask.float()).sum(dim=1).mean().item()
+                mass_invalid_after = (probs_masked * invalid_mask.float()).sum(dim=1).mean().item()
+                
+                print(f"[STAGEA-MASKDBG] Epoch {epoch}: invalid prob mass before={mass_invalid_before:.6f} after={mass_invalid_after:.6f}")
+
     
     # Save checkpoint
     os.makedirs(outf, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(outf, 'encoder_final.pt'))
+    torch.save(model.state_dict(), os.path.join(outf, 'encoder_final_new.pt'))
     print("Encoder training complete!")
     
     return model

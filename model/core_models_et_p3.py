@@ -252,7 +252,19 @@ class GEMSModel:
         ratio_start: float = 0.0,      # ADD THIS
         ratio_end: float = 1.0,        # ADD THIS
         mmdbatch: float = 0.1,
-        outf: str = 'output'
+        outf: str = 'output',
+        # NEW: Local miniset parameters
+        local_miniset_mode: bool = False,
+        n_min: int = 128,
+        n_max: int = 384,
+        pool_mult: float = 4.0,
+        stochastic_tau: float = 1.0,
+        # NEW: Slide-invariance parameters
+        slide_align_mode: str = 'none',
+        slide_align_weight: float = 1.0,
+        # NEW: Optional losses
+        use_circle: bool = True,
+        use_mmd_sc: bool = True,
     ):
         """
         Train shared encoder (Stage A).
@@ -291,7 +303,16 @@ class GEMSModel:
             ratio_end=ratio_end,          # ADD THIS
             mmdbatch=mmdbatch,
             device=self.device,
-            outf=outf
+            outf=outf,
+            local_miniset_mode=local_miniset_mode,
+            n_min=n_min,
+            n_max=n_max,
+            pool_mult=pool_mult,
+            stochastic_tau=stochastic_tau,
+            slide_align_mode=slide_align_mode,
+            slide_align_weight=slide_align_weight,
+            use_circle=use_circle,
+            use_mmd_sc=use_mmd_sc,
         )
         
         # Freeze encoder for subsequent stages
