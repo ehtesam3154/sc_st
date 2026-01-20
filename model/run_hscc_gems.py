@@ -223,7 +223,7 @@ def main(args=None):
         n_embedding=[512, 256, 128],
         D_latent=32,
         c_dim=256,
-        n_heads=6,
+        n_heads=4,
         isab_m=128,
         device=str(fabric.device),
         use_canonicalize=args.use_canonicalize,
@@ -485,7 +485,7 @@ def main(args=None):
     history_st = model.train_stageC(
         st_gene_expr_dict=st_gene_expr_dict,
         sc_gene_expr=sc_expr,
-        n_min=96, n_max=384,
+        n_min=96, n_max=448,
         num_st_samples=args.num_st_samples,
         num_sc_samples=0,  # DISABLE SC in phase 1
         n_epochs=stageC_epochs,
@@ -853,7 +853,7 @@ def main(args=None):
 
                     sample_results = model.infer_sc_patchwise(
                         sc_gene_expr=st3_expr,
-                        n_timesteps_sample=600,  # Use 600 like mouse brain (you had 400)
+                        n_timesteps_sample=500,  # Use 600 like mouse brain (you had 400)
                         return_coords=True,
                         patch_size=192,  # Use 192 like mouse brain (you had 256)
                         coverage_per_cell=6.0,
