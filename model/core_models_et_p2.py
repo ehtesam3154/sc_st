@@ -2991,7 +2991,7 @@ def train_stageC_diffusion_generator(
     CTX_SNR_THRESH = 0.20  # SNR gate: only apply when snr_w >= this (try 0.10-0.30)
     CTX_KEEP_P = 0.8  # Fraction of extra points to keep (was 0.5, now milder)
     CTX_MIN_EXTRA = 16  # Minimum extra points to keep (was 8, now more)
-    CTX_DEBUG_EVERY = 300  # Print debug info every N steps
+    CTX_DEBUG_EVERY = 50  # Print debug info every N steps
     CTX_K = 8  # Number of neighbors for core->core kNN
     
     # Print ctx config once at startup
@@ -10792,6 +10792,7 @@ def sample_sc_edm_patchwise(
     commit_frac: float = 0.75,
     seq_align_dim: int = 2,
     inference_mode: str = "unanchored",  # "unanchored" or "anchored"
+    coldstart_diag: bool = False,
 ) -> Dict[str, torch.Tensor]:
 
     """
@@ -11954,6 +11955,21 @@ def sample_sc_edm_patchwise(
                 # Initialize from generator + noise
                 V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
                 V_t = V_t * mask_k.unsqueeze(-1).float()
+
+                # ============================
+                # COLD START DIAGNOSTIC (ONCE)
+                # ============================
+                use_coldstart = coldstart_diag and (k == 0)
+                if use_coldstart:
+                    # pure noise at sigma_max (same shape as V_gen)
+                    V_t = sigmas[0] * torch.randn_like(V_gen)
+                    V_t = V_t * mask_k.unsqueeze(-1).float()
+                    print(f"[COLDSTART-DIAG] patch={k} n={m_k} sigma_max={float(sigmas[0]):.4f} "
+                          f"steps={len(sigmas)-1} guidance={guidance_scale}")
+                else:
+                    # normal init: generator + noise
+                    V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
+                    V_t = V_t * mask_k.unsqueeze(-1).float()
                 
                 # EDM sampling (full D_latent, no 2D slicing!)
                 for i in range(len(sigmas) - 1):
@@ -12018,7 +12034,32 @@ def sample_sc_edm_patchwise(
                 V_final = V_t.squeeze(0)  # (m_k, D_latent)
                 V_centered = V_final - V_final.mean(dim=0, keepdim=True)
                 patch_coords_full.append(V_centered.detach().cpu())
-                
+
+                # ============================
+                # COLDSTART METRICS (ONCE)
+                # ============================
+                if use_coldstart and debug_knn and gt_coords is not None:
+                    # Compare only on this patch indices
+                    gt_patch = gt_coords.float().to(device)[S_k]  # (m_k, 2)
+                    pred_patch = V_centered[:, :2].float()        # use first 2 dims for kNN
+
+                    # kNN@10 / @20 overlap + jaccard
+                    for kk in [10, 20]:
+                        kk_eff = min(kk, m_k - 1)
+                        if kk_eff >= 2:
+                            idx_gt, _ = _knn_indices_dists(gt_patch, kk_eff)
+                            idx_pr, _ = _knn_indices_dists(pred_patch, kk_eff)
+
+                            overlap = _knn_overlap_score(idx_gt, idx_pr).mean().item()
+                            jacc = []
+                            for i in range(idx_gt.shape[0]):
+                                a = set(idx_gt[i].tolist())
+                                b = set(idx_pr[i].tolist())
+                                jacc.append(len(a & b) / max(1, len(a | b)))
+                            jacc = float(torch.tensor(jacc).mean().item())
+
+                            print(f"[COLDSTART-KNN] k={kk_eff} overlap_mean={overlap:.4f} jaccard_mean={jacc:.4f}")
+
                 if 'cuda' in device:
                     torch.cuda.empty_cache()
         

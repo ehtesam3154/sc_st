@@ -914,7 +914,8 @@ class GEMSModel:
         commit_frac: float = 0.75,
         seq_align_dim: int = 2,
         # --- INFERENCE MODE ---
-        inference_mode: str = "unanchored",  # "unanchored" or "anchored"
+        inference_mode: str = "unanchored",  # "unanchored" or "anchored",
+        coldstart_diag: bool = False
     ) -> Dict[str, torch.Tensor]:
 
 
@@ -1029,6 +1030,7 @@ class GEMSModel:
             commit_frac=commit_frac,
             seq_align_dim=seq_align_dim,
             inference_mode=inference_mode,
+            coldstart_diag=coldstart_diag
         )
         return res
 
