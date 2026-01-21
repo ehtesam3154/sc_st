@@ -447,3 +447,352 @@ def coral_loss(z_source: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
     loss_cov = (cov_s - cov_t).pow(2).mean()
     
     return loss_mean + loss_cov
+
+
+
+# ==============================================================================
+# DIAGNOSTIC UTILITIES (for adversary debugging - GPT 5.2 Pro recommendations)
+# ==============================================================================
+
+def compute_confusion_matrix(
+    pred: torch.Tensor, 
+    target: torch.Tensor, 
+    n_classes: int
+) -> torch.Tensor:
+    """
+    Compute normalized confusion matrix.
+    
+    Args:
+        pred: (N,) predicted class indices (long tensor)
+        target: (N,) ground truth class indices (long tensor)
+        n_classes: number of classes
+        
+    Returns:
+        cm: (n_classes, n_classes) normalized confusion matrix
+            cm[i,j] = P(pred=j | true=i)
+    """
+    if pred.numel() == 0:
+        return torch.zeros(n_classes, n_classes, device=pred.device)
+    
+    # Ensure tensors are on same device and are long type
+    pred = pred.long()
+    target = target.long()
+    device = pred.device
+    
+    # Build confusion matrix
+    cm = torch.zeros(n_classes, n_classes, device=device, dtype=torch.float32)
+    for i in range(n_classes):
+        mask_i = (target == i)
+        if mask_i.sum() > 0:
+            for j in range(n_classes):
+                cm[i, j] = ((pred == j) & mask_i).sum().float()
+    
+    # Row-normalize: cm[i,:] sums to 1 (or 0 if no samples for class i)
+    row_sums = cm.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    cm = cm / row_sums
+    
+    return cm
+
+
+def compute_entropy(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Compute prediction entropy from logits.
+    
+    High entropy = uncertain predictions (good for domain confusion).
+    Low entropy = confident predictions (discriminator winning).
+    
+    Args:
+        logits: (..., n_classes) raw logits
+        dim: dimension over which to compute softmax
+        
+    Returns:
+        entropy: (...,) entropy values in nats
+    """
+    if logits.numel() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    
+    probs = F.softmax(logits, dim=dim)
+    log_probs = F.log_softmax(logits, dim=dim)
+    
+    # H = -sum(p * log(p))
+    entropy = -(probs * log_probs).sum(dim=dim)
+    
+    return entropy
+
+
+def compute_gradient_norms(
+    named_parameters,
+    prefix: str = ""
+) -> Dict[str, float]:
+    """
+    Compute gradient norms for model parameters.
+    
+    Call this AFTER backward() but BEFORE optimizer.step().
+    
+    Args:
+        named_parameters: iterator of (name, param) tuples (model.named_parameters())
+        prefix: optional prefix for keys
+        
+    Returns:
+        grad_norms: dict mapping parameter names to gradient L2 norms
+    """
+    grad_norms = {}
+    total_norm_sq = 0.0
+    
+    for name, param in named_parameters:
+        if param.grad is not None:
+            grad_norm = param.grad.detach().norm(2).item()
+            key = f"{prefix}{name}" if prefix else name
+            grad_norms[key] = grad_norm
+            total_norm_sq += grad_norm ** 2
+    
+    grad_norms[f"{prefix}total"] = total_norm_sq ** 0.5
+    
+    return grad_norms
+
+
+def augment_expression_mild(
+    X: torch.Tensor,
+    gene_dropout: float = 0.05,
+    gauss_std: float = 0.005,
+    scale_jitter: float = 0.05,
+) -> torch.Tensor:
+    """
+    MILD augmentation for clean-ish representation.
+    
+    Use this for adversary input when you want the discriminator to see
+    something closer to the clean representation used at inference.
+    
+    Args:
+        X: (B, G) log1p expression
+        gene_dropout: fraction of genes to zero (default: 5%)
+        gauss_std: gaussian noise std (default: 0.005)
+        scale_jitter: library size jitter (default: 5%)
+        
+    Returns:
+        X_aug: mildly augmented expression
+    """
+    device = X.device
+    B, G = X.shape
+    X_aug = X.clone()
+    
+    # 1) Very light gene dropout
+    if gene_dropout > 0:
+        mask = (torch.rand(B, G, device=device) > gene_dropout).to(X_aug.dtype)
+        X_aug = X_aug * mask
+    
+    # 2) Very light scale jitter
+    if scale_jitter > 0:
+        X_lin = torch.expm1(X_aug)
+        scale = torch.empty(B, 1, device=device).uniform_(1.0 - scale_jitter, 1.0 + scale_jitter)
+        X_lin = X_lin * scale
+        X_aug = torch.log1p(X_lin)
+    
+    # 3) Very light gaussian noise
+    if gauss_std > 0:
+        X_aug = X_aug + torch.randn_like(X_aug) * gauss_std
+    
+    return torch.clamp(X_aug, min=-10.0, max=10.0)
+
+
+def get_adversary_representation(
+    model: nn.Module,
+    X_batch: torch.Tensor,
+    z1_aug: torch.Tensor,
+    z2_aug: torch.Tensor,
+    mode: str = 'clean',
+    use_layernorm: bool = False,
+    mild_dropout: float = 0.05,
+    mild_noise: float = 0.005,
+    mild_jitter: float = 0.05,
+) -> torch.Tensor:
+    """
+    Get the representation for adversary training based on mode.
+    
+    This function centralizes the logic for what the discriminator sees,
+    ensuring consistency between training and inference.
+    
+    Args:
+        model: encoder model
+        X_batch: (B, G) original clean expression batch
+        z1_aug: (B, D) embedding of first augmented view
+        z2_aug: (B, D) embedding of second augmented view
+        mode: one of:
+            - 'clean': use encoder(X_clean) - RECOMMENDED for inference consistency
+            - 'mild_aug': use encoder(X_mildly_augmented)
+            - 'ln_avg_aug': use LayerNorm(avg(z1_aug, z2_aug)) - LEGACY (buggy)
+        use_layernorm: whether to apply LayerNorm to final representation
+        mild_dropout, mild_noise, mild_jitter: parameters for mild augmentation
+        
+    Returns:
+        z_cond: (B, D) representation for adversary
+    """
+    device = X_batch.device
+    
+    if mode == 'clean':
+        # Run clean batch through encoder - matches inference exactly
+        z_cond = model(X_batch)
+        
+    elif mode == 'mild_aug':
+        # Apply very mild augmentation - close to clean but with some noise
+        X_mild = augment_expression_mild(X_batch, mild_dropout, mild_noise, mild_jitter)
+        z_cond = model(X_mild)
+        
+    elif mode == 'ln_avg_aug':
+        # LEGACY: average of augmented views - causes train/inference mismatch!
+        z_bar_raw = (z1_aug + z2_aug) / 2.0
+        z_cond = z_bar_raw
+        
+    else:
+        raise ValueError(f"Unknown adversary representation mode: {mode}. "
+                        f"Valid modes: 'clean', 'mild_aug', 'ln_avg_aug'")
+    
+    # Optional LayerNorm (should match what Stage C diffusion uses)
+    if use_layernorm:
+        z_cond = F.layer_norm(z_cond, (z_cond.shape[1],))
+    
+    return z_cond
+
+
+def log_adversary_diagnostics(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    n_classes: int,
+    prefix: str = "",
+    epoch: int = 0,
+    verbose: bool = True
+) -> Dict[str, float]:
+    """
+    Comprehensive logging for adversary diagnostics.
+    
+    Args:
+        logits: (B, n_classes) discriminator output
+        targets: (B,) true domain labels
+        n_classes: number of domains
+        prefix: string prefix for log keys
+        epoch: current epoch (for printing)
+        verbose: whether to print detailed stats
+        
+    Returns:
+        stats: dict with accuracy, entropy, per-class accuracy, confusion matrix
+    """
+    with torch.no_grad():
+        pred = logits.argmax(dim=1)
+        
+        # Overall accuracy
+        acc = (pred == targets).float().mean().item()
+        
+        # Per-class accuracy
+        per_class_acc = {}
+        for c in range(n_classes):
+            mask_c = (targets == c)
+            if mask_c.sum() > 0:
+                per_class_acc[c] = (pred[mask_c] == c).float().mean().item()
+            else:
+                per_class_acc[c] = 0.0
+        
+        # Entropy (mean and std)
+        ent = compute_entropy(logits)
+        ent_mean = ent.mean().item()
+        ent_std = ent.std().item() if ent.numel() > 1 else 0.0
+        
+        # Max entropy for reference (uniform = log(n_classes))
+        max_entropy = math.log(n_classes)
+        ent_ratio = ent_mean / max_entropy  # 1.0 = perfect confusion
+        
+        # Confusion matrix
+        cm = compute_confusion_matrix(pred, targets, n_classes)
+        
+        stats = {
+            f'{prefix}acc': acc,
+            f'{prefix}ent_mean': ent_mean,
+            f'{prefix}ent_std': ent_std,
+            f'{prefix}ent_ratio': ent_ratio,
+        }
+        
+        for c in range(n_classes):
+            stats[f'{prefix}acc_class{c}'] = per_class_acc[c]
+        
+        # Flatten confusion matrix into stats
+        for i in range(n_classes):
+            for j in range(n_classes):
+                stats[f'{prefix}cm_{i}_{j}'] = cm[i, j].item()
+        
+        if verbose and epoch % 50 == 0:
+            print(f"  [{prefix}] Acc={acc:.3f}, Ent={ent_mean:.3f}/{max_entropy:.3f} "
+                  f"(ratio={ent_ratio:.3f})")
+            print(f"  [{prefix}] Per-class acc: {per_class_acc}")
+            print(f"  [{prefix}] Confusion matrix:\n{cm.cpu().numpy()}")
+        
+        return stats
+
+
+
+# ==============================================================================
+# LOCAL ALIGNMENT LOSS (Run 4 - GPT 5.2 Pro)
+# ==============================================================================
+
+def compute_local_alignment_loss(
+    z_sc: torch.Tensor,
+    z_st: torch.Tensor, 
+    x_sc: torch.Tensor,
+    x_st: torch.Tensor,
+    tau_x: float = 0.1,
+    tau_z: float = 0.1,
+    bidirectional: bool = True
+) -> torch.Tensor:
+    """
+    Local alignment loss: Match neighborhood distributions between expression and embedding space.
+    
+    For each SC cell, compute soft neighbors in ST based on:
+      - Teacher: expression similarity (ground truth)
+      - Student: embedding similarity (learned)
+    Then minimize KL(teacher || student).
+    
+    Args:
+        z_sc: (n_sc, D) SC embeddings from encoder
+        z_st: (n_st, D) ST embeddings from encoder
+        x_sc: (n_sc, G) SC expression (raw, not encoded)
+        x_st: (n_st, G) ST expression (raw, not encoded)
+        tau_x: temperature for expression similarities (teacher)
+        tau_z: temperature for embedding similarities (student)
+        bidirectional: if True, also compute ST->SC alignment
+        
+    Returns:
+        loss: scalar local alignment loss
+    """
+    # Normalize for cosine similarity
+    x_sc_norm = F.normalize(x_sc, dim=1)  # (n_sc, G)
+    x_st_norm = F.normalize(x_st, dim=1)  # (n_st, G)
+    z_sc_norm = F.normalize(z_sc, dim=1)  # (n_sc, D)
+    z_st_norm = F.normalize(z_st, dim=1)  # (n_st, D)
+    
+    # ========== SC -> ST direction ==========
+    # Teacher: expression-based soft neighbors (SC queries ST)
+    sim_x_sc2st = (x_sc_norm @ x_st_norm.T) / tau_x  # (n_sc, n_st)
+    q_sc2st = F.softmax(sim_x_sc2st, dim=1)  # Teacher distribution
+    
+    # Student: embedding-based soft neighbors
+    sim_z_sc2st = (z_sc_norm @ z_st_norm.T) / tau_z  # (n_sc, n_st)
+    log_p_sc2st = F.log_softmax(sim_z_sc2st, dim=1)  # Student log-distribution
+    
+    # KL divergence: KL(q || p) = sum_j q_j * (log q_j - log p_j)
+    # Using F.kl_div which expects log_p and q
+    loss_sc2st = F.kl_div(log_p_sc2st, q_sc2st, reduction='batchmean')
+    
+    if not bidirectional:
+        return loss_sc2st
+    
+    # ========== ST -> SC direction ==========
+    # Teacher: expression-based soft neighbors (ST queries SC)
+    sim_x_st2sc = (x_st_norm @ x_sc_norm.T) / tau_x  # (n_st, n_sc)
+    q_st2sc = F.softmax(sim_x_st2sc, dim=1)
+    
+    # Student: embedding-based soft neighbors
+    sim_z_st2sc = (z_st_norm @ z_sc_norm.T) / tau_z  # (n_st, n_sc)
+    log_p_st2sc = F.log_softmax(sim_z_st2sc, dim=1)
+    
+    loss_st2sc = F.kl_div(log_p_st2sc, q_st2sc, reduction='batchmean')
+    
+    # Average both directions
+    return 0.5 * (loss_sc2st + loss_st2sc)

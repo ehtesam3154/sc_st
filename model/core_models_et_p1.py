@@ -13,7 +13,16 @@ import os
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from torch.utils.data import Dataset
-from ssl_utils import *
+from ssl_utils import (
+    FullGatherLayer, batch_all_gather, GradientReversalFunction, grad_reverse,
+    off_diagonal, VICRegLoss, SlideDiscriminator, augment_expression,
+    sample_balanced_slide_indices, grl_alpha_schedule, coral_loss,
+    # NEW: diagnostic utilities (GPT 5.2 Pro fix)
+    compute_confusion_matrix, compute_entropy, compute_gradient_norms,
+    augment_expression_mild, get_adversary_representation, log_adversary_diagnostics
+)
+import math
+
 
 # Import from project knowledge Set-Transformer components
 from modules import MAB, SAB, ISAB, PMA
@@ -21,7 +30,6 @@ import utils_et as uet
 
 
 def _cpu(x):
-    import torch
     return x.detach().cpu() if isinstance(x, torch.Tensor) else x
 
 
@@ -148,16 +156,34 @@ def train_encoder(
     aug_gauss_std: float = 0.01,
     aug_scale_jitter: float = 0.2,
     # Slide adversary parameters
-    adv_slide_weight: float = 10.0,
+    adv_slide_weight: float = 50.0,
     adv_warmup_epochs: int = 50,
     adv_ramp_epochs: int = 200,
     grl_alpha_max: float = 1.0,
     disc_hidden: int = 256,
     disc_dropout: float = 0.1,
     # Balanced slide batching
+    # Balanced slide batching
     stageA_balanced_slides: bool = True,
     return_aux: bool = False,
+    # ========== NEW: Adversary representation control (GPT 5.2 Pro fix) ==========
+    # These parameters control what representation the discriminator sees
+    adv_representation_mode: str = 'clean',  # 'clean', 'mild_aug', 'ln_avg_aug'
+    adv_use_layernorm: bool = False,  # Set False for Run 1+ (remove LN mismatch)
+    adv_mild_dropout: float = 0.05,   # For 'mild_aug' mode
+    adv_mild_noise: float = 0.005,    # For 'mild_aug' mode  
+    adv_mild_jitter: float = 0.05,    # For 'mild_aug' mode
+    adv_log_diagnostics: bool = True, # Enable comprehensive discriminator logging
+    adv_log_grad_norms: bool = False, # Log gradient norms (expensive, for debugging)
+    # ========== NEW: Local Alignment Loss (Run 4) ==========
+    use_local_align: bool = False,
+    local_align_weight: float = 1.0,
+    local_align_tau_x: float = 0.1,
+    local_align_tau_z: float = 0.1,
+    local_align_bidirectional: bool = True,
+    local_align_warmup: int = 100,  # Start after discriminator warmup
 ):
+
     """
     Train the shared encoder (Stage A).
     
@@ -240,7 +266,7 @@ def train_encoder(
         from ssl_utils import (
             VICRegLoss, SlideDiscriminator, grad_reverse,
             augment_expression, sample_balanced_slide_indices,
-            grl_alpha_schedule, coral_loss
+            grl_alpha_schedule, coral_loss, compute_local_alignment_loss
         )
         
         print("\n" + "="*70)
@@ -313,13 +339,24 @@ def train_encoder(
         print(f"  Augmentations: dropout={aug_gene_dropout}, noise={aug_gauss_std}, jitter={aug_scale_jitter}")
         print(f"  Adversary: weight={adv_slide_weight}, warmup={adv_warmup_epochs}, ramp={adv_ramp_epochs}")
         print("  CORAL: ST↔SC alignment enabled (on same z_cond used by adversary)")
+        print(f"  [GPT5.2-FIX] adv_representation_mode='{adv_representation_mode}', adv_use_layernorm={adv_use_layernorm}")
+        if adv_representation_mode == 'ln_avg_aug':
+            print("  [WARNING] Using legacy ln_avg_aug mode - this causes train/inference mismatch!")
         print("="*70 + "\n")
+
 
         history_vicreg = {
             'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_adv': [], 'loss_coral': [],
+            'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
-            'std_mean': [], 'std_min': [], 'disc_acc': [], 'grl_alpha': []
+            'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': []
         }
+        
+        # Print local alignment config
+        if use_local_align:
+            print(f"  LOCAL ALIGN: weight={local_align_weight}, tau_x={local_align_tau_x}, "
+                  f"tau_z={local_align_tau_z}, bidir={local_align_bidirectional}, warmup={local_align_warmup}")
+
 
     else:
         # Geometry mode: original optimizer
@@ -427,11 +464,17 @@ def train_encoder(
             alpha = grl_alpha_schedule(epoch, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max)
 
             # ------------------------------------------------------------
-            # Define the conditioning representation ONCE (z_cond)
-            # This is what you should later feed into diffusion too.
+            # FIX (Run 4.1): Compute conditioning representation from CLEAN input
+            # CRITICAL: z1/z2 are augmented (for VICReg invariance only)
+            # But adversary, CORAL, local_align must use CLEAN embeddings
+            # This matches what evaluation and diffusion will see!
             # ------------------------------------------------------------
-            z_bar_raw = (z1 + z2) / 2.0
-            z_cond = F.layer_norm(z_bar_raw, (z_bar_raw.shape[1],))   # (B, D)
+            z_clean = model(X_batch)  # Clean input, NO augmentation
+            
+            if adv_use_layernorm:
+                z_cond = F.layer_norm(z_clean, (z_clean.shape[1],))
+            else:
+                z_cond = z_clean  # Use raw clean embedding
 
             # (A) Train discriminator on DETACHED z_cond
             with torch.no_grad():
@@ -441,18 +484,39 @@ def train_encoder(
             disc_acc_val = 0.0
 
             # Always train disc a bit (even during warmup) so it doesn't start from scratch later
+            disc_grad_norms = {}
             for _ in range(disc_steps):
                 logits_d = discriminator(z_det)
                 loss_disc = F.cross_entropy(logits_d, s_batch)
 
                 opt_disc.zero_grad(set_to_none=True)
                 loss_disc.backward()
+                
+                # Optionally log gradient norms before step
+                if adv_log_grad_norms and epoch % 50 == 0:
+                    disc_grad_norms = compute_gradient_norms(
+                        discriminator.named_parameters(), prefix="disc_"
+                    )
+                
                 opt_disc.step()
 
                 with torch.no_grad():
                     pred = logits_d.argmax(dim=1)
                     disc_acc_val = (pred == s_batch).float().mean().item()
                     disc_loss_val = loss_disc.item()
+            
+            # Comprehensive discriminator diagnostics (GPT 5.2 Pro recommendation)
+            disc_diag = {}
+            if adv_log_diagnostics:
+                disc_diag = log_adversary_diagnostics(
+                    logits=logits_d,
+                    targets=s_batch,
+                    n_classes=n_domains,
+                    prefix="disc_",
+                    epoch=epoch,
+                    verbose=(epoch % 100 == 0)
+                )
+
 
             # (B) Train encoder to confuse discriminator via GRL
             for p in discriminator.parameters():
@@ -469,13 +533,54 @@ def train_encoder(
             logits_adv = discriminator(grad_reverse(z_cond, alpha))
             loss_adv_enc = F.cross_entropy(logits_adv, s_batch)
 
-            coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
-            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral
+            # ========== NEW: Local Alignment Loss (Run 4.1 - FIXED) ==========
+            loss_local = torch.tensor(0.0, device=device)
+            local_w = 0.0
+            if use_local_align and epoch >= local_align_warmup:
+                # Get raw expressions for this batch (teacher signal)
+                x_st_batch = X_batch[~is_sc]  # ST expression in batch
+                x_sc_batch = X_batch[is_sc]   # SC expression in batch
+                
+                # FIXED: Use CLEAN embeddings (matches adversary and evaluation)
+                z_st_raw = z_clean[~is_sc]  # Clean ST embeddings
+                z_sc_raw = z_clean[is_sc]   # Clean SC embeddings
 
-            opt_enc.zero_grad(set_to_none=True)
-            loss_total.backward()
+                
+                if z_st_raw.shape[0] > 8 and z_sc_raw.shape[0] > 8:
+                    loss_local = compute_local_alignment_loss(
+                        z_sc=z_sc_raw,
+                        z_st=z_st_raw,
+                        x_sc=x_sc_batch,
+                        x_st=x_st_batch,
+                        tau_x=local_align_tau_x,
+                        tau_z=local_align_tau_z,
+                        bidirectional=local_align_bidirectional
+                    )
+                    
+                    # Ramp up local align weight
+                    local_w = local_align_weight * float(np.clip(
+                        (epoch - local_align_warmup) / max(1, adv_ramp_epochs), 0.0, 1.0
+                    ))
+
+            coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
+            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral + local_w * loss_local
+
+            
+            # Optionally log encoder gradient norms before step
+            enc_grad_norms = {}
+            if adv_log_grad_norms and epoch % 50 == 0:
+                enc_grad_norms = compute_gradient_norms(
+                    model.named_parameters(), prefix="enc_"
+                )
+                if projector is not None:
+                    proj_grad_norms = compute_gradient_norms(
+                        projector.named_parameters(), prefix="proj_"
+                    )
+                    enc_grad_norms.update(proj_grad_norms)
+            
             opt_enc.step()
             scheduler.step()
+
 
             for p in discriminator.parameters():
                 p.requires_grad_(True)
@@ -485,23 +590,64 @@ def train_encoder(
                 logits_det = discriminator(z_det)
                 disc_acc_det = (logits_det.argmax(dim=1) == s_batch).float().mean().item()
 
-                # post-update
-                z1_post = model(X1)
-                z2_post = model(X2)
-                z_post = F.layer_norm(((z1_post + z2_post) / 2.0), (z1_post.shape[1],))
-                disc_acc_post = (discriminator(z_post).argmax(dim=1) == s_batch).float().mean().item()
+                # Post-update: use CLEAN representation (matches training now)
+                z_clean_post = model(X_batch)
+                if adv_use_layernorm:
+                    z_post = F.layer_norm(z_clean_post, (z_clean_post.shape[1],))
+                else:
+                    z_post = z_clean_post
+                    
+                logits_post = discriminator(z_post)
+                disc_acc_post = (logits_post.argmax(dim=1) == s_batch).float().mean().item()
+                
+                # Now disc_post and disc_CLEAN should be identical (same representation)
+                disc_acc_clean = disc_acc_post  # They're the same now!
+                
+                # DIAGNOSTIC: Also check augmented for comparison
+                z_aug_check = model(X1)
+                logits_aug = discriminator(z_aug_check)
+                disc_acc_aug = (logits_aug.argmax(dim=1) == s_batch).float().mean().item()
+
+                
+                # Post-update diagnostics on clean representation
+                clean_diag = {}
+                if adv_log_diagnostics:
+                    clean_diag = log_adversary_diagnostics(
+                        logits=logits_post,
+                        targets=s_batch,
+                        n_classes=n_domains,
+                        prefix="clean_",
+                        epoch=epoch,
+                        verbose=(epoch % 100 == 0)
+                    )
 
                 loss_adv = loss_adv_enc.detach()
 
 
             # Logging
-            if epoch % 10 == 0 or epoch < 5:
+            # Logging
+            if epoch % 50 == 0 or (epoch < 5 or epoch > (n_epochs - 25)):
+                local_str = f", Local={loss_local.item():.4f}" if use_local_align and epoch >= local_align_warmup else ""
+                aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
                 print(f"Epoch {epoch}/{n_epochs} | "
                     f"Loss={loss_total.item():.4f} "
-                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}) | "
+                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{local_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
-                    f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}, α={alpha:.3f}")
+                    f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}")
+
+
+                
+                # Extra diagnostic logging every 100 epochs
+                if epoch % 100 == 0 and adv_log_diagnostics:
+                    print(f"  [DIAG] mode='{adv_representation_mode}', LN={adv_use_layernorm}")
+                    if disc_diag:
+                        print(f"  [DIAG] Disc entropy ratio: {disc_diag.get('disc_ent_ratio', 0):.3f}")
+                    if clean_diag:
+                        print(f"  [DIAG] CLEAN entropy ratio: {clean_diag.get('clean_ent_ratio', 0):.3f}")
+                        print(f"  [DIAG] CLEAN per-class: ST={clean_diag.get('clean_acc_class0', 0):.3f}, "
+                              f"SC={clean_diag.get('clean_acc_class1', 0):.3f}")
+
 
             # Save history
             history_vicreg['epoch'].append(epoch)
@@ -509,13 +655,16 @@ def train_encoder(
             history_vicreg['loss_vicreg'].append(loss_vicreg.item())
             history_vicreg['loss_adv'].append(loss_adv.item())
             history_vicreg['loss_coral'].append(loss_coral.item())
+            history_vicreg['loss_local'].append(loss_local.item() if use_local_align else 0.0)
             history_vicreg['vicreg_inv'].append(vicreg_stats['inv'])
             history_vicreg['vicreg_var'].append(vicreg_stats['var'])
             history_vicreg['vicreg_cov'].append(vicreg_stats['cov'])
             history_vicreg['std_mean'].append(vicreg_stats['std_mean'])
             history_vicreg['std_min'].append(vicreg_stats['std_min'])
             history_vicreg['disc_acc'].append(disc_acc_det)
+            history_vicreg['disc_acc_clean'].append(disc_acc_clean)  # NEW: track clean accuracy
             history_vicreg['grl_alpha'].append(alpha)
+
 
             continue  # Skip geometry code, go to next epoch
 
