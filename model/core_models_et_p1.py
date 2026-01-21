@@ -13,6 +13,7 @@ import os
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from torch.utils.data import Dataset
+from ssl_utils import *
 
 # Import from project knowledge Set-Transformer components
 from modules import MAB, SAB, ISAB, PMA
@@ -69,6 +70,30 @@ class SharedEncoder(nn.Module):
         return self.encoder(X)
 
 
+def build_vicreg_projector(
+    input_dim: int,
+    project_dim: int = 256,
+    hidden_dim: int = 512
+) -> nn.Module:
+    """
+    Build projector for VICReg (MLP with BN).
+    
+    Args:
+        input_dim: backbone output dimension
+        project_dim: final projection dimension
+        hidden_dim: hidden layer dimension
+        
+    Returns:
+        projector: nn.Sequential module
+    """
+    return nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.LayerNorm(hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, project_dim, bias=False)
+    )
+
+
 def train_encoder(
     model: SharedEncoder,
     st_gene_expr: torch.Tensor,
@@ -103,10 +128,35 @@ def train_encoder(
     infonce_smin: float = 0.75,   # cosine sim threshold for MNN pairs
     align_warmup: int = 200,      # epochs before alignment starts
     align_ramp: int = 200,        # epochs to ramp alignment weight
-
     # NEW: Optional SC-related losses
     use_circle: bool = True,
     use_mmd_sc: bool = True,
+    # ========== NEW: VICReg + Adversary mode ==========
+    stageA_obj: str = 'geom',  # 'geom' (default) or 'vicreg_adv'
+    # VICReg parameters
+    vicreg_lambda_inv: float = 25.0,
+    vicreg_lambda_var: float = 25.0,
+    vicreg_lambda_cov: float = 1.0,
+    vicreg_gamma: float = 1.0,
+    vicreg_eps: float = 1e-4,
+    vicreg_project_dim: int = 256,
+    vicreg_use_projector: bool = True,
+    vicreg_float32_stats: bool = True,
+    vicreg_ddp_gather: bool = True,
+    # Expression augmentation parameters
+    aug_gene_dropout: float = 0.2,
+    aug_gauss_std: float = 0.01,
+    aug_scale_jitter: float = 0.2,
+    # Slide adversary parameters
+    adv_slide_weight: float = 10.0,
+    adv_warmup_epochs: int = 50,
+    adv_ramp_epochs: int = 200,
+    grl_alpha_max: float = 1.0,
+    disc_hidden: int = 256,
+    disc_dropout: float = 0.1,
+    # Balanced slide batching
+    stageA_balanced_slides: bool = True,
+    return_aux: bool = False,
 ):
     """
     Train the shared encoder (Stage A).
@@ -147,6 +197,7 @@ def train_encoder(
     print("[Stage A] Using pre-normalized coordinates")
     
     # Auto-compute sigma if not provided
+    # if stageA_obj != 'vicreg_adv':
     if sigma is None:
         with torch.no_grad():
             sigmas_per_slide = []
@@ -184,11 +235,99 @@ def train_encoder(
     slide_mask = uet.block_diag_mask(slide_ids)  # (n_st, n_st)
     
     # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    # ========== VICReg Mode Setup ==========
+    if stageA_obj == 'vicreg_adv':
+        from ssl_utils import (
+            VICRegLoss, SlideDiscriminator, grad_reverse,
+            augment_expression, sample_balanced_slide_indices,
+            grl_alpha_schedule, coral_loss
+        )
+        
+        print("\n" + "="*70)
+        print("STAGE A MODE: VICReg + Domain Adversary (ST vs SC)")
+        print("="*70 + "\n")
+
+        # ---- (optional) keep your ST slide-id remap for future use ----
+        unique_st_slides = torch.unique(slide_ids)
+        n_st_slides = len(unique_st_slides)
+        if not torch.equal(unique_st_slides, torch.arange(n_st_slides, device=device)):
+            print(f"[VICReg] Remapping ST slide_ids from {unique_st_slides.tolist()} to 0..{n_st_slides-1}")
+            slide_id_map = {int(s.item()): i for i, s in enumerate(unique_st_slides)}
+            slide_ids = torch.tensor([slide_id_map[int(s.item())] for s in slide_ids],
+                                    dtype=torch.long, device=device)
+        else:
+            print(f"[VICReg] ST slide_ids already contiguous: 0..{n_st_slides-1}")
+
+        # ---- Binary domain labels: ST=0, SC=1 ----
+        n_st = st_gene_expr.shape[0]
+        n_sc = sc_gene_expr.shape[0]
+
+        X_ssl = torch.cat([st_gene_expr, sc_gene_expr], dim=0)
+        domain_ids = torch.cat([
+            torch.zeros(n_st, device=device, dtype=torch.long),
+            torch.ones(n_sc, device=device, dtype=torch.long),
+        ], dim=0)
+
+        ST_LABEL = 0
+        SC_LABEL = 1
+        n_domains = 2
+
+        print(f"[VICReg] Domain setup: ST(n={n_st}) vs SC(n={n_sc}) => {n_domains} domains")
+        if batch_size % n_domains != 0:
+            print(f"[WARNING] batch_size={batch_size} not divisible by {n_domains} "
+                f"(recommend even batch_size for perfectly balanced sampling)")
+
+        # Build projector
+        h_dim = model.n_embedding[-1]
+        if vicreg_use_projector:
+            projector = build_vicreg_projector(h_dim, vicreg_project_dim).to(device)
+            print(f"  Projector: {h_dim} → {vicreg_project_dim}")
+        else:
+            projector = None
+            print("  No projector (VICReg on backbone)")
+
+        # Build DOMAIN discriminator (binary ST vs SC)
+        discriminator = SlideDiscriminator(
+            h_dim, n_domains, disc_hidden, disc_dropout
+        ).to(device)
+        print(f"  Discriminator: {h_dim} → {n_domains} (ST vs SC)")
+
+        # VICReg loss
+        vicreg_loss_fn = VICRegLoss(
+            vicreg_lambda_inv, vicreg_lambda_var, vicreg_lambda_cov,
+            vicreg_gamma, vicreg_eps, vicreg_ddp_gather, vicreg_float32_stats
+        )
+        print(f"  VICReg: λ_inv={vicreg_lambda_inv}, λ_var={vicreg_lambda_var}, λ_cov={vicreg_lambda_cov}")
+
+        # Optimizers
+        enc_params = list(model.parameters())
+        if projector is not None:
+            enc_params += list(projector.parameters())
+
+        opt_enc = torch.optim.Adam(enc_params, lr=lr)
+        opt_disc = torch.optim.Adam(discriminator.parameters(), lr=3.0 * lr, weight_decay=1e-4)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_enc, T_max=n_epochs)
+        disc_steps = 10
+
+        print(f"  Augmentations: dropout={aug_gene_dropout}, noise={aug_gauss_std}, jitter={aug_scale_jitter}")
+        print(f"  Adversary: weight={adv_slide_weight}, warmup={adv_warmup_epochs}, ramp={adv_ramp_epochs}")
+        print("  CORAL: ST↔SC alignment enabled (on same z_cond used by adversary)")
+        print("="*70 + "\n")
+
+        history_vicreg = {
+            'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_adv': [], 'loss_coral': [],
+            'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
+            'std_mean': [], 'std_min': [], 'disc_acc': [], 'grl_alpha': []
+        }
+
+    else:
+        # Geometry mode: original optimizer
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     nettrue = A_target
-    
+
     # Training loop
     # Precompute per-slide index lists for local sampling
     if local_miniset_mode:
@@ -246,10 +385,146 @@ def train_encoder(
                     print(f"[STAGEA-INFO] MNN pairs: 0 (smin={infonce_smin})")
 
 
-    
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
     for epoch in range(n_epochs):
+        # ========== BRANCH 1: VICReg Mode ==========
+        if stageA_obj == 'vicreg_adv':
+            model.train()
+            if projector is not None:
+                projector.train()
+            discriminator.train()
+            
+            # ========== Balanced domain sampling ==========
+            # Sample from all domains (ST slides + SC)
+            # ========== Balanced domain sampling ==========
+            if stageA_balanced_slides:
+                idx = sample_balanced_slide_indices(domain_ids, batch_size, device)
+            else:
+                idx = torch.randperm(X_ssl.shape[0], device=device)[:batch_size]
+
+            X_batch = X_ssl[idx]
+            s_batch = domain_ids[idx]  # 0=ST, 1=SC
+
+            # Two augmented views
+            X1 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+            X2 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+
+            # Forward
+            z1 = model(X1)
+            z2 = model(X2)
+
+            # Projector (VICReg uses y*)
+            if projector is not None:
+                y1 = projector(z1)
+                y2 = projector(z2)
+            else:
+                y1 = z1
+                y2 = z2
+
+            loss_vicreg, vicreg_stats = vicreg_loss_fn(y1, y2)
+
+            alpha = grl_alpha_schedule(epoch, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max)
+
+            # ------------------------------------------------------------
+            # Define the conditioning representation ONCE (z_cond)
+            # This is what you should later feed into diffusion too.
+            # ------------------------------------------------------------
+            z_bar_raw = (z1 + z2) / 2.0
+            z_cond = F.layer_norm(z_bar_raw, (z_bar_raw.shape[1],))   # (B, D)
+
+            # (A) Train discriminator on DETACHED z_cond
+            with torch.no_grad():
+                z_det = z_cond.detach()
+
+            disc_loss_val = 0.0
+            disc_acc_val = 0.0
+
+            # Always train disc a bit (even during warmup) so it doesn't start from scratch later
+            for _ in range(disc_steps):
+                logits_d = discriminator(z_det)
+                loss_disc = F.cross_entropy(logits_d, s_batch)
+
+                opt_disc.zero_grad(set_to_none=True)
+                loss_disc.backward()
+                opt_disc.step()
+
+                with torch.no_grad():
+                    pred = logits_d.argmax(dim=1)
+                    disc_acc_val = (pred == s_batch).float().mean().item()
+                    disc_loss_val = loss_disc.item()
+
+            # (B) Train encoder to confuse discriminator via GRL
+            for p in discriminator.parameters():
+                p.requires_grad_(False)
+
+            # CORAL between ST and SC on the SAME z_cond space
+            loss_coral = torch.tensor(0.0, device=device)
+            is_sc = (s_batch == SC_LABEL)
+            z_st = z_cond[~is_sc]
+            z_sc = z_cond[is_sc]
+            if z_st.shape[0] > 8 and z_sc.shape[0] > 8:
+                loss_coral = coral_loss(z_st, z_sc)
+
+            logits_adv = discriminator(grad_reverse(z_cond, alpha))
+            loss_adv_enc = F.cross_entropy(logits_adv, s_batch)
+
+            coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
+            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral
+
+            opt_enc.zero_grad(set_to_none=True)
+            loss_total.backward()
+            opt_enc.step()
+            scheduler.step()
+
+            for p in discriminator.parameters():
+                p.requires_grad_(True)
+
+            # Logging accuracy (chance=0.5 is what you want to approach)
+            with torch.no_grad():
+                logits_det = discriminator(z_det)
+                disc_acc_det = (logits_det.argmax(dim=1) == s_batch).float().mean().item()
+
+                # post-update
+                z1_post = model(X1)
+                z2_post = model(X2)
+                z_post = F.layer_norm(((z1_post + z2_post) / 2.0), (z1_post.shape[1],))
+                disc_acc_post = (discriminator(z_post).argmax(dim=1) == s_batch).float().mean().item()
+
+                loss_adv = loss_adv_enc.detach()
+
+
+            # Logging
+            if epoch % 10 == 0 or epoch < 5:
+                print(f"Epoch {epoch}/{n_epochs} | "
+                    f"Loss={loss_total.item():.4f} "
+                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}) | "
+                    f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
+                    f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
+                    f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}, α={alpha:.3f}")
+
+            # Save history
+            history_vicreg['epoch'].append(epoch)
+            history_vicreg['loss_total'].append(loss_total.item())
+            history_vicreg['loss_vicreg'].append(loss_vicreg.item())
+            history_vicreg['loss_adv'].append(loss_adv.item())
+            history_vicreg['loss_coral'].append(loss_coral.item())
+            history_vicreg['vicreg_inv'].append(vicreg_stats['inv'])
+            history_vicreg['vicreg_var'].append(vicreg_stats['var'])
+            history_vicreg['vicreg_cov'].append(vicreg_stats['cov'])
+            history_vicreg['std_mean'].append(vicreg_stats['std_mean'])
+            history_vicreg['std_min'].append(vicreg_stats['std_min'])
+            history_vicreg['disc_acc'].append(disc_acc_det)
+            history_vicreg['grl_alpha'].append(alpha)
+
+            continue  # Skip geometry code, go to next epoch
+
+        
+        # ========== BRANCH 2: Geometry Mode (rest of your code stays the same) ==========
+
+
+        
+        # ========== BRANCH 2: Geometry Mode (existing code below) ==========
         # ===================================================================
         # SAMPLE ST BATCH (local miniset mode or global random)
         # ===================================================================
@@ -708,10 +983,47 @@ def train_encoder(
     
     # Save checkpoint
     os.makedirs(outf, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(outf, 'encoder_final_new.pt'))
-    print("Encoder training complete!")
     
+    if stageA_obj == 'vicreg_adv':
+        # Save VICReg history
+        import json
+        history_path = os.path.join(outf, 'stageA_vicreg_history.json')
+        with open(history_path, 'w') as f:
+            json.dump(history_vicreg, f, indent=2)
+        
+        print("\n" + "="*70)
+        print("VICReg Training Complete")
+        print("="*70)
+        print(f"Final Loss: {history_vicreg['loss_total'][-1]:.4f}")
+        print(f"Final VICReg: {history_vicreg['loss_vicreg'][-1]:.3f}")
+        print(f"Final std mean: {history_vicreg['std_mean'][-1]:.3f}")
+        print(f"Final disc acc: {history_vicreg['disc_acc'][-1]:.3f}")
+        print("="*70 + "\n")
+        print(f"History saved: {history_path}")
+    
+    torch.save(model.state_dict(), os.path.join(outf, 'encoder_final_new.pt'))
+
+    if stageA_obj == 'vicreg_adv':
+        aux_path = os.path.join(outf, 'stageA_vicreg_aux.pt')
+        aux = {
+            "vicreg_use_projector": vicreg_use_projector,
+            "h_dim": model.n_embedding[-1],
+            "vicreg_project_dim": vicreg_project_dim,
+            "disc_hidden": disc_hidden,
+            "disc_dropout": disc_dropout,
+            "n_slides": int(torch.unique(slide_ids).numel()),
+            "projector_state_dict": (projector.state_dict() if projector is not None else None),
+            "discriminator_state_dict": discriminator.state_dict(),
+        }
+        torch.save(aux, aux_path)
+        print(f"[StageA] Saved aux modules to: {aux_path}")
+
+    print("Encoder training complete!")
+
+    if return_aux and stageA_obj == 'vicreg_adv':
+        return model, projector, discriminator, history_vicreg
     return model
+
 
 
 # ==============================================================================
