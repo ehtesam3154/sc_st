@@ -732,67 +732,120 @@ def log_adversary_diagnostics(
 # LOCAL ALIGNMENT LOSS (Run 4 - GPT 5.2 Pro)
 # ==============================================================================
 
+# def compute_local_alignment_loss(
+#     z_sc: torch.Tensor,
+#     z_st: torch.Tensor, 
+#     x_sc: torch.Tensor,
+#     x_st: torch.Tensor,
+#     tau_x: float = 0.1,
+#     tau_z: float = 0.1,
+#     bidirectional: bool = True
+# ) -> torch.Tensor:
+#     """
+#     Local alignment loss: Match neighborhood distributions between expression and embedding space.
+    
+#     For each SC cell, compute soft neighbors in ST based on:
+#       - Teacher: expression similarity (ground truth)
+#       - Student: embedding similarity (learned)
+#     Then minimize KL(teacher || student).
+    
+#     Args:
+#         z_sc: (n_sc, D) SC embeddings from encoder
+#         z_st: (n_st, D) ST embeddings from encoder
+#         x_sc: (n_sc, G) SC expression (raw, not encoded)
+#         x_st: (n_st, G) ST expression (raw, not encoded)
+#         tau_x: temperature for expression similarities (teacher)
+#         tau_z: temperature for embedding similarities (student)
+#         bidirectional: if True, also compute ST->SC alignment
+        
+#     Returns:
+#         loss: scalar local alignment loss
+#     """
+#     # Normalize for cosine similarity
+#     x_sc_norm = F.normalize(x_sc, dim=1)  # (n_sc, G)
+#     x_st_norm = F.normalize(x_st, dim=1)  # (n_st, G)
+#     z_sc_norm = F.normalize(z_sc, dim=1)  # (n_sc, D)
+#     z_st_norm = F.normalize(z_st, dim=1)  # (n_st, D)
+    
+#     # ========== SC -> ST direction ==========
+#     # Teacher: expression-based soft neighbors (SC queries ST)
+#     sim_x_sc2st = (x_sc_norm @ x_st_norm.T) / tau_x  # (n_sc, n_st)
+#     q_sc2st = F.softmax(sim_x_sc2st, dim=1)  # Teacher distribution
+    
+#     # Student: embedding-based soft neighbors
+#     sim_z_sc2st = (z_sc_norm @ z_st_norm.T) / tau_z  # (n_sc, n_st)
+#     log_p_sc2st = F.log_softmax(sim_z_sc2st, dim=1)  # Student log-distribution
+    
+#     # KL divergence: KL(q || p) = sum_j q_j * (log q_j - log p_j)
+#     # Using F.kl_div which expects log_p and q
+#     loss_sc2st = F.kl_div(log_p_sc2st, q_sc2st, reduction='batchmean')
+    
+#     if not bidirectional:
+#         return loss_sc2st
+    
+#     # ========== ST -> SC direction ==========
+#     # Teacher: expression-based soft neighbors (ST queries SC)
+#     sim_x_st2sc = (x_st_norm @ x_sc_norm.T) / tau_x  # (n_st, n_sc)
+#     q_st2sc = F.softmax(sim_x_st2sc, dim=1)
+    
+#     # Student: embedding-based soft neighbors
+#     sim_z_st2sc = (z_st_norm @ z_sc_norm.T) / tau_z  # (n_st, n_sc)
+#     log_p_st2sc = F.log_softmax(sim_z_st2sc, dim=1)
+    
+#     loss_st2sc = F.kl_div(log_p_st2sc, q_st2sc, reduction='batchmean')
+    
+#     # Average both directions
+#     return 0.5 * (loss_sc2st + loss_st2sc)
+
 def compute_local_alignment_loss(
     z_sc: torch.Tensor,
-    z_st: torch.Tensor, 
-    x_sc: torch.Tensor,
-    x_st: torch.Tensor,
+    z_st: torch.Tensor,
+    x_sc: torch.Tensor = None,
+    x_st: torch.Tensor = None,
     tau_x: float = 0.1,
     tau_z: float = 0.1,
-    bidirectional: bool = True
+    bidirectional: bool = True,
+    mnn_min_sim: float = 0.2,
 ) -> torch.Tensor:
     """
-    Local alignment loss: Match neighborhood distributions between expression and embedding space.
-    
-    For each SC cell, compute soft neighbors in ST based on:
-      - Teacher: expression similarity (ground truth)
-      - Student: embedding similarity (learned)
-    Then minimize KL(teacher || student).
-    
-    Args:
-        z_sc: (n_sc, D) SC embeddings from encoder
-        z_st: (n_st, D) ST embeddings from encoder
-        x_sc: (n_sc, G) SC expression (raw, not encoded)
-        x_st: (n_st, G) ST expression (raw, not encoded)
-        tau_x: temperature for expression similarities (teacher)
-        tau_z: temperature for embedding similarities (student)
-        bidirectional: if True, also compute ST->SC alignment
-        
-    Returns:
-        loss: scalar local alignment loss
+    Local alignment via MNN in embedding space (InfoNCE).
+    Ignores x_sc/x_st (kept for backward compatibility).
     """
+
     # Normalize for cosine similarity
-    x_sc_norm = F.normalize(x_sc, dim=1)  # (n_sc, G)
-    x_st_norm = F.normalize(x_st, dim=1)  # (n_st, G)
     z_sc_norm = F.normalize(z_sc, dim=1)  # (n_sc, D)
     z_st_norm = F.normalize(z_st, dim=1)  # (n_st, D)
-    
-    # ========== SC -> ST direction ==========
-    # Teacher: expression-based soft neighbors (SC queries ST)
-    sim_x_sc2st = (x_sc_norm @ x_st_norm.T) / tau_x  # (n_sc, n_st)
-    q_sc2st = F.softmax(sim_x_sc2st, dim=1)  # Teacher distribution
-    
-    # Student: embedding-based soft neighbors
-    sim_z_sc2st = (z_sc_norm @ z_st_norm.T) / tau_z  # (n_sc, n_st)
-    log_p_sc2st = F.log_softmax(sim_z_sc2st, dim=1)  # Student log-distribution
-    
-    # KL divergence: KL(q || p) = sum_j q_j * (log q_j - log p_j)
-    # Using F.kl_div which expects log_p and q
-    loss_sc2st = F.kl_div(log_p_sc2st, q_sc2st, reduction='batchmean')
-    
+
+    # Similarity matrix (SC x ST)
+    S = z_sc_norm @ z_st_norm.T  # (n_sc, n_st)
+
+    # Nearest neighbors
+    nn_sc = S.argmax(dim=1)      # (n_sc,)
+    nn_st = S.argmax(dim=0)      # (n_st,)
+
+    # Mutual nearest neighbors mask
+    idx_sc = torch.arange(S.shape[0], device=S.device)
+    mnn_mask = (nn_st[nn_sc] == idx_sc)
+
+    # Optional similarity threshold
+    if mnn_min_sim > 0:
+        mnn_mask = mnn_mask & (S[idx_sc, nn_sc] >= mnn_min_sim)
+
+    # If no pairs, return zero
+    if mnn_mask.sum() == 0:
+        return torch.tensor(0.0, device=S.device)
+
+    # InfoNCE: SC -> ST
+    pos_st = nn_sc[mnn_mask]          # (n_pairs,)
+    pos_sc = idx_sc[mnn_mask]         # (n_pairs,)
+    logits_sc2st = S[pos_sc] / tau_z  # (n_pairs, n_st)
+    loss_sc2st = F.cross_entropy(logits_sc2st, pos_st)
+
     if not bidirectional:
         return loss_sc2st
-    
-    # ========== ST -> SC direction ==========
-    # Teacher: expression-based soft neighbors (ST queries SC)
-    sim_x_st2sc = (x_st_norm @ x_sc_norm.T) / tau_x  # (n_st, n_sc)
-    q_st2sc = F.softmax(sim_x_st2sc, dim=1)
-    
-    # Student: embedding-based soft neighbors
-    sim_z_st2sc = (z_st_norm @ z_sc_norm.T) / tau_z  # (n_st, n_sc)
-    log_p_st2sc = F.log_softmax(sim_z_st2sc, dim=1)
-    
-    loss_st2sc = F.kl_div(log_p_st2sc, q_st2sc, reduction='batchmean')
-    
-    # Average both directions
+
+    # InfoNCE: ST -> SC (use the same pairs)
+    logits_st2sc = S.T[pos_st] / tau_z  # (n_pairs, n_sc)
+    loss_st2sc = F.cross_entropy(logits_st2sc, pos_sc)
+
     return 0.5 * (loss_sc2st + loss_st2sc)

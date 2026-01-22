@@ -567,6 +567,11 @@ def train_encoder(
 
             
             # Optionally log encoder gradient norms before step
+            # Backprop for encoder (MISSING BEFORE!)
+            opt_enc.zero_grad(set_to_none=True)
+            loss_total.backward()
+
+            # Optionally log encoder gradient norms AFTER backward
             enc_grad_norms = {}
             if adv_log_grad_norms and epoch % 50 == 0:
                 enc_grad_norms = compute_gradient_norms(
@@ -577,9 +582,10 @@ def train_encoder(
                         projector.named_parameters(), prefix="proj_"
                     )
                     enc_grad_norms.update(proj_grad_norms)
-            
+
             opt_enc.step()
             scheduler.step()
+
 
 
             for p in discriminator.parameters():
