@@ -64,6 +64,29 @@ debug_state = {
     'last_gram_trace_ratio': 85.0 
 }
 
+
+def apply_z_ln(Z_set: torch.Tensor, context_encoder: nn.Module) -> torch.Tensor:
+    """
+    Apply LayerNorm to Z_set features only.
+    If anchor channel exists (last dim), leave it untouched.
+    """
+    input_dim = Z_set.shape[-1]
+    anchor_train = getattr(context_encoder, "anchor_train", False)
+    expected_in = getattr(context_encoder, "input_dim", None)
+    if expected_in is None and hasattr(context_encoder, "input_proj"):
+        expected_in = context_encoder.input_proj.in_features
+
+    # If anchor channel present: normalize all but last dim
+    if anchor_train and expected_in is not None and input_dim == expected_in:
+        z_feat = Z_set[..., :-1]
+        z_anchor = Z_set[..., -1:]
+        z_feat = F.layer_norm(z_feat, (z_feat.shape[-1],))
+        return torch.cat([z_feat, z_anchor], dim=-1)
+
+    # Otherwise normalize full vector
+    return F.layer_norm(Z_set, (Z_set.shape[-1],))
+
+
 # ===================================================================
 # DIAGNOSTIC HELPER FUNCTIONS FOR PATCH-BASED INFERENCE
 # ===================================================================
@@ -1310,6 +1333,8 @@ def run_ab_tests_fixed_batch(
         
         # Get D_latent from score_net (handle DDP wrapper)
         D_lat = score_net_unwrapped.D_latent
+
+        Z_fixed = apply_z_ln(Z_fixed, context_encoder)
         
         H_fixed = context_encoder(Z_fixed, mask_fixed)
         
@@ -2001,6 +2026,8 @@ def run_probe_eval_multi_sigma(
     
     with torch.no_grad():
         B, N, D = V_target.shape
+        Z_probe = apply_z_ln(Z_probe, context_encoder)
+
         
         # Get context (same for all sigmas)
         H = context_encoder(Z_probe, mask_probe)
@@ -2225,7 +2252,8 @@ def run_probe_open_loop_sample(
         step_indices = torch.linspace(0, 1, n_steps + 1, device=device)
         sigmas = (sigma_max ** (1/rho) + step_indices * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
         sigmas[-1] = 0  # Final sigma is 0 (clean)
-        
+
+        Z_probe = apply_z_ln(Z_probe, context_encoder)
         # ========== Get context (once) ==========
         H = context_encoder(Z_probe, mask_probe)
         
@@ -3485,6 +3513,9 @@ def train_stageC_diffusion_generator(
                 
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
+            # === Z_ln conditioning: normalize Z_set before augmentation ===
+            Z_set = apply_z_ln(Z_set, context_encoder)
+
 
             # Core membership mask (core points of the sampled ST miniset).
             # This is distinct from anchor_cond_mask (conditioning anchors).
@@ -8338,6 +8369,7 @@ def train_stageC_diffusion_generator(
                 
                 with torch.no_grad():
                     Z_fixed = fixed_batch_data['Z_set'].to(device)
+                    Z_fixed = apply_z_ln(Z_fixed, context_encoder)
                     mask_fixed = fixed_batch_data['mask'].to(device)
                     V_target_fixed = fixed_batch_data['V_target'].to(device)
                     G_target_fixed = fixed_batch_data['G_target'].to(device)
@@ -11935,7 +11967,17 @@ def sample_sc_edm_patchwise(
                     Z_k_batched = torch.cat([Z_k_batched, zeros_anchor], dim=-1)
                     if k == 0:
                         print(f"[ANCHOR-CHAN] Initial sampling: appended zero anchor channel")
-                
+
+                # === Z_ln conditioning for sampling ===
+                if expected_in_ctx is not None and expected_in_ctx == Z_k_batched.shape[-1]:
+                    # Handle anchor channel: normalize all but last dim
+                    z_feat = Z_k_batched[..., :-1]
+                    z_anchor = Z_k_batched[..., -1:]
+                    z_feat = F.layer_norm(z_feat, (z_feat.shape[-1],))
+                    Z_k_batched = torch.cat([z_feat, z_anchor], dim=-1)
+                else:
+                    Z_k_batched = F.layer_norm(Z_k_batched, (Z_k_batched.shape[-1],))
+
                 H_k = context_encoder(Z_k_batched, mask_k)
                 
                 # CORAL transform if enabled
@@ -12987,6 +13029,17 @@ def sample_sc_edm_patchwise(
                     Z_k = Z_all[S_k_cpu].to(device)
                     Z_k_batched = Z_k.unsqueeze(0)  # (1, m_k, h_dim)
                     mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
+
+                    # === Z_ln conditioning for sampling ===
+                    if expected_in_ctx is not None and expected_in_ctx == Z_k_batched.shape[-1]:
+                        # Handle anchor channel: normalize all but last dim
+                        z_feat = Z_k_batched[..., :-1]
+                        z_anchor = Z_k_batched[..., -1:]
+                        z_feat = F.layer_norm(z_feat, (z_feat.shape[-1],))
+                        Z_k_batched = torch.cat([z_feat, z_anchor], dim=-1)
+                    else:
+                        Z_k_batched = F.layer_norm(Z_k_batched, (Z_k_batched.shape[-1],))
+
                     
                     # ========== NEW: Add anchor channel if context_encoder expects it ==========
                     expected_in = getattr(context_encoder, "input_dim", None)
