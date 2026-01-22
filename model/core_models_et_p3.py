@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import os
 from typing import Dict, List, Tuple, Optional
+import torch.nn.functional as F
 
 from core_models_et_p1 import (
     SharedEncoder, train_encoder, STStageBPrecomputer, 
@@ -238,6 +239,9 @@ class GEMSModel:
     # ==========================================================================
     # STAGE A: ENCODER TRAINING
     # ==========================================================================
+    # ==========================================================================
+    # STAGE A: ENCODER TRAINING (FIXED VICReg+GRL CONFIG)
+    # ==========================================================================
     def train_stageA(
         self,
         st_gene_expr: torch.Tensor,
@@ -247,49 +251,24 @@ class GEMSModel:
         n_epochs: int = 1000,
         batch_size: int = 256,
         lr: float = 1e-3,
-        sigma: Optional[float] = None,
-        alpha: float = 0.9,
-        ratio_start: float = 0.0,      # ADD THIS
-        ratio_end: float = 1.0,        # ADD THIS
-        mmdbatch: float = 0.1,
         outf: str = 'output',
-        # NEW: Local miniset parameters
-        local_miniset_mode: bool = False,
-        n_min: int = 128,
-        n_max: int = 384,
-        pool_mult: float = 4.0,
-        stochastic_tau: float = 1.0,
-        # NEW: Slide-invariance parameters
-        slide_align_mode: str = 'none',
-        slide_align_weight: float = 1.0,
-        # NEW: Optional losses
-        use_circle: bool = True,
-        use_mmd_sc: bool = True,
     ):
         """
-        Train shared encoder (Stage A).
-        
-        Args:
-            st_gene_expr: (n_st, n_genes)
-            st_coords: (n_st, 2)
-            sc_gene_expr: (n_sc, n_genes)
-            slide_ids: (n_st,) optional slide identifiers
-            n_epochs: training epochs
-            batch_size: batch size
-            lr: learning rate
-            sigma: RBF bandwidth (auto if None)
-            alpha: MMD loss weight (domain alignment)           # UPDATE THIS
-            ratio_start: circle loss warmup start value         # ADD THIS
-            ratio_end: circle loss warmup end value             # ADD THIS
-            mmdbatch: MMD batch fraction
-            outf: output directory
+        Train shared encoder (Stage A) using fixed VICReg + adversary config.
+        This is now the only supported Stage A path.
         """
         print("\n" + "="*60)
-        print("STAGE A: Training Shared Encoder")
+        print("STAGE A: Training Shared Encoder (VICReg + GRL)")
         print("="*60)
-        
-        self.encoder = train_encoder(
-            model=self.encoder,
+
+        encoder_vicreg = SharedEncoder(
+            n_genes=st_gene_expr.shape[1],
+            n_embedding=[512, 256, 128],
+            dropout=0.1
+        )
+
+        encoder_vicreg, projector, discriminator, hist = train_encoder(
+            model=encoder_vicreg,
             st_gene_expr=st_gene_expr,
             st_coords=st_coords,
             sc_gene_expr=sc_gene_expr,
@@ -297,30 +276,54 @@ class GEMSModel:
             n_epochs=n_epochs,
             batch_size=batch_size,
             lr=lr,
-            sigma=sigma,
-            alpha=alpha,
-            ratio_start=ratio_start,      # ADD THIS
-            ratio_end=ratio_end,          # ADD THIS
-            mmdbatch=mmdbatch,
             device=self.device,
             outf=outf,
-            local_miniset_mode=local_miniset_mode,
-            n_min=n_min,
-            n_max=n_max,
-            pool_mult=pool_mult,
-            stochastic_tau=stochastic_tau,
-            slide_align_mode=slide_align_mode,
-            slide_align_weight=slide_align_weight,
-            use_circle=use_circle,
-            use_mmd_sc=use_mmd_sc,
+            # ========== VICReg Mode ==========
+            stageA_obj='vicreg_adv',
+            vicreg_lambda_inv=25.0,
+            vicreg_lambda_var=25.0,
+            vicreg_lambda_cov=1.0,
+            vicreg_gamma=1.0,
+            vicreg_eps=1e-4,
+            vicreg_project_dim=256,
+            vicreg_use_projector=False,
+            vicreg_float32_stats=True,
+            vicreg_ddp_gather=False,
+            # Expression augmentations
+            aug_gene_dropout=0.2,
+            aug_gauss_std=0.01,
+            aug_scale_jitter=0.1,
+            # Domain adversary
+            adv_slide_weight=50.0,
+            adv_warmup_epochs=50,
+            adv_ramp_epochs=200,
+            grl_alpha_max=1.0,
+            disc_hidden=256,
+            disc_dropout=0.1,
+            # Balanced domain sampling
+            stageA_balanced_slides=True,
+            # Adversary representation
+            adv_representation_mode='clean',
+            adv_use_layernorm=True,
+            adv_log_diagnostics=True,
+            adv_log_grad_norms=False,
+            # Local alignment
+            use_local_align=True,
+            local_align_bidirectional=True,
+            local_align_weight=4.0,
+            local_align_tau_z=0.07,
+            return_aux=True
         )
-        
+
+        self.encoder = encoder_vicreg
+
         # Freeze encoder for subsequent stages
         self.encoder.eval()
         for param in self.encoder.parameters():
             param.requires_grad = False
-        
+
         print("Stage A complete. Encoder frozen.")
+
     
     # ==========================================================================
     # STAGE B: PRECOMPUTE GEOMETRIC TARGETS
@@ -947,14 +950,14 @@ class GEMSModel:
 
         # Prepare CORAL params if enabled
         coral_params = None
-        if hasattr(self, 'coral_enabled') and self.coral_enabled:
-            coral_params = {
-                'mu_sc': self.coral_mu_sc,
-                'mu_st': self.coral_mu_st,
-                'A': self.coral_A,
-                'B': self.coral_B,
-            }
-            print("[CORAL] Applying CORAL transformation during SC inference")
+        # if hasattr(self, 'coral_enabled') and self.coral_enabled:
+        #     coral_params = {
+        #         'mu_sc': self.coral_mu_sc,
+        #         'mu_st': self.coral_mu_st,
+        #         'A': self.coral_A,
+        #         'B': self.coral_B,
+        #     }
+        #     print("[CORAL] Applying CORAL transformation during SC inference")
 
         # If you have a stored ST scale, you can pass it; otherwise None
         target_st_p95 = getattr(self, "target_st_p95", None)
@@ -1118,6 +1121,8 @@ class GEMSModel:
                 
                 # Encode
                 Z = self.encoder(gene_expr)
+                Z = F.layer_norm(Z, (Z.shape[1],))
+
                 mask = torch.ones(n, dtype=torch.bool, device=self.device)
                 
                 # Context
@@ -1213,6 +1218,8 @@ class GEMSModel:
                 
                 # Encode
                 Z = self.encoder(gene_expr)
+                Z = F.layer_norm(Z, (Z.shape[1],))
+
                 mask = torch.ones(n, dtype=torch.bool, device=self.device)
                 
                 # Context
