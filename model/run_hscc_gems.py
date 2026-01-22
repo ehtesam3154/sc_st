@@ -136,6 +136,61 @@ def parse_args():
                         choices=['unanchored', 'anchored'],
                         help='Inference mode: unanchored (legacy) or anchored (new sequential)')
     
+    # ========== NEW: Stage A VICReg + Adversary Arguments ==========
+    parser.add_argument('--stageA_obj', type=str, default='geom',
+                        choices=['geom', 'vicreg_adv'],
+                        help='Stage A objective: geom (coord-based) or vicreg_adv (SSL)')
+    
+    # VICReg loss weights
+    parser.add_argument('--vicreg_lambda_inv', type=float, default=25.0,
+                        help='VICReg invariance loss weight')
+    parser.add_argument('--vicreg_lambda_var', type=float, default=25.0,
+                        help='VICReg variance loss weight')
+    parser.add_argument('--vicreg_lambda_cov', type=float, default=1.0,
+                        help='VICReg covariance loss weight')
+    parser.add_argument('--vicreg_gamma', type=float, default=1.0,
+                        help='VICReg target std (variance hinge threshold)')
+    parser.add_argument('--vicreg_eps', type=float, default=1e-4,
+                        help='VICReg numerical stability epsilon')
+    parser.add_argument('--vicreg_project_dim', type=int, default=256,
+                        help='VICReg projector output dimension')
+    parser.add_argument('--vicreg_use_projector', action=argparse.BooleanOptionalAction, 
+                        default=True,
+                        help='Use projector head for VICReg')
+    parser.add_argument('--vicreg_float32_stats', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Compute VICReg var/cov in fp32')
+    parser.add_argument('--vicreg_ddp_gather', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Gather embeddings across GPUs for VICReg var/cov')
+    
+    # Expression augmentations
+    parser.add_argument('--aug_gene_dropout', type=float, default=0.2,
+                        help='Gene dropout probability')
+    parser.add_argument('--aug_gauss_std', type=float, default=0.01,
+                        help='Gaussian noise std')
+    parser.add_argument('--aug_scale_jitter', type=float, default=0.2,
+                        help='Scale jitter range [1-j, 1+j]')
+    
+    # Slide adversary
+    parser.add_argument('--adv_slide_weight', type=float, default=1.0,
+                        help='Slide adversary loss weight')
+    parser.add_argument('--adv_warmup_epochs', type=int, default=10,
+                        help='Adversary warmup epochs (alpha=0)')
+    parser.add_argument('--adv_ramp_epochs', type=int, default=20,
+                        help='Adversary ramp epochs (0 to alpha_max)')
+    parser.add_argument('--grl_alpha_max', type=float, default=1.0,
+                        help='Maximum GRL alpha value')
+    parser.add_argument('--disc_hidden', type=int, default=256,
+                        help='Discriminator hidden dimension')
+    parser.add_argument('--disc_dropout', type=float, default=0.1,
+                        help='Discriminator dropout')
+    
+    # Balanced slide sampling
+    parser.add_argument('--stageA_balanced_slides', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Balance batch sampling across slides in Stage A')
+    
     return parser.parse_args()
 
 
@@ -147,7 +202,10 @@ def load_hscc_data():
     print("Loading hSCC data...")
     
     # Load SC data (used as test data, like ST2 in mouse_brain)
-    scadata = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/scP2.h5ad')
+    # scadata = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/scP2.h5ad')
+    # Treat ST3 as the "SC" domain for now (so we have GT coords)
+    scadata = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/stP2rep3.h5ad')
+
     
     # Load 3 ST datasets (use first 2 for training, 3rd for inference)
     stadata1 = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/stP2.h5ad')
@@ -161,23 +219,22 @@ def load_hscc_data():
         sc.pp.log1p(adata)
     
     # Create rough cell types for SC data (from hSCC_gems.ipynb)
-    print("Creating rough cell types...")
-    scadata.obs['celltype'] = scadata.obs['level1_celltype'].astype(str)
-    scadata.obs.loc[scadata.obs['level1_celltype']=='CLEC9A', 'celltype'] = 'DC'
-    scadata.obs.loc[scadata.obs['level1_celltype']=='CD1C', 'celltype'] = 'DC'
-    scadata.obs.loc[scadata.obs['level1_celltype']=='ASDC', 'celltype'] = 'DC'
-    scadata.obs.loc[scadata.obs['level1_celltype']=='PDC', 'celltype'] = 'PDC'
-    scadata.obs.loc[scadata.obs['level1_celltype']=='MDSC', 'celltype'] = 'DC'
-    scadata.obs.loc[scadata.obs['level1_celltype']=='LC', 'celltype'] = 'DC'
-    scadata.obs.loc[scadata.obs['level1_celltype']=='Mac', 'celltype'] = 'Myeloid cell'
-    scadata.obs.loc[scadata.obs['level1_celltype']=='Tcell', 'celltype'] = 'T cell'
-    scadata.obs.loc[scadata.obs['level2_celltype']=='TSK', 'celltype'] = 'TSK'
-    scadata.obs.loc[scadata.obs['level2_celltype'].isin(['Tumor_KC_Basal', 'Tumor_KC_Diff', 'Tumor_KC_Cyc']), 'celltype'] = 'NonTSK'
-    
-    print(f"SC data loaded: {scadata.shape[0]} cells, {scadata.shape[1]} genes")
-    print(f"ST slide 1: {stadata1.shape[0]} spots, {stadata1.shape[1]} genes")
-    print(f"ST slide 2: {stadata2.shape[0]} spots, {stadata2.shape[1]} genes")
-    print(f"ST slide 3 (inference): {stadata3.shape[0]} spots, {stadata3.shape[1]} genes")
+    if 'level1_celltype' in scadata.obs.columns:
+        print("Creating rough cell types...")
+        scadata.obs['celltype'] = scadata.obs['level1_celltype'].astype(str)
+        scadata.obs.loc[scadata.obs['level1_celltype']=='CLEC9A', 'celltype'] = 'DC'
+        scadata.obs.loc[scadata.obs['level1_celltype']=='CD1C', 'celltype'] = 'DC'
+        scadata.obs.loc[scadata.obs['level1_celltype']=='ASDC', 'celltype'] = 'DC'
+        scadata.obs.loc[scadata.obs['level1_celltype']=='PDC', 'celltype'] = 'PDC'
+        scadata.obs.loc[scadata.obs['level1_celltype']=='MDSC', 'celltype'] = 'DC'
+        scadata.obs.loc[scadata.obs['level1_celltype']=='LC', 'celltype'] = 'DC'
+        scadata.obs.loc[scadata.obs['level1_celltype']=='Mac', 'celltype'] = 'Myeloid cell'
+        scadata.obs.loc[scadata.obs['level1_celltype']=='Tcell', 'celltype'] = 'T cell'
+        scadata.obs.loc[scadata.obs['level2_celltype']=='TSK', 'celltype'] = 'TSK'
+        scadata.obs.loc[scadata.obs['level2_celltype'].isin(['Tumor_KC_Basal', 'Tumor_KC_Diff', 'Tumor_KC_Cyc']), 'celltype'] = 'NonTSK'
+    else:
+        print("No celltype metadata in scadata (ST3). Skipping celltype relabeling.")
+
     
     return scadata, stadata1, stadata2, stadata3
 
@@ -331,21 +388,19 @@ def main(args=None):
         print(f"[Rank-0] Per-slide canonicalization: {len(torch.unique(slide_ids))} slides")
 
         print("\n=== Stage A (single GPU, rank-0) ===")
-        model.train_stageA(
-            st_gene_expr=st_expr,
-            st_coords=st_coords,
-            sc_gene_expr=sc_expr,
-            slide_ids=slide_ids,
-            n_epochs=stageA_epochs,
-            batch_size=256,
-            lr=1e-4,
-            sigma=None,
-            alpha=0.8,
-            ratio_start=0.0,
-            ratio_end=1.0,
-            mmdbatch=1.0,
-            outf=outdir,
-        )
+        if fabric.is_global_zero:
+            # Stage A
+            print("\n=== Stage A (single GPU, rank-0) ===")
+            model.train_stageA(
+                st_gene_expr=st_expr,
+                st_coords=st_coords,
+                sc_gene_expr=sc_expr,
+                slide_ids=slide_ids,
+                n_epochs=stageA_epochs,
+                batch_size=256,
+                lr=1e-3,
+                outf=outdir,
+            )
 
         print("\n=== Stage B (single GPU, rank-0) ===")
         # Create slides_dict for 2 training slides
@@ -735,39 +790,39 @@ def main(args=None):
     if not fabric.is_global_zero:
         return
     
-    # ========== COMPUTE CORAL TRANSFORMATION PARAMETERS ==========
-    print("\n" + "="*70)
-    print("COMPUTING CORAL TRANSFORMATION PARAMETERS")
-    print("="*70)
+    # # ========== COMPUTE CORAL TRANSFORMATION PARAMETERS ==========
+    # print("\n" + "="*70)
+    # print("COMPUTING CORAL TRANSFORMATION PARAMETERS")
+    # print("="*70)
     
-    # Rebuild st_gene_expr_dict for CORAL computation (it's still in scope but make sure)
-    st1_expr_tensor = torch.tensor(X_st1, dtype=torch.float32, device=fabric.device)
-    st2_expr_tensor = torch.tensor(X_st2, dtype=torch.float32, device=fabric.device)
-    st_gene_expr_dict = {
-        0: st1_expr_tensor,
-        1: st2_expr_tensor
-    }
+    # # Rebuild st_gene_expr_dict for CORAL computation (it's still in scope but make sure)
+    # st1_expr_tensor = torch.tensor(X_st1, dtype=torch.float32, device=fabric.device)
+    # st2_expr_tensor = torch.tensor(X_st2, dtype=torch.float32, device=fabric.device)
+    # st_gene_expr_dict = {
+    #     0: st1_expr_tensor,
+    #     1: st2_expr_tensor
+    # }
     
-    # Compute ST distribution from training slides
-    model.compute_coral_params_from_st(
-        st_gene_expr_dict=st_gene_expr_dict,
-        n_samples=2000,
-        n_min=96,
-        n_max=384,
-    )
+    # # Compute ST distribution from training slides
+    # model.compute_coral_params_from_st(
+    #     st_gene_expr_dict=st_gene_expr_dict,
+    #     n_samples=2000,
+    #     n_min=96,
+    #     n_max=384,
+    # )
     
-    # Compute SC distribution and build CORAL transform
-    # For HSCC: use SC data for transform (even though we infer on ST3)
-    model.build_coral_transform(
-        sc_gene_expr=sc_expr,
-        n_samples=2000,
-        n_min=96,
-        n_max=384,
-        shrink=0.01,
-        eps=1e-5,
-    )
+    # # Compute SC distribution and build CORAL transform
+    # # For HSCC: use SC data for transform (even though we infer on ST3)
+    # model.build_coral_transform(
+    #     sc_gene_expr=sc_expr,
+    #     n_samples=2000,
+    #     n_min=96,
+    #     n_max=384,
+    #     shrink=0.01,
+    #     eps=1e-5,
+    # )
     
-    print("✓ CORAL transformation ready for inference")
+    # print("✓ CORAL transformation ready for inference")
 
 
     # ---------- Inference (rank-0 only, single GPU) ----------
