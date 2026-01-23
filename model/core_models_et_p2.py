@@ -10778,6 +10778,8 @@ def sample_sc_edm_patchwise(
     debug_k_list: Tuple[int, int] = (10, 20),
     debug_global_subset: int = 4096,
     debug_gap_k: int = 10,
+    # --- ANCHOR-CHANNEL DIAGNOSTIC ---
+    anchor_channel_sensitivity_diag: bool = False,
     # --- TWO-PASS MODE ---
     two_pass: bool = False,
     _pass_number: int = 1,  # Internal: which pass are we on (1 or 2)
@@ -12515,13 +12517,34 @@ def sample_sc_edm_patchwise(
                   f"p50={ov_t.median().item():.0f} p75={ov_t.quantile(0.75).item():.0f} max={ov_t.max().item():.0f}")
         
         # Choose root patch (max total overlap mass)
+        # Choose root patch by geometry quality (lowest anisotropy), tie-break by overlap mass
         overlap_mass = {}
         for k in range(K):
             mass = sum(G_overlap[k][nbr]['weight'] for nbr in G_overlap.neighbors(k)) if G_overlap.degree(k) > 0 else 0
             overlap_mass[k] = mass
-        root_patch = max(overlap_mass, key=overlap_mass.get)
+
+        patch_aniso = {}
+        for k in range(K):
+            V = patch_coords_seq[k].to(device)
+            Vc = V - V.mean(dim=0, keepdim=True)
+            cov = (Vc.T @ Vc) / max(1, Vc.shape[0] - 1)
+            eigs = torch.linalg.eigvalsh(cov)
+            aniso = (eigs.max() / eigs.min().clamp(min=1e-8)).item()
+            patch_aniso[k] = aniso
+
+        best_aniso = min(patch_aniso.values())
+        candidates = [k for k, a in patch_aniso.items() if abs(a - best_aniso) / max(best_aniso, 1e-8) < 1e-6]
+        root_patch = max(candidates, key=lambda k: overlap_mass[k])
+
+        print(f"[ANCHOR-ORDER] root_patch={root_patch} aniso={patch_aniso[root_patch]:.2e} overlap_mass={overlap_mass[root_patch]}")
+
+        # overlap_mass = {}
+        # for k in range(K):
+        #     mass = sum(G_overlap[k][nbr]['weight'] for nbr in G_overlap.neighbors(k)) if G_overlap.degree(k) > 0 else 0
+        #     overlap_mass[k] = mass
+        # root_patch = max(overlap_mass, key=overlap_mass.get)
         
-        print(f"[ANCHOR-ORDER] root_patch={root_patch} overlap_mass={overlap_mass[root_patch]}")
+        # print(f"[ANCHOR-ORDER] root_patch={root_patch} overlap_mass={overlap_mass[root_patch]}")
         
         # -------------------------------------------------------------------
         # Sequential placement (BFS order)
@@ -12813,22 +12836,35 @@ def sample_sc_edm_patchwise(
                 A_k = []               # hard anchors (global indices)
                 revise_overlap = []     # overlap but NOT anchored (global indices)
             else:
-                # DIAGNOSTIC: over-anchor all overlap points for edm_anchor_local
-                if anchor_sampling_mode == "edm_anchor_local":
-                    A_k = list(overlap_global)  # anchor ALL overlap points
-                    revise_overlap = []         # nothing left to revise
-                else:
-                    nA_raw = max(1, int(round(infer_anchor_frac * n_overlap)))
-                    nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw))
-                    nA = min(nA, n_overlap)  # hard cap
-                    # perm = torch.randperm(n_overlap, device=device)[:nA]
-                    # A_k = [overlap_global[j] for j in perm.tolist()]
-                    X_overlap = X_placed[overlap_global].float()
-                    idx_pick = pick_farthest_indices(X_overlap, nA)
-                    A_k = [overlap_global[j] for j in idx_pick]
+                # Cap anchors to training-like range even for edm_anchor_local
+                nA_raw = max(1, int(round(infer_anchor_frac * n_overlap)))
+                nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw))
+                nA = min(nA, n_overlap)  # hard cap
 
-                    A_set = set(A_k)
-                    revise_overlap = [g for g in overlap_global if g not in A_set]
+                # Use farthest-point sampling in overlap (more stable than random)
+                X_overlap = X_placed[overlap_global].float()
+                idx_pick = pick_farthest_indices(X_overlap, nA)
+                A_k = [overlap_global[j] for j in idx_pick]
+
+                A_set = set(A_k)
+                revise_overlap = [g for g in overlap_global if g not in A_set]
+
+                # # DIAGNOSTIC: over-anchor all overlap points for edm_anchor_local
+                # if anchor_sampling_mode == "edm_anchor_local":
+                #     A_k = list(overlap_global)  # anchor ALL overlap points
+                #     revise_overlap = []         # nothing left to revise
+                # else:
+                #     nA_raw = max(1, int(round(infer_anchor_frac * n_overlap)))
+                #     nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw))
+                #     nA = min(nA, n_overlap)  # hard cap
+                #     # perm = torch.randperm(n_overlap, device=device)[:nA]
+                #     # A_k = [overlap_global[j] for j in perm.tolist()]
+                #     X_overlap = X_placed[overlap_global].float()
+                #     idx_pick = pick_farthest_indices(X_overlap, nA)
+                #     A_k = [overlap_global[j] for j in idx_pick]
+
+                #     A_set = set(A_k)
+                #     revise_overlap = [g for g in overlap_global if g not in A_set]
 
 
             n_anchors = len(A_k)
@@ -12852,8 +12888,15 @@ def sample_sc_edm_patchwise(
                         Rr, sr, tr, rmseA = weighted_procrustes_2d(V_ref_A, X_A)
                         V_ref_aligned = sr * (V_ref @ Rr.T) + tr
                     else:
-                        Rr, tr, rmseA = weighted_procrustes_rt_rankk_frozen_perp(V_ref_A, X_A, weights=None, rank_k=2)
-                        V_ref_aligned = (V_ref @ Rr.T) + tr
+                        Rr, sr, tr, rmseA = weighted_procrustes_full_d(V_ref_A, X_A)
+                        if align_freeze_scale:
+                            sr = sr * 0.0 + 1.0
+                        sr = sr.clamp(align_scale_clamp[0], align_scale_clamp[1])
+                        V_ref_aligned = sr * (V_ref @ Rr.T) + tr
+
+                    # else:
+                    #     Rr, tr, rmseA = weighted_procrustes_rt_rankk_frozen_perp(V_ref_A, X_A, weights=None, rank_k=2)
+                    #     V_ref_aligned = (V_ref @ Rr.T) + tr
 
 
                     idxO_local = torch.tensor(overlap_local_idx, device=device, dtype=torch.long)
@@ -13111,8 +13154,16 @@ def sample_sc_edm_patchwise(
                         if len(processed) <= 3:
                             print(f"[ANCHOR-CHAN] appended anchor channel, Z_k shape={Z_k_batched.shape}, nA_marked={anchor_channel.sum().item():.0f}")
                     
-                    H_k = context_encoder(Z_k_batched, mask_k)
                     
+                    H_k = context_encoder(Z_k_batched, mask_k)
+
+                    # ========== ANCHOR-CHANNEL SENSITIVITY DIAGNOSTIC ==========
+                    H_k_no_anchor = None
+                    if anchor_channel_sensitivity_diag and expected_in is not None and expected_in == Z_k.shape[-1] + 1:
+                        Z_k_no_anchor = Z_k_batched.clone()
+                        Z_k_no_anchor[..., -1] = 0.0  # Zero ONLY the anchor channel
+                        H_k_no_anchor = context_encoder(Z_k_no_anchor, mask_k)
+
                     # ========== NEW: Build anchor-aware unconditional context for CFG ==========
                     H_uncond = None
                     if use_anchor_aware_cfg and guidance_scale != 1.0:
@@ -13126,7 +13177,7 @@ def sample_sc_edm_patchwise(
                         H_uncond = context_encoder(Z_uncond, mask_k)
                         if len(processed) <= 3:
                             print(f"[ANCHOR-CFG] computed anchor-aware H_uncond")
-                    
+
                     if coral_params is not None:
                         from core_models_et_p3 import GEMSModel
                         H_k = GEMSModel.apply_coral_transform(
@@ -13136,10 +13187,18 @@ def sample_sc_edm_patchwise(
                             B=coral_params['B'],
                             mu_st=coral_params['mu_st']
                         )
-                        # Also transform H_uncond if it exists
+                        # Also transform H_uncond / H_k_no_anchor if they exist
                         if H_uncond is not None:
                             H_uncond = GEMSModel.apply_coral_transform(
                                 H_uncond,
+                                mu_sc=coral_params['mu_sc'],
+                                A=coral_params['A'],
+                                B=coral_params['B'],
+                                mu_st=coral_params['mu_st']
+                            )
+                        if H_k_no_anchor is not None:
+                            H_k_no_anchor = GEMSModel.apply_coral_transform(
+                                H_k_no_anchor,
                                 mu_sc=coral_params['mu_sc'],
                                 A=coral_params['A'],
                                 B=coral_params['B'],
@@ -13155,10 +13214,18 @@ def sample_sc_edm_patchwise(
                         # R_pre, s_pre, t_pre, rmse_pre = weighted_procrustes_full_d(V_gen_anchor, X_anchor_global)
                         # s_pre = s_pre.clamp(0.5, 2.0)
                         # V_gen = s_pre * (V_gen @ R_pre.T) + t_pre
-                        R_pre, t_pre, rmse_pre = weighted_procrustes_rt(V_gen_anchor, X_anchor_global)
-                        V_gen = (V_gen @ R_pre.T) + t_pre
+                        # R_pre, t_pre, rmse_pre = weighted_procrustes_rt(V_gen_anchor, X_anchor_global)
+                        # V_gen = (V_gen @ R_pre.T) + t_pre
+                        # if len(processed) <= 3:
+                        #     print(f"[EDM-ANCHOR-PROCR] patch={k} rmse={rmse_pre.item():.4f} (rigid-no-scale)")
+                        R_pre, s_pre, t_pre, rmse_pre = weighted_procrustes_full_d(V_gen_anchor, X_anchor_global)
+                        if align_freeze_scale:
+                            s_pre = s_pre * 0.0 + 1.0
+                        s_pre = s_pre.clamp(align_scale_clamp[0], align_scale_clamp[1])
+                        V_gen = s_pre * (V_gen @ R_pre.T) + t_pre
                         if len(processed) <= 3:
-                            print(f"[EDM-ANCHOR-PROCR] patch={k} rmse={rmse_pre.item():.4f} (rigid-no-scale)")
+                            print(f"[EDM-ANCHOR-PROCR] patch={k} rmse={rmse_pre.item():.4f} s={s_pre.item():.3f} (similarity)")
+
 
                     # ========== UNKNOWN MASK for selective updates ==========
                     # ========== UNKNOWN MASK for selective updates ==========
@@ -13228,6 +13295,22 @@ def sample_sc_edm_patchwise(
                             sigma_data,
                             center_mask=anchor_cond_mask_k,
                         )
+
+                        # ===== DIAG: does anchor channel change prediction? =====
+                        if anchor_channel_sensitivity_diag and H_k_no_anchor is not None and i == 0 and len(processed) <= 3:
+                            x0_no_anchor = _forward_edm_self_cond(
+                                score_net,
+                                V_t,
+                                sigma_b,
+                                H_k_no_anchor,
+                                mask_k,
+                                sigma_data,
+                                center_mask=anchor_cond_mask_k,
+                            )
+                            diff = (x0_c - x0_no_anchor).norm(dim=[1, 2]).mean().item()
+                            base = x0_c.norm(dim=[1, 2]).mean().item()
+                            rel = diff / max(base, 1e-8)
+                            print(f"[ANCHOR-CHAN-DIAG] patch={k} sigma={float(sigma):.4f} abs={diff:.4f} rel={rel:.4f}")
 
                         if guidance_scale != 1.0:
                             # ========== Anchor-aware CFG ==========
