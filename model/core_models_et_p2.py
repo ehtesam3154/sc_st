@@ -10889,6 +10889,34 @@ def sample_sc_edm_patchwise(
             overlaps.append(overlap)
         return torch.tensor(overlaps)  # (n,)
 
+    def _forward_edm_self_cond(
+        score_net,
+        x_t,
+        sigma_b,
+        H_ctx,
+        mask_k,
+        sigma_data,
+        center_mask=None,
+    ):
+        x0_pred_0 = score_net.forward_edm(
+            x_t,
+            sigma_b,
+            H_ctx,
+            mask_k,
+            sigma_data,
+            self_cond=None,
+            center_mask=center_mask,
+        )
+        x0_pred = score_net.forward_edm(
+            x_t,
+            sigma_b,
+            H_ctx,
+            mask_k,
+            sigma_data,
+            self_cond=x0_pred_0.detach(),
+            center_mask=center_mask,
+        )
+        return x0_pred
 
     def _nn_gap_stats(coords, k_gap):
         """Compute NN gap statistics: gap = d[k+1] - d[k], gap_ratio = gap / d[k]."""
@@ -11980,16 +12008,16 @@ def sample_sc_edm_patchwise(
 
                 H_k = context_encoder(Z_k_batched, mask_k)
                 
-                # CORAL transform if enabled
-                if coral_params is not None:
-                    from core_models_et_p3 import GEMSModel
-                    H_k = GEMSModel.apply_coral_transform(
-                        H_k,
-                        mu_sc=coral_params['mu_sc'],
-                        A=coral_params['A'],
-                        B=coral_params['B'],
-                        mu_st=coral_params['mu_st']
-                    )
+                # # CORAL transform if enabled
+                # if coral_params is not None:
+                #     from core_models_et_p3 import GEMSModel
+                #     H_k = GEMSModel.apply_coral_transform(
+                #         H_k,
+                #         mu_sc=coral_params['mu_sc'],
+                #         A=coral_params['A'],
+                #         B=coral_params['B'],
+                #         mu_st=coral_params['mu_st']
+                #     )
                 
                 # Generator proposal (full D_latent)
                 V_gen = generator(H_k, mask_k)  # (1, m_k, D_latent)
@@ -12020,11 +12048,15 @@ def sample_sc_edm_patchwise(
                     sigma_b = sigma.view(1)
                     
                     # Score prediction with CFG (FULL D_latent)
-                    x0_c = score_net.forward_edm(V_t, sigma_b, H_k, mask_k, sigma_data, self_cond=None)
+                    x0_c = _forward_edm_self_cond(
+                        score_net, V_t, sigma_b, H_k, mask_k, sigma_data
+                    )
                     
                     if guidance_scale != 1.0:
                         H_null = torch.zeros_like(H_k)
-                        x0_u = score_net.forward_edm(V_t, sigma_b, H_null, mask_k, sigma_data, self_cond=None)
+                        x0_u = _forward_edm_self_cond(
+                            score_net, V_t, sigma_b, H_null, mask_k, sigma_data
+                        )
                         
                         sigma_f = float(sigma)
                         guidance_eff = _sigma_guidance_eff(sigma_f, guidance_scale)
@@ -12044,9 +12076,23 @@ def sample_sc_edm_patchwise(
                     
                     # Heun corrector
                     if sigma_next > 0:
-                        x0_next_c = score_net.forward_edm(V_euler, sigma_next.view(1), H_k, mask_k, sigma_data, self_cond=None)
+                        x0_next_c = _forward_edm_self_cond(
+                            score_net,
+                            V_euler,
+                            sigma_next.view(1),
+                            H_k,
+                            mask_k,
+                            sigma_data,
+                        )
                         if guidance_scale != 1.0:
-                            x0_next_u = score_net.forward_edm(V_euler, sigma_next.view(1), H_null, mask_k, sigma_data, self_cond=None)
+                            x0_next_u = _forward_edm_self_cond(
+                                score_net,
+                                V_euler,
+                                sigma_next.view(1),
+                                H_null,
+                                mask_k,
+                                sigma_data,
+                            )
                             
                             sigma_next_f = float(sigma_next)
                             guidance_eff_next = _sigma_guidance_eff(sigma_next_f, guidance_scale)
@@ -12767,17 +12813,23 @@ def sample_sc_edm_patchwise(
                 A_k = []               # hard anchors (global indices)
                 revise_overlap = []     # overlap but NOT anchored (global indices)
             else:
-                nA_raw = max(1, int(round(infer_anchor_frac * n_overlap)))
-                nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw))
-                nA = min(nA, n_overlap)  # hard cap
-                # perm = torch.randperm(n_overlap, device=device)[:nA]
-                # A_k = [overlap_global[j] for j in perm.tolist()]
-                X_overlap = X_placed[overlap_global].float()
-                idx_pick = pick_farthest_indices(X_overlap, nA)
-                A_k = [overlap_global[j] for j in idx_pick]
+                # DIAGNOSTIC: over-anchor all overlap points for edm_anchor_local
+                if anchor_sampling_mode == "edm_anchor_local":
+                    A_k = list(overlap_global)  # anchor ALL overlap points
+                    revise_overlap = []         # nothing left to revise
+                else:
+                    nA_raw = max(1, int(round(infer_anchor_frac * n_overlap)))
+                    nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw))
+                    nA = min(nA, n_overlap)  # hard cap
+                    # perm = torch.randperm(n_overlap, device=device)[:nA]
+                    # A_k = [overlap_global[j] for j in perm.tolist()]
+                    X_overlap = X_placed[overlap_global].float()
+                    idx_pick = pick_farthest_indices(X_overlap, nA)
+                    A_k = [overlap_global[j] for j in idx_pick]
 
-                A_set = set(A_k)
-                revise_overlap = [g for g in overlap_global if g not in A_set]
+                    A_set = set(A_k)
+                    revise_overlap = [g for g in overlap_global if g not in A_set]
+
 
             n_anchors = len(A_k)
             n_revise = len(revise_overlap)
@@ -13167,7 +13219,15 @@ def sample_sc_edm_patchwise(
                         # ========== SAFETY: Clamp anchors to sigma target BEFORE score_net call ==========
                         V_t[0, anchor_idx_t] = get_anchor_target(sigma)
 
-                        x0_c = score_net.forward_edm(V_t, sigma_b, H_k, mask_k, sigma_data, self_cond=None)
+                        x0_c = _forward_edm_self_cond(
+                            score_net,
+                            V_t,
+                            sigma_b,
+                            H_k,
+                            mask_k,
+                            sigma_data,
+                            center_mask=anchor_cond_mask_k,
+                        )
 
                         if guidance_scale != 1.0:
                             # ========== Anchor-aware CFG ==========
@@ -13175,7 +13235,15 @@ def sample_sc_edm_patchwise(
                                 H_null = H_uncond
                             else:
                                 H_null = torch.zeros_like(H_k)
-                            x0_u = score_net.forward_edm(V_t, sigma_b, H_null, mask_k, sigma_data, self_cond=None)
+                            x0_u = _forward_edm_self_cond(
+                                score_net,
+                                V_t,
+                                sigma_b,
+                                H_null,
+                                mask_k,
+                                sigma_data,
+                                center_mask=anchor_cond_mask_k,
+                            )
 
                             guidance_eff = _sigma_guidance_eff(float(sigma), guidance_scale)
 
@@ -13201,9 +13269,25 @@ def sample_sc_edm_patchwise(
                             # This ensures model at sigma_next sees anchors at the correct noise level
                             V_euler[0, anchor_idx_t] = get_anchor_target(sigma_next)
 
-                            x0_next_c = score_net.forward_edm(V_euler, sigma_next.view(1), H_k, mask_k, sigma_data, self_cond=None)
+                            x0_next_c = _forward_edm_self_cond(
+                                score_net,
+                                V_euler,
+                                sigma_next.view(1),
+                                H_k,
+                                mask_k,
+                                sigma_data,
+                                center_mask=anchor_cond_mask_k,
+                            )
                             if guidance_scale != 1.0:
-                                x0_next_u = score_net.forward_edm(V_euler, sigma_next.view(1), H_null, mask_k, sigma_data, self_cond=None)
+                                x0_next_u = _forward_edm_self_cond(
+                                    score_net,
+                                    V_euler,
+                                    sigma_next.view(1),
+                                    H_null,
+                                    mask_k,
+                                    sigma_data,
+                                    center_mask=anchor_cond_mask_k,
+                                )
                                 
                                 guidance_eff_next = _sigma_guidance_eff(float(sigma_next), guidance_scale)
                                 
