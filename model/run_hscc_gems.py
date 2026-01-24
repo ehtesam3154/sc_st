@@ -118,7 +118,16 @@ def parse_args():
     parser.add_argument('--anchor_warmup_steps', type=int, default=0,
                         help='Steps to linearly ramp anchored probability (0=no warmup)')
     parser.add_argument('--anchor_debug_every', type=int, default=200,
-                        help='Steps between anchor debug prints')
+                        help='Debug print frequency for anchor stats')
+
+    # ---- Stage C resume ----
+    parser.add_argument('--resume_stageC_ckpt', type=str, default=None,
+                        help='Path to a full Stage C checkpoint to resume from (must include generator).')
+    parser.add_argument('--resume_reset_optimizer', action=argparse.BooleanOptionalAction, default=False,
+                        help='If set, ignore optimizer state when resuming Stage C.')
+    parser.add_argument('--skip_stageA', action=argparse.BooleanOptionalAction, default=False,
+                        help='Skip Stage A training (useful when resuming from a full checkpoint).')
+
     
     # ========== ANCHOR GEOMETRY LOSSES ==========
     parser.add_argument('--anchor_geom_losses', action=argparse.BooleanOptionalAction, default=True,
@@ -297,10 +306,8 @@ def main(args=None):
         anchor_train=args.anchor_train,
         anchor_geom_losses=args.anchor_geom_losses,
         anchor_geom_mode=args.anchor_geom_mode,
-        anchor_geom_min_unknown=args.anchor_geom_min_unknown,
-        anchor_geom_debug_every=args.anchor_geom_debug_every,
+        anchor_geom_min_unknown=args.anchor_geom_min_unknown
     )
-
 
     # ---------- Stage A & B on rank-0 only ----------
     if fabric.is_global_zero:
@@ -388,19 +395,39 @@ def main(args=None):
         print(f"[Rank-0] Per-slide canonicalization: {len(torch.unique(slide_ids))} slides")
 
         print("\n=== Stage A (single GPU, rank-0) ===")
+
+        resume_ckpt_path = args.resume_stageC_ckpt
+        skip_stageA = args.skip_stageA or (resume_ckpt_path is not None)
+
+        if resume_ckpt_path and fabric.is_global_zero:
+            print(f"[RESUME] Loading full checkpoint: {resume_ckpt_path}")
+            ckpt = torch.load(resume_ckpt_path, map_location=fabric.device)
+            if 'encoder' in ckpt:
+                model.encoder.load_state_dict(ckpt['encoder'])
+            if 'context_encoder' in ckpt:
+                model.context_encoder.load_state_dict(ckpt['context_encoder'])
+            if 'generator' in ckpt:
+                model.generator.load_state_dict(ckpt['generator'])
+            if 'score_net' in ckpt:
+                model.score_net.load_state_dict(ckpt['score_net'])
+            print("[RESUME] Loaded encoder/context/generator/score_net (if present).")
+
         if fabric.is_global_zero:
-            # Stage A
-            print("\n=== Stage A (single GPU, rank-0) ===")
-            model.train_stageA(
-                st_gene_expr=st_expr,
-                st_coords=st_coords,
-                sc_gene_expr=sc_expr,
-                slide_ids=slide_ids,
-                n_epochs=stageA_epochs,
-                batch_size=256,
-                lr=1e-3,
-                outf=outdir,
-            )
+            if skip_stageA:
+                print("[Stage A] Skipped (resume or --skip_stageA enabled).")
+            else:
+                print("\n=== Stage A (single GPU, rank-0) ===")
+                model.train_stageA(
+                    st_gene_expr=st_expr,
+                    st_coords=st_coords,
+                    sc_gene_expr=sc_expr,
+                    slide_ids=slide_ids,
+                    n_epochs=stageA_epochs,
+                    batch_size=256,
+                    lr=1e-3,
+                    outf=outdir,
+                )
+
 
         print("\n=== Stage B (single GPU, rank-0) ===")
         # Create slides_dict for 2 training slides
@@ -583,7 +610,11 @@ def main(args=None):
         anchor_mask_score_loss=args.anchor_mask_score_loss,
         anchor_warmup_steps=args.anchor_warmup_steps,
         anchor_debug_every=args.anchor_debug_every,
+        # ---- Resume Stage C ----
+        resume_stageC_ckpt=args.resume_stageC_ckpt,
+        resume_reset_optimizer=args.resume_reset_optimizer,
     )
+
 
     
     fabric.barrier()
