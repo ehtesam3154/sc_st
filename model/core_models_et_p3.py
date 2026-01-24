@@ -427,6 +427,16 @@ class GEMSModel:
         # ---- Resume Stage C ----
         resume_stageC_ckpt: str = None,
         resume_reset_optimizer: bool = False,
+        # ========== CONTEXT REPLACEMENT INVARIANCE ==========
+        ctx_replace_variant: str = 'permute',
+        ctx_loss_weight: float = 0.0,
+        ctx_replace_p: float = 0.5,
+        ctx_snr_thresh: float = 0.3,
+        ctx_warmup_steps: int = 1000,
+        ctx_debug_every: int = 100,
+        # ========== SELF-CONDITIONING MODE ==========
+        self_cond_mode: str = 'standard',
+
     ):
 
 
@@ -590,6 +600,15 @@ class GEMSModel:
             anchor_geom_debug_every=anchor_geom_debug_every,
             resume_ckpt_path=resume_stageC_ckpt,
             resume_reset_optimizer=resume_reset_optimizer,
+            # ========== CONTEXT REPLACEMENT INVARIANCE ==========
+            ctx_replace_variant=ctx_replace_variant,
+            ctx_loss_weight=ctx_loss_weight,
+            ctx_replace_p=ctx_replace_p,
+            ctx_snr_thresh=ctx_snr_thresh,
+            ctx_warmup_steps=ctx_warmup_steps,
+            ctx_debug_every=ctx_debug_every,
+            # ========== SELF-CONDITIONING MODE ==========
+            self_cond_mode=self_cond_mode,
         )
 
 

@@ -145,6 +145,26 @@ def parse_args():
                         choices=['unanchored', 'anchored'],
                         help='Inference mode: unanchored (legacy) or anchored (new sequential)')
     
+    # ========== CONTEXT REPLACEMENT INVARIANCE ==========
+    parser.add_argument('--ctx_replace_variant', type=str, default='permute',
+                        choices=['permute', 'hard'],
+                        help='Context replacement variant: permute (random shuffle) or hard (most similar)')
+    parser.add_argument('--ctx_loss_weight', type=float, default=0.0,
+                        help='Context replacement invariance loss weight (lambda_ctx)')
+    parser.add_argument('--ctx_replace_p', type=float, default=0.5,
+                        help='Probability of applying context replacement per batch')
+    parser.add_argument('--ctx_snr_thresh', type=float, default=0.3,
+                        help='SNR threshold for context loss gating (0.3-0.5 recommended)')
+    parser.add_argument('--ctx_warmup_steps', type=int, default=1000,
+                        help='Warmup steps for context loss weight')
+    parser.add_argument('--ctx_debug_every', type=int, default=100,
+                        help='Debug print frequency for context replacement loss')
+
+    # ========== SELF-CONDITIONING MODE ==========
+    parser.add_argument('--self_cond_mode', type=str, default='standard',
+                        choices=['none', 'standard'],
+                        help='Self-conditioning mode: none (disabled) or standard (two-pass)')
+
     # ========== NEW: Stage A VICReg + Adversary Arguments ==========
     parser.add_argument('--stageA_obj', type=str, default='geom',
                         choices=['geom', 'vicreg_adv'],
@@ -613,6 +633,15 @@ def main(args=None):
         # ---- Resume Stage C ----
         resume_stageC_ckpt=args.resume_stageC_ckpt,
         resume_reset_optimizer=args.resume_reset_optimizer,
+        # ========== CONTEXT REPLACEMENT INVARIANCE ==========
+        ctx_replace_variant=args.ctx_replace_variant,
+        ctx_loss_weight=args.ctx_loss_weight,
+        ctx_replace_p=args.ctx_replace_p,
+        ctx_snr_thresh=args.ctx_snr_thresh,
+        ctx_warmup_steps=args.ctx_warmup_steps,
+        ctx_debug_every=args.ctx_debug_every,
+        # ========== SELF-CONDITIONING MODE ==========
+        self_cond_mode=args.self_cond_mode,
     )
 
 
