@@ -14056,7 +14056,7 @@ def sample_sc_edm_patchwise(
     # ------------------------------------------------------------------
     # DEBUG: Save patch coords (AFTER all patches sampled, BEFORE alignment)
     # ------------------------------------------------------------------
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         all_rms = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
         print(f"\n[PATCH-SAMPLE] Final RMS distribution across patches: "
               f"min={all_rms.min().item():.3f} "
@@ -14064,7 +14064,7 @@ def sample_sc_edm_patchwise(
               f"p50={all_rms.quantile(0.50).item():.3f} "
               f"p75={all_rms.quantile(0.75).item():.3f} "
               f"max={all_rms.max().item():.3f}")
-        
+
         torch.save(
             {
                 "patch_indices": [p.cpu() for p in patch_indices],
@@ -14078,14 +14078,14 @@ def sample_sc_edm_patchwise(
     # ===================================================================
     # DIAGNOSTIC B3: OVERLAP NEIGHBOR AGREEMENT (JACCARD)
     # ===================================================================
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print("\n" + "="*70)
         print("DIAGNOSTIC B3: OVERLAP NEIGHBOR AGREEMENT")
         print("="*70)
-        
+
         overlap_jaccards = []
         overlap_dist_corrs = []
-        
+
         # Sample 20 random overlapping patch pairs
         overlap_pairs = []
         for i in range(min(K, 50)):
@@ -14095,11 +14095,12 @@ def sample_sc_edm_patchwise(
                 shared = S_i & S_j
                 if len(shared) >= 30:  # Need enough for meaningful kNN
                     overlap_pairs.append((i, j, list(shared)))
-        
+
         # Analyze up to 20 pairs
         for i, j, shared_list in overlap_pairs[:20]:
             # Get coords for shared cells in both patches
-
+            if i >= len(patch_coords) or j >= len(patch_coords):
+                continue
 
             # Build position lookup dicts (O(1) lookup)
             pos_i = {int(cid): p for p, cid in enumerate(patch_indices[i].tolist())}
@@ -14108,46 +14109,46 @@ def sample_sc_edm_patchwise(
 
             shared_idx_i = torch.tensor([pos_i[c] for c in shared_list], dtype=torch.long)
             shared_idx_j = torch.tensor([pos_j[c] for c in shared_list], dtype=torch.long)
-            
+
             V_i_shared = patch_coords[i][shared_idx_i]
             V_j_shared = patch_coords[j][shared_idx_j]
-            
+
             # Compute kNN Jaccard
             knn_i = knn_sets(V_i_shared, k=min(10, len(shared_list)-1))
             knn_j = knn_sets(V_j_shared, k=min(10, len(shared_list)-1))
             jaccard = mean_jaccard(knn_i, knn_j)
             overlap_jaccards.append(jaccard)
-            
+
             # Also compute distance correlation
             D_i = torch.cdist(V_i_shared, V_i_shared).cpu().numpy()
             D_j = torch.cdist(V_j_shared, V_j_shared).cpu().numpy()
             triu = np.triu_indices(len(shared_list), k=1)
             dist_corr = np.corrcoef(D_i[triu], D_j[triu])[0, 1]
             overlap_dist_corrs.append(dist_corr)
-        
+
         if overlap_jaccards:
             print(f"\n[B3] Analyzed {len(overlap_jaccards)} overlapping patch pairs:")
             print(f"  kNN Jaccard: {np.mean(overlap_jaccards):.3f} ± {np.std(overlap_jaccards):.3f}")
             print(f"  Distance corr: {np.mean(overlap_dist_corrs):.3f} ± {np.std(overlap_dist_corrs):.3f}")
-            
+
             if np.mean(overlap_jaccards) < 0.3:
                 print("  ⚠️  LOW JACCARD: Patches disagree on neighborhoods → DIFFUSION PROBLEM")
             elif np.mean(overlap_jaccards) > 0.6:
                 print("  ✓ GOOD JACCARD: Patches agree on neighborhoods")
-            
+
             # Plot
             import matplotlib.pyplot as plt
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-            
+
             axes[0].hist(overlap_jaccards, bins=20, edgecolor='black', alpha=0.7, color='blue')
-            axes[0].axvline(np.mean(overlap_jaccards), color='red', linestyle='--', 
+            axes[0].axvline(np.mean(overlap_jaccards), color='red', linestyle='--',
                            label=f'Mean={np.mean(overlap_jaccards):.3f}')
             axes[0].set_xlabel('kNN Jaccard')
             axes[0].set_ylabel('Count')
             axes[0].set_title('Overlap Neighbor Agreement (Jaccard)')
             axes[0].legend()
             axes[0].grid(alpha=0.3)
-            
+
             axes[1].scatter(overlap_dist_corrs, overlap_jaccards, alpha=0.6)
             axes[1].axhline(0.5, color='red', linestyle='--', alpha=0.5)
             axes[1].axvline(0.8, color='red', linestyle='--', alpha=0.5)
@@ -14155,26 +14156,29 @@ def sample_sc_edm_patchwise(
             axes[1].set_ylabel('kNN Jaccard')
             axes[1].set_title('Distance Corr vs Neighbor Agreement')
             axes[1].grid(alpha=0.3)
-            
+
             plt.tight_layout()
             plt.show()
-        
+
         print("="*70 + "\n")
 
 
     # Compute median patch RMS as target scale for global alignment
-    patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
-    rms_target = patch_rms_list.median().item()
+    if len(patch_coords) > 0:
+        patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
+        rms_target = patch_rms_list.median().item()
+    else:
+        rms_target = 1.0  # Default value when patch_coords is empty
 
 
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print(f"[ALIGN] Target RMS for global space: {rms_target:.3f} (median of patches)")
 
 
 
 
     # DEBUG 3: RMS distribution across all patches
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         all_rms = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
         print(f"\n[PATCH-SAMPLE] RMS distribution across patches: "
             f"min={all_rms.min().item():.3f} "
@@ -14182,7 +14186,7 @@ def sample_sc_edm_patchwise(
             f"p50={all_rms.quantile(0.50).item():.3f} "
             f"p75={all_rms.quantile(0.75).item():.3f} "
             f"max={all_rms.max().item():.3f}")
-        
+
         # Save patch coords for reproducibility testing
         torch.save(
             {
@@ -14195,50 +14199,54 @@ def sample_sc_edm_patchwise(
 
 
     # ===== DIAGNOSTIC: Patch-level geometry BEFORE any stitching =====
-    if DEBUG_FLAG and K > 1:
+    if DEBUG_FLAG and K > 1 and len(patch_coords) > 0:
         print("\n" + "="*60)
         print("PATCH OVERLAP DIAGNOSTIC (pre-alignment)")
         print("="*60)
-        
+
         # Find pairs of overlapping patches
         overlap_corrs = []
-        
+
         for k1 in range(min(10, K)):  # Check first 10 patches
+            if k1 >= len(patch_coords):
+                continue
             S_k1 = set(patch_indices[k1].cpu().tolist())
             V_k1 = patch_coords[k1].cpu()  # (m_k1, D)
-            
+
             for k2 in range(k1+1, min(k1+5, K)):  # Check next 4 patches
+                if k2 >= len(patch_coords):
+                    continue
                 S_k2 = set(patch_indices[k2].cpu().tolist())
-                
+
                 # Find shared cells
                 shared = S_k1 & S_k2
                 if len(shared) < 20:  # Need enough overlap
                     continue
-                
+
                 shared_list = sorted(list(shared))
-                
+
                 # Get positions in each patch
                 S_k1_list = patch_indices[k1].cpu().tolist()
                 S_k2_list = patch_indices[k2].cpu().tolist()
-                
+
                 pos_k1 = [S_k1_list.index(s) for s in shared_list]
                 pos_k2 = [S_k2_list.index(s) for s in shared_list]
-                
+
                 # Extract shared cell coords from each patch
                 V_shared_k1 = V_k1[pos_k1]  # (n_shared, D)
                 V_shared_k2 = patch_coords[k2].cpu()[pos_k2]
-                
+
                 # Compute pairwise distances within shared cells
                 D_k1 = torch.cdist(V_shared_k1, V_shared_k1).numpy()
                 D_k2 = torch.cdist(V_shared_k2, V_shared_k2).numpy()
-                
+
                 # Compare distances (upper triangle)
                 tri = np.triu_indices(len(shared_list), k=1)
                 if len(tri[0]) > 10:
                     from scipy.stats import pearsonr
                     corr = pearsonr(D_k1[tri], D_k2[tri])[0]
                     overlap_corrs.append(corr)
-        
+
         if overlap_corrs:
             overlap_corrs = np.array(overlap_corrs)
             print(f"[OVERLAP] Checked {len(overlap_corrs)} patch pairs")
@@ -14248,7 +14256,7 @@ def sample_sc_edm_patchwise(
                 f"median={np.median(overlap_corrs):.3f} "
                 f"p75={np.percentile(overlap_corrs, 75):.3f} "
                 f"max={overlap_corrs.max():.3f}")
-            
+
             if np.median(overlap_corrs) < 0.7:
                 print("\n⚠️  WARNING: Low overlap consistency!")
                 print("    Patches disagree about shared cells' neighborhoods")
@@ -14260,38 +14268,41 @@ def sample_sc_edm_patchwise(
             else:
                 print("\n⚠️  Moderate overlap consistency")
                 print("    Some disagreement between patches")
-        
+
         print("="*60 + "\n")
 
 
     # DEBUG: Patch-level correlation to GT (if GT is available)
-    if DEBUG_FLAG and hasattr(sc_gene_expr, 'gt_coords'):
+    if DEBUG_FLAG and hasattr(sc_gene_expr, 'gt_coords') and len(patch_coords) > 0:
         from scipy.spatial.distance import cdist
         from scipy.stats import pearsonr
-        
+
         gt_coords = sc_gene_expr.gt_coords  # Assume passed in somehow
         patch_local_corrs = []
-        
+
         for k in range(K):
+            if k >= len(patch_coords):
+                continue
             S_k_np = patch_indices[k].cpu().numpy()
             V_k = patch_coords[k].cpu().numpy()  # (m_k, D_latent)
             gt_k = gt_coords[S_k_np]  # (m_k, 2)
-            
+
             D_pred = cdist(V_k, V_k)
             D_gt = cdist(gt_k, gt_k)
-            
+
             tri = np.triu_indices(len(S_k_np), k=1)
             if len(tri[0]) > 0:
                 r = pearsonr(D_pred[tri], D_gt[tri])[0]
                 patch_local_corrs.append(r)
-        
-        patch_local_corrs = np.array(patch_local_corrs)
-        print(f"\n[PATCH-LOCAL] Pearson vs GT: "
-              f"min={patch_local_corrs.min():.3f} "
-              f"p25={np.percentile(patch_local_corrs, 25):.3f} "
-              f"p50={np.median(patch_local_corrs):.3f} "
-              f"p75={np.percentile(patch_local_corrs, 75):.3f} "
-              f"max={patch_local_corrs.max():.3f}")
+
+        if len(patch_local_corrs) > 0:
+            patch_local_corrs = np.array(patch_local_corrs)
+            print(f"\n[PATCH-LOCAL] Pearson vs GT: "
+                  f"min={patch_local_corrs.min():.3f} "
+                  f"p25={np.percentile(patch_local_corrs, 25):.3f} "
+                  f"p50={np.median(patch_local_corrs):.3f} "
+                  f"p75={np.percentile(patch_local_corrs, 75):.3f} "
+                  f"max={patch_local_corrs.max():.3f}")
 
 
     # ------------------------------------------------------------------
@@ -14306,11 +14317,13 @@ def sample_sc_edm_patchwise(
     W_global = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
 
 
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print("\n[ALIGN] Stitching with centrality weighting...")
 
 
     for k in range(K):
+        if k >= len(patch_coords):
+            continue
         # Global indices for this patch
         S_k = patch_indices[k].to(device)              # (m_k,)
         V_k = patch_coords[k].to(device)               # (m_k, D)
@@ -14350,7 +14363,7 @@ def sample_sc_edm_patchwise(
 
 
     rms_final = X_global.pow(2).mean().sqrt().item()
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print(f"[ALIGN] Init X_global: rms_raw={rms_init:.3f} "
             f"→ rescaled to {rms_final:.3f} (target={rms_target:.3f}, scale={scale_factor:.3f})")
 
@@ -14494,50 +14507,61 @@ def sample_sc_edm_patchwise(
     # Project all patches to 2D via GLOBAL PCA
     # (Per-patch PCA caused rotation degeneracy collapse - reverted)
     # ===================================================================
-    print(f"[PGSO-A] Projecting patches to 2D via global PCA...")
-
-    # Gather all patch coords for PCA
-    all_coords_for_pca = []
-    for k in range(K):
-        all_coords_for_pca.append(patch_coords[k])
-    all_coords_cat = torch.cat(all_coords_for_pca, dim=0)  # (sum_m_k, D_latent)
-
-    # Compute PCA basis (top 2 components)
-    all_coords_centered = all_coords_cat - all_coords_cat.mean(dim=0, keepdim=True)
-    cov = all_coords_centered.T @ all_coords_centered / all_coords_centered.shape[0]
-    eigs, vecs = torch.linalg.eigh(cov)
-    # eigh returns in ascending order, we want descending
-    pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2) - top 2 eigenvectors
-
-    # Project each patch to 2D
     patch_coords_2d = []
-    patch_eig_ratios_2d = []  # Track per-patch anisotropy in 2D for rotation weighting
-    
-    for k in range(K):
-        V_k = patch_coords[k]  # (m_k, D_latent)
-        V_k_centered = V_k - V_k.mean(dim=0, keepdim=True)
-        V_k_2d = V_k_centered @ pca_basis  # (m_k, 2)
-        patch_coords_2d.append(V_k_2d)
-        
-        # Compute anisotropy in 2D for this patch (used for rotation confidence)
-        cov_2d = V_k_2d.T @ V_k_2d / V_k_2d.shape[0]
-        eigs_2d = torch.linalg.eigvalsh(cov_2d)
-        eig_ratio_2d = (eigs_2d.max() / eigs_2d.min().clamp(min=1e-8)).item()
-        patch_eig_ratios_2d.append(eig_ratio_2d)
+    patch_eig_ratios_2d = []
+    pca_basis = None
+    eigs = None
 
-    if DEBUG_FLAG:
-        eig_ratio = eigs[-1] / eigs[-2] if eigs[-2] > 1e-8 else float('inf')
-        print(f"[PGSO-A] Global PCA eigenvalues: top2=[{eigs[-1].item():.4f}, {eigs[-2].item():.4f}], ratio={eig_ratio:.2f}")
-        
-        # Report per-patch 2D anisotropy (for rotation confidence diagnostic)
-        eig_ratios_2d_t = torch.tensor(patch_eig_ratios_2d)
-        print(f"[PGSO-A] Per-patch 2D anisotropy (eig_max/eig_min):")
-        print(f"    p25={eig_ratios_2d_t.quantile(0.25).item():.1f} "
-              f"p50={eig_ratios_2d_t.median().item():.1f} "
-              f"p75={eig_ratios_2d_t.quantile(0.75).item():.1f} "
-              f"max={eig_ratios_2d_t.max().item():.1f}")
-        if eig_ratios_2d_t.median() > 10:
-            print(f"    ⚠️ HIGH ANISOTROPY: Patches are near-1D in 2D space → rotation is ill-conditioned")
+    if len(patch_coords) > 0:
+        print(f"[PGSO-A] Projecting patches to 2D via global PCA...")
+
+        # Gather all patch coords for PCA
+        all_coords_for_pca = []
+        for k in range(K):
+            if k < len(patch_coords):
+                all_coords_for_pca.append(patch_coords[k])
+
+        if len(all_coords_for_pca) > 0:
+            all_coords_cat = torch.cat(all_coords_for_pca, dim=0)  # (sum_m_k, D_latent)
+
+            # Compute PCA basis (top 2 components)
+            all_coords_centered = all_coords_cat - all_coords_cat.mean(dim=0, keepdim=True)
+            cov = all_coords_centered.T @ all_coords_centered / all_coords_centered.shape[0]
+            eigs, vecs = torch.linalg.eigh(cov)
+            # eigh returns in ascending order, we want descending
+            pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2) - top 2 eigenvectors
+
+            # Project each patch to 2D
+            for k in range(K):
+                if k >= len(patch_coords):
+                    continue
+                V_k = patch_coords[k]  # (m_k, D_latent)
+                V_k_centered = V_k - V_k.mean(dim=0, keepdim=True)
+                V_k_2d = V_k_centered @ pca_basis  # (m_k, 2)
+                patch_coords_2d.append(V_k_2d)
+
+                # Compute anisotropy in 2D for this patch (used for rotation confidence)
+                cov_2d = V_k_2d.T @ V_k_2d / V_k_2d.shape[0]
+                eigs_2d = torch.linalg.eigvalsh(cov_2d)
+                eig_ratio_2d = (eigs_2d.max() / eigs_2d.min().clamp(min=1e-8)).item()
+                patch_eig_ratios_2d.append(eig_ratio_2d)
+
+            if DEBUG_FLAG and eigs is not None:
+                eig_ratio = eigs[-1] / eigs[-2] if eigs[-2] > 1e-8 else float('inf')
+                print(f"[PGSO-A] Global PCA eigenvalues: top2=[{eigs[-1].item():.4f}, {eigs[-2].item():.4f}], ratio={eig_ratio:.2f}")
+
+                # Report per-patch 2D anisotropy (for rotation confidence diagnostic)
+                if len(patch_eig_ratios_2d) > 0:
+                    eig_ratios_2d_t = torch.tensor(patch_eig_ratios_2d)
+                    print(f"[PGSO-A] Per-patch 2D anisotropy (eig_max/eig_min):")
+                    print(f"    p25={eig_ratios_2d_t.quantile(0.25).item():.1f} "
+                          f"p50={eig_ratios_2d_t.median().item():.1f} "
+                          f"p75={eig_ratios_2d_t.quantile(0.75).item():.1f} "
+                          f"max={eig_ratios_2d_t.max().item():.1f}")
+                    if eig_ratios_2d_t.median() > 10:
+                        print(f"    ⚠️ HIGH ANISOTROPY: Patches are near-1D in 2D space → rotation is ill-conditioned")
+    else:
+        print(f"[PGSO-A] Skipping PCA projection (no patch_coords available)")
 
 
     # ===================================================================
@@ -14547,37 +14571,39 @@ def sample_sc_edm_patchwise(
     # If kNN is already ~0.36/0.50 in 2D (same as final), then PGSO cannot
     # improve it - the problem is the 2D readout, not stitching.
     # ===================================================================
-    if debug_knn and gt_coords is not None:
+    if debug_knn and gt_coords is not None and len(patch_coords_2d) > 0 and len(patch_coords) > 0:
         print("\n" + "="*70)
         print("[PATCH-KNN-VS-GT-2D] PATCH kNN IN PCA-PROJECTED 2D SPACE")
         print("="*70)
-        
+
         with torch.no_grad():
             gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
-            
+
             patch_knn_2d_overlap = {k_val: [] for k_val in debug_k_list}
-            
+
             # Also compute 32D kNN for comparison (same patches)
             patch_knn_32d_overlap = {k_val: [] for k_val in debug_k_list}
-            
-            n_patches_to_test = min(K, debug_max_patches)
-            
+
+            n_patches_to_test = min(K, debug_max_patches, len(patch_coords_2d), len(patch_coords))
+
             for k in range(n_patches_to_test):
+                if k >= len(patch_coords_2d) or k >= len(patch_coords):
+                    continue
                 S_k = patch_indices[k]
                 m_k = S_k.numel()
-                
+
                 if m_k < max(debug_k_list) + 5:
                     continue
-                
+
                 # Get GT coords for this patch
                 gt_patch = gt_coords_t[S_k]  # (m_k, 2)
-                
+
                 # Get 2D coords (PCA-projected)
                 pred_patch_2d = patch_coords_2d[k].float().to(device)  # (m_k, 2)
-                
+
                 # Get 32D coords (original)
                 pred_patch_32d = patch_coords[k].float().to(device)  # (m_k, D_latent)
-                
+
                 for k_val in debug_k_list:
                     if m_k > k_val + 1:
                         # kNN in 2D projected space
@@ -14585,48 +14611,48 @@ def sample_sc_edm_patchwise(
                         knn_gt, _ = _knn_indices_dists(gt_patch, k_val)
                         overlap_2d = _knn_overlap_score(knn_pred_2d, knn_gt)
                         patch_knn_2d_overlap[k_val].append(overlap_2d.mean().item())
-                        
+
                         # kNN in 32D space (for comparison)
                         knn_pred_32d, _ = _knn_indices_dists(pred_patch_32d, k_val)
                         overlap_32d = _knn_overlap_score(knn_pred_32d, knn_gt)
                         patch_knn_32d_overlap[k_val].append(overlap_32d.mean().item())
-            
+
             # Print results
             print(f"[PATCH-KNN-VS-GT-2D] n_patches_tested={n_patches_to_test}")
             print()
             print("Comparing kNN overlap in 32D (original) vs 2D (PCA-projected):")
             print()
-            
+
             for k_val in debug_k_list:
                 if patch_knn_2d_overlap[k_val] and patch_knn_32d_overlap[k_val]:
                     ov_2d = torch.tensor(patch_knn_2d_overlap[k_val])
                     ov_32d = torch.tensor(patch_knn_32d_overlap[k_val])
-                    
+
                     print(f"[PATCH-KNN-VS-GT-2D] k={k_val}: "
                           f"mean={ov_2d.mean().item():.3f} "
                           f"p10={ov_2d.quantile(0.1).item():.3f} "
                           f"p50={ov_2d.median().item():.3f} "
                           f"p90={ov_2d.quantile(0.9).item():.3f}")
-                    
+
                     print(f"[PATCH-KNN-VS-GT-32D] k={k_val}: "
                           f"mean={ov_32d.mean().item():.3f} "
                           f"p10={ov_32d.quantile(0.1).item():.3f} "
                           f"p50={ov_32d.median().item():.3f} "
                           f"p90={ov_32d.quantile(0.9).item():.3f}")
-                    
+
                     # Delta
                     delta = ov_32d.mean().item() - ov_2d.mean().item()
                     print(f"[PATCH-KNN-VS-GT] k={k_val} delta(32D-2D)={delta:+.3f}")
                     print()
-            
+
             # Interpretation
             k_main = debug_k_list[0]
             if patch_knn_2d_overlap[k_main]:
                 mean_2d = torch.tensor(patch_knn_2d_overlap[k_main]).mean().item()
                 mean_32d = torch.tensor(patch_knn_32d_overlap[k_main]).mean().item()
-                
+
                 delta_main = mean_32d - mean_2d
-                
+
                 if delta_main > 0.08:
                     print(f"[PATCH-KNN-VS-GT-2D] ⚠️ SIGNIFICANT DROP: 32D→2D loses {delta_main:.2f} kNN overlap")
                     print(f"    → PCA projection is discarding neighborhood-relevant dimensions")
@@ -14637,60 +14663,64 @@ def sample_sc_edm_patchwise(
                 else:
                     print(f"[PATCH-KNN-VS-GT-2D] ✓ MINIMAL DROP: 32D and 2D give similar kNN ({delta_main:+.2f})")
                     print(f"    → Projection is not the bottleneck")
-                
+
                 # Check if 2D is already at final level
                 # (We'll compare with global final kNN in Test B)
                 print()
                 print(f"[PATCH-KNN-VS-GT-2D] 2D patch kNN@{k_main} = {mean_2d:.3f}")
                 print(f"    → Compare this to [GLOBAL-KNN-STAGE] and final kNN to see if PGSO helps or hurts")
-        
+
         print("="*70 + "\n")
 
 
     # Build overlap graph edges
-    print(f"[PGSO-A] Computing pairwise Procrustes on overlapping patches...")
     edges = []  # List of (a, b, R_ab, s_ab, t_ab, weight, n_overlap)
 
-    for a in range(K):
-        S_a = set(patch_indices[a].tolist())
-        V_a_2d = patch_coords_2d[a]
+    if len(patch_coords_2d) > 0:
+        print(f"[PGSO-A] Computing pairwise Procrustes on overlapping patches...")
 
-        for b in range(a + 1, K):
-            S_b = set(patch_indices[b].tolist())
-            shared = S_a & S_b
-
-            if len(shared) < MIN_OVERLAP_FOR_EDGE:
+        for a in range(K):
+            if a >= len(patch_coords_2d):
                 continue
+            S_a = set(patch_indices[a].tolist())
+            V_a_2d = patch_coords_2d[a]
 
-            shared_list = list(shared)
+            for b in range(a + 1, K):
+                if b >= len(patch_coords_2d):
+                    continue
+                S_b = set(patch_indices[b].tolist())
+                shared = S_a & S_b
 
-            # Get positions in each patch
-            pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
-            pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
+                if len(shared) < MIN_OVERLAP_FOR_EDGE:
+                    continue
 
-            idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
-            idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
+                shared_list = list(shared)
 
-            V_shared_a = V_a_2d[idx_a]  # (n_shared, 2)
-            V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
+                # Get positions in each patch
+                pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
+                pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
 
-            # Compute Procrustes: V_b ≈ s_ab * (V_a @ R_ab.T) + t_ab
-            R_ab, s_ab, t_ab, residual = weighted_procrustes_2d(V_shared_a, V_shared_b)
+                idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
+                idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
 
-            # Weight by overlap size and inverse residual
-            # weight = len(shared) / (residual.item() + 0.01)
-            
-            # Weight by overlap size and inverse residual SQUARED (stronger penalty)
-            # This downweights bad edges much more aggressively
-            weight = len(shared) / (residual.item() ** 2 + 1e-4)
+                V_shared_a = V_a_2d[idx_a]  # (n_shared, 2)
+                V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
 
+                # Compute Procrustes: V_b ≈ s_ab * (V_a @ R_ab.T) + t_ab
+                R_ab, s_ab, t_ab, residual = weighted_procrustes_2d(V_shared_a, V_shared_b)
 
-            edges.append({
-                'a': a, 'b': b,
-                'R_ab': R_ab, 's_ab': s_ab, 't_ab': t_ab,
-                'weight': weight, 'n_overlap': len(shared),
-                'residual': residual.item()
-            })
+                # Weight by overlap size and inverse residual SQUARED (stronger penalty)
+                # This downweights bad edges much more aggressively
+                weight = len(shared) / (residual.item() ** 2 + 1e-4)
+
+                edges.append({
+                    'a': a, 'b': b,
+                    'R_ab': R_ab, 's_ab': s_ab, 't_ab': t_ab,
+                    'weight': weight, 'n_overlap': len(shared),
+                    'residual': residual.item()
+                })
+    else:
+        print(f"[PGSO-A] Skipping pairwise Procrustes (no patch_coords_2d available)")
 
     # ===================================================================
     # [EDGE-MODEL] DIAGNOSTIC 6: Similarity vs Affine fit comparison
@@ -14757,18 +14787,20 @@ def sample_sc_edm_patchwise(
         
         for e in edges_to_test:
             a, b = e['a'], e['b']
+            if a >= len(patch_coords_2d) or b >= len(patch_coords_2d):
+                continue
             shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
-            
+
             if len(shared_list) < 20:
                 continue
-            
+
             # Get positions in each patch
             pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
             pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
-            
+
             idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
             idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
-            
+
             V_shared_a = patch_coords_2d[a][idx_a]  # (n_shared, 2)
             V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
             
@@ -15226,18 +15258,24 @@ def sample_sc_edm_patchwise(
     # ===================================================================
     # PGSO-C: Apply global transforms to each patch (in 2D space)
     # ===================================================================
-    print(f"\n[PGSO-C] Applying global transforms to patches...")
-
     patch_coords_transformed = []
-    for k in range(K):
-        V_k_2d = patch_coords_2d[k]  # (m_k, 2)
-        R_k = R_global_list[k]
-        s_k = s_global_list[k]
-        t_k = t_global_list[k]
 
-        # Transform: X_hat_k = s_k * (V_k @ R_k.T) + t_k
-        X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
-        patch_coords_transformed.append(X_hat_k)
+    if len(patch_coords_2d) > 0:
+        print(f"\n[PGSO-C] Applying global transforms to patches...")
+
+        for k in range(K):
+            if k >= len(patch_coords_2d) or k >= len(R_global_list) or k >= len(s_global_list) or k >= len(t_global_list):
+                continue
+            V_k_2d = patch_coords_2d[k]  # (m_k, 2)
+            R_k = R_global_list[k]
+            s_k = s_global_list[k]
+            t_k = t_global_list[k]
+
+            # Transform: X_hat_k = s_k * (V_k @ R_k.T) + t_k
+            X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
+            patch_coords_transformed.append(X_hat_k)
+    else:
+        print(f"\n[PGSO-C] Skipping global transforms (no patch_coords_2d available)")
 
 
     # ===================================================================
@@ -15251,6 +15289,8 @@ def sample_sc_edm_patchwise(
         
         for e in edges[:min(50, len(edges))]:  # Check first 50 edges
             a, b = e['a'], e['b']
+            if a >= len(patch_coords_transformed) or b >= len(patch_coords_transformed):
+                continue
             shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
 
             pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
@@ -15370,6 +15410,8 @@ def sample_sc_edm_patchwise(
     W_global = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
 
     for k in range(K):
+        if k >= len(patch_coords_transformed) or k >= len(patch_coords_2d):
+            continue
         S_k = patch_indices[k].to(device)
         X_hat_k = patch_coords_transformed[k].to(device)
         V_k_2d = patch_coords_2d[k].to(device)
@@ -15451,17 +15493,19 @@ def sample_sc_edm_patchwise(
             best_weight = torch.zeros(n_sc, dtype=torch.float32, device=device)
             
             for k in range(K):
+                if k >= len(patch_coords_transformed) or k >= len(patch_coords_2d):
+                    continue
                 S_k = patch_indices[k].to(device)
                 X_hat_k = patch_coords_transformed[k].to(device)
                 V_k_2d = patch_coords_2d[k].to(device)
-                
+
                 # Centrality weights
                 center_k = V_k_2d.mean(dim=0, keepdim=True)
                 dists = torch.norm(V_k_2d - center_k, dim=1)
                 max_d = dists.max().clamp_min(1e-6)
                 weights_k = 1.0 - (dists / (max_d * 1.2))
                 weights_k = weights_k.clamp(min=0.01)
-                
+
                 # For each cell, keep coord if this patch has higher weight
                 for local_idx, global_idx in enumerate(S_k.tolist()):
                     w = weights_k[local_idx].item()
@@ -15486,6 +15530,8 @@ def sample_sc_edm_patchwise(
                 
                 coords_i = []
                 for p_idx in patches_with_i:
+                    if p_idx >= len(patch_coords_transformed):
+                        continue
                     patch_cell_list = patch_indices[p_idx].tolist()
                     if cell_i in patch_cell_list:
                         local_pos = patch_cell_list.index(cell_i)
@@ -15631,6 +15677,8 @@ def sample_sc_edm_patchwise(
                     # Collect coords for cell_i from each patch (post-transform)
                     coords_i = []
                     for p_idx in patches_with_i:
+                        if p_idx >= len(patch_coords_transformed):
+                            continue
                         # Find position of cell_i in patch p_idx
                         patch_cell_list = patch_indices[p_idx].tolist()
                         if cell_i in patch_cell_list:
@@ -15740,33 +15788,35 @@ def sample_sc_edm_patchwise(
         n_frozen_scale = 0
         
         for k in range(K):
+            if k >= len(patch_coords_2d):
+                continue
             S_k = patch_indices[k]
             V_k_2d = patch_coords_2d[k]  # Patch coords in 2D
             X_k_global = X_global[S_k, :2].cpu()  # Current global coords for this patch's cells
-            
+
             # Compute centrality weights
             center_k = V_k_2d.mean(dim=0, keepdim=True)
             dists = torch.norm(V_k_2d - center_k, dim=1)
             max_d = dists.max().clamp_min(1e-6)
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)
-            
+
             # Get patch anisotropy in 2D (already computed earlier)
             aniso_k = patch_eig_ratios_2d[k] if k < len(patch_eig_ratios_2d) else 1.0
-            
+
             # Decide what to freeze based on anisotropy
             freeze_rotation = (aniso_k > ANISO_FREEZE_ROTATION_THRESH)
             freeze_scale = (aniso_k > ANISO_FREEZE_SCALE_THRESH)
-            
+
             if freeze_rotation:
                 n_frozen_rot += 1
             if freeze_scale:
                 n_frozen_scale += 1
-            
+
             if freeze_rotation:
                 # Keep rotation from PGSO (or identity if not available)
                 R_k_fixed = R_global_list[k] if k < len(R_global_list) else torch.eye(2)
-                
+
                 if freeze_scale:
                     # Only solve translation
                     s_k_fixed = s_global_list[k] if k < len(s_global_list) else torch.tensor(1.0)
@@ -15780,44 +15830,47 @@ def sample_sc_edm_patchwise(
                     # Solve scale + translation with fixed rotation
                     # Apply fixed rotation first
                     V_k_rotated = V_k_2d @ R_k_fixed.T
-                    
+
                     # Weighted Procrustes for scale+translation only
                     # X_k_global ≈ s * V_k_rotated + t
                     w = weights_k.unsqueeze(1)
                     w_sum = w.sum()
                     mu_src = (w * V_k_rotated).sum(dim=0, keepdim=True) / w_sum
                     mu_tgt = (w * X_k_global).sum(dim=0, keepdim=True) / w_sum
-                    
+
                     Vc = V_k_rotated - mu_src
                     Yc = X_k_global - mu_tgt
-                    
+
                     # Scale: s = sum(w * Yc · Vc) / sum(w * Vc · Vc)
                     numer = (w * Yc * Vc).sum()
                     denom = (w * Vc * Vc).sum().clamp_min(1e-8)
                     s_k = numer / denom
                     s_k = s_k.clamp(0.5, 2.0)  # Safety clamp
-                    
+
                     # Translation
                     t_k = (mu_tgt - s_k * mu_src).squeeze(0)
                     R_k = R_k_fixed
-                    
+
                     residual_k = ((s_k * V_k_rotated + t_k - X_k_global) ** 2).sum(dim=1).sqrt().mean()
             else:
                 # Full similarity Procrustes
                 R_k, s_k, t_k, residual_k = weighted_procrustes_2d(
                     V_k_2d, X_k_global, weights_k
                 )
-            
+
             iter_residuals.append(residual_k.item() if torch.is_tensor(residual_k) else residual_k)
-            
+
             # Apply transform
             X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
             new_patch_coords_transformed.append(X_hat_k)
-            
+
             # Update global lists for next iteration
-            R_global_list[k] = R_k
-            s_global_list[k] = s_k if torch.is_tensor(s_k) else torch.tensor(s_k)
-            t_global_list[k] = t_k
+            if k < len(R_global_list):
+                R_global_list[k] = R_k
+            if k < len(s_global_list):
+                s_global_list[k] = s_k if torch.is_tensor(s_k) else torch.tensor(s_k)
+            if k < len(t_global_list):
+                t_global_list[k] = t_k
         
         # ===============================================================
         # Step B: Global merge (weighted average of all patch predictions)
@@ -15826,17 +15879,19 @@ def sample_sc_edm_patchwise(
         W_global_new = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
         
         for k in range(K):
+            if k >= len(new_patch_coords_transformed) or k >= len(patch_coords_2d):
+                continue
             S_k = patch_indices[k].to(device)
             X_hat_k = new_patch_coords_transformed[k].to(device)
             V_k_2d = patch_coords_2d[k].to(device)
-            
+
             # Centrality weights
             center_k = V_k_2d.mean(dim=0, keepdim=True)
             dists = torch.norm(V_k_2d - center_k, dim=1, keepdim=True)
             max_d = dists.max().clamp_min(1e-6)
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)
-            
+
             X_global_new.index_add_(0, S_k, X_hat_k * weights_k)
             W_global_new.index_add_(0, S_k, weights_k)
         
@@ -15861,19 +15916,21 @@ def sample_sc_edm_patchwise(
         iter_coord_mismatches = []
         for e in edges[:min(30, len(edges))]:
             a, b = e['a'], e['b']
+            if a >= len(patch_coords_transformed) or b >= len(patch_coords_transformed):
+                continue
             shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
             if len(shared_list) < 10:
                 continue
-            
+
             pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
             pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
-            
+
             idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
             idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
-            
+
             X_a = patch_coords_transformed[a][idx_a]
             X_b = patch_coords_transformed[b][idx_b]
-            
+
             coord_diff = (X_a - X_b).norm(dim=1).mean().item()
             iter_coord_mismatches.append(coord_diff)
         
@@ -15968,30 +16025,32 @@ def sample_sc_edm_patchwise(
         meas_compare_samples = []
         
         for k in range(n_patches_used):
+            if k >= len(patch_coords_transformed):
+                continue
             S_k = patch_indices[k]
             # USE TRANSFORMED COORDS (post-PGSO) instead of raw patch_coords_2d
             V_k_transformed = patch_coords_transformed[k].to(device)  # (m_k, 2)
             m_k = V_k_transformed.shape[0]
-            
+
             if m_k < dgso_k_edge + 1:
                 continue
-            
+
             # Compute centrality weights for this patch
             center_k = V_k_transformed.mean(dim=0, keepdim=True)
             dists_to_center = torch.norm(V_k_transformed - center_k, dim=1)
             max_d = dists_to_center.max().clamp_min(1e-6)
             centrality_k = 1.0 - (dists_to_center / (max_d * 1.2))
             centrality_k = centrality_k.clamp(min=0.01)
-            
+
             # Compute pairwise distances within patch (POST-TRANSFORM)
             D_patch = torch.cdist(V_k_transformed, V_k_transformed)  # (m_k, m_k)
             D_patch.fill_diagonal_(float('inf'))
-            
+
             # Get kNN for each point in patch
             _, knn_local = D_patch.topk(dgso_k_edge, largest=False, dim=1)  # (m_k, k_edge)
-            
+
             # Also compute raw distances for comparison (first patch only)
-            if k == 0 and DEBUG_FLAG:
+            if k == 0 and DEBUG_FLAG and k < len(patch_coords_2d):
                 V_k_raw = patch_coords_2d[k].to(device)
                 D_patch_raw = torch.cdist(V_k_raw, V_k_raw)
             
@@ -16499,6 +16558,8 @@ def sample_sc_edm_patchwise(
                     # Collect coords for cell_i from each patch (post-refine transforms)
                     coords_i = []
                     for p_idx in patches_with_i:
+                        if p_idx >= len(patch_coords_transformed):
+                            continue
                         patch_cell_list = patch_indices[p_idx].tolist()
                         if cell_i in patch_cell_list:
                             local_pos = patch_cell_list.index(cell_i)
