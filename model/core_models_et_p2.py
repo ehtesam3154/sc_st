@@ -2423,11 +2423,17 @@ def train_stageC_diffusion_generator(
     anchor_geom_mode: str = "clamp_only",  # "clamp_only" or "clamp_and_mask"
     anchor_geom_min_unknown: int = 8,
     anchor_geom_debug_every: int = 200,
-    # ---- Resume Stage C ----
-    resume_ckpt_path: Optional[str] = None,
-    resume_reset_optimizer: bool = False,
-):
+    # ========== CONTEXT REPLACEMENT INVARIANCE ==========
+    ctx_replace_variant: str = 'permute',
+    ctx_loss_weight: float = 0.0,
+    ctx_replace_p: float = 0.5,
+    ctx_snr_thresh: float = 0.3,
+    ctx_warmup_steps: int = 1000,
+    ctx_debug_every: int = 100,
+    # ========== SELF-CONDITIONING MODE ==========
+    self_cond_mode: str = 'standard',
 
+):
     
     # Initialize debug tracking
     global debug_state
@@ -2702,7 +2708,33 @@ def train_stageC_diffusion_generator(
                 v_ema.mul_(decay).add_(v, alpha=1.0 - decay)
     # ===================================================
 
-    
+    # ========== UNANCHORED MODE SAFETY CHECK ==========
+    if not anchor_train and (fabric is None or fabric.is_global_zero):
+        print("\n" + "="*70)
+        print("UNANCHORED DIFFUSION TRAINING MODE")
+        print("="*70)
+        print("  anchor_train=False: No anchor channel, no anchor CFG, no anchor loss masking")
+        print(f"  self_cond_mode={self_cond_mode}")
+        print(f"  ctx_loss_weight={ctx_loss_weight}")
+        print(f"  ctx_replace_variant={ctx_replace_variant}")
+        
+        # Warn if any anchor flags are set
+        anchor_flags_active = []
+        if anchor_p_uncond != 0.50:
+            anchor_flags_active.append(f"anchor_p_uncond={anchor_p_uncond}")
+        if anchor_clamp_clean:
+            anchor_flags_active.append("anchor_clamp_clean=True")
+        if anchor_mask_score_loss:
+            anchor_flags_active.append("anchor_mask_score_loss=True")
+        if anchor_warmup_steps > 0:
+            anchor_flags_active.append(f"anchor_warmup_steps={anchor_warmup_steps}")
+        
+        if anchor_flags_active:
+            print("\n⚠️  WARNING: Anchor flags are set but anchor_train=False. These will be IGNORED:")
+            for flag in anchor_flags_active:
+                print(f"    - {flag}")
+        print("="*70 + "\n")
+ 
     # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
     from core_models_et_p1 import collate_minisets, collate_sc_minisets
@@ -3089,46 +3121,20 @@ def train_stageC_diffusion_generator(
         'epoch': [],
         'batch_losses': [],
         'epoch_avg': {
-            ...
+            'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 
+            'gram_learn': [], 'heat': [],
+            'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
+            'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],
+            'dim': [], 'triangle': [], 'radial': [],
+            'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': [],
+            'ctx_edge': [],  # NEW: context invariance loss
+            'ctx_replace': [],
+            'ctx_snr_med': [],
+            'ctx_apply_rate': [],
+            'ctx_hard_sim': [],  # Only used if variant=hard
+            'ctx_perm_fixed': [],  # Only used if variant=permute
         }
     }
-
-    start_epoch = 0
-    if resume_ckpt_path:
-        print(f"[RESUME] Loading Stage C checkpoint: {resume_ckpt_path}")
-        ckpt = torch.load(resume_ckpt_path, map_location=device)
-
-        if 'context_encoder' in ckpt:
-            context_encoder.load_state_dict(ckpt['context_encoder'])
-        if 'score_net' in ckpt:
-            score_net.load_state_dict(ckpt['score_net'])
-        if 'generator' in ckpt:
-            generator.load_state_dict(ckpt['generator'])
-        else:
-            print("[RESUME] WARNING: generator not found in checkpoint.")
-
-        if 'context_encoder_ema' in ckpt:
-            context_encoder_ema.load_state_dict(ckpt['context_encoder_ema'])
-        if 'score_net_ema' in ckpt:
-            score_net_ema.load_state_dict(ckpt['score_net_ema'])
-
-        if 'optimizer' in ckpt and not resume_reset_optimizer:
-            optimizer.load_state_dict(ckpt['optimizer'])
-
-        if 'epoch' in ckpt:
-            start_epoch = int(ckpt['epoch']) + 1
-
-        if 'history' in ckpt:
-            history = ckpt['history']
-
-        if 'sigma_data' in ckpt:
-            sigma_data = ckpt['sigma_data']
-        if 'sigma_min' in ckpt:
-            sigma_min = ckpt['sigma_min']
-        if 'sigma_max' in ckpt:
-            sigma_max = ckpt['sigma_max']
-
-        print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
 
 
     # ========== EDM DEBUG STATE INITIALIZATION ==========
@@ -3473,7 +3479,7 @@ def train_stageC_diffusion_generator(
     # Track pin-rate for adaptive clamp (persists across steps within this training run)
     last_pin_rate = 1.0  # Assume worst case initially
     
-    for epoch in range(start_epoch, n_epochs):
+    for epoch in range(n_epochs):
         epoch_cv_sum = 0.0
         epoch_qent_sum = 0.0
         epoch_nca_loss_sum = 0.0
@@ -3484,6 +3490,14 @@ def train_stageC_diffusion_generator(
         
         epoch_losses = {k: 0.0 for k in WEIGHTS.keys()}
         epoch_losses['total'] = 0.0
+
+        # Context replacement loss tracking (separate from WEIGHTS)
+        ctx_replace_sum = 0.0
+        ctx_apply_count = 0
+        ctx_snr_sum = 0.0
+        ctx_hard_sim_sum = 0.0
+        ctx_perm_fixed_sum = 0.0
+
         n_batches = 0
         c_overlap = 0
 
@@ -4148,152 +4162,60 @@ def train_stageC_diffusion_generator(
                         if not is_sc:
                             tgt_sum_before = V_target.sum().item()
                     # =========================================================
-                    
-                    if use_self_cond and score_net.self_conditioning:
+
+                    # ========== SELF-CONDITIONING (STANDARD MODE) ==========
+                    if self_cond_mode == 'standard' and score_net.self_conditioning:
+                        # Standard two-pass self-conditioning (matches inference)
                         with torch.no_grad():
-                            # === FIX 1 & 2: Delayed generator blend + Frame alignment ===
-                            
-                            # FIX 2: Start generator blend LATER and with LOWER cap
-                            sigma_prior_start = 0.80  # Was 0.30
-                            sigma_prior_k = 5.0       # Was 15.0
-                            w_gen = torch.sigmoid((sigma_flat - sigma_prior_start) * sigma_prior_k)
-                            w_gen = w_gen * 0.3       # Was 0.8 - now max 30%
-                            
-                            # Get generator output
-                            V_gen_prior = generator(H_train, mask).detach()
-                            
-                            # First pass: pure diffusion estimate (KEEP SEPARATE for debug)
-                            x0_pred_0_result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
-                                                                    self_cond=None, return_debug=False)
-                            if isinstance(x0_pred_0_result, tuple):
-                                x0_pred_0_diff = x0_pred_0_result[0]
-                            else:
-                                x0_pred_0_diff = x0_pred_0_result
-                            
-                            # FIX 1: Align generator to diffusion frame BEFORE blending
-                            V_gen_prior_aligned = uet.rigid_align_apply_no_scale(
-                                V_gen_prior, 
-                                x0_pred_0_diff,  # Use pure diffusion, not blended
-                                mask
+                            # First pass: no self-conditioning
+                            x0_pred_0_result = score_net.forward_edm(
+                                V_t, sigma_flat, H_train, mask, sigma_data,
+                                self_cond=None, return_debug=False
                             )
-                            
-                            # Now blend using ALIGNED generator
-                            w_gen_3d = w_gen.view(-1, 1, 1)
-                            self_cond = (1.0 - w_gen_3d) * x0_pred_0_diff + w_gen_3d * V_gen_prior_aligned
-                            
-                            # === DEBUG-PRIOR-ALIGN: Alignment quality on CENTERED coords ===
-                            # === DEBUG-PRIOR-ALIGN: Make alignment interpretable ===
-                            if torch.rand(1).item() < 0.01:
-                                # Store x0_pred_0_base INSIDE the debug condition (avoid clone every step)
-                                x0_pred_0_base = x0_pred_0_diff.detach()  # No clone needed if we don't modify
-                                
-                                # Helper: per-sample centered MSE
-                                def _centered_mse_batch(A, B, m):
-                                    mf = m.unsqueeze(-1).float()
-                                    denom = mf.sum(dim=1, keepdim=True).clamp(min=1)
-                                    A_c = A - (A * mf).sum(dim=1, keepdim=True) / denom
-                                    B_c = B - (B * mf).sum(dim=1, keepdim=True) / denom
-                                    err2 = ((A_c - B_c).pow(2) * mf).sum(dim=(1,2)) / denom.squeeze(-1).squeeze(-1)
-                                    return err2.mean()
-                                
-                                def _centered_rms(A, m):
-                                    mf = m.unsqueeze(-1).float()
-                                    denom = mf.sum(dim=1, keepdim=True).clamp(min=1)
-                                    A_c = A - (A * mf).sum(dim=1, keepdim=True) / denom
-                                    rms = (A_c.pow(2) * mf).sum(dim=(1,2)) / denom.squeeze(-1).squeeze(-1)
-                                    return rms.mean().sqrt()
-                                
-                                mse_before = _centered_mse_batch(V_gen_prior, x0_pred_0_base, mask)
-                                mse_after = _centered_mse_batch(V_gen_prior_aligned, x0_pred_0_base, mask)
-                                delta_align = _centered_rms(V_gen_prior_aligned - V_gen_prior, mask)
-                                
-                                # Track rotation magnitude (not "failure")
-                                non_identity_count = 0
-                                svd_exception_count = 0
-                                svd_total = 0
-                                rot_traces = []
-                                
-                                for b in range(min(4, V_gen_prior.shape[0])):
-                                    mb = mask[b].bool()
-                                    n_valid = int(mb.sum().item())
-                                    if n_valid < 2:
-                                        continue
-                                    X = V_gen_prior[b, mb].float()
-                                    Y = x0_pred_0_diff[b, mb].float()
-                                    X_c = X - X.mean(dim=0, keepdim=True)
-                                    Y_c = Y - Y.mean(dim=0, keepdim=True)
-                                    M = X_c.T @ Y_c
-                                    
-                                    # PATCH 1B: Skip non-finite
-                                    if not torch.isfinite(M).all():
-                                        continue
-                                    
-                                    try:
-                                        # PATCH 1B: CPU SVD in double precision
-                                        M_cpu = M.detach().cpu().double()
-                                        U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(M_cpu, full_matrices=False)
-                                        R_cpu = U_cpu @ Vh_cpu
-                                        rot_traces.append((R_cpu.trace() / R_cpu.shape[0]).item())
-                                    except:
-                                        pass
-
-                                
-                                improvement = (1 - mse_after / mse_before.clamp(min=1e-8)) * 100
-                                
-                                print(f"\n[DEBUG-PRIOR-ALIGN] Generator→Diffusion alignment:")
-                                print(f"  w_gen: min={w_gen.min():.3f} mean={w_gen.mean():.3f} max={w_gen.max():.3f}")
-                                print(f"  MSE before (centered): {mse_before.item():.6f}")
-                                print(f"  MSE after (centered):  {mse_after.item():.6f}")
-                                print(f"  Alignment improvement: {improvement.item():.1f}%")
-                                print(f"  delta_align (RMS of V_aligned - V_gen): {delta_align.item():.6f}")
-                                print(f"  Non-identity rotation rate (tr(R)/D < 0.9): {non_identity_count}/{svd_total}")
-                                print(f"  SVD exceptions: {svd_exception_count}/{svd_total}")
-                                if rot_traces:
-                                    mean_tr = sum(rot_traces) / len(rot_traces)
-                                    min_tr = min(rot_traces)
-                                    print(f"  tr(R)/D: mean={mean_tr:.3f} min={min_tr:.3f}")
-                                
-                                # Decision rule
-                                if delta_align.item() < 1e-4 and abs(mse_before.item() - mse_after.item()) < 1e-6:
-                                    print(f"  ⚠️ Alignment is effectively identity → consider removing alignment code")
-                      
-                            # === DEBUG-FRAME: Track rotation magnitude ===
-                            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
-                                rot_traces = []
-                                for b in range(min(4, V_gen_prior.shape[0])):
-                                    mb = mask[b].bool()
-                                    n_valid = int(mb.sum().item())
-                                    if n_valid < 2:
-                                        continue
-                                    X = V_gen_prior[b, mb].float()
-                                    Y = x0_pred_0_diff[b, mb].float()
-                                    X_c = X - X.mean(dim=0, keepdim=True)
-                                    Y_c = Y - Y.mean(dim=0, keepdim=True)
-                                    M = X_c.T @ Y_c
-                                    
-                                    # PATCH 1B: Skip non-finite
-                                    if not torch.isfinite(M).all():
-                                        continue
-                                    
-                                    try:
-                                        # PATCH 1B: CPU SVD in double precision
-                                        M_cpu = M.detach().cpu().double()
-                                        U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(M_cpu, full_matrices=False)
-                                        R_cpu = U_cpu @ Vh_cpu
-                                        rot_traces.append((R_cpu.trace() / R_cpu.shape[0]).item())
-                                    except:
-                                        pass
-
-                                if rot_traces:
-                                    print(f"[DEBUG-FRAME] step={global_step} mean(tr(R)/D)={sum(rot_traces)/len(rot_traces):.4f} (1.0=no rotation needed)")
+                            if isinstance(x0_pred_0_result, tuple):
+                                x0_pred_0_tmp = x0_pred_0_result[0]
+                            else:
+                                x0_pred_0_tmp = x0_pred_0_result
                         
-                        result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
-                                                    self_cond=self_cond, return_debug=return_debug)
-                    else:
-                        result = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
-                                                      self_cond=None, return_debug=return_debug)
+                        # Second pass: use first pass output as self-conditioning
+                        result = score_net.forward_edm(
+                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            self_cond=x0_pred_0_tmp.detach(),  # stopgrad
+                            return_debug=return_debug
+                        )
+                        
+                        # Debug self-conditioning effectiveness
+                        if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                            with torch.no_grad():
+                                if isinstance(result, tuple):
+                                    x0_pred_final = result[0]
+                                else:
+                                    x0_pred_final = result
+                                
+                                diff = (x0_pred_final - x0_pred_0_tmp).abs()
+                                mask_f = mask.unsqueeze(-1).float()
+                                diff_mean = (diff * mask_f).sum() / mask_f.sum()
+                                x0_scale = (x0_pred_final.abs() * mask_f).sum() / mask_f.sum()
+                                rel_diff = diff_mean / x0_scale.clamp(min=1e-6)
+                                
+                                print(f"\n[SELF-COND] step={global_step} mode={self_cond_mode}")
+                                print(f"  Relative change from pass1 to pass2: {rel_diff.item()*100:.2f}%")
 
-                    
+                    elif self_cond_mode == 'none':
+                        # No self-conditioning
+                        result = score_net.forward_edm(
+                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            self_cond=None, return_debug=return_debug
+                        )
+                        
+                    else:
+                        # Fallback for old behavior (should not happen with new args)
+                        result = score_net.forward_edm(
+                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            self_cond=None, return_debug=return_debug
+                        )
+
+                                        
                     if isinstance(result, tuple):
                         x0_pred, debug_dict = result
                     else:
@@ -5044,11 +4966,7 @@ def train_stageC_diffusion_generator(
                         n_unknown = unknown_mask.sum(dim=1)
                         
                         # Only use anchor_geom if we have enough unknown points
-                        # use_anchor_geom = (n_unknown.median() >= anchor_geom_min_unknown) and anchor_cond_mask.any()
-                        if anchor_geom_min_unknown is None:
-                            anchor_geom_min_unknown = 0
                         use_anchor_geom = (n_unknown.median() >= anchor_geom_min_unknown) and anchor_cond_mask.any()
-
                         
                         if use_anchor_geom:
                             # Center the target in the same frame as V_geom for proper clamping
@@ -5063,11 +4981,7 @@ def train_stageC_diffusion_generator(
                             V_hat_centered_L = uet.clamp_anchors_for_loss(V_hat_centered, V_target_centered, anchor_cond_mask, mask)
                             
                             # Debug logging
-                            if anchor_geom_debug_every is None:
-                                anchor_geom_debug_every = 0  # disable debug prints when None
-
-                            if anchor_geom_debug_every > 0 and (global_step % anchor_geom_debug_every == 0) and (fabric is None or fabric.is_global_zero):
-
+                            if global_step % anchor_geom_debug_every == 0 and (fabric is None or fabric.is_global_zero):
                                 with torch.no_grad():
                                     n_anchor_mean = anchor_cond_mask.float().sum(dim=1).mean().item()
                                     n_unknown_mean = unknown_mask.float().sum(dim=1).mean().item()
@@ -5210,244 +5124,265 @@ def train_stageC_diffusion_generator(
                 L_subspace = torch.tensor(0.0, device=device)
 
             # ---------------------------------------------------------------
-            # NEW: Context invariance regularizer (core-edge stability)
-            # Same core points should predict the same local edge lengths
-            # even if we drop/change the surrounding context points.
-            # ---------------------------------------------------------------
-            # FIXES APPLIED:
-            # A) center_mask ensures both forwards use same coordinate frame
-            # B) core->core kNN avoids invalid edges to non-core points
-            # C) SNR-based gating (not sigma_data which can be tiny)
-            # D) Milder context drop (keep_p=0.8, min_extra=16)
-            # E) Comprehensive debug tags for verification
-            # ---------------------------------------------------------------
-            knn_spatial = batch.get('knn_spatial', None)
-            if knn_spatial is not None:
-                knn_spatial = knn_spatial.to(device)
-            
-            # Check master switch and conditions
-            ctx_edge_active = (
-                ENABLE_CTX_EDGE and 
-                (not is_sc) and 
-                (knn_spatial is not None) and 
-                (anchor_mask is not None) and 
-                (WEIGHTS.get('ctx_edge', 0.0) > 0)
-            )
-            
-            if ctx_edge_active:
-                core_mask = anchor_mask & mask
-                extra_mask = mask & (~core_mask)
+            # ========== CONTEXT REPLACEMENT INVARIANCE LOSS ==========
+            L_ctx_replace = torch.tensor(0.0, device=device)
+
+            if (not is_sc and 
+                ctx_loss_weight > 0 and 
+                'anchor_mask' in batch and 
+                'knn_spatial' in batch and
+                not anchor_train):  # Only apply in unanchored mode
                 
-                # Count for debug
-                n_core = int(core_mask.sum().item())
-                n_extra = int(extra_mask.sum().item())
-                B_ctx = mask.shape[0]
-
-                if extra_mask.any() and n_core >= 8:
-                    # ----- BUILD CORE->CORE kNN -----
-                    with torch.no_grad():
-                        V_for_knn = V_target.float()  # (B, N, D)
-                        B_knn, N_knn, D_knn = V_for_knn.shape
-                        K_ctx = min(CTX_K, n_core // B_ctx - 1) if n_core > B_ctx else CTX_K
-                        K_ctx = max(K_ctx, 4)  # At least 4 neighbors
-                        
-                        # Compute pairwise distances
-                        d_all = torch.cdist(V_for_knn, V_for_knn)  # (B, N, N)
-                        
-                        # Mask: only core->core edges are valid
-                        ok_mask = core_mask.unsqueeze(2) & core_mask.unsqueeze(1)  # (B, N, N)
-                        d_all = d_all + (~ok_mask).float() * 1e9
-                        
-                        # Mask self-edges
-                        eye = torch.eye(N_knn, device=device).unsqueeze(0)
-                        d_all = d_all + eye * 1e9
-                        
-                        # Get k nearest core neighbors
-                        knn_ctx = d_all.topk(k=K_ctx, largest=False).indices  # (B, N, K)
+                # Get core mask (reuse anchor_mask which marks core vs extras regardless of anchor_train)
+                core_mask = batch['anchor_mask'].to(device).bool() & mask
+                knn_spatial = batch['knn_spatial'].to(device)
+                
+                # Check if we have both core and extra points
+                n_core_per_sample = core_mask.sum(dim=1)
+                extra_mask = mask & (~core_mask)
+                n_extra_per_sample = extra_mask.sum(dim=1)
+                
+                # Require core >= 8 and extras > 0 for meaningful replacement
+                valid_samples = (n_core_per_sample >= 8) & (n_extra_per_sample > 0)
+                
+                if valid_samples.any():
+                    B_ctx = batch_size_real
+                    n_core = int(n_core_per_sample.float().mean().item())
+                    n_extra = int(n_extra_per_sample.float().mean().item())
                     
-                    # ----- [KNN-CTX] DEBUG: Verify core->core edges -----
-                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                        with torch.no_grad():
-                            flat_j = knn_ctx.reshape(B_ctx, -1)
-                            # Clamp indices to valid range before gather
-                            flat_j_safe = flat_j.clamp(0, core_mask.shape[1] - 1)
-                            core_j = torch.gather(core_mask, 1, flat_j_safe).reshape(B_ctx, N_knn, K_ctx)
-                            frac_core_neighbors = (core_j[core_mask].float().mean().item()
-                                                   if core_mask.any() else 0.0)
-                            core_counts = core_mask.sum(dim=1)
-                            min_core = int(core_counts.min().item())
-                            print(f"[KNN-CTX] step={global_step} K={K_ctx} "
-                                  f"frac_core_neighbors={frac_core_neighbors:.4f} min_core_per_sample={min_core}")
+                    # Decide whether to apply ctx loss this step
+                    apply_ctx = (torch.rand(1, device=device).item() < ctx_replace_p)
                     
-                    # ----- CONTEXT DROPOUT -----
-                    with torch.no_grad():
-                        rand = torch.rand_like(extra_mask.float())
-                        ctx_drop_mask = core_mask | (extra_mask & (rand < CTX_KEEP_P))
-
-                        # Ensure minimum extras are kept
-                        extra_kept = (ctx_drop_mask & extra_mask).sum(dim=1)
-                        need = (extra_mask.sum(dim=1) > 0) & (extra_kept < CTX_MIN_EXTRA)
-                        if need.any():
-                            for b in need.nonzero(as_tuple=True)[0].tolist():
-                                extra_idx = extra_mask[b].nonzero(as_tuple=True)[0]
-                                take = extra_idx[:CTX_MIN_EXTRA]
-                                ctx_drop_mask[b, take] = True
-                    
-                    # ----- [DROP] DEBUG: Verify dropout changes context -----
-                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                        with torch.no_grad():
-                            extra_total = extra_mask.sum(dim=1).float()
-                            extra_kept_cnt = (ctx_drop_mask & extra_mask).sum(dim=1).float()
-                            keep_frac = (extra_kept_cnt / extra_total.clamp(min=1)).median().item()
-                            print(f"[DROP] step={global_step} keep_p={CTX_KEEP_P:.2f} "
-                                  f"keep_frac_med={keep_frac:.3f} "
-                                  f"extra_kept_med={extra_kept_cnt.median().item():.1f}/"
-                                  f"{extra_total.median().item():.1f}")
-
-                    # ----- FORWARD PASS WITH DROPPED CONTEXT -----
-                    H_drop = context_encoder(Z_set, ctx_drop_mask)
-                    V_hat_drop = score_net.forward_edm(
-                        V_t, sigma_flat, H_drop, ctx_drop_mask, sigma_data,
-                        self_cond=None, return_debug=False,
-                        center_mask=mask  # FIX: Use original mask for centering!
-                    )
-
-                    # ----- COMPUTE LOSS IN FP32 -----
-                    with torch.autocast(device_type='cuda', enabled=False):
-                        V_full = V_hat_f32
-                        V_drop_f32 = V_hat_drop.float()
-                        
-                        # ----- [CENTER] DEBUG: Verify coordinate frame consistency -----
-                        # ----- [CENTER] DEBUG: Verify coordinate frame consistency (absolute + relative) -----
-                        if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                            mf = mask.float().unsqueeze(-1)        # (B,N,1)
-                            cf = core_mask.float().unsqueeze(-1)   # (B,N,1)
-
-                            denom_m = mf.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B,1,1)
-                            denom_c = cf.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B,1,1)
-
-                            mu_full_m = (V_full * mf).sum(dim=1, keepdim=True) / denom_m
-                            mu_drop_m = (V_drop_f32 * mf).sum(dim=1, keepdim=True) / denom_m
-                            mu_full_c = (V_full * cf).sum(dim=1, keepdim=True) / denom_c
-                            mu_drop_c = (V_drop_f32 * cf).sum(dim=1, keepdim=True) / denom_c
-
-                            # Absolute mean-shift per sample
-                            dm_vec = (mu_full_m - mu_drop_m).norm(dim=-1).squeeze(1)  # (B,)
-                            dc_vec = (mu_full_c - mu_drop_c).norm(dim=-1).squeeze(1)  # (B,)
-
-                            # Coordinate scale (RMS) in the same frame (centered by full-pass mean)
-                            mf_sum = mf.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
-                            cf_sum = cf.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
-
-                            V_full_m0 = (V_full - mu_full_m) * mf
-                            V_full_c0 = (V_full - mu_full_c) * cf
-
-                            rms_m = torch.sqrt(V_full_m0.pow(2).sum(dim=(1, 2)) / mf_sum)  # (B,)
-                            rms_c = torch.sqrt(V_full_c0.pow(2).sum(dim=(1, 2)) / cf_sum)  # (B,)
-
-                            # Relative drift ratios (dimensionless)
-                            ratio_m = dm_vec / (rms_m + 1e-8)
-                            ratio_c = dc_vec / (rms_c + 1e-8)
-
-                            print(
-                                f"[CENTER] step={global_step} "
-                                f"|Δmu_mask| mean={dm_vec.mean().item():.6f} med={dm_vec.median().item():.6f} "
-                                f"|Δmu_core| mean={dc_vec.mean().item():.6f} med={dc_vec.median().item():.6f} "
-                                f"rms_mask med={rms_m.median().item():.4f} rms_core med={rms_c.median().item():.4f} "
-                                f"ratio_mask med={ratio_m.median().item():.4f} max={ratio_m.max().item():.4f} "
-                                f"ratio_core med={ratio_c.median().item():.4f} max={ratio_c.max().item():.4f}"
-                            )
-
-                        # Center both on core points (same reference frame)
-                        core_f = core_mask.float().unsqueeze(-1)
-                        denom_c = core_f.sum(dim=1, keepdim=True).clamp(min=1.0)
-
-                        mu_full = (V_full * core_f).sum(dim=1, keepdim=True) / denom_c
-                        mu_drop = (V_drop_f32 * core_f).sum(dim=1, keepdim=True) / denom_c
-
-                        V_full_c = (V_full - mu_full) * core_f
-                        V_drop_c = (V_drop_f32 - mu_drop) * core_f
-
-                        # ----- SNR-BASED GATING (robust to tiny sigma_data) -----
-                        # snr_w = sigma_data^2 / (sigma^2 + sigma_data^2)
-                        # High snr_w = low noise (sigma near 0), low snr_w = high noise
-                        sigma_sq = sigma_flat.squeeze() ** 2 if sigma_flat.dim() > 1 else sigma_flat ** 2
+                    if apply_ctx:
+                        # ===== COMPUTE SNR GATING =====
+                        sigma_flat_ctx = sigma_flat if use_edm else torch.exp(4.0 * t_norm)
+                        sigma_sq = sigma_flat_ctx ** 2
                         snr_w = (sigma_data**2 / (sigma_sq + sigma_data**2)).detach().float()
                         if snr_w.dim() == 0:
                             snr_w = snr_w.unsqueeze(0)
                         
-                        # Gate: only apply ctx loss when SNR is high enough (low noise)
-                        w_ctx = (snr_w >= CTX_SNR_THRESH).float()
+                        # Gate: only apply when SNR is high enough (low noise)
+                        w_snr = (snr_w >= ctx_snr_thresh).float()
                         
-                        # Apply warmup
-                        warmup_mult = min(1.0, global_step / max(CTX_WARMUP_STEPS, 1))
-                        w_ctx = w_ctx * warmup_mult
-
-                        # ----- [CTX-GATE] DEBUG: Verify gating is sane -----
-                        if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                            sigma_med = sigma_flat.median().item() if sigma_flat.numel() > 0 else 0.0
-                            snr_med = snr_w.median().item() if snr_w.numel() > 0 else 0.0
-                            n_on = int((w_ctx > 0).sum().item())
-                            print(f"[CTX-GATE] step={global_step} sigma_data={sigma_data:.5f} "
-                                  f"sigma_med={sigma_med:.4f} snr_med={snr_med:.4f} "
-                                  f"snr_thresh={CTX_SNR_THRESH:.2f} n_on={n_on}/{B_ctx} warm={warmup_mult:.2f}")
-
-                        # ----- COMPUTE EDGE CONSISTENCY LOSS -----
-                        L_ctx_edge = uet.edge_consistency_loss(
-                            V_full_c, V_drop_c, knn_ctx,
-                            mask=core_mask, anchor_mask=core_mask,
-                            sample_weight=w_ctx,
-                            eps=1e-8,
-                            huber_delta=0.25,
-                        )
+                        # Warmup ramp
+                        warmup_mult = min(1.0, global_step / max(ctx_warmup_steps, 1))
+                        w_ctx = w_snr * warmup_mult
                         
-                        # ----- [CTX-EDGE-STATS] DEBUG: Show magnitude of penalized discrepancy -----
-                        if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                            with torch.no_grad():
-                                b0 = 0
-                                core_idx = core_mask[b0].nonzero(as_tuple=True)[0]
-                                if core_idx.numel() > 0:
-                                    sel = core_idx[:min(64, core_idx.numel())]
-                                    j = knn_ctx[b0, sel]  # (S, K)
-                                    j = j.clamp(0, V_full_c.shape[1] - 1)  # Safety clamp
-                                    Va = V_full_c[b0, sel]               # (S, D)
-                                    Vb = V_drop_c[b0, sel]               # (S, D)
-                                    Va_j = V_full_c[b0, j]               # (S, K, D)
-                                    Vb_j = V_drop_c[b0, j]               # (S, K, D)
-                                    da = ((Va[:, None, :] - Va_j)**2).sum(-1).clamp_min(1e-8).log()
-                                    db = ((Vb[:, None, :] - Vb_j)**2).sum(-1).clamp_min(1e-8).log()
-                                    diff = (da - db).abs()
-                                    print(f"[CTX-EDGE-STATS] step={global_step} |logd_a-logd_b| "
-                                          f"mean={diff.mean().item():.4f} p90={diff.quantile(0.9).item():.4f} "
-                                          f"max={diff.max().item():.4f}")
+                        # Only proceed if at least some samples pass SNR gate
+                        if w_ctx.sum() > 0:
+                            # ===== BUILD REPLACEMENT CONTEXT =====
+                            # We already have H from the main forward pass (this is H_train actually)
+                            # We need to compute a replacement context
+                            
+                            if ctx_replace_variant == 'permute':
+                                # Random permutation (prefer derangement)
+                                with torch.no_grad():
+                                    perm = torch.randperm(B_ctx, device=device)
+                                    
+                                    # Try to fix any fixed points (best effort)
+                                    fixed_points = (perm == torch.arange(B_ctx, device=device))
+                                    n_fixed = fixed_points.sum().item()
+                                    
+                                    if n_fixed > 0 and B_ctx > 1:
+                                        # Swap fixed points with their neighbors
+                                        fixed_idx = fixed_points.nonzero(as_tuple=True)[0]
+                                        for i in fixed_idx:
+                                            swap_target = (i + 1) % B_ctx
+                                            if not fixed_points[swap_target]:
+                                                perm[i], perm[swap_target] = perm[swap_target].clone(), perm[i].clone()
+                                    
+                                    # Check again
+                                    fixed_points_final = (perm == torch.arange(B_ctx, device=device))
+                                    n_fixed_final = fixed_points_final.sum().item()
+                                    perm_fixed_frac = n_fixed_final / max(B_ctx, 1)
+                                
+                                # Apply permutation to Z_set to get replacement context
+                                Z_set_rep = Z_set[perm]
+                                mask_rep = mask[perm]
+                                
+                                # Encode replacement context
+                                H_rep = context_encoder(Z_set_rep, mask_rep)
+                                
+                                ctx_debug_info = f"permute fixed={n_fixed_final}/{B_ctx}"
+                                ctx_metric = perm_fixed_frac
+                                
+                            elif ctx_replace_variant == 'hard':
+                                # Hard negative: most similar context
+                                with torch.no_grad():
+                                    # Pool context to per-sample vectors
+                                    mask_f = mask.unsqueeze(-1).float()
+                                    denom = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+                                    
+                                    # H_train is either (B, D) or (B, N, D) depending on architecture
+                                    if H_train.dim() == 2:
+                                        v_ctx = H_train  # Already pooled
+                                    elif H_train.dim() == 3:
+                                        v_ctx = (H_train * mask_f).sum(dim=1) / denom.squeeze(-1)
+                                    else:
+                                        # Fallback
+                                        v_ctx = H_train.reshape(B_ctx, -1)
+                                    
+                                    # Normalize for cosine similarity
+                                    v_ctx_norm = v_ctx / (v_ctx.norm(dim=-1, keepdim=True) + 1e-8)
+                                    
+                                    # Compute pairwise cosine similarity
+                                    sim_matrix = v_ctx_norm @ v_ctx_norm.T  # (B, B)
+                                    
+                                    # Mask diagonal (can't pick self)
+                                    sim_matrix.fill_diagonal_(-1.0)
+                                    
+                                    # For each sample, find most similar other sample
+                                    hard_idx = sim_matrix.argmax(dim=1)  # (B,)
+                                    hard_sim = sim_matrix.max(dim=1)[0]  # (B,)
+                                    
+                                    # Random baseline (for comparison)
+                                    rand_idx = torch.randint(0, B_ctx, (B_ctx,), device=device)
+                                    rand_idx = torch.where(rand_idx == torch.arange(B_ctx, device=device), 
+                                                        (rand_idx + 1) % B_ctx, 
+                                                        rand_idx)
+                                    rand_sim = sim_matrix[torch.arange(B_ctx, device=device), rand_idx]
+                                    
+                                    hard_sim_mean = hard_sim.mean().item()
+                                    rand_sim_mean = rand_sim.mean().item()
+                                
+                                # Apply hard negative selection to Z_set
+                                Z_set_rep = Z_set[hard_idx]
+                                mask_rep = mask[hard_idx]
+                                
+                                # Encode replacement context
+                                H_rep = context_encoder(Z_set_rep, mask_rep)
+                                
+                                ctx_debug_info = f"hard sim={hard_sim_mean:.3f} vs rand={rand_sim_mean:.3f}"
+                                ctx_metric = hard_sim_mean
+                            
+                            else:
+                                raise ValueError(f"Unknown ctx_replace_variant: {ctx_replace_variant}")
+                            
+                            # ===== FORWARD PASS WITH REPLACEMENT CONTEXT =====
+                            # Use SAME self-conditioning strategy but with replacement context
+                            with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                                if self_cond_mode == 'standard' and score_net.self_conditioning:
+                                    # Two-pass self-conditioning for replacement branch
+                                    with torch.no_grad():
+                                        x0_pred_rep_0_result = score_net.forward_edm(
+                                            V_t, sigma_flat, H_rep, mask, sigma_data,
+                                            self_cond=None, return_debug=False
+                                        )
+                                        if isinstance(x0_pred_rep_0_result, tuple):
+                                            x0_pred_rep_0 = x0_pred_rep_0_result[0]
+                                        else:
+                                            x0_pred_rep_0 = x0_pred_rep_0_result
+                                    
+                                    x0_pred_rep_result = score_net.forward_edm(
+                                        V_t, sigma_flat, H_rep, mask, sigma_data,
+                                        self_cond=x0_pred_rep_0.detach(),
+                                        return_debug=False
+                                    )
+                                else:
+                                    # No self-conditioning
+                                    x0_pred_rep_result = score_net.forward_edm(
+                                        V_t, sigma_flat, H_rep, mask, sigma_data,
+                                        self_cond=None, return_debug=False
+                                    )
+                                
+                                if isinstance(x0_pred_rep_result, tuple):
+                                    x0_pred_rep = x0_pred_rep_result[0]
+                                else:
+                                    x0_pred_rep = x0_pred_rep_result
+                            
+                            # ===== COMPUTE CONTEXT REPLACEMENT LOSS =====
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                x0_pred_full = x0_pred.float()  # x0_pred from main forward pass
+                                x0_pred_rep_f32 = x0_pred_rep.float()
+                                
+                                # Center both on core points (same reference frame)
+                                core_f = core_mask.float().unsqueeze(-1)
+                                denom_c = core_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+                                
+                                mu_full = (x0_pred_full * core_f).sum(dim=1, keepdim=True) / denom_c
+                                mu_rep = (x0_pred_rep_f32 * core_f).sum(dim=1, keepdim=True) / denom_c
+                                
+                                x0_full_c = x0_pred_full - mu_full
+                                x0_rep_c = x0_pred_rep_f32 - mu_rep
+                                
+                                # MSE on core points only
+                                err2_core = ((x0_full_c - x0_rep_c).pow(2) * core_f).sum(dim=-1)  # (B, N)
+                                
+                                # Per-sample average over core points
+                                n_core_tensor = core_f.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
+                                err2_per_sample = err2_core.sum(dim=1) / n_core_tensor  # (B,)
+                                
+                                # Apply SNR gating
+                                L_ctx_replace = (w_ctx * err2_per_sample).sum() / w_ctx.sum().clamp(min=1.0)
+                            
+                            # ===== DEBUG LOGGING =====
+                            if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                with torch.no_grad():
+                                    sigma_med = sigma_flat_ctx.median().item()
+                                    snr_med = snr_w.median().item()
+                                    n_on = int((w_ctx > 0).sum().item())
+                                    
+                                    print(f"\n[CTX-REPL] step={global_step} variant={ctx_replace_variant}")
+                                    print(f"  {ctx_debug_info}")
+                                    print(f"  p_apply={ctx_replace_p:.2f} applied=True")
+                                    print(f"  core={n_core} extra={n_extra}")
+                                    
+                                    print(f"\n[CTX-GATE] step={global_step}")
+                                    print(f"  sigma_data={sigma_data:.5f} sigma_med={sigma_med:.4f}")
+                                    print(f"  snr_med={snr_med:.4f} snr_thresh={ctx_snr_thresh:.2f}")
+                                    print(f"  n_on={n_on}/{B_ctx} warmup={warmup_mult:.2f}")
+                                    
+                                    print(f"\n[CTX-LOSS] step={global_step}")
+                                    print(f"  L_ctx_replace={L_ctx_replace.item():.6f}")
+                                    print(f"  λ_ctx={ctx_loss_weight} contribution={ctx_loss_weight * L_ctx_replace.item():.6f}")
+                                    
+                                    # Delta statistics
+                                    core_delta = ((x0_full_c - x0_rep_c).pow(2).sum(dim=-1).sqrt() * core_mask.float()).sum(dim=1) / n_core_tensor
+                                    print(f"\n[CTX-DELTA] step={global_step}")
+                                    print(f"  core_delta_mean={core_delta.mean().item():.6f}")
+                                    print(f"  core_delta_p90={core_delta.quantile(0.9).item():.6f}")
+                            
+                            # Track for epoch averaging
+                            ctx_replace_sum += L_ctx_replace.item()
+                            ctx_apply_count += 1
+                            ctx_snr_sum += snr_w.median().item()
+                            
+                            if ctx_replace_variant == 'hard':
+                                ctx_hard_sim_sum += ctx_metric
+                            elif ctx_replace_variant == 'permute':
+                                ctx_perm_fixed_sum += ctx_metric
                         
-                    # ----- [CTX] MAIN DEBUG PRINT -----
-                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                        ctx_w = float(WEIGHTS.get('ctx_edge', 0.0))
-                        n_on = int((w_ctx > 0).sum().item())
-                        print(f"[CTX] step={global_step} entered=True L_ctx_edge={L_ctx_edge.item():.6f} "
-                              f"ctx_w={ctx_w:.4f} core={n_core} extra={n_extra} "
-                              f"n_on={n_on}/{B_ctx} warm={warmup_mult:.2f}")
+                        else:
+                            # SNR gate blocked all samples
+                            if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                print(f"[CTX-REPL] step={global_step} SNR gate blocked all samples")
+                    
+                    else:
+                        # Not applying this step (probability gate)
+                        if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                            print(f"[CTX-REPL] step={global_step} skipped (prob gate)")
+                
                 else:
-                    # Not enough points for ctx loss
-                    if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
-                        print(f"[CTX] step={global_step} SKIPPED: core={n_core} extra={n_extra} "
-                              f"(need core>=8 and extra>0)")
+                    # Not enough core/extra points
+                    if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                        print(f"[CTX-REPL] step={global_step} skipped: insufficient core/extra")
+
             else:
-                # Ctx loss disabled or conditions not met
-                if (global_step % CTX_DEBUG_EVERY == 0) and (fabric is None or fabric.is_global_zero):
+                # Context loss disabled or wrong conditions
+                if global_step % (ctx_debug_every * 5) == 0 and (fabric is None or fabric.is_global_zero):
                     reasons = []
-                    if not ENABLE_CTX_EDGE:
-                        reasons.append("ENABLE_CTX_EDGE=False")
                     if is_sc:
                         reasons.append("is_sc=True")
-                    if knn_spatial is None:
-                        reasons.append("knn_spatial=None")
-                    if anchor_mask is None:
-                        reasons.append("anchor_mask=None")
-                    if WEIGHTS.get('ctx_edge', 0.0) <= 0:
+                    if ctx_loss_weight <= 0:
                         reasons.append("weight=0")
-                    print(f"[CTX] step={global_step} entered=False reason={', '.join(reasons)}")
+                    if 'anchor_mask' not in batch:
+                        reasons.append("no_anchor_mask")
+                    if 'knn_spatial' not in batch:
+                        reasons.append("no_knn_spatial")
+                    if anchor_train:
+                        reasons.append("anchor_train=True (ctx_replace only in unanchored mode)")
+                    print(f"[CTX-REPL] step={global_step} disabled: {', '.join(reasons)}")
+
 
 
 
@@ -7868,7 +7803,8 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['topo'] * L_topo +
                     WEIGHTS['shape_spec'] * L_shape_spec +
                     WEIGHTS.get('subspace', 0) * L_subspace +  # PATCH 7
-                    WEIGHTS.get('ctx_edge', 0) * L_ctx_edge)   # NEW: context invariance
+                    WEIGHTS.get('ctx_edge', 0) * L_ctx_edge +
+                    ctx_loss_weight * L_ctx_replace)   # NEW: context invariance
             
             # Add SC dimension prior if this is an SC batch
             if is_sc:
@@ -8357,6 +8293,8 @@ def train_stageC_diffusion_generator(
             epoch_losses['subspace'] += L_subspace.item()
             epoch_losses['gram_learn'] += L_gram_learn.item()  # FIX: Was missing!
             epoch_losses['ctx_edge'] += L_ctx_edge.item()  # NEW: context invariance
+            # epoch_losses['ctx_replace'] += L_ctx_replace.item()
+
 
 
             def _is_rank0():
@@ -8750,6 +8688,28 @@ def train_stageC_diffusion_generator(
             avg_score = epoch_losses['score'] / max(n_batches, 1)
             avg_gram = epoch_losses['gram'] / max(n_batches, 1)
             avg_total = epoch_losses['total'] / max(n_batches, 1)
+
+            avg_ctx_replace = ctx_replace_sum / max(ctx_apply_count, 1)
+            avg_ctx_snr = ctx_snr_sum / max(ctx_apply_count, 1)
+            ctx_apply_rate = ctx_apply_count / max(n_batches, 1)
+
+            if ctx_replace_variant == 'hard':
+                avg_ctx_hard_sim = ctx_hard_sim_sum / max(ctx_apply_count, 1)
+                avg_ctx_perm_fixed = 0.0
+            elif ctx_replace_variant == 'permute':
+                avg_ctx_perm_fixed = ctx_perm_fixed_sum / max(ctx_apply_count, 1)
+                avg_ctx_hard_sim = 0.0
+            else:
+                avg_ctx_hard_sim = 0.0
+                avg_ctx_perm_fixed = 0.0
+
+            history['epoch_avg']['ctx_replace'].append(avg_ctx_replace)
+            history['epoch_avg']['ctx_snr_med'].append(avg_ctx_snr)
+            history['epoch_avg']['ctx_apply_rate'].append(ctx_apply_rate)
+            history['epoch_avg']['ctx_hard_sim'].append(avg_ctx_hard_sim)
+            history['epoch_avg']['ctx_perm_fixed'].append(avg_ctx_perm_fixed)
+
+
             
             
             # Print detailed losses every 5 epochs, simple summary otherwise
@@ -9061,7 +9021,6 @@ def train_stageC_diffusion_generator(
                     'epoch': epoch,
                     'context_encoder': context_encoder.state_dict(),
                     'score_net': score_net.state_dict(),
-                    'generator': generator.state_dict(),
                     'context_encoder_ema': context_encoder_ema.state_dict(),
                     'score_net_ema': score_net_ema.state_dict(),
                     'ema_decay': ema_decay,
@@ -9079,7 +9038,6 @@ def train_stageC_diffusion_generator(
             'epoch': epoch,
             'context_encoder': context_encoder.state_dict(),
             'score_net': score_net.state_dict(),
-            'generator': generator.state_dict(),
             'context_encoder_ema': context_encoder_ema.state_dict(),
             'score_net_ema': score_net_ema.state_dict(),
             'ema_decay': ema_decay,
@@ -9089,7 +9047,6 @@ def train_stageC_diffusion_generator(
             'sigma_min': sigma_min,
             'sigma_max': sigma_max,
         }
-
 
         torch.save(ckpt_final, os.path.join(outf, 'ckpt_final.pt'))
         print(f"Saved final checkpoint at epoch {epoch+1}")
@@ -10826,10 +10783,6 @@ def sample_sc_edm_patchwise(
     debug_gap_k: int = 10,
     # --- ANCHOR-CHANNEL DIAGNOSTIC ---
     anchor_channel_sensitivity_diag: bool = False,
-    anchor_bit_only_diag: bool = False,
-    anchor_bit_scale: float = 1.0,
-    # --- PATCH SAMPLER STYLE ---
-    probe_style_patch_sampling: bool = False,
     # --- TWO-PASS MODE ---
     two_pass: bool = False,
     _pass_number: int = 1,  # Internal: which pass are we on (1 or 2)
@@ -12072,48 +12025,11 @@ def sample_sc_edm_patchwise(
                 #     )
                 
                 # Generator proposal (full D_latent)
-                # --- PATCH SAMPLER: probe-style (open-loop) vs default ---
-                if probe_style_patch_sampling:
-                    # PROBE-STYLE: pure noise, Euler, center every step (matches run_probe_open_loop_sample)
-                    V_t = sigmas[0] * torch.randn(1, m_k, D_latent, device=device)
-                    V_t = V_t * mask_k.unsqueeze(-1).float()
-
-                    for i in range(len(sigmas) - 1):
-                        sigma = sigmas[i]
-                        sigma_next = sigmas[i + 1]
-                        sigma_b = sigma.view(1)
-
-                        # center current state
-                        V_t_centered, _ = uet.center_only(V_t, mask_k)
-
-                        # denoise
-                        x0 = score_net.forward_edm(
-                            V_t_centered, sigma_b, H_k, mask_k, sigma_data,
-                            self_cond=None, return_debug=False
-                        )
-                        if isinstance(x0, tuple):
-                            x0 = x0[0]
-
-                        # center denoised
-                        x0_centered, _ = uet.center_only(x0, mask_k)
-
-                        if sigma_next > 0:
-                            d = (V_t_centered - x0_centered) / sigma.clamp_min(1e-8)
-                            V_t = V_t_centered + (sigma_next - sigma) * d
-                        else:
-                            V_t = x0_centered
-
-                        V_t = V_t * mask_k.unsqueeze(-1).float()
-
-                    V_final = V_t.squeeze(0)
-
-                else:
-                    # DEFAULT: generator init + existing EDM sampling
-                    V_gen = generator(H_k, mask_k)  # (1, m_k, D_latent)
-
-                    # Initialize from generator + noise
-                    V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
-                    V_t = V_t * mask_k.unsqueeze(-1).float()
+                V_gen = generator(H_k, mask_k)  # (1, m_k, D_latent)
+                
+                # Initialize from generator + noise
+                V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
+                V_t = V_t * mask_k.unsqueeze(-1).float()
 
                 # ============================
                 # COLD START DIAGNOSTIC (ONCE)
@@ -13237,12 +13153,9 @@ def sample_sc_edm_patchwise(
                     # Append anchor channel if needed
                     if expected_in is not None and expected_in == Z_k_batched.shape[-1] + 1:
                         anchor_channel = anchor_cond_mask_k.float().unsqueeze(-1)  # (1, m_k, 1)
-                        if anchor_bit_scale != 1.0:
-                            anchor_channel = anchor_channel * anchor_bit_scale
                         Z_k_batched = torch.cat([Z_k_batched, anchor_channel], dim=-1)
                         if len(processed) <= 3:
                             print(f"[ANCHOR-CHAN] appended anchor channel, Z_k shape={Z_k_batched.shape}, nA_marked={anchor_channel.sum().item():.0f}")
-
                     
                     
                     H_k = context_encoder(Z_k_batched, mask_k)
@@ -13328,24 +13241,6 @@ def sample_sc_edm_patchwise(
                     noise_init = torch.randn_like(V_gen) * sigmas[0]
                     V_t = V_t + noise_init * unknown_3d  # Only add noise to unknown
                     V_t = V_t * mask_k.unsqueeze(-1).float()
-
-                    # ===== ANCHOR-BIT-ONLY DIAG (no center_mask, no clamping) =====
-                    if anchor_bit_only_diag and H_k_no_anchor is not None and len(processed) <= 3:
-                        sigma0 = sigmas[0].view(1)
-                        x0_c_diag = _forward_edm_self_cond(
-                            score_net, V_t, sigma0, H_k, mask_k, sigma_data, center_mask=None
-                        )
-                        x0_no_anchor_diag = _forward_edm_self_cond(
-                            score_net, V_t, sigma0, H_k_no_anchor, mask_k, sigma_data, center_mask=None
-                        )
-                        diff = (x0_c_diag - x0_no_anchor_diag).norm(dim=[1, 2]).mean().item()
-                        base = x0_c_diag.norm(dim=[1, 2]).mean().item()
-                        rel = diff / max(base, 1e-8)
-                        print(f"[ANCHOR-BIT-ONLY] patch={k} sigma={float(sigmas[0]):.4f} "
-                            f"scale={anchor_bit_scale:.1f} abs={diff:.4f} rel={rel:.4f}")
-
-                    # Initialize revisable overlap points from current global coords
-
 
                     # Initialize revisable overlap points from current global coords
                     # (they are treated as unknowns, so they are allowed to move)
@@ -14164,19 +14059,15 @@ def sample_sc_edm_patchwise(
     # ------------------------------------------------------------------
     # DEBUG: Save patch coords (AFTER all patches sampled, BEFORE alignment)
     # ------------------------------------------------------------------
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         all_rms = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
-        if all_rms.numel() == 0:
-            print("\n[PATCH-SAMPLE] Final RMS distribution across patches: (no patches)")
-        else:
-            print(f"\n[PATCH-SAMPLE] Final RMS distribution across patches: "
-                f"min={all_rms.min().item():.3f} "
-                f"p25={all_rms.quantile(0.25).item():.3f} "
-                f"p50={all_rms.quantile(0.50).item():.3f} "
-                f"p75={all_rms.quantile(0.75).item():.3f} "
-                f"max={all_rms.max().item():.3f}")
+        print(f"\n[PATCH-SAMPLE] Final RMS distribution across patches: "
+              f"min={all_rms.min().item():.3f} "
+              f"p25={all_rms.quantile(0.25).item():.3f} "
+              f"p50={all_rms.quantile(0.50).item():.3f} "
+              f"p75={all_rms.quantile(0.75).item():.3f} "
+              f"max={all_rms.max().item():.3f}")
 
-        
         torch.save(
             {
                 "patch_indices": [p.cpu() for p in patch_indices],
@@ -14190,14 +14081,14 @@ def sample_sc_edm_patchwise(
     # ===================================================================
     # DIAGNOSTIC B3: OVERLAP NEIGHBOR AGREEMENT (JACCARD)
     # ===================================================================
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print("\n" + "="*70)
         print("DIAGNOSTIC B3: OVERLAP NEIGHBOR AGREEMENT")
         print("="*70)
-        
+
         overlap_jaccards = []
         overlap_dist_corrs = []
-        
+
         # Sample 20 random overlapping patch pairs
         overlap_pairs = []
         for i in range(min(K, 50)):
@@ -14207,11 +14098,12 @@ def sample_sc_edm_patchwise(
                 shared = S_i & S_j
                 if len(shared) >= 30:  # Need enough for meaningful kNN
                     overlap_pairs.append((i, j, list(shared)))
-        
+
         # Analyze up to 20 pairs
         for i, j, shared_list in overlap_pairs[:20]:
             # Get coords for shared cells in both patches
-
+            if i >= len(patch_coords) or j >= len(patch_coords):
+                continue
 
             # Build position lookup dicts (O(1) lookup)
             pos_i = {int(cid): p for p, cid in enumerate(patch_indices[i].tolist())}
@@ -14220,53 +14112,46 @@ def sample_sc_edm_patchwise(
 
             shared_idx_i = torch.tensor([pos_i[c] for c in shared_list], dtype=torch.long)
             shared_idx_j = torch.tensor([pos_j[c] for c in shared_list], dtype=torch.long)
-            
-            # V_i_shared = patch_coords[i][shared_idx_i]
-            # V_j_shared = patch_coords[j][shared_idx_j]
-            # Guard for probe-style/unanchored paths where patch_coords may be empty
-            if i >= len(patch_coords) or j >= len(patch_coords):
-                continue
-            if patch_coords[i].numel() == 0 or patch_coords[j].numel() == 0:
-                continue
+
             V_i_shared = patch_coords[i][shared_idx_i]
             V_j_shared = patch_coords[j][shared_idx_j]
-            
+
             # Compute kNN Jaccard
             knn_i = knn_sets(V_i_shared, k=min(10, len(shared_list)-1))
             knn_j = knn_sets(V_j_shared, k=min(10, len(shared_list)-1))
             jaccard = mean_jaccard(knn_i, knn_j)
             overlap_jaccards.append(jaccard)
-            
+
             # Also compute distance correlation
             D_i = torch.cdist(V_i_shared, V_i_shared).cpu().numpy()
             D_j = torch.cdist(V_j_shared, V_j_shared).cpu().numpy()
             triu = np.triu_indices(len(shared_list), k=1)
             dist_corr = np.corrcoef(D_i[triu], D_j[triu])[0, 1]
             overlap_dist_corrs.append(dist_corr)
-        
+
         if overlap_jaccards:
             print(f"\n[B3] Analyzed {len(overlap_jaccards)} overlapping patch pairs:")
             print(f"  kNN Jaccard: {np.mean(overlap_jaccards):.3f} ± {np.std(overlap_jaccards):.3f}")
             print(f"  Distance corr: {np.mean(overlap_dist_corrs):.3f} ± {np.std(overlap_dist_corrs):.3f}")
-            
+
             if np.mean(overlap_jaccards) < 0.3:
                 print("  ⚠️  LOW JACCARD: Patches disagree on neighborhoods → DIFFUSION PROBLEM")
             elif np.mean(overlap_jaccards) > 0.6:
                 print("  ✓ GOOD JACCARD: Patches agree on neighborhoods")
-            
+
             # Plot
             import matplotlib.pyplot as plt
             fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-            
+
             axes[0].hist(overlap_jaccards, bins=20, edgecolor='black', alpha=0.7, color='blue')
-            axes[0].axvline(np.mean(overlap_jaccards), color='red', linestyle='--', 
+            axes[0].axvline(np.mean(overlap_jaccards), color='red', linestyle='--',
                            label=f'Mean={np.mean(overlap_jaccards):.3f}')
             axes[0].set_xlabel('kNN Jaccard')
             axes[0].set_ylabel('Count')
             axes[0].set_title('Overlap Neighbor Agreement (Jaccard)')
             axes[0].legend()
             axes[0].grid(alpha=0.3)
-            
+
             axes[1].scatter(overlap_dist_corrs, overlap_jaccards, alpha=0.6)
             axes[1].axhline(0.5, color='red', linestyle='--', alpha=0.5)
             axes[1].axvline(0.8, color='red', linestyle='--', alpha=0.5)
@@ -14274,38 +14159,37 @@ def sample_sc_edm_patchwise(
             axes[1].set_ylabel('kNN Jaccard')
             axes[1].set_title('Distance Corr vs Neighbor Agreement')
             axes[1].grid(alpha=0.3)
-            
+
             plt.tight_layout()
             plt.show()
-        
+
         print("="*70 + "\n")
 
 
     # Compute median patch RMS as target scale for global alignment
-    patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
-    rms_target = patch_rms_list.median().item()
+    if len(patch_coords) > 0:
+        patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
+        rms_target = patch_rms_list.median().item()
+    else:
+        rms_target = 1.0  # Default value when patch_coords is empty
 
 
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print(f"[ALIGN] Target RMS for global space: {rms_target:.3f} (median of patches)")
 
 
 
 
     # DEBUG 3: RMS distribution across all patches
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         all_rms = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords])
-        if all_rms.numel() == 0:
-            print("\n[PATCH-SAMPLE] RMS distribution across patches: (no patches)")
-        else:
-            print(f"\n[PATCH-SAMPLE] RMS distribution across patches: "
-                f"min={all_rms.min().item():.3f} "
-                f"p25={all_rms.quantile(0.25).item():.3f} "
-                f"p50={all_rms.quantile(0.50).item():.3f} "
-                f"p75={all_rms.quantile(0.75).item():.3f} "
-                f"max={all_rms.max().item():.3f}")
+        print(f"\n[PATCH-SAMPLE] RMS distribution across patches: "
+            f"min={all_rms.min().item():.3f} "
+            f"p25={all_rms.quantile(0.25).item():.3f} "
+            f"p50={all_rms.quantile(0.50).item():.3f} "
+            f"p75={all_rms.quantile(0.75).item():.3f} "
+            f"max={all_rms.max().item():.3f}")
 
-        
         # Save patch coords for reproducibility testing
         torch.save(
             {
@@ -14318,55 +14202,54 @@ def sample_sc_edm_patchwise(
 
 
     # ===== DIAGNOSTIC: Patch-level geometry BEFORE any stitching =====
-    # ===== DIAGNOSTIC: Patch-level geometry BEFORE any stitching =====
-    if DEBUG_FLAG and K > 1:
+    if DEBUG_FLAG and K > 1 and len(patch_coords) > 0:
         print("\n" + "="*60)
         print("PATCH OVERLAP DIAGNOSTIC (pre-alignment)")
         print("="*60)
-        
+
         # Find pairs of overlapping patches
         overlap_corrs = []
-        
+
         for k1 in range(min(10, K)):  # Check first 10 patches
             if k1 >= len(patch_coords):
                 continue
             S_k1 = set(patch_indices[k1].cpu().tolist())
             V_k1 = patch_coords[k1].cpu()  # (m_k1, D)
-            
+
             for k2 in range(k1+1, min(k1+5, K)):  # Check next 4 patches
                 if k2 >= len(patch_coords):
                     continue
                 S_k2 = set(patch_indices[k2].cpu().tolist())
-                
+
                 # Find shared cells
                 shared = S_k1 & S_k2
                 if len(shared) < 20:  # Need enough overlap
                     continue
-                
+
                 shared_list = sorted(list(shared))
-                
+
                 # Get positions in each patch
                 S_k1_list = patch_indices[k1].cpu().tolist()
                 S_k2_list = patch_indices[k2].cpu().tolist()
-                
+
                 pos_k1 = [S_k1_list.index(s) for s in shared_list]
                 pos_k2 = [S_k2_list.index(s) for s in shared_list]
-                
+
                 # Extract shared cell coords from each patch
                 V_shared_k1 = V_k1[pos_k1]  # (n_shared, D)
                 V_shared_k2 = patch_coords[k2].cpu()[pos_k2]
-                
+
                 # Compute pairwise distances within shared cells
                 D_k1 = torch.cdist(V_shared_k1, V_shared_k1).numpy()
                 D_k2 = torch.cdist(V_shared_k2, V_shared_k2).numpy()
-                
+
                 # Compare distances (upper triangle)
                 tri = np.triu_indices(len(shared_list), k=1)
                 if len(tri[0]) > 10:
                     from scipy.stats import pearsonr
                     corr = pearsonr(D_k1[tri], D_k2[tri])[0]
                     overlap_corrs.append(corr)
-        
+
         if overlap_corrs:
             overlap_corrs = np.array(overlap_corrs)
             print(f"[OVERLAP] Checked {len(overlap_corrs)} patch pairs")
@@ -14376,7 +14259,7 @@ def sample_sc_edm_patchwise(
                 f"median={np.median(overlap_corrs):.3f} "
                 f"p75={np.percentile(overlap_corrs, 75):.3f} "
                 f"max={overlap_corrs.max():.3f}")
-            
+
             if np.median(overlap_corrs) < 0.7:
                 print("\n⚠️  WARNING: Low overlap consistency!")
                 print("    Patches disagree about shared cells' neighborhoods")
@@ -14388,41 +14271,41 @@ def sample_sc_edm_patchwise(
             else:
                 print("\n⚠️  Moderate overlap consistency")
                 print("    Some disagreement between patches")
-        else:
-            print("[OVERLAP] Skipped (no valid patch_coords)")
 
         print("="*60 + "\n")
 
 
-
     # DEBUG: Patch-level correlation to GT (if GT is available)
-    if DEBUG_FLAG and hasattr(sc_gene_expr, 'gt_coords'):
+    if DEBUG_FLAG and hasattr(sc_gene_expr, 'gt_coords') and len(patch_coords) > 0:
         from scipy.spatial.distance import cdist
         from scipy.stats import pearsonr
-        
+
         gt_coords = sc_gene_expr.gt_coords  # Assume passed in somehow
         patch_local_corrs = []
-        
+
         for k in range(K):
+            if k >= len(patch_coords):
+                continue
             S_k_np = patch_indices[k].cpu().numpy()
             V_k = patch_coords[k].cpu().numpy()  # (m_k, D_latent)
             gt_k = gt_coords[S_k_np]  # (m_k, 2)
-            
+
             D_pred = cdist(V_k, V_k)
             D_gt = cdist(gt_k, gt_k)
-            
+
             tri = np.triu_indices(len(S_k_np), k=1)
             if len(tri[0]) > 0:
                 r = pearsonr(D_pred[tri], D_gt[tri])[0]
                 patch_local_corrs.append(r)
-        
-        patch_local_corrs = np.array(patch_local_corrs)
-        print(f"\n[PATCH-LOCAL] Pearson vs GT: "
-              f"min={patch_local_corrs.min():.3f} "
-              f"p25={np.percentile(patch_local_corrs, 25):.3f} "
-              f"p50={np.median(patch_local_corrs):.3f} "
-              f"p75={np.percentile(patch_local_corrs, 75):.3f} "
-              f"max={patch_local_corrs.max():.3f}")
+
+        if len(patch_local_corrs) > 0:
+            patch_local_corrs = np.array(patch_local_corrs)
+            print(f"\n[PATCH-LOCAL] Pearson vs GT: "
+                  f"min={patch_local_corrs.min():.3f} "
+                  f"p25={np.percentile(patch_local_corrs, 25):.3f} "
+                  f"p50={np.median(patch_local_corrs):.3f} "
+                  f"p75={np.percentile(patch_local_corrs, 75):.3f} "
+                  f"max={patch_local_corrs.max():.3f}")
 
 
     # ------------------------------------------------------------------
@@ -14437,16 +14320,17 @@ def sample_sc_edm_patchwise(
     W_global = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
 
 
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print("\n[ALIGN] Stitching with centrality weighting...")
 
 
     for k in range(K):
-        # Global indices for this patch
         if k >= len(patch_coords):
             continue
+        # Global indices for this patch
         S_k = patch_indices[k].to(device)              # (m_k,)
         V_k = patch_coords[k].to(device)               # (m_k, D)
+
 
         # --- centrality weights in patch coordinates ---
         # center of patch in its local frame
@@ -14482,7 +14366,7 @@ def sample_sc_edm_patchwise(
 
 
     rms_final = X_global.pow(2).mean().sqrt().item()
-    if DEBUG_FLAG:
+    if DEBUG_FLAG and len(patch_coords) > 0:
         print(f"[ALIGN] Init X_global: rms_raw={rms_init:.3f} "
             f"→ rescaled to {rms_final:.3f} (target={rms_target:.3f}, scale={scale_factor:.3f})")
 
@@ -14626,60 +14510,61 @@ def sample_sc_edm_patchwise(
     # Project all patches to 2D via GLOBAL PCA
     # (Per-patch PCA caused rotation degeneracy collapse - reverted)
     # ===================================================================
-    print(f"[PGSO-A] Projecting patches to 2D via global PCA...")
-
-    # Gather all patch coords for PCA
-    all_coords_for_pca = []
-    for k in range(K):
-        if k >= len(patch_coords):
-            continue
-        all_coords_for_pca.append(patch_coords[k])
-
-    if len(all_coords_for_pca) == 0:
-        print("[PCA] Skipped (no patch_coords)")
-        all_coords_cat = None
-    else:
-        all_coords_cat = torch.cat(all_coords_for_pca, dim=0)  # (sum_m_k, D_latent)
-
-    # Compute PCA basis (top 2 components)
-
-
-    # Compute PCA basis (top 2 components)
-    all_coords_centered = all_coords_cat - all_coords_cat.mean(dim=0, keepdim=True)
-    cov = all_coords_centered.T @ all_coords_centered / all_coords_centered.shape[0]
-    eigs, vecs = torch.linalg.eigh(cov)
-    # eigh returns in ascending order, we want descending
-    pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2) - top 2 eigenvectors
-
-    # Project each patch to 2D
     patch_coords_2d = []
-    patch_eig_ratios_2d = []  # Track per-patch anisotropy in 2D for rotation weighting
-    
-    for k in range(K):
-        V_k = patch_coords[k]  # (m_k, D_latent)
-        V_k_centered = V_k - V_k.mean(dim=0, keepdim=True)
-        V_k_2d = V_k_centered @ pca_basis  # (m_k, 2)
-        patch_coords_2d.append(V_k_2d)
-        
-        # Compute anisotropy in 2D for this patch (used for rotation confidence)
-        cov_2d = V_k_2d.T @ V_k_2d / V_k_2d.shape[0]
-        eigs_2d = torch.linalg.eigvalsh(cov_2d)
-        eig_ratio_2d = (eigs_2d.max() / eigs_2d.min().clamp(min=1e-8)).item()
-        patch_eig_ratios_2d.append(eig_ratio_2d)
+    patch_eig_ratios_2d = []
+    pca_basis = None
+    eigs = None
 
-    if DEBUG_FLAG:
-        eig_ratio = eigs[-1] / eigs[-2] if eigs[-2] > 1e-8 else float('inf')
-        print(f"[PGSO-A] Global PCA eigenvalues: top2=[{eigs[-1].item():.4f}, {eigs[-2].item():.4f}], ratio={eig_ratio:.2f}")
-        
-        # Report per-patch 2D anisotropy (for rotation confidence diagnostic)
-        eig_ratios_2d_t = torch.tensor(patch_eig_ratios_2d)
-        print(f"[PGSO-A] Per-patch 2D anisotropy (eig_max/eig_min):")
-        print(f"    p25={eig_ratios_2d_t.quantile(0.25).item():.1f} "
-              f"p50={eig_ratios_2d_t.median().item():.1f} "
-              f"p75={eig_ratios_2d_t.quantile(0.75).item():.1f} "
-              f"max={eig_ratios_2d_t.max().item():.1f}")
-        if eig_ratios_2d_t.median() > 10:
-            print(f"    ⚠️ HIGH ANISOTROPY: Patches are near-1D in 2D space → rotation is ill-conditioned")
+    if len(patch_coords) > 0:
+        print(f"[PGSO-A] Projecting patches to 2D via global PCA...")
+
+        # Gather all patch coords for PCA
+        all_coords_for_pca = []
+        for k in range(K):
+            if k < len(patch_coords):
+                all_coords_for_pca.append(patch_coords[k])
+
+        if len(all_coords_for_pca) > 0:
+            all_coords_cat = torch.cat(all_coords_for_pca, dim=0)  # (sum_m_k, D_latent)
+
+            # Compute PCA basis (top 2 components)
+            all_coords_centered = all_coords_cat - all_coords_cat.mean(dim=0, keepdim=True)
+            cov = all_coords_centered.T @ all_coords_centered / all_coords_centered.shape[0]
+            eigs, vecs = torch.linalg.eigh(cov)
+            # eigh returns in ascending order, we want descending
+            pca_basis = vecs[:, -2:].flip(dims=[1])  # (D_latent, 2) - top 2 eigenvectors
+
+            # Project each patch to 2D
+            for k in range(K):
+                if k >= len(patch_coords):
+                    continue
+                V_k = patch_coords[k]  # (m_k, D_latent)
+                V_k_centered = V_k - V_k.mean(dim=0, keepdim=True)
+                V_k_2d = V_k_centered @ pca_basis  # (m_k, 2)
+                patch_coords_2d.append(V_k_2d)
+
+                # Compute anisotropy in 2D for this patch (used for rotation confidence)
+                cov_2d = V_k_2d.T @ V_k_2d / V_k_2d.shape[0]
+                eigs_2d = torch.linalg.eigvalsh(cov_2d)
+                eig_ratio_2d = (eigs_2d.max() / eigs_2d.min().clamp(min=1e-8)).item()
+                patch_eig_ratios_2d.append(eig_ratio_2d)
+
+            if DEBUG_FLAG and eigs is not None:
+                eig_ratio = eigs[-1] / eigs[-2] if eigs[-2] > 1e-8 else float('inf')
+                print(f"[PGSO-A] Global PCA eigenvalues: top2=[{eigs[-1].item():.4f}, {eigs[-2].item():.4f}], ratio={eig_ratio:.2f}")
+
+                # Report per-patch 2D anisotropy (for rotation confidence diagnostic)
+                if len(patch_eig_ratios_2d) > 0:
+                    eig_ratios_2d_t = torch.tensor(patch_eig_ratios_2d)
+                    print(f"[PGSO-A] Per-patch 2D anisotropy (eig_max/eig_min):")
+                    print(f"    p25={eig_ratios_2d_t.quantile(0.25).item():.1f} "
+                          f"p50={eig_ratios_2d_t.median().item():.1f} "
+                          f"p75={eig_ratios_2d_t.quantile(0.75).item():.1f} "
+                          f"max={eig_ratios_2d_t.max().item():.1f}")
+                    if eig_ratios_2d_t.median() > 10:
+                        print(f"    ⚠️ HIGH ANISOTROPY: Patches are near-1D in 2D space → rotation is ill-conditioned")
+    else:
+        print(f"[PGSO-A] Skipping PCA projection (no patch_coords available)")
 
 
     # ===================================================================
@@ -14689,37 +14574,39 @@ def sample_sc_edm_patchwise(
     # If kNN is already ~0.36/0.50 in 2D (same as final), then PGSO cannot
     # improve it - the problem is the 2D readout, not stitching.
     # ===================================================================
-    if debug_knn and gt_coords is not None:
+    if debug_knn and gt_coords is not None and len(patch_coords_2d) > 0 and len(patch_coords) > 0:
         print("\n" + "="*70)
         print("[PATCH-KNN-VS-GT-2D] PATCH kNN IN PCA-PROJECTED 2D SPACE")
         print("="*70)
-        
+
         with torch.no_grad():
             gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
-            
+
             patch_knn_2d_overlap = {k_val: [] for k_val in debug_k_list}
-            
+
             # Also compute 32D kNN for comparison (same patches)
             patch_knn_32d_overlap = {k_val: [] for k_val in debug_k_list}
-            
-            n_patches_to_test = min(K, debug_max_patches)
-            
+
+            n_patches_to_test = min(K, debug_max_patches, len(patch_coords_2d), len(patch_coords))
+
             for k in range(n_patches_to_test):
+                if k >= len(patch_coords_2d) or k >= len(patch_coords):
+                    continue
                 S_k = patch_indices[k]
                 m_k = S_k.numel()
-                
+
                 if m_k < max(debug_k_list) + 5:
                     continue
-                
+
                 # Get GT coords for this patch
                 gt_patch = gt_coords_t[S_k]  # (m_k, 2)
-                
+
                 # Get 2D coords (PCA-projected)
                 pred_patch_2d = patch_coords_2d[k].float().to(device)  # (m_k, 2)
-                
+
                 # Get 32D coords (original)
                 pred_patch_32d = patch_coords[k].float().to(device)  # (m_k, D_latent)
-                
+
                 for k_val in debug_k_list:
                     if m_k > k_val + 1:
                         # kNN in 2D projected space
@@ -14727,48 +14614,48 @@ def sample_sc_edm_patchwise(
                         knn_gt, _ = _knn_indices_dists(gt_patch, k_val)
                         overlap_2d = _knn_overlap_score(knn_pred_2d, knn_gt)
                         patch_knn_2d_overlap[k_val].append(overlap_2d.mean().item())
-                        
+
                         # kNN in 32D space (for comparison)
                         knn_pred_32d, _ = _knn_indices_dists(pred_patch_32d, k_val)
                         overlap_32d = _knn_overlap_score(knn_pred_32d, knn_gt)
                         patch_knn_32d_overlap[k_val].append(overlap_32d.mean().item())
-            
+
             # Print results
             print(f"[PATCH-KNN-VS-GT-2D] n_patches_tested={n_patches_to_test}")
             print()
             print("Comparing kNN overlap in 32D (original) vs 2D (PCA-projected):")
             print()
-            
+
             for k_val in debug_k_list:
                 if patch_knn_2d_overlap[k_val] and patch_knn_32d_overlap[k_val]:
                     ov_2d = torch.tensor(patch_knn_2d_overlap[k_val])
                     ov_32d = torch.tensor(patch_knn_32d_overlap[k_val])
-                    
+
                     print(f"[PATCH-KNN-VS-GT-2D] k={k_val}: "
                           f"mean={ov_2d.mean().item():.3f} "
                           f"p10={ov_2d.quantile(0.1).item():.3f} "
                           f"p50={ov_2d.median().item():.3f} "
                           f"p90={ov_2d.quantile(0.9).item():.3f}")
-                    
+
                     print(f"[PATCH-KNN-VS-GT-32D] k={k_val}: "
                           f"mean={ov_32d.mean().item():.3f} "
                           f"p10={ov_32d.quantile(0.1).item():.3f} "
                           f"p50={ov_32d.median().item():.3f} "
                           f"p90={ov_32d.quantile(0.9).item():.3f}")
-                    
+
                     # Delta
                     delta = ov_32d.mean().item() - ov_2d.mean().item()
                     print(f"[PATCH-KNN-VS-GT] k={k_val} delta(32D-2D)={delta:+.3f}")
                     print()
-            
+
             # Interpretation
             k_main = debug_k_list[0]
             if patch_knn_2d_overlap[k_main]:
                 mean_2d = torch.tensor(patch_knn_2d_overlap[k_main]).mean().item()
                 mean_32d = torch.tensor(patch_knn_32d_overlap[k_main]).mean().item()
-                
+
                 delta_main = mean_32d - mean_2d
-                
+
                 if delta_main > 0.08:
                     print(f"[PATCH-KNN-VS-GT-2D] ⚠️ SIGNIFICANT DROP: 32D→2D loses {delta_main:.2f} kNN overlap")
                     print(f"    → PCA projection is discarding neighborhood-relevant dimensions")
@@ -14779,60 +14666,64 @@ def sample_sc_edm_patchwise(
                 else:
                     print(f"[PATCH-KNN-VS-GT-2D] ✓ MINIMAL DROP: 32D and 2D give similar kNN ({delta_main:+.2f})")
                     print(f"    → Projection is not the bottleneck")
-                
+
                 # Check if 2D is already at final level
                 # (We'll compare with global final kNN in Test B)
                 print()
                 print(f"[PATCH-KNN-VS-GT-2D] 2D patch kNN@{k_main} = {mean_2d:.3f}")
                 print(f"    → Compare this to [GLOBAL-KNN-STAGE] and final kNN to see if PGSO helps or hurts")
-        
+
         print("="*70 + "\n")
 
 
     # Build overlap graph edges
-    print(f"[PGSO-A] Computing pairwise Procrustes on overlapping patches...")
     edges = []  # List of (a, b, R_ab, s_ab, t_ab, weight, n_overlap)
 
-    for a in range(K):
-        S_a = set(patch_indices[a].tolist())
-        V_a_2d = patch_coords_2d[a]
+    if len(patch_coords_2d) > 0:
+        print(f"[PGSO-A] Computing pairwise Procrustes on overlapping patches...")
 
-        for b in range(a + 1, K):
-            S_b = set(patch_indices[b].tolist())
-            shared = S_a & S_b
-
-            if len(shared) < MIN_OVERLAP_FOR_EDGE:
+        for a in range(K):
+            if a >= len(patch_coords_2d):
                 continue
+            S_a = set(patch_indices[a].tolist())
+            V_a_2d = patch_coords_2d[a]
 
-            shared_list = list(shared)
+            for b in range(a + 1, K):
+                if b >= len(patch_coords_2d):
+                    continue
+                S_b = set(patch_indices[b].tolist())
+                shared = S_a & S_b
 
-            # Get positions in each patch
-            pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
-            pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
+                if len(shared) < MIN_OVERLAP_FOR_EDGE:
+                    continue
 
-            idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
-            idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
+                shared_list = list(shared)
 
-            V_shared_a = V_a_2d[idx_a]  # (n_shared, 2)
-            V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
+                # Get positions in each patch
+                pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
+                pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
 
-            # Compute Procrustes: V_b ≈ s_ab * (V_a @ R_ab.T) + t_ab
-            R_ab, s_ab, t_ab, residual = weighted_procrustes_2d(V_shared_a, V_shared_b)
+                idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
+                idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
 
-            # Weight by overlap size and inverse residual
-            # weight = len(shared) / (residual.item() + 0.01)
-            
-            # Weight by overlap size and inverse residual SQUARED (stronger penalty)
-            # This downweights bad edges much more aggressively
-            weight = len(shared) / (residual.item() ** 2 + 1e-4)
+                V_shared_a = V_a_2d[idx_a]  # (n_shared, 2)
+                V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
 
+                # Compute Procrustes: V_b ≈ s_ab * (V_a @ R_ab.T) + t_ab
+                R_ab, s_ab, t_ab, residual = weighted_procrustes_2d(V_shared_a, V_shared_b)
 
-            edges.append({
-                'a': a, 'b': b,
-                'R_ab': R_ab, 's_ab': s_ab, 't_ab': t_ab,
-                'weight': weight, 'n_overlap': len(shared),
-                'residual': residual.item()
-            })
+                # Weight by overlap size and inverse residual SQUARED (stronger penalty)
+                # This downweights bad edges much more aggressively
+                weight = len(shared) / (residual.item() ** 2 + 1e-4)
+
+                edges.append({
+                    'a': a, 'b': b,
+                    'R_ab': R_ab, 's_ab': s_ab, 't_ab': t_ab,
+                    'weight': weight, 'n_overlap': len(shared),
+                    'residual': residual.item()
+                })
+    else:
+        print(f"[PGSO-A] Skipping pairwise Procrustes (no patch_coords_2d available)")
 
     # ===================================================================
     # [EDGE-MODEL] DIAGNOSTIC 6: Similarity vs Affine fit comparison
@@ -14899,18 +14790,20 @@ def sample_sc_edm_patchwise(
         
         for e in edges_to_test:
             a, b = e['a'], e['b']
+            if a >= len(patch_coords_2d) or b >= len(patch_coords_2d):
+                continue
             shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
-            
+
             if len(shared_list) < 20:
                 continue
-            
+
             # Get positions in each patch
             pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
             pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
-            
+
             idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
             idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
-            
+
             V_shared_a = patch_coords_2d[a][idx_a]  # (n_shared, 2)
             V_shared_b = patch_coords_2d[b][idx_b]  # (n_shared, 2)
             
@@ -15368,18 +15261,24 @@ def sample_sc_edm_patchwise(
     # ===================================================================
     # PGSO-C: Apply global transforms to each patch (in 2D space)
     # ===================================================================
-    print(f"\n[PGSO-C] Applying global transforms to patches...")
-
     patch_coords_transformed = []
-    for k in range(K):
-        V_k_2d = patch_coords_2d[k]  # (m_k, 2)
-        R_k = R_global_list[k]
-        s_k = s_global_list[k]
-        t_k = t_global_list[k]
 
-        # Transform: X_hat_k = s_k * (V_k @ R_k.T) + t_k
-        X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
-        patch_coords_transformed.append(X_hat_k)
+    if len(patch_coords_2d) > 0:
+        print(f"\n[PGSO-C] Applying global transforms to patches...")
+
+        for k in range(K):
+            if k >= len(patch_coords_2d) or k >= len(R_global_list) or k >= len(s_global_list) or k >= len(t_global_list):
+                continue
+            V_k_2d = patch_coords_2d[k]  # (m_k, 2)
+            R_k = R_global_list[k]
+            s_k = s_global_list[k]
+            t_k = t_global_list[k]
+
+            # Transform: X_hat_k = s_k * (V_k @ R_k.T) + t_k
+            X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
+            patch_coords_transformed.append(X_hat_k)
+    else:
+        print(f"\n[PGSO-C] Skipping global transforms (no patch_coords_2d available)")
 
 
     # ===================================================================
@@ -15393,6 +15292,8 @@ def sample_sc_edm_patchwise(
         
         for e in edges[:min(50, len(edges))]:  # Check first 50 edges
             a, b = e['a'], e['b']
+            if a >= len(patch_coords_transformed) or b >= len(patch_coords_transformed):
+                continue
             shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
 
             pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
@@ -15512,6 +15413,8 @@ def sample_sc_edm_patchwise(
     W_global = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
 
     for k in range(K):
+        if k >= len(patch_coords_transformed) or k >= len(patch_coords_2d):
+            continue
         S_k = patch_indices[k].to(device)
         X_hat_k = patch_coords_transformed[k].to(device)
         V_k_2d = patch_coords_2d[k].to(device)
@@ -15593,17 +15496,19 @@ def sample_sc_edm_patchwise(
             best_weight = torch.zeros(n_sc, dtype=torch.float32, device=device)
             
             for k in range(K):
+                if k >= len(patch_coords_transformed) or k >= len(patch_coords_2d):
+                    continue
                 S_k = patch_indices[k].to(device)
                 X_hat_k = patch_coords_transformed[k].to(device)
                 V_k_2d = patch_coords_2d[k].to(device)
-                
+
                 # Centrality weights
                 center_k = V_k_2d.mean(dim=0, keepdim=True)
                 dists = torch.norm(V_k_2d - center_k, dim=1)
                 max_d = dists.max().clamp_min(1e-6)
                 weights_k = 1.0 - (dists / (max_d * 1.2))
                 weights_k = weights_k.clamp(min=0.01)
-                
+
                 # For each cell, keep coord if this patch has higher weight
                 for local_idx, global_idx in enumerate(S_k.tolist()):
                     w = weights_k[local_idx].item()
@@ -15628,6 +15533,8 @@ def sample_sc_edm_patchwise(
                 
                 coords_i = []
                 for p_idx in patches_with_i:
+                    if p_idx >= len(patch_coords_transformed):
+                        continue
                     patch_cell_list = patch_indices[p_idx].tolist()
                     if cell_i in patch_cell_list:
                         local_pos = patch_cell_list.index(cell_i)
@@ -15773,6 +15680,8 @@ def sample_sc_edm_patchwise(
                     # Collect coords for cell_i from each patch (post-transform)
                     coords_i = []
                     for p_idx in patches_with_i:
+                        if p_idx >= len(patch_coords_transformed):
+                            continue
                         # Find position of cell_i in patch p_idx
                         patch_cell_list = patch_indices[p_idx].tolist()
                         if cell_i in patch_cell_list:
@@ -15882,33 +15791,35 @@ def sample_sc_edm_patchwise(
         n_frozen_scale = 0
         
         for k in range(K):
+            if k >= len(patch_coords_2d):
+                continue
             S_k = patch_indices[k]
             V_k_2d = patch_coords_2d[k]  # Patch coords in 2D
             X_k_global = X_global[S_k, :2].cpu()  # Current global coords for this patch's cells
-            
+
             # Compute centrality weights
             center_k = V_k_2d.mean(dim=0, keepdim=True)
             dists = torch.norm(V_k_2d - center_k, dim=1)
             max_d = dists.max().clamp_min(1e-6)
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)
-            
+
             # Get patch anisotropy in 2D (already computed earlier)
             aniso_k = patch_eig_ratios_2d[k] if k < len(patch_eig_ratios_2d) else 1.0
-            
+
             # Decide what to freeze based on anisotropy
             freeze_rotation = (aniso_k > ANISO_FREEZE_ROTATION_THRESH)
             freeze_scale = (aniso_k > ANISO_FREEZE_SCALE_THRESH)
-            
+
             if freeze_rotation:
                 n_frozen_rot += 1
             if freeze_scale:
                 n_frozen_scale += 1
-            
+
             if freeze_rotation:
                 # Keep rotation from PGSO (or identity if not available)
                 R_k_fixed = R_global_list[k] if k < len(R_global_list) else torch.eye(2)
-                
+
                 if freeze_scale:
                     # Only solve translation
                     s_k_fixed = s_global_list[k] if k < len(s_global_list) else torch.tensor(1.0)
@@ -15922,44 +15833,47 @@ def sample_sc_edm_patchwise(
                     # Solve scale + translation with fixed rotation
                     # Apply fixed rotation first
                     V_k_rotated = V_k_2d @ R_k_fixed.T
-                    
+
                     # Weighted Procrustes for scale+translation only
                     # X_k_global ≈ s * V_k_rotated + t
                     w = weights_k.unsqueeze(1)
                     w_sum = w.sum()
                     mu_src = (w * V_k_rotated).sum(dim=0, keepdim=True) / w_sum
                     mu_tgt = (w * X_k_global).sum(dim=0, keepdim=True) / w_sum
-                    
+
                     Vc = V_k_rotated - mu_src
                     Yc = X_k_global - mu_tgt
-                    
+
                     # Scale: s = sum(w * Yc · Vc) / sum(w * Vc · Vc)
                     numer = (w * Yc * Vc).sum()
                     denom = (w * Vc * Vc).sum().clamp_min(1e-8)
                     s_k = numer / denom
                     s_k = s_k.clamp(0.5, 2.0)  # Safety clamp
-                    
+
                     # Translation
                     t_k = (mu_tgt - s_k * mu_src).squeeze(0)
                     R_k = R_k_fixed
-                    
+
                     residual_k = ((s_k * V_k_rotated + t_k - X_k_global) ** 2).sum(dim=1).sqrt().mean()
             else:
                 # Full similarity Procrustes
                 R_k, s_k, t_k, residual_k = weighted_procrustes_2d(
                     V_k_2d, X_k_global, weights_k
                 )
-            
+
             iter_residuals.append(residual_k.item() if torch.is_tensor(residual_k) else residual_k)
-            
+
             # Apply transform
             X_hat_k = s_k * (V_k_2d @ R_k.T) + t_k
             new_patch_coords_transformed.append(X_hat_k)
-            
+
             # Update global lists for next iteration
-            R_global_list[k] = R_k
-            s_global_list[k] = s_k if torch.is_tensor(s_k) else torch.tensor(s_k)
-            t_global_list[k] = t_k
+            if k < len(R_global_list):
+                R_global_list[k] = R_k
+            if k < len(s_global_list):
+                s_global_list[k] = s_k if torch.is_tensor(s_k) else torch.tensor(s_k)
+            if k < len(t_global_list):
+                t_global_list[k] = t_k
         
         # ===============================================================
         # Step B: Global merge (weighted average of all patch predictions)
@@ -15968,17 +15882,19 @@ def sample_sc_edm_patchwise(
         W_global_new = torch.zeros(n_sc, 1, dtype=torch.float32, device=device)
         
         for k in range(K):
+            if k >= len(new_patch_coords_transformed) or k >= len(patch_coords_2d):
+                continue
             S_k = patch_indices[k].to(device)
             X_hat_k = new_patch_coords_transformed[k].to(device)
             V_k_2d = patch_coords_2d[k].to(device)
-            
+
             # Centrality weights
             center_k = V_k_2d.mean(dim=0, keepdim=True)
             dists = torch.norm(V_k_2d - center_k, dim=1, keepdim=True)
             max_d = dists.max().clamp_min(1e-6)
             weights_k = 1.0 - (dists / (max_d * 1.2))
             weights_k = weights_k.clamp(min=0.01)
-            
+
             X_global_new.index_add_(0, S_k, X_hat_k * weights_k)
             W_global_new.index_add_(0, S_k, weights_k)
         
@@ -16003,19 +15919,21 @@ def sample_sc_edm_patchwise(
         iter_coord_mismatches = []
         for e in edges[:min(30, len(edges))]:
             a, b = e['a'], e['b']
+            if a >= len(patch_coords_transformed) or b >= len(patch_coords_transformed):
+                continue
             shared_list = list(set(patch_indices[a].tolist()) & set(patch_indices[b].tolist()))
             if len(shared_list) < 10:
                 continue
-            
+
             pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
             pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
-            
+
             idx_a = torch.tensor([pos_a[c] for c in shared_list], dtype=torch.long)
             idx_b = torch.tensor([pos_b[c] for c in shared_list], dtype=torch.long)
-            
+
             X_a = patch_coords_transformed[a][idx_a]
             X_b = patch_coords_transformed[b][idx_b]
-            
+
             coord_diff = (X_a - X_b).norm(dim=1).mean().item()
             iter_coord_mismatches.append(coord_diff)
         
@@ -16110,30 +16028,32 @@ def sample_sc_edm_patchwise(
         meas_compare_samples = []
         
         for k in range(n_patches_used):
+            if k >= len(patch_coords_transformed):
+                continue
             S_k = patch_indices[k]
             # USE TRANSFORMED COORDS (post-PGSO) instead of raw patch_coords_2d
             V_k_transformed = patch_coords_transformed[k].to(device)  # (m_k, 2)
             m_k = V_k_transformed.shape[0]
-            
+
             if m_k < dgso_k_edge + 1:
                 continue
-            
+
             # Compute centrality weights for this patch
             center_k = V_k_transformed.mean(dim=0, keepdim=True)
             dists_to_center = torch.norm(V_k_transformed - center_k, dim=1)
             max_d = dists_to_center.max().clamp_min(1e-6)
             centrality_k = 1.0 - (dists_to_center / (max_d * 1.2))
             centrality_k = centrality_k.clamp(min=0.01)
-            
+
             # Compute pairwise distances within patch (POST-TRANSFORM)
             D_patch = torch.cdist(V_k_transformed, V_k_transformed)  # (m_k, m_k)
             D_patch.fill_diagonal_(float('inf'))
-            
+
             # Get kNN for each point in patch
             _, knn_local = D_patch.topk(dgso_k_edge, largest=False, dim=1)  # (m_k, k_edge)
-            
+
             # Also compute raw distances for comparison (first patch only)
-            if k == 0 and DEBUG_FLAG:
+            if k == 0 and DEBUG_FLAG and k < len(patch_coords_2d):
                 V_k_raw = patch_coords_2d[k].to(device)
                 D_patch_raw = torch.cdist(V_k_raw, V_k_raw)
             
@@ -16641,6 +16561,8 @@ def sample_sc_edm_patchwise(
                     # Collect coords for cell_i from each patch (post-refine transforms)
                     coords_i = []
                     for p_idx in patches_with_i:
+                        if p_idx >= len(patch_coords_transformed):
+                            continue
                         patch_cell_list = patch_indices[p_idx].tolist()
                         if cell_i in patch_cell_list:
                             local_pos = patch_cell_list.index(cell_i)
