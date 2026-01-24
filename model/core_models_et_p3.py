@@ -128,7 +128,11 @@ class GEMSModel:
         anchor_geom_mode: str = "clamp_only",
         anchor_geom_min_unknown: int = 8,
         anchor_geom_debug_every: int = 200,
+        # ---- Resume Stage C ----
+        resume_ckpt_path: Optional[str] = None,
+        resume_reset_optimizer: bool = False,
     ):
+
         """
         Args:
             n_genes: number of genes
@@ -265,7 +269,7 @@ class GEMSModel:
             n_genes=st_gene_expr.shape[1],
             n_embedding=[512, 256, 128],
             dropout=0.1
-        )
+        ).to(self.device)
 
         encoder_vicreg, projector, discriminator, hist = train_encoder(
             model=encoder_vicreg,
@@ -420,7 +424,11 @@ class GEMSModel:
         anchor_geom_mode: str = None,
         anchor_geom_min_unknown: int = None,
         anchor_geom_debug_every: int = None,
+        # ---- Resume Stage C ----
+        resume_stageC_ckpt: str = None,
+        resume_reset_optimizer: bool = False,
     ):
+
 
         """
         Train diffusion generator with mixed ST/SC regimen.
@@ -578,8 +586,10 @@ class GEMSModel:
             # ========== ANCHOR GEOMETRY LOSSES ==========
             anchor_geom_losses=effective_anchor_geom_losses,
             anchor_geom_mode=effective_anchor_geom_mode,
-            anchor_geom_min_unknown=effective_anchor_geom_min_unknown,
-            anchor_geom_debug_every=effective_anchor_geom_debug_every,
+            anchor_geom_min_unknown=anchor_geom_min_unknown,
+            anchor_geom_debug_every=anchor_geom_debug_every,
+            resume_ckpt_path=resume_stageC_ckpt,
+            resume_reset_optimizer=resume_reset_optimizer,
         )
 
 
@@ -896,6 +906,8 @@ class GEMSModel:
         debug_k_list: Tuple[int, int] = (10, 20),
         debug_global_subset: int = 4096,
         debug_gap_k: int = 10,
+        anchor_bit_only_diag: bool = False,
+        anchor_bit_scale: float = 1.0,
         two_pass: bool = False,
         # --- ST-STYLE STOCHASTIC PATCH SAMPLING ---
         pool_mult: float = 2.0,
@@ -939,7 +951,9 @@ class GEMSModel:
         seq_align_dim: int = 2,
         # --- INFERENCE MODE ---
         inference_mode: str = "unanchored",  # "unanchored" or "anchored",
-        coldstart_diag: bool = False
+        coldstart_diag: bool = False,
+        anchor_channel_sensitivity_diag: bool = False,
+        probe_style_patch_sampling: bool = False,
     ) -> Dict[str, torch.Tensor]:
 
 
@@ -971,6 +985,7 @@ class GEMSModel:
             sigma_max = getattr(self, 'sigma_max', 80.0)
         
         print(f"[Inference] Using sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.2f}, sigma_data={sigma_data:.4f}")
+        print(f"[DEBUG_TAG][INFER-SIGMA] sigma_min={sigma_min:.6f} sigma_max={sigma_max:.6f} sigma_data={sigma_data:.6f}")
 
         if sigma_data is None:
             raise ValueError("sigma_data not set - load from checkpoint or compute from data")
@@ -1054,7 +1069,11 @@ class GEMSModel:
             commit_frac=commit_frac,
             seq_align_dim=seq_align_dim,
             inference_mode=inference_mode,
-            coldstart_diag=coldstart_diag
+            coldstart_diag=coldstart_diag,
+            anchor_channel_sensitivity_diag=anchor_channel_sensitivity_diag,
+            anchor_bit_only_diag=anchor_bit_only_diag,
+            anchor_bit_scale=anchor_bit_scale,
+            probe_style_patch_sampling=probe_style_patch_sampling,
         )
         return res
 
