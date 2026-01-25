@@ -5342,53 +5342,93 @@ def train_stageC_diffusion_generator(
                                     x0_pred_rep = x0_pred_rep_result
                             
                             # ===== COMPUTE EDGE-BASED CONTEXT INVARIANCE LOSS =====
+                            # UPDATED: Now uses SHAPE + SCALE decomposition
+                            # - Shape loss: centered (scale-invariant), penalizes relative edge distortion
+                            # - Scale loss: penalizes global scale drift (the main stitching failure mode!)
+                            CTX_SCALE_WEIGHT = 1.0  # Weight for scale term relative to shape term
+
                             with torch.autocast(device_type='cuda', enabled=False):
                                 x0_pred_full = x0_pred.float()
                                 x0_pred_rep_f32 = x0_pred_rep.float()
-                                
-                                # Use CENTERED edge-log-ratio loss on core→core edges
-                                # Centering makes it scale-invariant (only penalizes shape)
-                                edge_losses, n_edges = uet.core_edge_log_invariance_loss(
+
+                                # Get BOTH shape and scale losses
+                                shape_losses, scale_losses, n_edges, ctx_debug_dict = uet.core_edge_log_invariance_loss(
                                     x0_pred_full, x0_pred_rep_f32,
                                     core_mask, knn_spatial, mask,
-                                    eps=1e-8, huber_delta=0.1
+                                    eps=1e-8, huber_delta=0.1,
+                                    scale_weight=CTX_SCALE_WEIGHT
                                 )
-                                
+
+                                # Combined loss = shape + scale_weight * scale
+                                combined_losses = shape_losses + CTX_SCALE_WEIGHT * scale_losses
+
                                 # Per-sample losses weighted by SNR gate
                                 valid_loss_samples = (n_edges > 0) & (w_ctx > 0)
-                                
+
                                 if valid_loss_samples.any():
-                                    L_ctx_replace = (w_ctx * edge_losses)[valid_loss_samples].sum() / w_ctx[valid_loss_samples].sum().clamp(min=1.0)
+                                    # Total ctx loss (shape + scale combined)
+                                    L_ctx_replace = (w_ctx * combined_losses)[valid_loss_samples].sum() / w_ctx[valid_loss_samples].sum().clamp(min=1.0)
+
+                                    # Track components separately for logging
+                                    L_ctx_shape = (w_ctx * shape_losses)[valid_loss_samples].sum() / w_ctx[valid_loss_samples].sum().clamp(min=1.0)
+                                    L_ctx_scale = (w_ctx * scale_losses)[valid_loss_samples].sum() / w_ctx[valid_loss_samples].sum().clamp(min=1.0)
                                 else:
                                     L_ctx_replace = torch.tensor(0.0, device=device)
-                            
-                            # ===== DEBUG LOGGING =====
+                                    L_ctx_shape = torch.tensor(0.0, device=device)
+                                    L_ctx_scale = torch.tensor(0.0, device=device)
+
+                            # ===== DEBUG LOGGING (ENHANCED) =====
                             if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
                                 with torch.no_grad():
                                     sigma_med = sigma_flat_ctx.median().item()
                                     snr_med = snr_w.median().item()
                                     n_on = int((w_ctx > 0).sum().item())
                                     n_edges_mean = n_edges[n_edges > 0].mean().item() if (n_edges > 0).any() else 0
-                                    
-                                    print(f"\n[CTX-REPL-v2] step={global_step} variant={ctx_replace_variant}")
+
+                                    print(f"\n[CTX-REPL-v3] step={global_step} variant={ctx_replace_variant}")
                                     print(f"  {ctx_debug_info}")
                                     print(f"  p_apply={ctx_replace_p:.2f} applied=True")
                                     print(f"  core={n_core} extra={n_extra} (CORE-FIXED replacement)")
                                     print(f"  mean_core_edges={n_edges_mean:.1f}")
-                                    
+
                                     print(f"\n[CTX-GATE] step={global_step}")
                                     print(f"  sigma_data={sigma_data:.5f} sigma_med={sigma_med:.4f}")
                                     print(f"  snr_med={snr_med:.4f} snr_thresh={ctx_snr_thresh:.2f}")
                                     print(f"  n_on={n_on}/{B_ctx} warmup={warmup_mult:.2f}")
-                                    
-                                    print(f"\n[CTX-LOSS-EDGE] step={global_step}")
-                                    print(f"  L_ctx_edge={L_ctx_replace.item():.6f} (centered log-ratio)")
+
+                                    # ===== KEY NEW DIAGNOSTICS =====
+                                    print(f"\n[CTX-LOSS-DECOMPOSED] step={global_step}")
+                                    print(f"  L_shape={L_ctx_shape.item():.6f} (centered, scale-invariant)")
+                                    print(f"  L_scale={L_ctx_scale.item():.6f} (scale drift penalty)")
+                                    print(f"  L_total={L_ctx_replace.item():.6f} (shape + {CTX_SCALE_WEIGHT}*scale)")
                                     print(f"  λ_ctx={ctx_loss_weight} contribution={ctx_loss_weight * L_ctx_replace.item():.6f}")
-                                    
-                                    # Additional diagnostic: edge loss distribution
+
+                                    # Scale shift diagnostics (THE KEY METRIC)
+                                    print(f"\n[CTX-SCALE-SHIFT] step={global_step}")
+                                    print(f"  delta_scale_mean={ctx_debug_dict['delta_scale_mean']:.4f} (should be ~0 if no drift)")
+                                    print(f"  delta_scale_abs_mean={ctx_debug_dict['delta_scale_abs_mean']:.4f} (magnitude of drift)")
+                                    if 'delta_scale_abs_p90' in ctx_debug_dict:
+                                        print(f"  delta_scale_abs_p90={ctx_debug_dict['delta_scale_abs_p90']:.4f}")
+                                        print(f"  delta_scale_abs_max={ctx_debug_dict['delta_scale_abs_max']:.4f}")
+                                    print(f"  raw_log_diff_mean={ctx_debug_dict['raw_log_diff_mean']:.4f} (pre-centering diff)")
+                                    print(f"  shape_residual_mean={ctx_debug_dict['shape_residual_mean']:.6f} (post-centering residual)")
+
+                                    # Interpretation help
+                                    ds_abs = ctx_debug_dict['delta_scale_abs_mean']
+                                    if ds_abs > 0.1:
+                                        implied_scale = 2.718 ** ds_abs  # e^delta ≈ scale ratio
+                                        print(f"  [!] SCALE DRIFT DETECTED: |delta|={ds_abs:.3f} => scale_ratio≈{implied_scale:.3f} or {1/implied_scale:.3f}")
+                                    elif ds_abs > 0.05:
+                                        print(f"  [~] Moderate scale drift: |delta|={ds_abs:.3f}")
+                                    else:
+                                        print(f"  [✓] Scale drift is small: |delta|={ds_abs:.3f}")
+
+                                    # Additional per-sample diagnostics
                                     if valid_loss_samples.any():
-                                        print(f"  edge_loss_mean={edge_losses[valid_loss_samples].mean().item():.6f}")
-                                        print(f"  edge_loss_max={edge_losses[valid_loss_samples].max().item():.6f}")
+                                        print(f"\n[CTX-LOSS-SAMPLES] step={global_step}")
+                                        print(f"  shape_loss: mean={shape_losses[valid_loss_samples].mean().item():.6f} max={shape_losses[valid_loss_samples].max().item():.6f}")
+                                        print(f"  scale_loss: mean={scale_losses[valid_loss_samples].mean().item():.6f} max={scale_losses[valid_loss_samples].max().item():.6f}")
+                                        print(f"  combined:   mean={combined_losses[valid_loss_samples].mean().item():.6f} max={combined_losses[valid_loss_samples].max().item():.6f}")
                             
                             # Track for epoch averaging
                             ctx_replace_sum += L_ctx_replace.item()
@@ -5403,17 +5443,17 @@ def train_stageC_diffusion_generator(
                         else:
                             # SNR gate blocked all samples
                             if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                                print(f"[CTX-REPL-v2] step={global_step} SNR gate blocked all samples")
+                                print(f"[CTX-REPL-v3] step={global_step} SNR gate blocked all samples")
                     
                     else:
                         # Not applying this step (probability gate)
                         if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                            print(f"[CTX-REPL-v2] step={global_step} skipped (prob gate)")
+                            print(f"[CTX-REPL-v3] step={global_step} skipped (prob gate)")
                 
                 else:
                     # Not enough core/extra points
                     if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                        print(f"[CTX-REPL-v2] step={global_step} skipped: insufficient core/extra")
+                        print(f"[CTX-REPL-v3] step={global_step} skipped: insufficient core/extra")
 
             else:
                 # Context loss disabled or wrong conditions
@@ -5429,7 +5469,7 @@ def train_stageC_diffusion_generator(
                         reasons.append("no_knn_spatial")
                     if anchor_train:
                         reasons.append("anchor_train=True (ctx_replace only in unanchored mode)")
-                    print(f"[CTX-REPL-v2] step={global_step} disabled: {', '.join(reasons)}")
+                    print(f"[CTX-REPL-v3] step={global_step} disabled: {', '.join(reasons)}")
 
 
             if not is_sc:
