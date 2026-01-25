@@ -2423,6 +2423,9 @@ def train_stageC_diffusion_generator(
     anchor_geom_mode: str = "clamp_only",  # "clamp_only" or "clamp_and_mask"
     anchor_geom_min_unknown: int = 8,
     anchor_geom_debug_every: int = 200,
+    # ---- Resume Stage C ----
+    resume_ckpt_path: Optional[str] = None,
+    resume_reset_optimizer: bool = False,
     # ========== CONTEXT REPLACEMENT INVARIANCE ==========
     ctx_replace_variant: str = 'permute',
     ctx_loss_weight: float = 0.0,
@@ -3136,6 +3139,43 @@ def train_stageC_diffusion_generator(
         }
     }
 
+    start_epoch = 0
+    if resume_ckpt_path:
+        print(f"[RESUME] Loading Stage C checkpoint: {resume_ckpt_path}")
+        ckpt = torch.load(resume_ckpt_path, map_location=device)
+
+        if 'context_encoder' in ckpt:
+            context_encoder.load_state_dict(ckpt['context_encoder'])
+        if 'score_net' in ckpt:
+            score_net.load_state_dict(ckpt['score_net'])
+        if 'generator' in ckpt:
+            generator.load_state_dict(ckpt['generator'])
+        else:
+            print("[RESUME] WARNING: generator not found in checkpoint.")
+
+        if 'context_encoder_ema' in ckpt:
+            context_encoder_ema.load_state_dict(ckpt['context_encoder_ema'])
+        if 'score_net_ema' in ckpt:
+            score_net_ema.load_state_dict(ckpt['score_net_ema'])
+
+        if 'optimizer' in ckpt and not resume_reset_optimizer:
+            optimizer.load_state_dict(ckpt['optimizer'])
+
+        if 'epoch' in ckpt:
+            start_epoch = int(ckpt['epoch']) + 1
+
+        if 'history' in ckpt:
+            history = ckpt['history']
+
+        if 'sigma_data' in ckpt:
+            sigma_data = ckpt['sigma_data']
+        if 'sigma_min' in ckpt:
+            sigma_min = ckpt['sigma_min']
+        if 'sigma_max' in ckpt:
+            sigma_max = ckpt['sigma_max']
+
+        print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
+
 
     # ========== EDM DEBUG STATE INITIALIZATION ==========
     edm_debug_state = {
@@ -3479,7 +3519,7 @@ def train_stageC_diffusion_generator(
     # Track pin-rate for adaptive clamp (persists across steps within this training run)
     last_pin_rate = 1.0  # Assume worst case initially
     
-    for epoch in range(n_epochs):
+    for epoch in range(start_epoch, n_epochs):
         epoch_cv_sum = 0.0
         epoch_qent_sum = 0.0
         epoch_nca_loss_sum = 0.0
@@ -5124,7 +5164,11 @@ def train_stageC_diffusion_generator(
                 L_subspace = torch.tensor(0.0, device=device)
 
             # ---------------------------------------------------------------
+            # ---------------------------------------------------------------
             # ========== CONTEXT REPLACEMENT INVARIANCE LOSS ==========
+            # Key insight: We want CORE geometry to be invariant to EXTRA points.
+            # So we keep core tokens the same and only replace extras.
+            # Loss uses CENTERED edge-length invariance (scale+gauge-safe).
             L_ctx_replace = torch.tensor(0.0, device=device)
 
             if (not is_sc and 
@@ -5133,7 +5177,7 @@ def train_stageC_diffusion_generator(
                 'knn_spatial' in batch and
                 not anchor_train):  # Only apply in unanchored mode
                 
-                # Get core mask (reuse anchor_mask which marks core vs extras regardless of anchor_train)
+                # Get core mask (anchor_mask marks core vs extras regardless of anchor_train)
                 core_mask = batch['anchor_mask'].to(device).bool() & mask
                 knn_spatial = batch['knn_spatial'].to(device)
                 
@@ -5170,13 +5214,12 @@ def train_stageC_diffusion_generator(
                         
                         # Only proceed if at least some samples pass SNR gate
                         if w_ctx.sum() > 0:
-                            # ===== BUILD REPLACEMENT CONTEXT =====
-                            # We already have H from the main forward pass (this is H_train actually)
-                            # We need to compute a replacement context
+                            # ===== BUILD CORE-FIXED REPLACEMENT CONTEXT =====
+                            # CRITICAL: Keep core tokens the same, only replace extras
                             
-                            if ctx_replace_variant == 'permute':
-                                # Random permutation (prefer derangement)
-                                with torch.no_grad():
+                            with torch.no_grad():
+                                if ctx_replace_variant == 'permute':
+                                    # Random permutation for donor selection (prefer derangement)
                                     perm = torch.randperm(B_ctx, device=device)
                                     
                                     # Try to fix any fixed points (best effort)
@@ -5184,82 +5227,91 @@ def train_stageC_diffusion_generator(
                                     n_fixed = fixed_points.sum().item()
                                     
                                     if n_fixed > 0 and B_ctx > 1:
-                                        # Swap fixed points with their neighbors
                                         fixed_idx = fixed_points.nonzero(as_tuple=True)[0]
                                         for i in fixed_idx:
                                             swap_target = (i + 1) % B_ctx
                                             if not fixed_points[swap_target]:
                                                 perm[i], perm[swap_target] = perm[swap_target].clone(), perm[i].clone()
                                     
-                                    # Check again
                                     fixed_points_final = (perm == torch.arange(B_ctx, device=device))
                                     n_fixed_final = fixed_points_final.sum().item()
                                     perm_fixed_frac = n_fixed_final / max(B_ctx, 1)
-                                
-                                # Apply permutation to Z_set to get replacement context
-                                Z_set_rep = Z_set[perm]
-                                mask_rep = mask[perm]
-                                
-                                # Encode replacement context
-                                H_rep = context_encoder(Z_set_rep, mask_rep)
-                                
-                                ctx_debug_info = f"permute fixed={n_fixed_final}/{B_ctx}"
-                                ctx_metric = perm_fixed_frac
-                                
-                            elif ctx_replace_variant == 'hard':
-                                # Hard negative: most similar context
-                                with torch.no_grad():
-                                    # Pool context to per-sample vectors
+                                    
+                                    donor_idx = perm
+                                    ctx_debug_info = f"permute fixed={n_fixed_final}/{B_ctx}"
+                                    ctx_metric = perm_fixed_frac
+                                    
+                                elif ctx_replace_variant == 'hard':
+                                    # Hard negative: most similar context as donor
                                     mask_f = mask.unsqueeze(-1).float()
                                     denom = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
                                     
-                                    # H_train is either (B, D) or (B, N, D) depending on architecture
                                     if H_train.dim() == 2:
-                                        v_ctx = H_train  # Already pooled
+                                        v_ctx = H_train
                                     elif H_train.dim() == 3:
                                         v_ctx = (H_train * mask_f).sum(dim=1) / denom.squeeze(-1)
                                     else:
-                                        # Fallback
                                         v_ctx = H_train.reshape(B_ctx, -1)
                                     
-                                    # Normalize for cosine similarity
                                     v_ctx_norm = v_ctx / (v_ctx.norm(dim=-1, keepdim=True) + 1e-8)
-                                    
-                                    # Compute pairwise cosine similarity
-                                    sim_matrix = v_ctx_norm @ v_ctx_norm.T  # (B, B)
-                                    
-                                    # Mask diagonal (can't pick self)
+                                    sim_matrix = v_ctx_norm @ v_ctx_norm.T
                                     sim_matrix.fill_diagonal_(-1.0)
                                     
-                                    # For each sample, find most similar other sample
-                                    hard_idx = sim_matrix.argmax(dim=1)  # (B,)
-                                    hard_sim = sim_matrix.max(dim=1)[0]  # (B,)
-                                    
-                                    # Random baseline (for comparison)
-                                    rand_idx = torch.randint(0, B_ctx, (B_ctx,), device=device)
-                                    rand_idx = torch.where(rand_idx == torch.arange(B_ctx, device=device), 
-                                                        (rand_idx + 1) % B_ctx, 
-                                                        rand_idx)
-                                    rand_sim = sim_matrix[torch.arange(B_ctx, device=device), rand_idx]
-                                    
+                                    hard_idx = sim_matrix.argmax(dim=1)
+                                    hard_sim = sim_matrix.max(dim=1)[0]
                                     hard_sim_mean = hard_sim.mean().item()
-                                    rand_sim_mean = rand_sim.mean().item()
+                                    
+                                    donor_idx = hard_idx
+                                    ctx_debug_info = f"hard sim={hard_sim_mean:.3f}"
+                                    ctx_metric = hard_sim_mean
+                                    
+                                else:
+                                    raise ValueError(f"Unknown ctx_replace_variant: {ctx_replace_variant}")
                                 
-                                # Apply hard negative selection to Z_set
-                                Z_set_rep = Z_set[hard_idx]
-                                mask_rep = mask[hard_idx]
+                                # ===== CONSTRUCT REPLACEMENT Z_set: KEEP CORE, REPLACE EXTRAS =====
+                                # Z_set shape: (B, N, D_z)
+                                Z_set_rep = Z_set.clone()
                                 
-                                # Encode replacement context
-                                H_rep = context_encoder(Z_set_rep, mask_rep)
+                                for b in range(B_ctx):
+                                    donor_b = donor_idx[b].item()
+                                    
+                                    # Get extra masks for this sample and donor
+                                    extra_b = extra_mask[b]       # (N,) bool - extras in sample b
+                                    extra_donor = extra_mask[donor_b]  # (N,) bool - extras in donor
+                                    
+                                    n_extra_b = int(extra_b.sum().item())
+                                    n_extra_donor = int(extra_donor.sum().item())
+                                    
+                                    if n_extra_b == 0 or n_extra_donor == 0:
+                                        continue
+                                    
+                                    # Get extra indices
+                                    extra_idx_b = extra_b.nonzero(as_tuple=True)[0]         # Where to put
+                                    extra_idx_donor = extra_donor.nonzero(as_tuple=True)[0]  # Where to get from
+                                    
+                                    # How many extras to actually replace (min of both)
+                                    n_replace = min(n_extra_b, n_extra_donor)
+                                    
+                                    # Random subset if donor has more extras than needed
+                                    if n_extra_donor > n_replace:
+                                        perm_donor = torch.randperm(n_extra_donor, device=device)[:n_replace]
+                                        extra_idx_donor = extra_idx_donor[perm_donor]
+                                    
+                                    # Random subset if target has more extra slots than donor extras
+                                    if n_extra_b > n_replace:
+                                        perm_b = torch.randperm(n_extra_b, device=device)[:n_replace]
+                                        extra_idx_b = extra_idx_b[perm_b]
+                                    
+                                    # Replace: Z_set_rep[b, extra positions] = Z_set[donor, donor extra positions]
+                                    Z_set_rep[b, extra_idx_b] = Z_set[donor_b, extra_idx_donor]
                                 
-                                ctx_debug_info = f"hard sim={hard_sim_mean:.3f} vs rand={rand_sim_mean:.3f}"
-                                ctx_metric = hard_sim_mean
+                                # Mask stays the same - same valid positions
+                                mask_rep = mask
                             
-                            else:
-                                raise ValueError(f"Unknown ctx_replace_variant: {ctx_replace_variant}")
+                            # Encode replacement context (core same, extras different)
+                            H_rep = context_encoder(Z_set_rep, mask_rep)
                             
                             # ===== FORWARD PASS WITH REPLACEMENT CONTEXT =====
-                            # Use SAME self-conditioning strategy but with replacement context
                             with torch.autocast(device_type='cuda', dtype=amp_dtype):
                                 if self_cond_mode == 'standard' and score_net.self_conditioning:
                                     # Two-pass self-conditioning for replacement branch
@@ -5279,7 +5331,6 @@ def train_stageC_diffusion_generator(
                                         return_debug=False
                                     )
                                 else:
-                                    # No self-conditioning
                                     x0_pred_rep_result = score_net.forward_edm(
                                         V_t, sigma_flat, H_rep, mask, sigma_data,
                                         self_cond=None, return_debug=False
@@ -5290,30 +5341,26 @@ def train_stageC_diffusion_generator(
                                 else:
                                     x0_pred_rep = x0_pred_rep_result
                             
-                            # ===== COMPUTE CONTEXT REPLACEMENT LOSS =====
+                            # ===== COMPUTE EDGE-BASED CONTEXT INVARIANCE LOSS =====
                             with torch.autocast(device_type='cuda', enabled=False):
-                                x0_pred_full = x0_pred.float()  # x0_pred from main forward pass
+                                x0_pred_full = x0_pred.float()
                                 x0_pred_rep_f32 = x0_pred_rep.float()
                                 
-                                # Center both on core points (same reference frame)
-                                core_f = core_mask.float().unsqueeze(-1)
-                                denom_c = core_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+                                # Use CENTERED edge-log-ratio loss on core→core edges
+                                # Centering makes it scale-invariant (only penalizes shape)
+                                edge_losses, n_edges = uet.core_edge_log_invariance_loss(
+                                    x0_pred_full, x0_pred_rep_f32,
+                                    core_mask, knn_spatial, mask,
+                                    eps=1e-8, huber_delta=0.1
+                                )
                                 
-                                mu_full = (x0_pred_full * core_f).sum(dim=1, keepdim=True) / denom_c
-                                mu_rep = (x0_pred_rep_f32 * core_f).sum(dim=1, keepdim=True) / denom_c
+                                # Per-sample losses weighted by SNR gate
+                                valid_loss_samples = (n_edges > 0) & (w_ctx > 0)
                                 
-                                x0_full_c = x0_pred_full - mu_full
-                                x0_rep_c = x0_pred_rep_f32 - mu_rep
-                                
-                                # MSE on core points only
-                                err2_core = ((x0_full_c - x0_rep_c).pow(2) * core_f).sum(dim=-1)  # (B, N)
-                                
-                                # Per-sample average over core points
-                                n_core_tensor = core_f.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
-                                err2_per_sample = err2_core.sum(dim=1) / n_core_tensor  # (B,)
-                                
-                                # Apply SNR gating
-                                L_ctx_replace = (w_ctx * err2_per_sample).sum() / w_ctx.sum().clamp(min=1.0)
+                                if valid_loss_samples.any():
+                                    L_ctx_replace = (w_ctx * edge_losses)[valid_loss_samples].sum() / w_ctx[valid_loss_samples].sum().clamp(min=1.0)
+                                else:
+                                    L_ctx_replace = torch.tensor(0.0, device=device)
                             
                             # ===== DEBUG LOGGING =====
                             if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
@@ -5321,26 +5368,27 @@ def train_stageC_diffusion_generator(
                                     sigma_med = sigma_flat_ctx.median().item()
                                     snr_med = snr_w.median().item()
                                     n_on = int((w_ctx > 0).sum().item())
+                                    n_edges_mean = n_edges[n_edges > 0].mean().item() if (n_edges > 0).any() else 0
                                     
-                                    print(f"\n[CTX-REPL] step={global_step} variant={ctx_replace_variant}")
+                                    print(f"\n[CTX-REPL-v2] step={global_step} variant={ctx_replace_variant}")
                                     print(f"  {ctx_debug_info}")
                                     print(f"  p_apply={ctx_replace_p:.2f} applied=True")
-                                    print(f"  core={n_core} extra={n_extra}")
+                                    print(f"  core={n_core} extra={n_extra} (CORE-FIXED replacement)")
+                                    print(f"  mean_core_edges={n_edges_mean:.1f}")
                                     
                                     print(f"\n[CTX-GATE] step={global_step}")
                                     print(f"  sigma_data={sigma_data:.5f} sigma_med={sigma_med:.4f}")
                                     print(f"  snr_med={snr_med:.4f} snr_thresh={ctx_snr_thresh:.2f}")
                                     print(f"  n_on={n_on}/{B_ctx} warmup={warmup_mult:.2f}")
                                     
-                                    print(f"\n[CTX-LOSS] step={global_step}")
-                                    print(f"  L_ctx_replace={L_ctx_replace.item():.6f}")
+                                    print(f"\n[CTX-LOSS-EDGE] step={global_step}")
+                                    print(f"  L_ctx_edge={L_ctx_replace.item():.6f} (centered log-ratio)")
                                     print(f"  λ_ctx={ctx_loss_weight} contribution={ctx_loss_weight * L_ctx_replace.item():.6f}")
                                     
-                                    # Delta statistics
-                                    core_delta = ((x0_full_c - x0_rep_c).pow(2).sum(dim=-1).sqrt() * core_mask.float()).sum(dim=1) / n_core_tensor
-                                    print(f"\n[CTX-DELTA] step={global_step}")
-                                    print(f"  core_delta_mean={core_delta.mean().item():.6f}")
-                                    print(f"  core_delta_p90={core_delta.quantile(0.9).item():.6f}")
+                                    # Additional diagnostic: edge loss distribution
+                                    if valid_loss_samples.any():
+                                        print(f"  edge_loss_mean={edge_losses[valid_loss_samples].mean().item():.6f}")
+                                        print(f"  edge_loss_max={edge_losses[valid_loss_samples].max().item():.6f}")
                             
                             # Track for epoch averaging
                             ctx_replace_sum += L_ctx_replace.item()
@@ -5355,17 +5403,17 @@ def train_stageC_diffusion_generator(
                         else:
                             # SNR gate blocked all samples
                             if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                                print(f"[CTX-REPL] step={global_step} SNR gate blocked all samples")
+                                print(f"[CTX-REPL-v2] step={global_step} SNR gate blocked all samples")
                     
                     else:
                         # Not applying this step (probability gate)
                         if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                            print(f"[CTX-REPL] step={global_step} skipped (prob gate)")
+                            print(f"[CTX-REPL-v2] step={global_step} skipped (prob gate)")
                 
                 else:
                     # Not enough core/extra points
                     if global_step % ctx_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                        print(f"[CTX-REPL] step={global_step} skipped: insufficient core/extra")
+                        print(f"[CTX-REPL-v2] step={global_step} skipped: insufficient core/extra")
 
             else:
                 # Context loss disabled or wrong conditions
@@ -5381,10 +5429,7 @@ def train_stageC_diffusion_generator(
                         reasons.append("no_knn_spatial")
                     if anchor_train:
                         reasons.append("anchor_train=True (ctx_replace only in unanchored mode)")
-                    print(f"[CTX-REPL] step={global_step} disabled: {', '.join(reasons)}")
-
-
-
+                    print(f"[CTX-REPL-v2] step={global_step} disabled: {', '.join(reasons)}")
 
 
             if not is_sc:
@@ -9021,6 +9066,7 @@ def train_stageC_diffusion_generator(
                     'epoch': epoch,
                     'context_encoder': context_encoder.state_dict(),
                     'score_net': score_net.state_dict(),
+                    'generator': generator.state_dict(),
                     'context_encoder_ema': context_encoder_ema.state_dict(),
                     'score_net_ema': score_net_ema.state_dict(),
                     'ema_decay': ema_decay,
@@ -9038,6 +9084,7 @@ def train_stageC_diffusion_generator(
             'epoch': epoch,
             'context_encoder': context_encoder.state_dict(),
             'score_net': score_net.state_dict(),
+            'generator': generator.state_dict(),
             'context_encoder_ema': context_encoder_ema.state_dict(),
             'score_net_ema': score_net_ema.state_dict(),
             'ema_decay': ema_decay,
@@ -9047,7 +9094,6 @@ def train_stageC_diffusion_generator(
             'sigma_min': sigma_min,
             'sigma_max': sigma_max,
         }
-
         torch.save(ckpt_final, os.path.join(outf, 'ckpt_final.pt'))
         print(f"Saved final checkpoint at epoch {epoch+1}")
 
@@ -10821,14 +10867,6 @@ def sample_sc_edm_patchwise(
     dgso_two_phase: bool = True,
     dgso_phase1_iters: int = 200,
     dgso_phase1_anchor_mult: float = 10.0,
-    # --- ANCHORED SEQUENTIAL SAMPLING (NEW) ---
-    # --- ANCHORED SEQUENTIAL SAMPLING (NEW) ---
-    anchor_sampling_mode: str = "off",  # "off", "seq_align_only", "edm_anchor_local", "align_vote_only"
-    anchor_min_overlap_start: int = 35,
-    anchor_min_overlap_floor: int = 20,
-    commit_frac: float = 0.75,
-    seq_align_dim: int = 2,
-    inference_mode: str = "unanchored",  # "unanchored" or "anchored"
     coldstart_diag: bool = False,
 ) -> Dict[str, torch.Tensor]:
 
@@ -10856,20 +10894,6 @@ def sample_sc_edm_patchwise(
 
 
     import random
-
-    # ===================================================================
-    # INFERENCE MODE ROUTING
-    # ===================================================================
-    print(f"\n[INFER-MODE] inference_mode={inference_mode} anchor_sampling_mode={anchor_sampling_mode}")
-    
-    # Auto-switch anchor_sampling_mode based on inference_mode
-    if inference_mode == "anchored" and anchor_sampling_mode == "off":
-        anchor_sampling_mode = "edm_anchor_local"
-        print(f"[INFER-MODE] Auto-enabled anchor_sampling_mode={anchor_sampling_mode}")
-    elif inference_mode == "unanchored" and anchor_sampling_mode != "off":
-        print(f"[INFER-MODE] WARNING: inference_mode=unanchored but anchor_sampling_mode={anchor_sampling_mode}")
-        print(f"[INFER-MODE] Using anchor_sampling_mode as specified (overrides inference_mode)")
-
 
     # ===================================================================
     # DEBUG KNN HELPERS (only used if debug_knn=True and gt_coords provided)
@@ -11821,10 +11845,6 @@ def sample_sc_edm_patchwise(
         print(f"\n[DEBUG-KNN] Precomputed GT kNN on subset of {M} cells (k={k_closure})")
 
 
-
-
-
-
     # EDM Karras sigma schedule - use refinement sigma range
     # sigma_max should match training sigma_refine_max (typically 1.0 * sigma_data)
     sigma_refine_max = min(sigma_max, 20.0 * sigma_data)  # Match training
@@ -11866,2038 +11886,294 @@ def sample_sc_edm_patchwise(
     prestitch_edge_spearman_list = []
     prestitch_knn_overlap_list = {k_val: [] for k_val in debug_k_list}
 
-
-
     if DEBUG_FLAG:
         print("\n[STEP] Sampling local geometries for patches...")
-
-
-    # ===================================================================
-    # ===================================================================
-    # ===================================================================
-    # ANCHORED SEQUENTIAL SAMPLING MODE (NEW)
-    # ===================================================================
-    # ===================================================================
-    # ===================================================================
-    # ANCHORED SEQUENTIAL SAMPLING MODE (NEW - CORRECTED)
-    # Modes: "seq_align_only" (sanity test) or "edm_anchor_local" (full anchored EDM)
-    # ===================================================================
-    # if anchor_sampling_mode in ("seq_align_only", "edm_anchor_local"):
-    if anchor_sampling_mode in ("seq_align_only", "edm_anchor_local", "align_vote_only"):
-        print("\n" + "="*70)
-        print(f"[ANCHOR] ANCHORED SEQUENTIAL SAMPLING - mode={anchor_sampling_mode}")
-        print("="*70)
-        print(f"[ANCHOR] anchor_min_overlap_start={anchor_min_overlap_start}, floor={anchor_min_overlap_floor}")
-        print(f"[ANCHOR] commit_frac={commit_frac}")
-        print(f"[ANCHOR] seq_align_dim={seq_align_dim}")
-
-        # -------------------------------------------------------------------
-        # Inference-time anchoring should mimic training:
-        # - Only a SUBSET of overlap points are hard anchors
-        # - The rest of overlap points are revisable (treated as unknowns)
-        # -------------------------------------------------------------------
-        infer_anchor_frac = 0.25   # 10-30% like training; start at 0.25
-        infer_anchor_min  = 20     # keep enough anchors for stable placement
-        infer_anchor_max  = 96     # cap to avoid freezing everything
-
-        import networkx as nx
-        from collections import deque
-        
-        # -------------------------------------------------------------------
-        # C0) Data structures - seq-align dimension (2D for seq_align_only)
-        # -------------------------------------------------------------------
-        if anchor_sampling_mode in ("seq_align_only", "align_vote_only"):
-            seq_dim = int(seq_align_dim)
-        else:
-            seq_dim = D_latent
-
-        if seq_dim != 2 and seq_dim != D_latent:
-            raise ValueError(f"seq_align_dim must be 2 or D_latent ({D_latent}), got {seq_dim}")
-
-        X_placed = torch.full((n_sc, seq_dim), float('nan'), dtype=torch.float32, device=device)
-        placed = torch.zeros(n_sc, dtype=torch.bool, device=device)
-        W_cell = torch.zeros(n_sc, dtype=torch.float32, device=device)
-        placed_by_patch = torch.full((n_sc,), -1, dtype=torch.long, device=device)
-
-
-        # =========================
-        # DEBUG: stagewise kNN on PLACED-only cells (LATENT + PCA2D)
-        # =========================
-        stage_idx = None
-        gt_coords_dev = None
-        if debug_knn and gt_coords is not None:
-            gt_coords_dev = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
-            # stable subset across stages
-            if global_knn_stage_subset is not None:
-                stage_idx = global_knn_stage_subset.to(device)
-            else:
-                stage_idx = torch.randperm(n_sc, device=device)[:min(n_sc, debug_global_subset)]
-
-        def _pca2(X: torch.Tensor) -> torch.Tensor:
-            # X: (m, d)
-            Xc = X - X.mean(dim=0, keepdim=True)
-            if Xc.shape[1] <= 2:
-                return Xc
-            cov = (Xc.T @ Xc) / max(1, Xc.shape[0] - 1)
-            eigs, vecs = torch.linalg.eigh(cov)
-            B2 = vecs[:, -2:]
-            return Xc @ B2
-
-        def _stage_knn_placed(tag: str):
-            if not (debug_knn and gt_coords_dev is not None and stage_idx is not None):
-                return
-            with torch.no_grad():
-                idx = stage_idx
-                keep = placed[idx]
-                idxp = idx[keep]
-                m = idxp.numel()
-                kmax = max(debug_k_list) if isinstance(debug_k_list, (tuple, list)) else int(debug_k_list)
-                if m <= kmax + 2:
-                    print(f"[STAGE-KNN-PLACED][{tag}] not_enough placed_in_subset={m} need>{kmax+2}")
-                    return
-
-                pred_lat = X_placed[idxp].float()
-                gt_sub = gt_coords_dev[idxp].float()
-
-                pred_pca = _pca2(pred_lat)
-
-                for kv in (debug_k_list if isinstance(debug_k_list, (tuple, list)) else [debug_k_list]):
-                    knn_p_lat, _ = _knn_indices_dists(pred_lat, kv)
-                    knn_p_pca, _ = _knn_indices_dists(pred_pca, kv)
-                    knn_g, _ = _knn_indices_dists(gt_sub, kv)
-                    ov_lat = _knn_overlap_score(knn_p_lat, knn_g).mean().item()
-                    ov_pca = _knn_overlap_score(knn_p_pca, knn_g).mean().item()
-                    print(f"[STAGE-KNN-PLACED][{tag}] kNN@{kv}: LAT{pred_lat.shape[1]}D={ov_lat:.3f} PCA2D={ov_pca:.3f} (m={m})")
-
-        
-        # -------------------------------------------------------------------
-        # Sample ALL patches first (baseline sampling in full D_latent)
-        # This is needed for both modes
-        # -------------------------------------------------------------------
-        print(f"\n[ANCHOR] Sampling {K} patches in full D_latent={D_latent}...")
-        
-        patch_coords_full: List[torch.Tensor] = []  # Store full D_latent coords
-        
-        with torch.no_grad():
-            # ========== NEW: Check if context_encoder expects anchor channel ==========
-            expected_in_ctx = getattr(context_encoder, "input_dim", None)
-            if expected_in_ctx is None and hasattr(context_encoder, 'input_proj'):
-                expected_in_ctx = context_encoder.input_proj.in_features
-            
-            for k in tqdm(range(K), desc="Sampling patches (full D)"):
-                S_k = patch_indices[k]
-                m_k = S_k.numel()
-                S_k_cpu = S_k.cpu() if torch.is_tensor(S_k) else S_k
-                Z_k = Z_all[S_k_cpu].to(device)
-                
-                Z_k_batched = Z_k.unsqueeze(0)  # (1, m_k, h_dim)
-                mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
-                
-                # ========== NEW: Add zero anchor channel if expected ==========
-                # For initial sampling, no anchors are known yet, so all zeros
-                if expected_in_ctx is not None and expected_in_ctx == Z_k_batched.shape[-1] + 1:
-                    zeros_anchor = torch.zeros(1, m_k, 1, device=device, dtype=Z_k_batched.dtype)
-                    Z_k_batched = torch.cat([Z_k_batched, zeros_anchor], dim=-1)
-                    if k == 0:
-                        print(f"[ANCHOR-CHAN] Initial sampling: appended zero anchor channel")
-
-                # === Z_ln conditioning for sampling ===
-                if expected_in_ctx is not None and expected_in_ctx == Z_k_batched.shape[-1]:
-                    # Handle anchor channel: normalize all but last dim
-                    z_feat = Z_k_batched[..., :-1]
-                    z_anchor = Z_k_batched[..., -1:]
-                    z_feat = F.layer_norm(z_feat, (z_feat.shape[-1],))
-                    Z_k_batched = torch.cat([z_feat, z_anchor], dim=-1)
-                else:
-                    Z_k_batched = F.layer_norm(Z_k_batched, (Z_k_batched.shape[-1],))
-
-                H_k = context_encoder(Z_k_batched, mask_k)
-                
-                # # CORAL transform if enabled
-                # if coral_params is not None:
-                #     from core_models_et_p3 import GEMSModel
-                #     H_k = GEMSModel.apply_coral_transform(
-                #         H_k,
-                #         mu_sc=coral_params['mu_sc'],
-                #         A=coral_params['A'],
-                #         B=coral_params['B'],
-                #         mu_st=coral_params['mu_st']
-                #     )
-                
-                # Generator proposal (full D_latent)
-                V_gen = generator(H_k, mask_k)  # (1, m_k, D_latent)
-                
-                # Initialize from generator + noise
-                V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
-                V_t = V_t * mask_k.unsqueeze(-1).float()
-
-                # ============================
-                # COLD START DIAGNOSTIC (ONCE)
-                # ============================
-                use_coldstart = coldstart_diag and (k == 0)
-                if use_coldstart:
-                    # pure noise at sigma_max (same shape as V_gen)
-                    V_t = sigmas[0] * torch.randn_like(V_gen)
-                    V_t = V_t * mask_k.unsqueeze(-1).float()
-                    print(f"[COLDSTART-DIAG] patch={k} n={m_k} sigma_max={float(sigmas[0]):.4f} "
-                          f"steps={len(sigmas)-1} guidance={guidance_scale}")
-                else:
-                    # normal init: generator + noise
-                    V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
-                    V_t = V_t * mask_k.unsqueeze(-1).float()
-                
-                # EDM sampling (full D_latent, no 2D slicing!)
-                for i in range(len(sigmas) - 1):
-                    sigma = sigmas[i]
-                    sigma_next = sigmas[i + 1]
-                    sigma_b = sigma.view(1)
-                    
-                    # Score prediction with CFG (FULL D_latent)
-                    x0_c = _forward_edm_self_cond(
-                        score_net, V_t, sigma_b, H_k, mask_k, sigma_data
-                    )
-                    
-                    if guidance_scale != 1.0:
-                        H_null = torch.zeros_like(H_k)
-                        x0_u = _forward_edm_self_cond(
-                            score_net, V_t, sigma_b, H_null, mask_k, sigma_data
-                        )
-                        
-                        sigma_f = float(sigma)
-                        guidance_eff = _sigma_guidance_eff(sigma_f, guidance_scale)
-                        
-                        diff = x0_c - x0_u
-                        diff_norm = diff.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                        x0_u_norm = x0_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                        wnorm_scale = (x0_u_norm / diff_norm).clamp(max=1.0)
-                        
-                        x0 = x0_u + guidance_eff * wnorm_scale * diff
-                    else:
-                        x0 = x0_c
-                    
-                    # Euler step
-                    d = (V_t - x0) / sigma.clamp_min(1e-8)
-                    V_euler = V_t + (sigma_next - sigma) * d
-                    
-                    # Heun corrector
-                    if sigma_next > 0:
-                        x0_next_c = _forward_edm_self_cond(
-                            score_net,
-                            V_euler,
-                            sigma_next.view(1),
-                            H_k,
-                            mask_k,
-                            sigma_data,
-                        )
-                        if guidance_scale != 1.0:
-                            x0_next_u = _forward_edm_self_cond(
-                                score_net,
-                                V_euler,
-                                sigma_next.view(1),
-                                H_null,
-                                mask_k,
-                                sigma_data,
-                            )
-                            
-                            sigma_next_f = float(sigma_next)
-                            guidance_eff_next = _sigma_guidance_eff(sigma_next_f, guidance_scale)
-                            
-                            diff_next = x0_next_c - x0_next_u
-                            diff_next_norm = diff_next.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                            x0_next_u_norm = x0_next_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                            wnorm_scale_next = (x0_next_u_norm / diff_next_norm).clamp(max=1.0)
-                            
-                            x0_next = x0_next_u + guidance_eff_next * wnorm_scale_next * diff_next
-                        else:
-                            x0_next = x0_next_c
-                        
-                        d2 = (V_euler - x0_next) / sigma_next.clamp_min(1e-8)
-                        V_t = V_t + (sigma_next - sigma) * 0.5 * (d + d2)
-                    else:
-                        V_t = V_euler
-                    
-                    V_t = V_t * mask_k.unsqueeze(-1).float()
-                    
-                    # Stochastic noise
-                    if eta > 0 and sigma_next > 0:
-                        noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma**2, min=0))
-                        V_t = V_t + noise_scale * torch.randn_like(V_t)
-                
-                # Center patch coords
-                V_final = V_t.squeeze(0)  # (m_k, D_latent)
-                V_centered = V_final - V_final.mean(dim=0, keepdim=True)
-                patch_coords_full.append(V_centered.detach().cpu())
-
-                # ============================
-                # COLDSTART METRICS (ONCE)
-                # ============================
-                if use_coldstart and debug_knn and gt_coords is not None:
-                    # Compare only on this patch indices
-                    gt_patch = gt_coords.float().to(device)[S_k]  # (m_k, 2)
-                    pred_patch = V_centered[:, :2].float()        # use first 2 dims for kNN
-
-                    # kNN@10 / @20 overlap + jaccard
-                    for kk in [10, 20]:
-                        kk_eff = min(kk, m_k - 1)
-                        if kk_eff >= 2:
-                            idx_gt, _ = _knn_indices_dists(gt_patch, kk_eff)
-                            idx_pr, _ = _knn_indices_dists(pred_patch, kk_eff)
-
-                            overlap = _knn_overlap_score(idx_gt, idx_pr).mean().item()
-                            jacc = []
-                            for i in range(idx_gt.shape[0]):
-                                a = set(idx_gt[i].tolist())
-                                b = set(idx_pr[i].tolist())
-                                jacc.append(len(a & b) / max(1, len(a | b)))
-                            jacc = float(torch.tensor(jacc).mean().item())
-
-                            print(f"[COLDSTART-KNN] k={kk_eff} overlap_mean={overlap:.4f} jaccard_mean={jacc:.4f}")
-
-                if 'cuda' in device:
-                    torch.cuda.empty_cache()
-        
-        print(f"[ANCHOR] All {K} patches sampled in full D_latent")
-        
-        # Compute patch RMS stats
-        patch_rms_list = torch.tensor([pc.pow(2).mean().sqrt().item() for pc in patch_coords_full])
-        print(f"[ANCHOR] Patch RMS: p50={patch_rms_list.median().item():.3f}")
-
-
-        # ===================================================================
-        # [TEST2-EDGE-STAB] GT kNN EDGE DISTANCE STABILITY ACROSS PATCHES
-        # ===================================================================
-        # For GT edges (i,j) from GT kNN graph:
-        #   collect predicted distances d_hat(i,j) from every patch that contains BOTH i and j
-        #   report variance / CV across patches.
-        # If this is high, patch constraints are not consistent across contexts.
-        # ===================================================================
-        if debug_knn and gt_coords is not None:
-            print("\n" + "=" * 70)
-            print("[TEST2-EDGE-STAB] GT kNN EDGE DISTANCE STABILITY ACROSS PATCHES")
-            print("=" * 70)
-
-            from scipy.stats import pearsonr
-
-
-            # -----------------------
-            # Config
-            # -----------------------
-            K_edge = max(debug_k_list) if isinstance(debug_k_list, (list, tuple)) else int(debug_k_list)
-            K_edge = int(K_edge)  # e.g., 20
-            M_eval = int(min(n_sc, debug_global_subset)) if 'debug_global_subset' in locals() else int(min(n_sc, 838))
-            GT_CHUNK = 4096  # for chunked GT kNN against full GT
-            MIN_OBS_FOR_VAR = 2  # need at least 2 patch observations to compute variance
-
-            # -----------------------
-            # Choose eval subset (stable if available)
-            # -----------------------
-            if 'global_knn_stage_subset' in locals() and global_knn_stage_subset is not None:
-                eval_idx = global_knn_stage_subset[:M_eval].to(device)
-            else:
-                eval_idx = torch.randperm(n_sc, device=device)[:M_eval]
-            eval_idx_cpu = eval_idx.detach().cpu().tolist()
-
-            # -----------------------
-            # GT coords device
-            # -----------------------
-            gt_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
-            N_gt = gt_t.shape[0]
-            if N_gt != n_sc:
-                print(f"[TEST2-EDGE-STAB] WARNING: gt_coords N={N_gt} != n_sc={n_sc}. Indexing assumes consistent IDs.")
-
-            # -----------------------
-            # Chunked kNN(eval subset) against FULL GT
-            # Returns indices in [0, N_gt)
-            # -----------------------
-            def _gt_knn_eval_against_full(gt_all: torch.Tensor, eval_ids: torch.Tensor, kmax: int, chunk: int = 4096):
-                with torch.no_grad():
-                    gt_eval = gt_all[eval_ids]  # (M,2)
-                    M = gt_eval.shape[0]
-                    best_d = torch.full((M, kmax), float("inf"), device=gt_all.device)
-                    best_i = torch.full((M, kmax), -1, dtype=torch.long, device=gt_all.device)
-
-                    for start in range(0, gt_all.shape[0], chunk):
-                        end = min(gt_all.shape[0], start + chunk)
-                        gt_chunk = gt_all[start:end]  # (C,2)
-                        D = torch.cdist(gt_eval, gt_chunk)  # (M,C)
-
-                        # mask self within this chunk
-                        mask = (eval_ids >= start) & (eval_ids < end)
-                        if mask.any():
-                            rows = torch.where(mask)[0]
-                            cols = (eval_ids[mask] - start).long()
-                            D[rows, cols] = float("inf")
-
-                        d_chunk, idx_local = D.topk(kmax, largest=False, dim=1)
-                        idx_chunk = idx_local + start
-
-                        d_cat = torch.cat([best_d, d_chunk], dim=1)
-                        i_cat = torch.cat([best_i, idx_chunk], dim=1)
-
-                        best_d, order = d_cat.topk(kmax, largest=False, dim=1)
-                        best_i = torch.gather(i_cat, 1, order)
-
-                    return best_i, best_d
-
-            gt_knn_full, _ = _gt_knn_eval_against_full(gt_t, eval_idx, K_edge, chunk=GT_CHUNK)  # (M_eval,K_edge)
-
-            # -----------------------
-            # Build unique undirected GT edge set from eval subset
-            # -----------------------
-            edges = set()
-            gt_knn_cpu = gt_knn_full.detach().cpu()
-            for r, i in enumerate(eval_idx_cpu):
-                nbrs = gt_knn_cpu[r].tolist()
-                for j in nbrs:
-                    if i == j:
-                        continue
-                    a, b = (i, j) if i < j else (j, i)
-                    edges.add((a, b))
-
-            edges = list(edges)
-            print(f"[TEST2-EDGE-STAB] eval={M_eval} k_edge={K_edge} unique_edges={len(edges)}")
-
-            # -----------------------
-            # Prepare patch lookups (CPU)
-            # memberships[g] should be list of patch ids containing g
-            # patch_coords_full[k] is (m_k, D_latent) on CPU
-            # -----------------------
-            patch_lists = [p.detach().cpu().tolist() for p in patch_indices]
-            patch_pos = [{gid: li for li, gid in enumerate(lst)} for lst in patch_lists]
-            patch_rms = patch_rms_list.detach().cpu().tolist()  # length K, floats
-
-            gt_cpu = gt_t.detach().cpu()  # for gt edge distances (optional correlation)
-
-            # -----------------------
-            # Accumulate stability stats
-            # -----------------------
-            n_obs_list = []
-            mean_raw_list, std_raw_list, cv_raw_list = [], [], []
-            mean_nrm_list, std_nrm_list, cv_nrm_list = [], [], []
-            gt_d_list = []  # GT distance for correlation
-            edge_ids = []   # (i,j) for top unstable reporting
-
-            # Helper for quick set intersection of patch memberships
-            # Convert memberships[i] to set on the fly (coverage is small, OK)
-            for (i, j) in edges:
-                if i >= n_sc or j >= n_sc:
-                    continue
-                pi = memberships[i]
-                pj = memberships[j]
-                if (pi is None) or (pj is None):
-                    continue
-                shared = set(pi).intersection(pj)
-                if len(shared) == 0:
-                    continue
-
-                ds_raw = []
-                ds_nrm = []
-                for pk in shared:
-                    li = patch_pos[pk].get(i, None)
-                    lj = patch_pos[pk].get(j, None)
-                    if li is None or lj is None:
-                        continue
-                    V = patch_coords_full[pk].float()  # CPU tensor
-                    d = float((V[li] - V[lj]).norm().item())
-                    ds_raw.append(d)
-
-                    rms = float(patch_rms[pk]) if pk < len(patch_rms) else 1.0
-                    ds_nrm.append(d / max(1e-8, rms))
-
-                if len(ds_raw) == 0:
-                    continue
-
-                # record stats only if multiple observations exist (variance meaningful)
-                if len(ds_raw) >= MIN_OBS_FOR_VAR:
-                    t_raw = torch.tensor(ds_raw, dtype=torch.float32)
-                    t_nrm = torch.tensor(ds_nrm, dtype=torch.float32)
-
-                    mu_raw = float(t_raw.mean().item())
-                    sd_raw = float(t_raw.std(unbiased=False).item())
-                    cv_raw = float(sd_raw / max(1e-8, mu_raw))
-
-                    mu_nrm = float(t_nrm.mean().item())
-                    sd_nrm = float(t_nrm.std(unbiased=False).item())
-                    cv_nrm = float(sd_nrm / max(1e-8, mu_nrm))
-
-                    n_obs_list.append(len(ds_raw))
-                    mean_raw_list.append(mu_raw); std_raw_list.append(sd_raw); cv_raw_list.append(cv_raw)
-                    mean_nrm_list.append(mu_nrm); std_nrm_list.append(sd_nrm); cv_nrm_list.append(cv_nrm)
-
-                    # GT distance for correlation (optional)
-                    dgt = float((gt_cpu[i] - gt_cpu[j]).norm().item())
-                    gt_d_list.append(dgt)
-
-                    edge_ids.append((i, j))
-
-            if len(cv_raw_list) == 0:
-                print("[TEST2-EDGE-STAB] Not enough multi-observed edges to compute variance.")
-                print("=" * 70 + "\n")
-            else:
-                cv_raw_t = torch.tensor(cv_raw_list, dtype=torch.float32)
-                sd_raw_t = torch.tensor(std_raw_list, dtype=torch.float32)
-                mu_raw_t = torch.tensor(mean_raw_list, dtype=torch.float32)
-
-                cv_nrm_t = torch.tensor(cv_nrm_list, dtype=torch.float32)
-                sd_nrm_t = torch.tensor(std_nrm_list, dtype=torch.float32)
-                mu_nrm_t = torch.tensor(mean_nrm_list, dtype=torch.float32)
-
-                nobs_t = torch.tensor(n_obs_list, dtype=torch.float32)
-
-                print(f"[TEST2-EDGE-STAB] edges_with_>= {MIN_OBS_FOR_VAR} obs: {len(cv_raw_list)} / {len(edges)}")
-                print(f"[TEST2-EDGE-STAB] #obs per edge: min={nobs_t.min().item():.0f} p50={nobs_t.median().item():.0f} "
-                    f"p90={nobs_t.quantile(0.9).item():.0f} max={nobs_t.max().item():.0f}")
-
-                # Raw distance stability
-                print("\n[TEST2-EDGE-STAB][RAW] distance across patches")
-                print(f"  mean(d):  mean={mu_raw_t.mean().item():.4f} p50={mu_raw_t.median().item():.4f}")
-                print(f"  std(d):   mean={sd_raw_t.mean().item():.4f} p50={sd_raw_t.median().item():.4f} "
-                    f"p90={sd_raw_t.quantile(0.9).item():.4f}")
-                print(f"  CV=std/mean: mean={cv_raw_t.mean().item():.4f} p50={cv_raw_t.median().item():.4f} "
-                    f"p90={cv_raw_t.quantile(0.9).item():.4f} max={cv_raw_t.max().item():.4f}")
-
-                # Normalized by patch RMS
-                print("\n[TEST2-EDGE-STAB][NORM] distance / patch_rms (removes scale drift)")
-                print(f"  mean(d/rms): mean={mu_nrm_t.mean().item():.4f} p50={mu_nrm_t.median().item():.4f}")
-                print(f"  std(d/rms):  mean={sd_nrm_t.mean().item():.4f} p50={sd_nrm_t.median().item():.4f} "
-                    f"p90={sd_nrm_t.quantile(0.9).item():.4f}")
-                print(f"  CV(d/rms):   mean={cv_nrm_t.mean().item():.4f} p50={cv_nrm_t.median().item():.4f} "
-                    f"p90={cv_nrm_t.quantile(0.9).item():.4f} max={cv_nrm_t.max().item():.4f}")
-
-                # Correlation between GT distances and predicted mean distances (sanity check)
-                gt_d = torch.tensor(gt_d_list, dtype=torch.float32).numpy()
-                pred_mu_raw = mu_raw_t.numpy()
-                pred_mu_nrm = mu_nrm_t.numpy()
-
-                pr = pearsonr(gt_d, pred_mu_raw)[0]
-                sr = spearmanr(gt_d, pred_mu_raw)[0]
-                prn = pearsonr(gt_d, pred_mu_nrm)[0]
-                srn = spearmanr(gt_d, pred_mu_nrm)[0]
-                print("\n[TEST2-EDGE-STAB] dist correlation over GT edges (higher is better)")
-                print(f"  corr(GT, mean_pred_raw):  pearson={pr:.3f} spearman={sr:.3f}")
-                print(f"  corr(GT, mean_pred_norm): pearson={prn:.3f} spearman={srn:.3f}")
-
-                # Top unstable edges (by raw CV)
-                topk = 10
-                order = torch.argsort(cv_raw_t, descending=True)[:topk].tolist()
-                print(f"\n[TEST2-EDGE-STAB] Top-{topk} most unstable edges by RAW CV:")
-                for idx in order:
-                    i, j = edge_ids[idx]
-                    print(f"  edge=({i},{j}) nObs={n_obs_list[idx]} "
-                        f"mean={mean_raw_list[idx]:.4f} std={std_raw_list[idx]:.4f} CV={cv_raw_list[idx]:.4f} "
-                        f" | normCV={cv_nrm_list[idx]:.4f}")
-
-                print("=" * 70 + "\n")
-
-
-        # -------------------------------------------------------------------
-        # [DIAG] Patch-level kNN vs GT (pre-placement)
-        # This measures whether patch sampling itself preserves local geometry,
-        # before any sequential anchoring / committing happens.
-        # -------------------------------------------------------------------
-        if debug_knn and gt_coords is not None:
-            print("\n" + "="*70)
-            print("[ANCHOR-DIAG] Patch-level kNN vs GT (pre-placement)")
-            print("="*70)
-
-            # Work on CPU to avoid GPU memory blowups
-            gt_cpu = gt_coords.detach().float().cpu()
-            K_list = debug_k_list if isinstance(debug_k_list, (list, tuple)) else [debug_k_list]
-
-            # Accumulate per-patch overlaps for summary
-            per_k_full = {k_val: [] for k_val in K_list}
-            per_k_pca2 = {k_val: [] for k_val in K_list}
-
-            # Optional: keep (patch_id, score) for worst-patch reporting
-            worst_tracker = {k_val: [] for k_val in K_list}
-
-            for pk in range(K):
-                S_pk = patch_indices[pk]
-                S_pk_cpu = S_pk.detach().cpu()
-
-                # Predicted patch coords (already CPU, centered)
-                pred_full = patch_coords_full[pk].float()          # (m, D_latent) CPU
-                m = pred_full.shape[0]
-
-                # GT coords restricted to same cells (usually (m,2))
-                gt_sub = gt_cpu[S_pk_cpu]
-                gt_sub = gt_sub - gt_sub.mean(dim=0, keepdim=True)
-
-                # Pred PCA2D for a fair “geometry dims only” view
-                if pred_full.shape[1] > 2:
-                    Vc = pred_full - pred_full.mean(dim=0, keepdim=True)
-                    cov = (Vc.T @ Vc) / max(1, Vc.shape[0])
-                    eigs, vecs = torch.linalg.eigh(cov)
-                    basis2 = vecs[:, -2:].flip(dims=[1])  # (D,2)
-                    pred_pca2 = Vc @ basis2               # (m,2)
-                else:
-                    pred_pca2 = pred_full
-
-                for k_val in K_list:
-                    if m <= (k_val + 1):
-                        continue
-
-                    # --- FULL-D overlap ---
-                    knn_pred_full, _ = _knn_indices_dists(pred_full, k_val)
-                    knn_gt, _ = _knn_indices_dists(gt_sub, k_val)
-                    ov_full = _knn_overlap_score(knn_pred_full, knn_gt).mean().item()
-                    per_k_full[k_val].append(ov_full)
-                    worst_tracker[k_val].append((pk, ov_full))
-
-                    # --- PCA2D overlap ---
-                    knn_pred_pca2, _ = _knn_indices_dists(pred_pca2, k_val)
-                    ov_pca2 = _knn_overlap_score(knn_pred_pca2, knn_gt).mean().item()
-                    per_k_pca2[k_val].append(ov_pca2)
-
-            # Summaries
-            for k_val in K_list:
-                if len(per_k_full[k_val]) == 0:
-                    continue
-
-                t_full = torch.tensor(per_k_full[k_val], dtype=torch.float32)
-                t_pca2 = torch.tensor(per_k_pca2[k_val], dtype=torch.float32)
-
-                print(f"[PATCH-KNN][FULL-D] k={k_val}: "
-                      f"mean={t_full.mean().item():.3f} p10={t_full.quantile(0.10).item():.3f} "
-                      f"p50={t_full.median().item():.3f} p90={t_full.quantile(0.90).item():.3f}")
-
-                print(f"[PATCH-KNN][PCA2D ] k={k_val}: "
-                      f"mean={t_pca2.mean().item():.3f} p10={t_pca2.quantile(0.10).item():.3f} "
-                      f"p50={t_pca2.median().item():.3f} p90={t_pca2.quantile(0.90).item():.3f}")
-
-                # Worst 5 patches (lowest overlap) to inspect
-                worst = sorted(worst_tracker[k_val], key=lambda x: x[1])[:5]
-                worst_str = ", ".join([f"(patch={pid},ov={ov:.3f})" for pid, ov in worst])
-                print(f"[PATCH-KNN][WORST] k={k_val}: {worst_str}")
-
-            print("="*70 + "\n")
-
-        # -------------------------------------------------------------------
-        # Project patch coords for seq-align (2D PCA per patch if needed)
-        # -------------------------------------------------------------------
-        def _project_patch_to_seq_dim(V_full: torch.Tensor, seq_dim: int) -> torch.Tensor:
-            if seq_dim == V_full.shape[1]:
-                return V_full
-            if seq_dim != 2:
-                raise ValueError(f"seq_dim must be 2 or full dim, got {seq_dim}")
-
-            V_centered = V_full - V_full.mean(dim=0, keepdim=True)
-            cov = V_centered.T @ V_centered / V_centered.shape[0]
-            eigs, vecs = torch.linalg.eigh(cov)
-            pca_basis = vecs[:, -2:].flip(dims=[1])
-            return V_centered @ pca_basis
-
-        if seq_dim == D_latent:
-            patch_coords_seq = patch_coords_full
-        else:
-            patch_coords_seq = [
-                _project_patch_to_seq_dim(pc.to(device), seq_dim).detach().cpu()
-                for pc in patch_coords_full
-            ]
-        
-        # -------------------------------------------------------------------
-        # Build overlap graph for BFS ordering
-        # -------------------------------------------------------------------
-        print(f"\n[ANCHOR-ORDER] Building overlap graph...")
-        
-        MIN_OVERLAP_BFS = anchor_min_overlap_floor
-        G_overlap = nx.Graph()
-        G_overlap.add_nodes_from(range(K))
-        
-        overlap_sizes = []
-        for a in range(K):
-            S_a = set(patch_indices[a].tolist())
-            for b in range(a + 1, K):
-                S_b = set(patch_indices[b].tolist())
-                overlap = len(S_a & S_b)
-                if overlap >= MIN_OVERLAP_BFS:
-                    G_overlap.add_edge(a, b, weight=overlap)
-                    overlap_sizes.append(overlap)
-        
-        if overlap_sizes:
-            ov_t = torch.tensor(overlap_sizes, dtype=torch.float32)
-            print(f"[ANCHOR-ORDER] overlap stats: min={ov_t.min().item():.0f} p25={ov_t.quantile(0.25).item():.0f} "
-                  f"p50={ov_t.median().item():.0f} p75={ov_t.quantile(0.75).item():.0f} max={ov_t.max().item():.0f}")
-        
-        # Choose root patch (max total overlap mass)
-        # Choose root patch by geometry quality (lowest anisotropy), tie-break by overlap mass
-        overlap_mass = {}
-        for k in range(K):
-            mass = sum(G_overlap[k][nbr]['weight'] for nbr in G_overlap.neighbors(k)) if G_overlap.degree(k) > 0 else 0
-            overlap_mass[k] = mass
-
-        patch_aniso = {}
-        for k in range(K):
-            V = patch_coords_seq[k].to(device)
-            Vc = V - V.mean(dim=0, keepdim=True)
-            cov = (Vc.T @ Vc) / max(1, Vc.shape[0] - 1)
-            eigs = torch.linalg.eigvalsh(cov)
-            aniso = (eigs.max() / eigs.min().clamp(min=1e-8)).item()
-            patch_aniso[k] = aniso
-
-        best_aniso = min(patch_aniso.values())
-        candidates = [k for k, a in patch_aniso.items() if abs(a - best_aniso) / max(best_aniso, 1e-8) < 1e-6]
-        root_patch = max(candidates, key=lambda k: overlap_mass[k])
-
-        print(f"[ANCHOR-ORDER] root_patch={root_patch} aniso={patch_aniso[root_patch]:.2e} overlap_mass={overlap_mass[root_patch]}")
-
-        # overlap_mass = {}
-        # for k in range(K):
-        #     mass = sum(G_overlap[k][nbr]['weight'] for nbr in G_overlap.neighbors(k)) if G_overlap.degree(k) > 0 else 0
-        #     overlap_mass[k] = mass
-        # root_patch = max(overlap_mass, key=overlap_mass.get)
-        
-        # print(f"[ANCHOR-ORDER] root_patch={root_patch} overlap_mass={overlap_mass[root_patch]}")
-        
-        # -------------------------------------------------------------------
-        # Sequential placement (BFS order)
-        # -------------------------------------------------------------------
-        print(f"\n[ANCHOR] Starting sequential placement...")
-        
-        processed = set()
-        queue = deque([root_patch])
-        patches_in_order = []
-        current_anchor_thresh = anchor_min_overlap_start
-        
-        stall_count = 0
-        MAX_STALL_BEFORE_RELAX = 3
-        
-        def weighted_procrustes_full_d(X_src, X_tgt, weights=None):
-            """
-            Compute similarity transform (R, s, t) mapping X_src -> X_tgt in full D.
-            For D>2, R is orthogonal D×D matrix.
-            """
-            n, D = X_src.shape
-            if weights is None:
-                weights = torch.ones(n, 1, device=X_src.device)
-            else:
-                weights = weights.view(-1, 1)
-            
-            w_sum = weights.sum()
-            mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
-            mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
-            
-            Xc = X_src - mu_src
-            Yc = X_tgt - mu_tgt
-            
-            w_sqrt = weights.sqrt()
-            Xc_w = Xc * w_sqrt
-            Yc_w = Yc * w_sqrt
-            
-            # Cross-covariance
-            C = Yc_w.T @ Xc_w  # (D, D)
-            
-            U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
-            R = U @ Vh
-            
-            # Ensure proper rotation (det = +1)
-            if torch.det(R) < 0:
-                U[:, -1] *= -1
-                R = U @ Vh
-            
-            # Scale
-            numer = S_vals.sum()
-            denom = (Xc_w ** 2).sum().clamp_min(1e-8)
-            s = numer / denom
-            
-            # Translation
-            t = (mu_tgt - s * (mu_src @ R.T)).squeeze(0)
-            
-            # Residual
-            X_hat = s * (X_src @ R.T) + t
-            residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
-            
-            return R, s, t, residual
-
-        def weighted_procrustes_2d(X_src, X_tgt, weights=None):
-            """
-            Compute similarity transform (R, s, t) mapping X_src -> X_tgt in 2D.
-            Convention: X_tgt ≈ s * (X_src @ R.T) + t  (row-vector convention)
-            """
-            n = X_src.shape[0]
-            if weights is None:
-                weights = torch.ones(n, 1, device=X_src.device)
-            else:
-                weights = weights.view(-1, 1)
-
-            w_sum = weights.sum()
-            mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
-            mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
-
-            Xc = X_src - mu_src
-            Yc = X_tgt - mu_tgt
-
-            w_sqrt = weights.sqrt()
-            Xc_w = Xc * w_sqrt
-            Yc_w = Yc * w_sqrt
-
-            C = Yc_w.T @ Xc_w  # (2, 2)
-
-            U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
-            R = U @ Vh
-
-            if torch.det(R) < 0:
-                U[:, -1] *= -1
-                R = U @ Vh
-
-            numer = S_vals.sum()
-            denom = (Xc_w ** 2).sum().clamp_min(1e-8)
-            s = numer / denom
-
-            t = (mu_tgt - s * (mu_src @ R.T)).squeeze(0)
-
-            X_hat = s * (X_src @ R.T) + t
-            residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
-
-            return R, s, t, residual
-        
-        def weighted_procrustes_rt_rankk_frozen_perp(X_src, X_tgt, weights=None, rank_k: int = 2):
-            """
-            Rigid alignment: X_tgt ≈ X_src @ R.T + t
-
-            Key property: rotation is estimated only in a rank-k subspace; the orthogonal
-            complement is *frozen* (no arbitrary mixing), then we project to nearest orthogonal
-            via polar decomposition for stability.
-
-            This avoids patch-to-patch inconsistency caused by random rotations in the 30D nullspace.
-            """
-            n, D = X_src.shape
-            if weights is None:
-                weights = torch.ones(n, 1, device=X_src.device, dtype=X_src.dtype)
-            else:
-                weights = weights.view(-1, 1).to(device=X_src.device, dtype=X_src.dtype)
-
-            w_sum = weights.sum().clamp_min(1e-8)
-            mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
-            mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
-
-            Xc = X_src - mu_src
-            Yc = X_tgt - mu_tgt
-
-            w_sqrt = weights.sqrt()
-            Xc_w = Xc * w_sqrt
-            Yc_w = Yc * w_sqrt
-
-            C = Yc_w.T @ Xc_w  # (D,D)
-            U, Svals, Vh = torch.linalg.svd(C, full_matrices=False)
-
-            r = int(min(rank_k, D))
-            Ur = U[:, :r]           # target subspace
-            Vr = Vh.T[:, :r]        # source subspace
-
-            I = torch.eye(D, device=X_src.device, dtype=X_src.dtype)
-
-            # "Frozen-perp" rotation proposal: map source rank-r -> target rank-r, leave source-perp unchanged
-            # R0 acts like:
-            #   v in span(Vr):  v -> Ur Vr^T v
-            #   v in perp(Vr):  v -> v
-            R0 = Ur @ Vr.T + (I - Vr @ Vr.T)
-
-            # Polar projection to nearest orthogonal matrix
-            Up, _, Vhp = torch.linalg.svd(R0, full_matrices=False)
-            R = Up @ Vhp
-            if torch.det(R) < 0:
-                Up[:, -1] *= -1
-                R = Up @ Vhp
-
-            t = (mu_tgt - (mu_src @ R.T)).squeeze(0)
-
-            X_hat = (X_src @ R.T) + t
-            residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
-            return R, t, residual
-
-
-        def weighted_procrustes_rt(X_src, X_tgt, weights=None):
-            """
-            Rigid transform only: X_tgt ≈ X_src @ R.T + t
-            (NO scale). Much more stable under high anisotropy / rank deficiency.
-            """
-            n, D = X_src.shape
-            if weights is None:
-                weights = torch.ones(n, 1, device=X_src.device)
-            else:
-                weights = weights.view(-1, 1)
-
-            w_sum = weights.sum().clamp_min(1e-8)
-            mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
-            mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
-
-            Xc = X_src - mu_src
-            Yc = X_tgt - mu_tgt
-
-            w_sqrt = weights.sqrt()
-            Xc_w = Xc * w_sqrt
-            Yc_w = Yc * w_sqrt
-
-            C = Yc_w.T @ Xc_w
-            U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
-            R = U @ Vh
-            if torch.det(R) < 0:
-                U[:, -1] *= -1
-                R = U @ Vh
-
-            t = (mu_tgt - (mu_src @ R.T)).squeeze(0)
-            X_hat = (X_src @ R.T) + t
-            residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
-            return R, t, residual
-
-        while len(processed) < K:
-            if not queue:
-                # Try to find unprocessed patches with enough anchors
-                found_any = False
-                for k in range(K):
-                    if k not in processed:
-                        S_k = set(patch_indices[k].tolist())
-                        n_anchors = sum(1 for i in S_k if placed[i].item())
-                        if n_anchors >= current_anchor_thresh:
-                            queue.append(k)
-                            found_any = True
-                            break
-                
-                if not found_any:
-                    stall_count += 1
-                    if stall_count >= MAX_STALL_BEFORE_RELAX:
-                        old_thresh = current_anchor_thresh
-                        current_anchor_thresh = max(anchor_min_overlap_floor, int(0.8 * current_anchor_thresh))
-                        stall_count = 0
-                        print(f"[ANCHOR-STALL] relax_thresh {old_thresh}->{current_anchor_thresh}")
-                    
-                    # Add any remaining unprocessed patch
-                    for k in range(K):
-                        if k not in processed:
-                            queue.append(k)
-                            break
-                    
-                    if not queue:
-                        break
-            
-            k = queue.popleft()
-            if k in processed:
-                continue
-            
-            S_k = patch_indices[k]
-            m_k = S_k.numel()
-            S_k_list = S_k.tolist()
-            
-            # Get patch coords for seq-align
-            V_k = patch_coords_seq[k].to(device)  # (m_k, seq_dim)
-            
-            # -------------------------------------------------------------------
-            # Overlap handling (CRITICAL):
-            # Do NOT treat ALL already-placed overlap points as hard anchors.
-            # Hard-anchor only a subset; the rest of overlap remains "revisable".
-            # -------------------------------------------------------------------
-            is_root = (len(processed) == 0)
-
-            # overlap = already placed cells in this patch
-            overlap_local_idx = torch.where(placed[S_k])[0].tolist()
-            overlap_global = [S_k_list[i] for i in overlap_local_idx]
-            n_overlap = len(overlap_global)
-
-            # new = not yet placed
-            new_global = [S_k_list[i] for i in range(m_k) if not placed[S_k_list[i]].item()]
-            n_new = len(new_global)
-
-            # For BFS gating, require enough OVERLAP (not "hard anchors")
-            if (not is_root) and (n_overlap < current_anchor_thresh):
-                queue.append(k)
-                continue
-
-            def pick_farthest_indices(X, n_pick):
-                """
-                Farthest-point sampling, but done in the intrinsic 2D PCA subspace of X.
-                This avoids selecting anchors based on tiny/noisy orthogonal dimensions in 32D.
-                """
-                n, D = X.shape
-                if n_pick >= n:
-                    return list(range(n))
-
-                # PCA2 projection (stable for small n)
-                Xc = X - X.mean(dim=0, keepdim=True)
-                if D > 2:
-                    # SVD-based PCA
-                    U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
-                    B2 = Vh[:2].T  # (D,2)
-                    X2 = Xc @ B2   # (n,2)
-                else:
-                    X2 = Xc
-
-                # farthest-point in 2D
-                mu = X2.mean(dim=0, keepdim=True)
-                d0 = (X2 - mu).pow(2).sum(dim=1)
-                first = int(torch.argmax(d0).item())
-                picked = [first]
-                dist = (X2 - X2[first]).pow(2).sum(dim=1)
-                for _ in range(1, n_pick):
-                    j = int(torch.argmax(dist).item())
-                    picked.append(j)
-                    dist = torch.minimum(dist, (X2 - X2[j]).pow(2).sum(dim=1))
-                return picked
-
-
-            if is_root or n_overlap == 0:
-                A_k = []               # hard anchors (global indices)
-                revise_overlap = []     # overlap but NOT anchored (global indices)
-            else:
-                # Cap anchors to training-like range even for edm_anchor_local
-                nA_raw = max(1, int(round(infer_anchor_frac * n_overlap)))
-                nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw))
-                nA = min(nA, n_overlap)  # hard cap
-
-                # Use farthest-point sampling in overlap (more stable than random)
-                X_overlap = X_placed[overlap_global].float()
-                idx_pick = pick_farthest_indices(X_overlap, nA)
-                A_k = [overlap_global[j] for j in idx_pick]
-
-                A_set = set(A_k)
-                revise_overlap = [g for g in overlap_global if g not in A_set]
-
-                # # DIAGNOSTIC: over-anchor all overlap points for edm_anchor_local
-                # if anchor_sampling_mode == "edm_anchor_local":
-                #     A_k = list(overlap_global)  # anchor ALL overlap points
-                #     revise_overlap = []         # nothing left to revise
-                # else:
-                #     nA_raw = max(1, int(round(infer_anchor_frac * n_overlap)))
-                #     nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw))
-                #     nA = min(nA, n_overlap)  # hard cap
-                #     # perm = torch.randperm(n_overlap, device=device)[:nA]
-                #     # A_k = [overlap_global[j] for j in perm.tolist()]
-                #     X_overlap = X_placed[overlap_global].float()
-                #     idx_pick = pick_farthest_indices(X_overlap, nA)
-                #     A_k = [overlap_global[j] for j in idx_pick]
-
-                #     A_set = set(A_k)
-                #     revise_overlap = [g for g in overlap_global if g not in A_set]
-
-
-            n_anchors = len(A_k)
-            n_revise = len(revise_overlap)
-
-
-            # =========================
-            # DEBUG: overlap consistency residual
-            # Compare aligned GOOD patch sample (patch_coords_full[k]) to current X_placed on OVERLAP
-            # =========================
-            if debug_knn and not is_root and n_overlap > 0 and n_anchors >= 3 and len(processed) <= 8:
-                with torch.no_grad():
-                    V_ref = patch_coords_seq[k].to(device).float()  # (m_k, seq_dim) - FIXED!
-                    
-                    idxA_local = torch.tensor([S_k_list.index(g) for g in A_k], device=device, dtype=torch.long)
-                    V_ref_A = V_ref[idxA_local]
-                    X_A = X_placed[A_k].float()
-                    
-                    # Use appropriate transform for seq_dim
-                    if seq_dim == 2:
-                        Rr, sr, tr, rmseA = weighted_procrustes_2d(V_ref_A, X_A)
-                        V_ref_aligned = sr * (V_ref @ Rr.T) + tr
-                    else:
-                        Rr, sr, tr, rmseA = weighted_procrustes_full_d(V_ref_A, X_A)
-                        if align_freeze_scale:
-                            sr = sr * 0.0 + 1.0
-                        sr = sr.clamp(align_scale_clamp[0], align_scale_clamp[1])
-                        V_ref_aligned = sr * (V_ref @ Rr.T) + tr
-
-                    # else:
-                    #     Rr, tr, rmseA = weighted_procrustes_rt_rankk_frozen_perp(V_ref_A, X_A, weights=None, rank_k=2)
-                    #     V_ref_aligned = (V_ref @ Rr.T) + tr
-
-
-                    idxO_local = torch.tensor(overlap_local_idx, device=device, dtype=torch.long)
-                    X_O = X_placed[overlap_global].float()
-                    resid = (V_ref_aligned[idxO_local] - X_O).norm(dim=1)
-
-                    # conditioning of anchor cloud (rank deficiency = unstable transform)
-                    XA = X_A - X_A.mean(dim=0, keepdim=True)
-                    covA = (XA.T @ XA) / max(1, XA.shape[0] - 1)
-                    eigA = torch.linalg.eigvalsh(covA)
-                    condA = (eigA.max() / eigA.min().clamp(min=1e-12)).item()
-
-                    print(f"[OVERLAP-RESID] patch={k} nO={n_overlap} nA={n_anchors} "
-                        f"rmseA={rmseA.item():.4f} resid_med={resid.median().item():.4f} resid_p90={resid.quantile(0.9).item():.4f} "
-                        f"anchor_cond={condA:.2e}")
-
-            
-            processed.add(k)
-            patches_in_order.append(k)
-            
-            if is_root:
-                # ROOT PATCH: just center and place all cells
-                V_centered = V_k - V_k.mean(dim=0, keepdim=True)
-                
-                # Compute centrality weights
-                center = V_centered.mean(dim=0, keepdim=True)
-                dists = (V_centered - center).norm(dim=1)
-                max_d = dists.max().clamp_min(1e-6)
-                w = (1.0 - dists / (1.2 * max_d)).clamp(min=0.01)
-                
-                # Place ALL cells in root patch
-                for local_i, global_i in enumerate(S_k_list):
-                    X_placed[global_i] = V_centered[local_i]
-                    placed[global_i] = True
-                    W_cell[global_i] = w[local_i]
-                    placed_by_patch[global_i] = k
-                
-                rms_root = V_centered.pow(2).mean().sqrt().item()
-                cov_root = V_centered.T @ V_centered / m_k
-                eigs_root = torch.linalg.eigvalsh(cov_root)
-                aniso_root = (eigs_root.max() / eigs_root.min().clamp(min=1e-8)).item()
-                
-                print(f"[ANCHOR-ROOT] patch={k} m={m_k} rms={rms_root:.3f} aniso_ratio={aniso_root:.1f} placed={placed.sum().item()}")
-                _stage_knn_placed("after_root")
-
-            
-            else:
-                # NON-ROOT PATCH: seq-align or anchored EDM
-                
-                # Get anchor coords (local and global)
-                anchor_local_idx = [S_k_list.index(g) for g in A_k]
-                X_anchor_global = X_placed[A_k]  # (n_anchors, seq_dim or D_latent)
-                
-                if anchor_sampling_mode == "seq_align_only":
-                    V_anchor_local = V_k[anchor_local_idx]  # (n_anchors, seq_dim)
-                    
-                    # Fit similarity transform: V_anchor_local -> X_anchor_global
-                    # Compute centrality weights for anchors
-                    center_local = V_anchor_local.mean(dim=0, keepdim=True)
-                    dists_anchor = (V_anchor_local - center_local).norm(dim=1)
-                    max_d_anchor = dists_anchor.max().clamp_min(1e-6)
-                    w_anchor = (1.0 - dists_anchor / (1.2 * max_d_anchor)).clamp(min=0.01)
-                    
-                    if seq_dim == 2:
-                        R_align, s_align, t_align, rmse_align = weighted_procrustes_2d(
-                            V_anchor_local, X_anchor_global, w_anchor
-                        )
-                    else:
-                        R_align, s_align, t_align, rmse_align = weighted_procrustes_full_d(
-                            V_anchor_local, X_anchor_global, w_anchor
-                        )
-                    
-                    # Safety clamp scale
-                    s_align = s_align.clamp(0.5, 2.0)
-                    
-                    # Apply transform to ALL points in patch
-                    V_aligned = s_align * (V_k @ R_align.T) + t_align  # (m_k, seq_dim)
-                    
-                    if len(processed) <= 5:
-                        print(f"[SEQ-ALIGN] patch={k} nA={n_anchors} nU={n_new} rmse={rmse_align.item():.4f} s={s_align.item():.3f}")
-                    
-                    # Compute centrality weights for commitment
-                    center_aligned = V_aligned.mean(dim=0, keepdim=True)
-                    dists_aligned = (V_aligned - center_aligned).norm(dim=1)
-                    max_d_aligned = dists_aligned.max().clamp_min(1e-6)
-                    w_all = (1.0 - dists_aligned / (1.2 * max_d_aligned)).clamp(min=0.01)
-
-                    # Update revisable overlap cells by weighted averaging (consensus)
-                    if n_revise > 0:
-                        for g in revise_overlap:
-                            local_i = S_k_list.index(g)
-                            w_new = float(w_all[local_i].item())
-                            w_old = float(W_cell[g].item())
-                            denom = max(1e-8, w_old + w_new)
-                            X_placed[g] = (w_old * X_placed[g] + w_new * V_aligned[local_i]) / denom
-                            W_cell[g] = w_old + w_new
-                            placed_by_patch[g] = k
-
-                    # Commit new cells (top commit_frac by centrality weight)
-                    if n_new > 0:
-                        new_local_idx = [S_k_list.index(g) for g in new_global]
-                        new_weights = w_all[new_local_idx]
-                        
-                        n_to_commit = max(1, int(commit_frac * n_new))
-                        _, commit_order = new_weights.topk(min(n_to_commit, len(new_weights)), largest=True)
-                        
-                        cells_to_commit = [new_global[commit_order[i].item()] for i in range(len(commit_order))]
-                        
-                        for global_i in cells_to_commit:
-                            local_i = S_k_list.index(global_i)
-                            X_placed[global_i] = V_aligned[local_i]
-                            placed[global_i] = True
-                            W_cell[global_i] = w_all[local_i]
-                            placed_by_patch[global_i] = k
-                        
-                        if len(processed) <= 5:
-                            w_commit = new_weights[commit_order[:len(cells_to_commit)]]
-                            w_skip_idx = [i for i in range(len(new_global)) if new_global[i] not in cells_to_commit]
-                            w_skip = new_weights[w_skip_idx] if w_skip_idx else torch.tensor([0.0])
-                            print(f"[ANCHOR-COMMIT] n_new={n_new} commit={len(cells_to_commit)} skip={n_new-len(cells_to_commit)} "
-                                  f"w_commit_p50={w_commit.median().item():.3f} w_skip_p50={w_skip.median().item():.3f}")
-
-                elif anchor_sampling_mode == "align_vote_only":
-                    # ALIGN-VOTE mode: rigid alignment in seq_dim space
-                    # Works for seq_dim == 2 or seq_dim == D_latent
-                    
-                    # if seq_dim != D_latent:
-                    #     raise ValueError("align_vote_only requires seq_dim == D_latent; use seq_align_dim=D_latent")
-                    
-                    # Get anchor coords (local and global)
-                    anchor_local_idx = [S_k_list.index(g) for g in A_k]
-                    
-                    V_local = V_k  # (m_k, seq_dim) from patch_coords_seq
-                    V_anchor = V_local[anchor_local_idx]          # (nA, seq_dim)
-                    X_anchor_global = X_placed[A_k].float()       # (nA, seq_dim)
-                    
-                    # Compute centrality weights for anchors
-                    center_local = V_anchor.mean(dim=0, keepdim=True)
-                    dists_anchor = (V_anchor - center_local).norm(dim=1)
-                    max_d_anchor = dists_anchor.max().clamp_min(1e-6)
-                    w_anchor = (1.0 - dists_anchor / (1.2 * max_d_anchor)).clamp(min=0.01)
-                    
-                    if seq_dim == 2:
-                        # 2D similarity transform (with scale)
-                        R_align, s_align, t_align, rmse_align = weighted_procrustes_2d(
-                            V_anchor, X_anchor_global, w_anchor
-                        )
-                        # Clamp scale to avoid patch-to-patch breathing
-                        s_align = s_align.clamp(0.85, 1.15)
-                        V_aligned = s_align * (V_local @ R_align.T) + t_align
-                    else:
-                        # 32D rigid transform (no scale, rank-2 stabilized)
-                        R_align, t_align, rmse_align = weighted_procrustes_rt_rankk_frozen_perp(
-                            V_anchor, X_anchor_global, weights=w_anchor, rank_k=2
-                        )
-                        V_aligned = (V_local @ R_align.T) + t_align
-                    
-                    # Optional: diagnostic kNN on aligned patch vs GT
-                    if debug_knn and gt_coords is not None and len(processed) <= 6:
-                        with torch.no_grad():
-                            gt_sub = gt_coords.detach().float().to(device)[S_k.to(device)]
-                            gt_sub = gt_sub - gt_sub.mean(dim=0, keepdim=True)
-                            
-                            pred_sub = V_aligned - V_aligned.mean(dim=0, keepdim=True)
-                            
-                            for kv in (debug_k_list if isinstance(debug_k_list, (tuple, list)) else [debug_k_list]):
-                                if pred_sub.shape[0] > kv + 1:
-                                    knn_p, _ = _knn_indices_dists(pred_sub, kv)
-                                    knn_g, _ = _knn_indices_dists(gt_sub, kv)
-                                    ov = _knn_overlap_score(knn_p, knn_g).mean().item()
-                                    print(f"[ALIGN-PATCH-KNN] patch={k} k={kv} ov_after_align={ov:.3f}")
-                    
-                    if len(processed) <= 5:
-                        if seq_dim == 2:
-                            print(f"[ALIGN-VOTE-2D] patch={k} nA={n_anchors} nU={n_new} rmse={rmse_align.item():.4f} s={s_align.item():.3f}")
-                        else:
-                            print(f"[ALIGN-VOTE] patch={k} nA={n_anchors} nU={n_new} rmse={rmse_align.item():.4f}")
-                    
-                    # Compute centrality weights for commitment
-                    center_aligned = V_aligned.mean(dim=0, keepdim=True)
-                    dists_aligned = (V_aligned - center_aligned).norm(dim=1)
-                    max_d_aligned = dists_aligned.max().clamp_min(1e-6)
-                    w_all = (1.0 - dists_aligned / (1.2 * max_d_aligned)).clamp(min=0.01)
-                    
-                    # NO LONGER REVISE OVERLAP (per Change A)
-                    # We only commit new cells
-                    
-                    # Commit new cells (top commit_frac by centrality weight)
-                    if n_new > 0:
-                        new_local_idx = [S_k_list.index(g) for g in new_global]
-                        new_weights = w_all[new_local_idx]
-                        
-                        n_to_commit = max(1, int(commit_frac * n_new))
-                        _, commit_order = new_weights.topk(min(n_to_commit, len(new_weights)), largest=True)
-                        
-                        cells_to_commit = [new_global[commit_order[i].item()] for i in range(len(commit_order))]
-                        
-                        for global_i in cells_to_commit:
-                            local_i = S_k_list.index(global_i)
-                            X_placed[global_i] = V_aligned[local_i]
-                            placed[global_i] = True
-                            W_cell[global_i] = w_all[local_i]
-                            placed_by_patch[global_i] = k
-                        
-                        if len(processed) <= 5:
-                            print(f"[ALIGN-VOTE-COMMIT] n_new={n_new} commit={len(cells_to_commit)} skip={n_new-len(cells_to_commit)}")
-
-
-                else:
-                    # EDM ANCHOR GLOBAL: denoise patch in GLOBAL frame with clamped anchors
-                    # ========== NEW FLAGS FOR BACKWARD COMPATIBILITY ==========
-                    use_clean_anchor_clamp = True  # Set False for old sigma-noised behavior
-                    use_anchor_aware_cfg = True    # Set False for old H_null=zeros behavior
-                    
-                    # anchors in global coords (same scale as X_placed)
-                    X_anchor_global = X_placed[A_k]  # (nA, D_latent)
-                    anchor_idx_t = torch.tensor(anchor_local_idx, device=device, dtype=torch.long)
-
-                    if len(processed) <= 3:
-                        print(f"[EDM-ANCHOR-GLOBAL] patch={k} nA={n_anchors} nU={n_new} "
-                              f"use_clean_clamp={use_clean_anchor_clamp} anchor_cfg={use_anchor_aware_cfg}")
-
-                    # Recompute H_k for this patch
-                    S_k_cpu = S_k.cpu() if torch.is_tensor(S_k) else S_k
-                    Z_k = Z_all[S_k_cpu].to(device)
-                    Z_k_batched = Z_k.unsqueeze(0)  # (1, m_k, h_dim)
-                    mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
-
-                    # === Z_ln conditioning for sampling ===
-                    if expected_in_ctx is not None and expected_in_ctx == Z_k_batched.shape[-1]:
-                        # Handle anchor channel: normalize all but last dim
-                        z_feat = Z_k_batched[..., :-1]
-                        z_anchor = Z_k_batched[..., -1:]
-                        z_feat = F.layer_norm(z_feat, (z_feat.shape[-1],))
-                        Z_k_batched = torch.cat([z_feat, z_anchor], dim=-1)
-                    else:
-                        Z_k_batched = F.layer_norm(Z_k_batched, (Z_k_batched.shape[-1],))
-
-                    
-                    # ========== NEW: Add anchor channel if context_encoder expects it ==========
-                    expected_in = getattr(context_encoder, "input_dim", None)
-                    if expected_in is None:
-                        # Try to infer from input_proj
-                        if hasattr(context_encoder, 'input_proj'):
-                            expected_in = context_encoder.input_proj.in_features
-                    
-                    # Build anchor conditioning mask
-                    anchor_cond_mask_k = torch.zeros(1, m_k, dtype=torch.bool, device=device)
-                    anchor_cond_mask_k[0, anchor_idx_t] = True
-                    
-                    # Append anchor channel if needed
-                    if expected_in is not None and expected_in == Z_k_batched.shape[-1] + 1:
-                        anchor_channel = anchor_cond_mask_k.float().unsqueeze(-1)  # (1, m_k, 1)
-                        Z_k_batched = torch.cat([Z_k_batched, anchor_channel], dim=-1)
-                        if len(processed) <= 3:
-                            print(f"[ANCHOR-CHAN] appended anchor channel, Z_k shape={Z_k_batched.shape}, nA_marked={anchor_channel.sum().item():.0f}")
-                    
-                    
-                    H_k = context_encoder(Z_k_batched, mask_k)
-
-                    # ========== ANCHOR-CHANNEL SENSITIVITY DIAGNOSTIC ==========
-                    H_k_no_anchor = None
-                    if anchor_channel_sensitivity_diag and expected_in is not None and expected_in == Z_k.shape[-1] + 1:
-                        Z_k_no_anchor = Z_k_batched.clone()
-                        Z_k_no_anchor[..., -1] = 0.0  # Zero ONLY the anchor channel
-                        H_k_no_anchor = context_encoder(Z_k_no_anchor, mask_k)
-
-                    # ========== NEW: Build anchor-aware unconditional context for CFG ==========
-                    H_uncond = None
-                    if use_anchor_aware_cfg and guidance_scale != 1.0:
-                        # Zero out gene embedding portion, keep anchor channel
-                        Z_uncond = Z_k_batched.clone()
-                        if expected_in is not None and expected_in == Z_k.shape[-1] + 1:
-                            # Z_uncond has anchor channel at last dim
-                            Z_uncond[..., :-1] = 0  # Zero gene embeddings, keep anchor
-                        else:
-                            Z_uncond = torch.zeros_like(Z_k_batched)
-                        H_uncond = context_encoder(Z_uncond, mask_k)
-                        if len(processed) <= 3:
-                            print(f"[ANCHOR-CFG] computed anchor-aware H_uncond")
-
-                    if coral_params is not None:
-                        from core_models_et_p3 import GEMSModel
-                        H_k = GEMSModel.apply_coral_transform(
-                            H_k,
-                            mu_sc=coral_params['mu_sc'],
-                            A=coral_params['A'],
-                            B=coral_params['B'],
-                            mu_st=coral_params['mu_st']
-                        )
-                        # Also transform H_uncond / H_k_no_anchor if they exist
-                        if H_uncond is not None:
-                            H_uncond = GEMSModel.apply_coral_transform(
-                                H_uncond,
-                                mu_sc=coral_params['mu_sc'],
-                                A=coral_params['A'],
-                                B=coral_params['B'],
-                                mu_st=coral_params['mu_st']
-                            )
-                        if H_k_no_anchor is not None:
-                            H_k_no_anchor = GEMSModel.apply_coral_transform(
-                                H_k_no_anchor,
-                                mu_sc=coral_params['mu_sc'],
-                                A=coral_params['A'],
-                                B=coral_params['B'],
-                                mu_st=coral_params['mu_st']
-                            )
-
-                    # Generator proposal (GLOBAL)
-                    V_gen = generator(H_k, mask_k)  # (1, m_k, D_latent)
-
-                    # Optional pre-align in GLOBAL space using anchors on CLEAN generator output
-                    V_gen_anchor = V_gen.squeeze(0)[anchor_idx_t]
-                    if V_gen_anchor.shape[0] >= 3:
-                        # R_pre, s_pre, t_pre, rmse_pre = weighted_procrustes_full_d(V_gen_anchor, X_anchor_global)
-                        # s_pre = s_pre.clamp(0.5, 2.0)
-                        # V_gen = s_pre * (V_gen @ R_pre.T) + t_pre
-                        # R_pre, t_pre, rmse_pre = weighted_procrustes_rt(V_gen_anchor, X_anchor_global)
-                        # V_gen = (V_gen @ R_pre.T) + t_pre
-                        # if len(processed) <= 3:
-                        #     print(f"[EDM-ANCHOR-PROCR] patch={k} rmse={rmse_pre.item():.4f} (rigid-no-scale)")
-                        R_pre, s_pre, t_pre, rmse_pre = weighted_procrustes_full_d(V_gen_anchor, X_anchor_global)
-                        if align_freeze_scale:
-                            s_pre = s_pre * 0.0 + 1.0
-                        s_pre = s_pre.clamp(align_scale_clamp[0], align_scale_clamp[1])
-                        V_gen = s_pre * (V_gen @ R_pre.T) + t_pre
-                        if len(processed) <= 3:
-                            print(f"[EDM-ANCHOR-PROCR] patch={k} rmse={rmse_pre.item():.4f} s={s_pre.item():.3f} (similarity)")
-
-
-                    # ========== UNKNOWN MASK for selective updates ==========
-                    # ========== UNKNOWN MASK for selective updates ==========
-                    unknown_mask_k = mask_k.clone()
-                    unknown_mask_k[0, anchor_idx_t] = False
-                    unknown_3d = unknown_mask_k.unsqueeze(-1).float()  # (1, m_k, 1)
-
-                    # Initialize GLOBAL state with noise (ONLY on unknown points)
-                    V_t = V_gen.clone()
-                    noise_init = torch.randn_like(V_gen) * sigmas[0]
-                    V_t = V_t + noise_init * unknown_3d  # Only add noise to unknown
-                    V_t = V_t * mask_k.unsqueeze(-1).float()
-
-                    # Initialize revisable overlap points from current global coords
-                    # (they are treated as unknowns, so they are allowed to move)
-                    if n_revise > 0:
-                        revise_local_idx = torch.tensor(
-                            [S_k_list.index(g) for g in revise_overlap],
-                            device=device, dtype=torch.long
-                        )
-                        V_t[0, revise_local_idx] = X_placed[revise_overlap].float()
-
-                    
-                    # ========== ANCHOR INITIALIZATION (mode-dependent) ==========
-                    # eps_A is ONLY used in noisy-anchor mode (RePaint style)
-                    eps_A = None  # Will be set only if needed
-                    
-                    if use_clean_anchor_clamp:
-                        # CLEAN MODE: Anchors are ALWAYS at exact clean coords (Dirichlet BC)
-                        # This matches anchored training where anchors never have noise
-                        V_t[0, anchor_idx_t] = X_anchor_global
-                        if len(processed) <= 3:
-                            init_drift = (V_t[0, anchor_idx_t] - X_anchor_global).norm(dim=1).max().item()
-                            print(f"[ANCHOR-INIT] CLEAN mode: anchors at exact coords, init_drift={init_drift:.2e} (should be 0)")
-                    else:
-                        # NOISY MODE (legacy RePaint-style): Anchors follow x_A(σ) = x_A* + σ * ε_A
-                        # Generate fixed noise for this patch (used throughout sampling)
-                        eps_A = torch.randn((n_anchors, D_latent), device=device)
-                        sigma0 = sigmas[0]
-                        V_t[0, anchor_idx_t] = X_anchor_global + sigma0 * eps_A
-                        if len(processed) <= 3:
-                            print(f"[ANCHOR-INIT] NOISY mode: anchors at sigma0-noised coords")
-
-                    # ========== HELPER: Get anchor target for current sigma ==========
-                    def get_anchor_target(sigma_val):
-                        """Returns anchor target coords for given sigma level."""
-                        if use_clean_anchor_clamp:
-                            return X_anchor_global
-                        else:
-                            return X_anchor_global + sigma_val * eps_A
-
-                    # EDM sampling with anchor clamp in GLOBAL frame
-                    for i in range(len(sigmas) - 1):
-                        sigma = sigmas[i]
-                        sigma_next = sigmas[i + 1]
-                        sigma_b = sigma.view(1)
-                        
-                        # ========== SAFETY: Clamp anchors to sigma target BEFORE score_net call ==========
-                        V_t[0, anchor_idx_t] = get_anchor_target(sigma)
-
-                        x0_c = _forward_edm_self_cond(
-                            score_net,
-                            V_t,
-                            sigma_b,
-                            H_k,
-                            mask_k,
-                            sigma_data,
-                            center_mask=anchor_cond_mask_k,
-                        )
-
-                        # ===== DIAG: does anchor channel change prediction? =====
-                        if anchor_channel_sensitivity_diag and H_k_no_anchor is not None and i == 0 and len(processed) <= 3:
-                            x0_no_anchor = _forward_edm_self_cond(
-                                score_net,
-                                V_t,
-                                sigma_b,
-                                H_k_no_anchor,
-                                mask_k,
-                                sigma_data,
-                                center_mask=anchor_cond_mask_k,
-                            )
-                            diff = (x0_c - x0_no_anchor).norm(dim=[1, 2]).mean().item()
-                            base = x0_c.norm(dim=[1, 2]).mean().item()
-                            rel = diff / max(base, 1e-8)
-                            print(f"[ANCHOR-CHAN-DIAG] patch={k} sigma={float(sigma):.4f} abs={diff:.4f} rel={rel:.4f}")
-
-                        if guidance_scale != 1.0:
-                            # ========== Anchor-aware CFG ==========
-                            if use_anchor_aware_cfg and H_uncond is not None:
-                                H_null = H_uncond
-                            else:
-                                H_null = torch.zeros_like(H_k)
-                            x0_u = _forward_edm_self_cond(
-                                score_net,
-                                V_t,
-                                sigma_b,
-                                H_null,
-                                mask_k,
-                                sigma_data,
-                                center_mask=anchor_cond_mask_k,
-                            )
-
-                            guidance_eff = _sigma_guidance_eff(float(sigma), guidance_scale)
-
-                            diff = x0_c - x0_u
-                            diff_norm = diff.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                            x0_u_norm = x0_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                            wnorm_scale = (x0_u_norm / diff_norm).clamp(max=1.0)
-
-                            x0 = x0_u + guidance_eff * wnorm_scale * diff
-                        else:
-                            x0 = x0_c
-
-                        d = (V_t - x0) / sigma.clamp_min(1e-8)
-
-                        # ========== Apply Euler update ONLY on unknown points ==========
-                        V_euler = V_t + (sigma_next - sigma) * d * unknown_3d
-                        
-                        # Clamp anchors to sigma_next target after Euler step
-                        V_euler[0, anchor_idx_t] = get_anchor_target(sigma_next)
-
-                        if sigma_next > 0:
-                            # ========== CRITICAL: Clamp anchors to sigma_next target BEFORE second model call ==========
-                            # This ensures model at sigma_next sees anchors at the correct noise level
-                            V_euler[0, anchor_idx_t] = get_anchor_target(sigma_next)
-
-                            x0_next_c = _forward_edm_self_cond(
-                                score_net,
-                                V_euler,
-                                sigma_next.view(1),
-                                H_k,
-                                mask_k,
-                                sigma_data,
-                                center_mask=anchor_cond_mask_k,
-                            )
-                            if guidance_scale != 1.0:
-                                x0_next_u = _forward_edm_self_cond(
-                                    score_net,
-                                    V_euler,
-                                    sigma_next.view(1),
-                                    H_null,
-                                    mask_k,
-                                    sigma_data,
-                                    center_mask=anchor_cond_mask_k,
-                                )
-                                
-                                guidance_eff_next = _sigma_guidance_eff(float(sigma_next), guidance_scale)
-                                
-                                diff_next = x0_next_c - x0_next_u
-                                diff_next_norm = diff_next.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                                x0_next_u_norm = x0_next_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
-                                wnorm_scale_next = (x0_next_u_norm / diff_next_norm).clamp(max=1.0)
-                                
-                                x0_next = x0_next_u + guidance_eff_next * wnorm_scale_next * diff_next
-                            else:
-                                x0_next = x0_next_c
-                            
-                            d2 = (V_euler - x0_next) / sigma_next.clamp_min(1e-8)
-                            
-                            # ========== Apply Heun update ONLY on unknown points ==========
-                            V_t = V_t + (sigma_next - sigma) * 0.5 * (d + d2) * unknown_3d
-                        else:
-                            V_t = V_euler
-                        
-                        V_t = V_t * mask_k.unsqueeze(-1).float()
-                        
-                        if eta > 0 and sigma_next > 0:
-                            noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma**2, min=0))
-                            # ========== Stochastic noise ONLY on unknown points ==========
-                            V_t = V_t + noise_scale * torch.randn_like(V_t) * unknown_3d
-                        
-                        # ========== END-OF-STEP ANCHOR CLAMPING ==========
-                        target = get_anchor_target(sigma_next)
-                        
-                        # Debug: compute drift BEFORE final clamp (should be ~0 due to unknown_3d masking)
-                        if len(processed) <= 3 and i < 3:
-                            err_pre = (V_t[0, anchor_idx_t] - target).norm(dim=1)
-                            anchor_drift = err_pre.max().item() if err_pre.numel() > 0 else 0.0
-                            mode_str = "CLEAN" if use_clean_anchor_clamp else "NOISY"
-                            print(f"[ANCHOR-STEP] mode={mode_str} step={i} sigma={float(sigma):.4f}→{float(sigma_next):.4f} "
-                                  f"anchor_drift={anchor_drift:.2e}")
-
-                        V_t[0, anchor_idx_t] = target
-
-                    # Final clamp at sigma=0 (GLOBAL) - always clean for final output
-                    V_t[0, anchor_idx_t] = X_anchor_global
-                    
-                    # Define final global coords BEFORE any diagnostics that use it
-                    V_final_global = V_t.squeeze(0)
-
-                    # =========================
-                    # DEBUG: compare anchored-EDM output to "aligned good sample" reference
-                    # =========================
-                    if debug_knn and gt_coords is not None and (len(processed) <= 5) and (n_anchors >= 3):
-                        with torch.no_grad():
-                            V_ref = patch_coords_full[k].to(device).float()
-                            V_ref_A = V_ref[anchor_idx_t]
-                            X_A = X_anchor_global.float()
-
-                            Rr, tr, rmseA = weighted_procrustes_rt(V_ref_A, X_A)
-                            V_ref_aligned = (V_ref @ Rr.T) + tr
-
-                            delta_med = (V_final_global - V_ref_aligned).norm(dim=1).median().item()
-
-                            gt_sub = gt_coords.detach().float().to(device)[S_k.to(device)]
-                            gt_sub = gt_sub - gt_sub.mean(dim=0, keepdim=True)
-
-                            # kNN on ALL points for both refs (centered)
-                            pred_ref = V_ref_aligned - V_ref_aligned.mean(dim=0, keepdim=True)
-                            pred_edm = V_final_global - V_final_global.mean(dim=0, keepdim=True)
-
-                            for kv in (debug_k_list if isinstance(debug_k_list, (tuple, list)) else [debug_k_list]):
-                                if m_k > kv + 1:
-                                    knn_ref, _ = _knn_indices_dists(pred_ref, kv)
-                                    knn_edm, _ = _knn_indices_dists(pred_edm, kv)
-                                    knn_gt, _ = _knn_indices_dists(gt_sub, kv)
-                                    ov_ref = _knn_overlap_score(knn_ref, knn_gt).mean().item()
-                                    ov_edm = _knn_overlap_score(knn_edm, knn_gt).mean().item()
-                                    print(f"[REF-VS-EDM] patch={k} k={kv} ov_refAligned={ov_ref:.3f} ov_anchorEDM={ov_edm:.3f} delta_med={delta_med:.4f} rmseA={rmseA.item():.4f}")
-
-
-                    # -------------------------------------------------------------------
-                    # [DIAG] Anchored-resample patch-level kNN vs GT (THIS tests the failing path)
-                    # -------------------------------------------------------------------
-                    if debug_knn and gt_coords is not None and len(processed) <= 5:
-                        with torch.no_grad():
-                            gt_sub = gt_coords.detach().float().to(device)[S_k.to(device)]
-                            gt_sub = gt_sub - gt_sub.mean(dim=0, keepdim=True)
-                            
-                            pred_sub = V_final_global.float()
-                            pred_sub = pred_sub - pred_sub.mean(dim=0, keepdim=True)
-                            
-                            # Unknown indices (the ones you actually update)
-                            anchor_set = set(anchor_local_idx)
-                            unknown_idx = torch.tensor(
-                                [ii for ii in range(m_k) if ii not in anchor_set],
-                                device=device, dtype=torch.long
-                            )
-                            
-                            k_list = debug_k_list if isinstance(debug_k_list, (list, tuple)) else [debug_k_list]
-                            for k_val in k_list:
-                                if pred_sub.shape[0] > k_val + 1:
-                                    knn_pred, _ = _knn_indices_dists(pred_sub, k_val)
-                                    knn_gt, _ = _knn_indices_dists(gt_sub, k_val)
-                                    ov = _knn_overlap_score(knn_pred, knn_gt).mean().item()
-                                    print(f"[ANCHOR-PATCH-KNN][ALL] patch={k} k={k_val} ov={ov:.3f}")
-                                
-                                if unknown_idx.numel() > k_val + 1:
-                                    pred_u = pred_sub[unknown_idx]
-                                    gt_u = gt_sub[unknown_idx]
-                                    knn_pred_u, _ = _knn_indices_dists(pred_u, k_val)
-                                    knn_gt_u, _ = _knn_indices_dists(gt_u, k_val)
-                                    ov_u = _knn_overlap_score(knn_pred_u, knn_gt_u).mean().item()
-                                    print(f"[ANCHOR-PATCH-KNN][UNK] patch={k} k={k_val} ov={ov_u:.3f}")
-
-                    if len(processed) <= 3:
-                        anchor_rmse = (V_final_global[anchor_idx_t] - X_anchor_global).pow(2).mean().sqrt().item()
-                        print(f"[EDM-ANCHOR-END] patch={k} anchor_rmse_global={anchor_rmse:.6f}")
-
-                    # Compute centrality weights for commitment
-                    center_aligned = V_final_global.mean(dim=0, keepdim=True)
-                    dists_aligned = (V_final_global - center_aligned).norm(dim=1)
-                    max_d_aligned = dists_aligned.max().clamp_min(1e-6)
-                    w_all = (1.0 - dists_aligned / (1.2 * max_d_aligned)).clamp(min=0.01)
-
-                    # Update revisable overlap cells by weighted averaging (consensus)
-                    # if n_revise > 0:
-                    #     for g in revise_overlap:
-                    #         local_i = S_k_list.index(g)
-                    #         w_new = float(w_all[local_i].item())
-                    #         w_old = float(W_cell[g].item())
-                    #         denom = max(1e-8, w_old + w_new)
-                    #         X_placed[g] = (w_old * X_placed[g] + w_new * V_final_global[local_i]) / denom
-                    #         W_cell[g] = w_old + w_new
-                    #         placed_by_patch[g] = k
-
-                    # Commit new cells (top commit_frac by centrality weight)
-                    if n_new > 0:
-                        new_local_idx = [S_k_list.index(g) for g in new_global]
-                        new_weights = w_all[new_local_idx]
-                        
-                        n_to_commit = max(1, int(commit_frac * n_new))
-                        _, commit_order = new_weights.topk(min(n_to_commit, len(new_weights)), largest=True)
-                        
-                        cells_to_commit = [new_global[commit_order[i].item()] for i in range(len(commit_order))]
-                        
-                        for global_i in cells_to_commit:
-                            local_i = S_k_list.index(global_i)
-                            X_placed[global_i] = V_final_global[local_i]
-                            placed[global_i] = True
-                            W_cell[global_i] = w_all[local_i]
-                            placed_by_patch[global_i] = k
-                        
-                        if len(processed) <= 5:
-                            w_commit = new_weights[commit_order[:len(cells_to_commit)]]
-                            w_skip_idx = [i for i in range(len(new_global)) if new_global[i] not in cells_to_commit]
-                            w_skip = new_weights[w_skip_idx] if w_skip_idx else torch.tensor([0.0])
-                            print(f"[EDM-ANCHOR-COMMIT] n_new={n_new} commit={len(cells_to_commit)} skip={n_new-len(cells_to_commit)} "
-                                  f"w_commit_p50={w_commit.median().item():.3f} w_skip_p50={w_skip.median().item():.3f}")
-
-            # Add neighbors to queue
-            for nbr in G_overlap.neighbors(k):
-                if nbr not in processed:
-                    queue.append(nbr)
-            
-            # Progress report
-            if len(processed) % 10 == 0 or len(processed) == K:
-                n_placed = placed.sum().item()
-                print(f"[ANCHOR-PROGRESS] processed_patches={len(processed)}/{K} placed={n_placed}/{n_sc} unplaced={n_sc-n_placed}")
-
-            _stage_knn_placed(f"after_{len(processed)}_patches")
-
-        # -------------------------------------------------------------------
-        # C9) Guaranteed placement (no NaNs allowed!)
-        # -------------------------------------------------------------------
-        # quick stage eval helper (same subset as later)
-        def _quick_global_knn(tag, X_pred, gt_coords, k_list=(10,20), M=838):
-            if (not debug_knn) or (gt_coords is None):
-                return
-            with torch.no_grad():
-                n = X_pred.shape[0]
-                M = min(n, M)
-                idx = torch.randperm(n, device=X_pred.device)[:M]
-                pred = X_pred[idx].float()
-                gt = gt_coords.to(X_pred.device).float()[idx]
-                for kv in k_list:
-                    if M > kv + 1:
-                        knn_p, _ = _knn_indices_dists(pred, kv)
-                        knn_g, _ = _knn_indices_dists(gt, kv)
-                        ov = _knn_overlap_score(knn_p, knn_g).mean().item()
-                        print(f"[STAGE-KNN][{tag}] kNN@{kv}: mean={ov:.3f}")
-
-        _stage_knn_placed("pre_fill_pre_refine")
-
-        _quick_global_knn("pre_fill_pre_refine", X_placed, gt_coords, k_list=debug_k_list, M=debug_global_subset)
-
-        print(f"[STAGE] unplaced_before_fill={(~placed).sum().item()}")
-        n_unplaced = (~placed).sum().item()
-        if n_unplaced > 0:
-            print(f"\n[ANCHOR-FILL] remaining={n_unplaced} cells unplaced, forcing placement...")
-            unplaced_idx = torch.where(~placed)[0].tolist()
-            for cell_i in unplaced_idx:
-                # Find best patch containing this cell (one with most anchors)
-                cell_patches = memberships[cell_i]
-                best_patch = None
-                best_n_anchors = -1
-                for p_idx in cell_patches:
-                    S_p = patch_indices[p_idx]
-                    n_anchors_p = placed[S_p].sum().item()
-                    if n_anchors_p > best_n_anchors:
-                        best_n_anchors = n_anchors_p
-                        best_patch = p_idx
-                
-                if best_patch is not None and best_n_anchors >= 3:
-                    # Align this patch and place the cell
-                    S_p = patch_indices[best_patch]
-                    S_p_list = S_p.tolist()
-                    V_p = patch_coords_seq[best_patch].to(device)
-                    # Get anchors
-                    anchor_mask_p = placed[S_p]
-                    A_p = [S_p_list[i] for i in range(len(S_p_list)) if anchor_mask_p[i].item()]
-                    anchor_local_idx = [S_p_list.index(g) for g in A_p]
-                    V_anchor_local = V_p[anchor_local_idx]
-                    X_anchor_global = X_placed[A_p]
-
-                    # if seq_dim == 2:
-                    #     R_align, s_align, t_align, _ = weighted_procrustes_2d(V_anchor_local, X_anchor_global)
-                    # else:
-                    #     R_align, s_align, t_align, _ = weighted_procrustes_full_d(V_anchor_local, X_anchor_global)
-                    # s_align = s_align.clamp(0.5, 2.0)
-                    # V_aligned = s_align * (V_p @ R_align.T) + t_align
-                    # R_align, t_align, _ = weighted_procrustes_rt(V_anchor_local, X_anchor_global)
-                    R_align, t_align, _ = weighted_procrustes_rt_rankk_frozen_perp(
-                        V_anchor_local, X_anchor_global, weights=None, rank_k=2
-                    )
-
-                    V_aligned = (V_p @ R_align.T) + t_align
-
-                    local_i = S_p_list.index(cell_i)
-                    X_placed[cell_i] = V_aligned[local_i]
-                    placed[cell_i] = True
-                    placed_by_patch[cell_i] = best_patch
-                    print(f"[ANCHOR-FILL] cell={cell_i} best_patch={best_patch} nA={best_n_anchors} committed=True")
-                
-                elif best_patch is not None:
-                    # Not enough anchors, use centroid + offset
-                    S_p = patch_indices[best_patch]
-                    S_p_list = S_p.tolist()
-                    V_p = patch_coords_seq[best_patch].to(device)
-                    local_i = S_p_list.index(cell_i)
-                    
-                    # Place relative to global centroid
-                    global_centroid = X_placed[placed].mean(dim=0)
-                    patch_centroid = V_p.mean(dim=0)
-                    offset = V_p[local_i] - patch_centroid
-                    X_placed[cell_i] = global_centroid + offset
-                    placed[cell_i] = True
-                    placed_by_patch[cell_i] = best_patch
-                    print(f"[ANCHOR-FILL] cell={cell_i} best_patch={best_patch} nA={best_n_anchors} committed=True (centroid fallback)")
-            
-            n_still_unplaced = (~placed).sum().item()
-            if n_still_unplaced > 0:
-                print(f"[ANCHOR-FILL] ERROR: {n_still_unplaced} cells could not be placed, using global centroid")
-                global_centroid = X_placed[placed].mean(dim=0)
-                X_placed[~placed] = global_centroid
-                placed[:] = True
-        
-        _stage_knn_placed("post_fill_pre_refine")
-
-        _quick_global_knn("post_fill_pre_refine", X_placed, gt_coords, k_list=debug_k_list, M=debug_global_subset)
-
-        # -------------------------------------------------------------------
-        # Final QC checks
-        # -------------------------------------------------------------------
-        any_nan = torch.isnan(X_placed).any().item()
-        print(f"\n[ANCHOR-QC] any_nan={any_nan}")
-        if any_nan:
-            print("[ANCHOR-QC] ERROR: NaNs detected! Replacing with zeros.")
-            X_placed = torch.nan_to_num(X_placed, nan=0.0)
-
-        # -------------------------------------------------------------------
-        # [ANCHOR-REFINE] Consensus refinement using cached patch samples
-        # - No diffusion
-        # - No scale
-        # - Just repeated rigid alignment + weighted averaging
-        # This is designed to improve global kNN without “DGSO-style” distortion.
-        # -------------------------------------------------------------------
-        # -------------------------------------------------------------------
-        # [ANCHOR-REFINE] Jacobi consensus refinement (order-independent)
-        # - Compute transforms against frozen X_prev
-        # - Accumulate patch "votes" then update once per pass
-        # - Robustly downweight patches with bad rigid fit
-        # -------------------------------------------------------------------
-        n_refine_passes = 6  # try 6–12
-        jacobi_alpha = 0.85  # blend: new <- alpha*new + (1-alpha)*old
-        rmse_tau = 0.35      # robust patch downweight strength (tune 0.25–0.6)
-
-        for p in range(n_refine_passes):
-            print(f"[ANCHOR-REFINE] pass={p+1}/{n_refine_passes}")
-            X_prev = X_placed.clone()
-            W_prev = W_cell.clone()
-            
-            # vote accumulators
-            X_accum = torch.zeros_like(X_prev)
-            W_accum = torch.zeros_like(W_prev)
-            
-            rmse_list = []
-            
-            for k in patches_in_order:
-                S_k = patch_indices[k]
-                S_k_list = S_k.tolist()
-                m_k = len(S_k_list)
-                
-                # Use the GOOD local geometry from independent sampling (centered)
-                # Use the GOOD local geometry from independent sampling (centered)
-                V_local = patch_coords_seq[k].to(device).float()  # (m_k, seq_dim)
-                
-                # anchors chosen in current global frame (X_prev), farthest-point
-                X_g = X_prev[S_k_list].float()
-                n_overlap = m_k
-                nA_raw = int(round(infer_anchor_frac * n_overlap))
-                nA = max(infer_anchor_min, min(infer_anchor_max, nA_raw, n_overlap))
-                
-                idxA = pick_farthest_indices(X_g, nA)
-                A_k = [S_k_list[i] for i in idxA]
-                
-                X_anchor = X_prev[A_k].float()
-                V_anchor = V_local[idxA]
-                
-                # Fit in seq_dim space (2D or 32D)
-                if seq_dim == 2:
-                    R_align, s_align, t_align, rmse = weighted_procrustes_2d(V_anchor, X_anchor, weights=None)
-                    s_align = s_align.clamp(0.85, 1.15)
-                    V_aligned = s_align * (V_local @ R_align.T) + t_align
-                else:
-                    R_align, t_align, rmse = weighted_procrustes_rt_rankk_frozen_perp(V_anchor, X_anchor, weights=None, rank_k=2)
-                    V_aligned = (V_local @ R_align.T) + t_align
-                
-                rm = float(rmse.item())
-                rmse_list.append(rm)
-                
-                # robust patch weight: bad-fit patches contribute less
-                # weight ~ exp(-(rmse/tau)^2)
-                w_patch = math.exp(- (rm / max(1e-8, rmse_tau))**2)
-
-                
-                V_aligned = (V_local @ R_align.T) + t_align  # (m_k, D_latent)
-                
-                # per-point centrality weights inside patch
-                center = V_aligned.mean(dim=0, keepdim=True)
-                dists = (V_aligned - center).norm(dim=1)
-                max_d = dists.max().clamp_min(1e-6)
-                w_all = (1.0 - dists / (1.2 * max_d)).clamp(min=0.01) # (m_k,)
-                
-                # accumulate votes
-                for li, gi in enumerate(S_k_list):
-                    w = float(w_all[li].item()) * w_patch
-                    X_accum[gi] += w * V_aligned[li]
-                    W_accum[gi] += w
-            
-            # finalize new coords from votes
-            eps = 1e-8
-            mask = W_accum > eps
-            X_new = X_prev.clone()
-            X_new[mask] = X_accum[mask] / W_accum[mask].unsqueeze(-1)
-            
-            # blend for stability
-            X_placed = jacobi_alpha * X_new + (1.0 - jacobi_alpha) * X_prev
-            
-            # W_cell = torch.maximum(W_prev, W_accum) # keep weights non-decreasing-ish
-            W_cell = W_prev + W_accum
-
-            # small summary
-            if len(rmse_list) > 0:
-                rt = torch.tensor(rmse_list)
-                print(f"[ANCHOR-REFINE-RMSE] mean={rt.mean().item():.3f} p50={rt.median().item():.3f} p90={rt.quantile(0.9).item():.3f}")
-
-        # -------------------------------------------------------------------
-        # C10) Output coords for both PCA-2D and EDM+MDS (baseline style)
-        # -------------------------------------------------------------------
-        print(f"\n[ANCHOR-PCA] Computing 2D coords via PCA...")
-        # Output PCA coords
-        if X_placed.shape[1] == 2:
-            # Already 2D, no PCA needed
-            coords_pca = (X_placed - X_placed.mean(dim=0, keepdim=True))
-            print("[ANCHOR-PCA] seq_dim=2, using X_placed directly")
-        else:
-            # Need PCA projection from high-D to 2D
-            print(f"\n[ANCHOR-PCA] Computing 2D coords via PCA...")
-            X_centered = X_placed - X_placed.mean(dim=0, keepdim=True)
-            cov = X_centered.T @ X_centered / n_sc
-            eigs, vecs = torch.linalg.eigh(cov)
-            pca_basis = vecs[:, -2:].flip(dims=[1])  # (seq_dim, 2)
-            coords_pca = X_centered @ pca_basis      # (n_sc, 2)
-            
-            total_var = eigs.sum().item()
-            top2_var = eigs[-2:].sum().item()
-            explained_var = top2_var / (total_var + 1e-8)
-            print(f"[ANCHOR-PCA] explained_var_top2={explained_var:.3f}")
-
-
-        coords_pca_cpu = coords_pca.detach().cpu()
-        coords_pca_canon = uet.canonicalize_coords(coords_pca_cpu).detach().cpu()
-
-        # -------------------------------------------------------------------
-        # Compute EDM from full D coords
-        # -------------------------------------------------------------------
-        D_anchor = torch.cdist(X_placed, X_placed)
-        D_edm_anchor = uet.edm_project(D_anchor).detach().cpu()
-        
-        # Scale to target if provided
-        if target_st_p95 is not None:
-            N = D_edm_anchor.shape[0]
-            iu_s, ju_s = torch.triu_indices(N, N, 1, device=D_edm_anchor.device)
-            D_vec = D_edm_anchor[iu_s, ju_s]
-            current_p95 = torch.quantile(D_vec, 0.95).clamp_min(1e-6)
-            scale_factor = (target_st_p95 / current_p95).clamp(0.5, 4.0)
-            D_edm_anchor = D_edm_anchor * scale_factor
-            print(f"[ANCHOR] Scaled EDM: current_p95={current_p95:.3f} -> target={target_st_p95:.3f}")
-
-        # -------------------------------------------------------------------
-        # kNN evaluation vs GT (PCA vs EDM+MDS)
-        # -------------------------------------------------------------------
-        if debug_knn and gt_coords is not None:
-            print("\n" + "="*70)
-            print(f"[ANCHOR-KNN] Final kNN evaluation (mode={anchor_sampling_mode})")
-            print("="*70)
-            
-            with torch.no_grad():
-                gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
-                
-                # ---------------------------------------------------------------
-                # [DIAG] Global kNN in latent space (NO PCA/MDS)
-                # ---------------------------------------------------------------
-                X_lat = X_placed.float()
-                gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
-                
-                M = min(n_sc, debug_global_subset)
-                subset_idx = torch.randperm(n_sc, device=device)[:M]
-                pred_lat_sub = X_lat[subset_idx]
-                gt_sub = gt_coords_t[subset_idx]
-                
-                for k_val in debug_k_list:
-                    if M > k_val + 1:
-                        knn_pred, _ = _knn_indices_dists(pred_lat_sub, k_val)
-                        knn_gt, _ = _knn_indices_dists(gt_sub, k_val)
-                        overlap = _knn_overlap_score(knn_pred, knn_gt)
-                        print(f"[SEQ-EVAL][LATENT{X_lat.shape[1]}D] kNN@{k_val}: mean={overlap.mean().item():.3f} "
-                              f"p10={overlap.quantile(0.1).item():.3f} "
-                              f"p50={overlap.median().item():.3f} "
-                              f"p90={overlap.quantile(0.9).item():.3f}")
-
-                # Use PCA 2D coords for kNN
-                coords_pca_device = coords_pca.to(device)
-                M = min(n_sc, debug_global_subset)
-                subset_idx = torch.randperm(n_sc, device=device)[:M]
-                
-                pred_subset_pca = coords_pca_device[subset_idx]
-                gt_subset = gt_coords_t[subset_idx]
-                
-                for k_val in debug_k_list:
-                    if M > k_val + 1:
-                        knn_pred, _ = _knn_indices_dists(pred_subset_pca, k_val)
-                        knn_gt, _ = _knn_indices_dists(gt_subset, k_val)
-                        overlap = _knn_overlap_score(knn_pred, knn_gt)
-                        print(f"[SEQ-EVAL][PCA2D] kNN@{k_val}: mean={overlap.mean().item():.3f} "
-                              f"p10={overlap.quantile(0.1).item():.3f} "
-                              f"p50={overlap.median().item():.3f} "
-                              f"p90={overlap.quantile(0.9).item():.3f}")
-                
-                # EDM+MDS eval
-                N = D_edm_anchor.shape[0]
-                Jn = torch.eye(N, device=D_edm_anchor.device) - torch.ones(N, N, device=D_edm_anchor.device) / N
-                B = -0.5 * (Jn @ (D_edm_anchor ** 2) @ Jn)
-                coords_mds = uet.classical_mds(B, d_out=2)
-                coords_mds_canon = uet.canonicalize_coords(coords_mds.detach().cpu()).detach().cpu()
-                
-                coords_mds_device = coords_mds.to(device)
-                pred_subset_mds = coords_mds_device[subset_idx]
-                
-                for k_val in debug_k_list:
-                    if M > k_val + 1:
-                        knn_pred, _ = _knn_indices_dists(pred_subset_mds, k_val)
-                        knn_gt, _ = _knn_indices_dists(gt_subset, k_val)
-                        overlap = _knn_overlap_score(knn_pred, knn_gt)
-                        print(f"[SEQ-EVAL][EDM+MDS] kNN@{k_val}: mean={overlap.mean().item():.3f} "
-                              f"p10={overlap.quantile(0.1).item():.3f} "
-                              f"p50={overlap.median().item():.3f} "
-                              f"p90={overlap.quantile(0.9).item():.3f}")
-            
-            print("="*70 + "\n")
-
-        # Compute MDS coords for output (baseline style)
-        N = D_edm_anchor.shape[0]
-        Jn = torch.eye(N, device=D_edm_anchor.device) - torch.ones(N, N, device=D_edm_anchor.device) / N
-        B = -0.5 * (Jn @ (D_edm_anchor ** 2) @ Jn)
-        coords_mds = uet.classical_mds(B, d_out=2)
-        coords_mds_canon = uet.canonicalize_coords(coords_mds.detach().cpu()).detach().cpu()
-
-        # -------------------------------------------------------------------
-        # Build result dict
-        # -------------------------------------------------------------------
-        result_anchor: Dict[str, torch.Tensor] = {
-            "D_edm": D_edm_anchor,
-            "coords": coords_mds.detach().cpu(),
-            "coords_canon": coords_mds_canon,
-            "coords_pca": coords_pca_cpu,
-            "coords_pca_canon": coords_pca_canon,
-        }
-        
-        # Cleanup
-        if "cuda" in device:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            gc.collect()
-
-        print("\n" + "=" * 72)
-        print(f"[ANCHOR] COMPLETE - mode={anchor_sampling_mode}")
-        print("=" * 72 + "\n")
-
-        return result_anchor
-
-
-
     
     # ===================================================================
     # ORIGINAL NON-ANCHORED MODE (existing code below)
     # ===================================================================
+    # ========== Check if context_encoder expects anchor channel ==========
+    expected_in_ctx = getattr(context_encoder, "input_dim", None)
+    if expected_in_ctx is None and hasattr(context_encoder, 'input_proj'):
+        expected_in_ctx = context_encoder.input_proj.in_features
+    
+    with torch.no_grad():
+        for k in tqdm(range(K), desc="Sampling patches"):
+            S_k = patch_indices[k]
+            m_k = S_k.numel()
+            Z_k = Z_all[S_k].to(device)         # (m_k, h)
 
+            Z_k_batched = Z_k.unsqueeze(0)      # (1, m_k, h)
+            mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
+            
+            # ========== Append zero anchor channel if context_encoder expects it ==========
+            if expected_in_ctx is not None and expected_in_ctx == Z_k_batched.shape[-1] + 1:
+                zeros_anchor = torch.zeros(1, m_k, 1, device=device, dtype=Z_k_batched.dtype)
+                Z_k_batched = torch.cat([Z_k_batched, zeros_anchor], dim=-1)
+                if k == 0:
+                    print(f"[SAMPLE] Appended zero anchor channel, Z_k shape={Z_k_batched.shape}")
+            
+            # ========== Apply Z layer normalization (matches training) ==========
+            Z_k_batched = apply_z_ln(Z_k_batched, context_encoder)
+            
+            H_k = context_encoder(Z_k_batched, mask_k)
+
+            
+            # APPLY CORAL TRANSFORMATION IF ENABLED
+            if coral_params is not None:
+                from core_models_et_p3 import GEMSModel
+                H_k = GEMSModel.apply_coral_transform(
+                    H_k,
+                    mu_sc=coral_params['mu_sc'],
+                    A=coral_params['A'],
+                    B=coral_params['B'],
+                    mu_st=coral_params['mu_st']
+                )
+
+
+            # Start from generator proposal + noise (refinement mode)
+            V_gen = generator(H_k, mask_k)  # Generator proposal
+            V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
+            V_t = V_t * mask_k.unsqueeze(-1).float()  # Mask out invalid positions
+
+
+            
+            # EDM Euler + Heun sampler
+            for i in range(len(sigmas) - 1):
+                sigma = sigmas[i]
+                sigma_next = sigmas[i + 1]
+                sigma_b = sigma.view(1)  # (B=1,)
+
+
+                # x0 predictions with CFG
+                # x0 predictions with CFG + SELF-CONDITIONING
+                x0_c = _forward_edm_self_cond(score_net, V_t, sigma_b, H_k, mask_k, sigma_data)
+
+                if guidance_scale != 1.0:
+                    H_null = torch.zeros_like(H_k)
+                    x0_u = _forward_edm_self_cond(score_net, V_t, sigma_b, H_null, mask_k, sigma_data)
+
+                    # x0 = x0_u + guidance_scale * (x0_c - x0_u)
+                    # Sigma-dependent effective guidance (guidance_scale is ceiling)
+                    sigma_f = float(sigma)
+                    guidance_eff = _sigma_guidance_eff(sigma_f, guidance_scale)
+
+
+                    # CFG WNORM: normalize diff to prevent blowing up locality
+                    diff = x0_c - x0_u
+                    diff_norm = diff.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)  # (B, 1, 1)
+                    x0_u_norm = x0_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                    wnorm_scale = (x0_u_norm / diff_norm).clamp(max=1.0)  # clamp to avoid amplifying
+
+
+                    # Apply: x0 = x0_u + guidance_eff * wnorm_scale * diff
+                    x0 = x0_u + guidance_eff * wnorm_scale * diff
+                else:
+                    x0 = x0_c
+
+
+                # Debug on first patch
+                if DEBUG_FLAG and k == 0 and i < 3:
+                    if guidance_scale != 1.0:
+                        du = x0_u.norm(dim=[1, 2]).mean().item()
+                        dc = x0_c.norm(dim=[1, 2]).mean().item()
+                        diff_mag = diff.norm(dim=[1, 2]).mean().item()
+                        wn_s = wnorm_scale.mean().item()
+                        print(f"  [PATCH0] i={i:3d} sigma={sigma_f:.4f} g_eff={guidance_eff:.3f} "
+                              f"||x0_u||={du:.3f} ||x0_c||={dc:.3f} ||diff||={diff_mag:.3f} wnorm={wn_s:.3f}")
+
+
+                # Euler step
+                d = (V_t - x0) / sigma.clamp_min(1e-8)
+                V_euler = V_t + (sigma_next - sigma) * d
+
+
+                # Heun corrector (skip if sigma_next==0)
+                if sigma_next > 0:
+                    x0_next_c = _forward_edm_self_cond(score_net, V_euler, sigma_next.view(1), H_k, mask_k, sigma_data)
+                    if guidance_scale != 1.0:
+                        x0_next_u = _forward_edm_self_cond(score_net, V_euler, sigma_next.view(1), H_null, mask_k, sigma_data)
+
+                        # x0_next = x0_next_u + guidance_scale * (x0_next_c - x0_next_u)
+                        # Sigma-dependent effective guidance for Heun step (use sigma_next)
+                        sigma_next_f = float(sigma_next)
+                        guidance_eff_next = _sigma_guidance_eff(sigma_next_f, guidance_scale)
+
+
+                        # CFG WNORM for Heun step
+                        diff_next = x0_next_c - x0_next_u
+                        diff_next_norm = diff_next.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                        x0_next_u_norm = x0_next_u.norm(dim=[1, 2], keepdim=True).clamp(min=1e-8)
+                        wnorm_scale_next = (x0_next_u_norm / diff_next_norm).clamp(max=1.0)
+
+
+                        x0_next = x0_next_u + guidance_eff_next * wnorm_scale_next * diff_next
+                    else:
+                        x0_next = x0_next_c
+
+
+                    d2 = (V_euler - x0_next) / sigma_next.clamp_min(1e-8)
+                    V_t = V_t + (sigma_next - sigma) * 0.5 * (d + d2)
+                else:
+                    V_t = V_euler
+
+
+                # Apply mask
+                V_t = V_t * mask_k.unsqueeze(-1).float()
+
+
+                
+                # Optional stochastic noise (if eta > 0)
+                if eta > 0 and sigma_next > 0:
+                    noise_scale = eta * torch.sqrt(torch.clamp(sigma_next**2 - sigma**2, min=0))
+                    V_t = V_t + noise_scale * torch.randn_like(V_t)
+
+
+
+
+            # if DEBUG_FLAG and (k % max(1, K // 5) == 0):
+            #     rms = V_canon.pow(2).mean().sqrt().item()
+            # NEW: Only center, do NOT apply unit RMS (matches training)
+            V_final = V_t.squeeze(0)  # (m_k, D)
+            V_centered = V_final - V_final.mean(dim=0, keepdim=True)
+
+
+            # ===================================================================
+            # DIAGNOSTIC B: PATCH SAMPLING QUALITY (first 3 patches only)
+            # ===================================================================
+            if DEBUG_FLAG and k < 3:
+                print(f"\n[DIAGNOSTIC B] Patch {k} sampling analysis:")
+                
+                # B1: Check if patch is isotropic (blob)
+                cov = torch.cov(V_centered.float().T)
+                eigs = torch.linalg.eigvalsh(cov)
+                aniso_ratio = float(eigs.max() / (eigs.min() + 1e-8))
+                print(f"  Anisotropy ratio: {aniso_ratio:.2f} (higher=more structured)")
+                
+                if aniso_ratio < 2.0:
+                    print(f"  ⚠️  WARNING: Patch {k} is very isotropic (blob-like)!")
+            patch_coords.append(V_centered.detach().cpu())
+
+
+
+
+            # ===================================================================
+            # [PATCH-KNN-VS-GT] PRE-STITCH: kNN overlap with GT (per-patch)
+            # ===================================================================
+            if debug_knn and gt_coords is not None and k < debug_max_patches:
+                with torch.no_grad():
+                    gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+                    gt_patch = gt_coords_t[S_k]  # (m_k, 2 or D)
+                    pred_patch = V_centered.float()  # (m_k, D_latent)
+                    
+                    for k_val in debug_k_list:
+                        if m_k > k_val + 1:
+                            knn_pred, _ = _knn_indices_dists(pred_patch, k_val)
+                            knn_gt, _ = _knn_indices_dists(gt_patch, k_val)
+                            overlap = _knn_overlap_score(knn_pred, knn_gt)
+                            
+                            # Collect for aggregation
+                            prestitch_knn_overlap_list[k_val].append(overlap.mean().item())
+                            
+                            if k < 10:  # Only print first 5 patches
+                                print(f"  [PATCH-KNN-VS-GT][PRE-STITCH] patch={k} n={m_k} "
+                                      f"k={k_val} mean={overlap.mean().item():.3f} "
+                                      f"p50={overlap.median().item():.3f}")
+
+
+
+
+            # ===================================================================
+            # [PATCH-KNN-CLOSURE]: How neighbor-closed is this patch vs global GT?
+            # ===================================================================
+            if debug_knn and gt_subset_indices is not None and k < debug_max_patches:
+                with torch.no_grad():
+                    # Find overlap between patch and GT subset
+                    S_k_set = set(S_k.tolist())
+                    subset_set = set(gt_subset_indices.tolist())
+                    patch_in_subset = S_k_set & subset_set
+                    
+                    if len(patch_in_subset) >= 20:
+                        # Map to subset-local indices
+                        subset_to_local = {int(g): i for i, g in enumerate(gt_subset_indices.tolist())}
+                        patch_local_in_subset = [subset_to_local[g] for g in patch_in_subset]
+                        
+                        closure_fracs = []
+                        for k_val in [10, 20]:
+                            if k_val <= gt_knn_global.shape[1]:
+                                for local_idx in patch_local_in_subset:
+                                    gt_neighbors = set(gt_knn_global[local_idx, :k_val].tolist())
+                                    neighbors_in_patch = gt_neighbors & set(patch_local_in_subset)
+                                    closure = len(neighbors_in_patch) / k_val
+                                    closure_fracs.append(closure)
+                        
+                        if closure_fracs and k < 10:
+                            closure_t = torch.tensor(closure_fracs)
+                            print(f"  [PATCH-KNN-CLOSURE] patch={k} n_eval={len(patch_in_subset)} "
+                                  f"closure_mean={closure_t.mean().item():.3f} "
+                                  f"closure_p50={closure_t.median().item():.3f}")
+
+
+            # ===================================================================
+            # [PATCH-LOCAL-EDGE-CORR][PRE-STITCH]: Local edge Spearman within patch
+            # ===================================================================
+            if debug_knn and gt_coords is not None and k < debug_max_patches:
+                with torch.no_grad():
+                    gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+                    gt_patch = gt_coords_t[S_k].cpu().numpy()  # (m_k, 2)
+                    pred_patch = V_centered.cpu().numpy()       # (m_k, D_latent)
+                    
+                    if m_k > 15:
+                        # Compute GT kNN within this patch
+                        from sklearn.neighbors import NearestNeighbors
+                        k_edge = min(20, m_k - 1)
+                        nbrs = NearestNeighbors(n_neighbors=k_edge+1, algorithm='ball_tree').fit(gt_patch)
+                        _, gt_knn_patch = nbrs.kneighbors(gt_patch)
+                        gt_knn_patch = gt_knn_patch[:, 1:]  # Remove self
+                        
+                        # Compute local-edge Spearman
+                        edge_spearman = _local_edge_spearman(pred_patch, gt_patch, gt_knn_patch)
+                        
+                        if not np.isnan(edge_spearman):
+                            prestitch_edge_spearman_list.append(edge_spearman)
+                        
+                        if k < 10:  # Only print first 5 patches
+                            print(f"  [PATCH-LOCAL-EDGE-CORR][PRE-STITCH] patch={k} n={m_k} "
+                                  f"k_edge={k_edge} spearman={edge_spearman:.3f}")
+
+
+
+
+            # DEBUG 2: Per-patch sample diagnostics
+            if DEBUG_FLAG and (k < 5 or k % max(1, K // 5) == 0):
+                rms = V_centered.pow(2).mean().sqrt().item()
+
+
+                # Coord covariance eigs to see anisotropy / effective dimension
+                cov_k = torch.cov(V_centered.float().T)
+                eigs_k = torch.linalg.eigvalsh(cov_k)
+                dim_eff = float((eigs_k.sum() ** 2) / (eigs_k ** 2).sum())
+                aniso = float(eigs_k.max() / (eigs_k.min().clamp(min=1e-8)))
+
+
+                print(f"[PATCH-SAMPLE] k={k}/{K} m_k={m_k} "
+                      f"rms={rms:.3f} dim_eff={dim_eff:.2f} aniso={aniso:.1f} "
+                      f"eigs_min={eigs_k.min().item():.3e} eigs_max={eigs_k.max().item():.3e}")
+
+
+            if DEBUG_FLAG and (k % max(1, K // 5) == 0):
+                rms = V_centered.pow(2).mean().sqrt().item()
+                print(f"  [PATCH {k}/{K}] RMS={rms:.3f} (centered, natural scale)")
+
+
+                # mean_norm = V_canon.mean(dim=0).norm().item()
+                mean_norm = V_centered.mean(dim=0).norm().item()
+                print(f"[PATCH] k={k}/{K} m_k={m_k} "
+                      f"coords_rms={rms:.3f} center_norm={mean_norm:.3e}")
+
+
+            if 'cuda' in device:
+                torch.cuda.empty_cache()
 
     
     # ===================================================================
@@ -16005,7 +14281,7 @@ def sample_sc_edm_patchwise(
     #      + lambda_all * (1/N) * sum_i |X_i - X0_i|^2
     #      + lambda_rad * (1/N) * sum_i rho(r_i(X) - r_bar_i)
     # ===================================================================
-    if enable_dgso and not enable_anchor_sampling:
+    if enable_dgso:
         print("\n" + "="*70)
         print("[DGSO-v2] DISTANCE-GRAPH STITCH OPTIMIZATION")
         print("="*70)
