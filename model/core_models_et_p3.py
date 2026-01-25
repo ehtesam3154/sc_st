@@ -554,6 +554,7 @@ class GEMSModel:
             st_dataset=st_dataset,
             sc_dataset=sc_dataset,
             prototype_bank=prototype_bank,
+            encoder=self.encoder,
             n_epochs=n_epochs,
             batch_size=batch_size,
             lr=lr,
@@ -706,7 +707,10 @@ class GEMSModel:
                 print(f"[ANCHOR-LOAD] Rebuilt context_encoder: input_dim={self.context_encoder.input_dim}")
         
         # Now load state dicts
-        self.encoder.load_state_dict(checkpoint['encoder'])
+        if 'encoder' in checkpoint:
+            self.encoder.load_state_dict(checkpoint['encoder'])
+        else:
+            print("[LOAD] WARNING: encoder not found in checkpoint; load it separately.")
         self.context_encoder.load_state_dict(checkpoint['context_encoder'])
         self.generator.load_state_dict(checkpoint['generator'])
         self.score_net.load_state_dict(checkpoint['score_net'])
@@ -962,17 +966,17 @@ class GEMSModel:
         dgso_two_phase: bool = True,
         dgso_phase1_iters: int = 200,
         dgso_phase1_anchor_mult: float = 10.0,
-        # --- ANCHORED SEQUENTIAL SAMPLING ---
-        anchor_sampling_mode: str = "off",  # "off", "seq_align_only", "edm_anchor_local"
-        anchor_min_overlap_start: int = 35,
-        anchor_min_overlap_floor: int = 20,
-        commit_frac: float = 0.75,
-        seq_align_dim: int = 2,
-        # --- INFERENCE MODE ---
-        inference_mode: str = "unanchored",  # "unanchored" or "anchored",
-        coldstart_diag: bool = False,
-        anchor_channel_sensitivity_diag: bool = False,
-        probe_style_patch_sampling: bool = False,
+        # --- NEW DEBUG FLAGS (pass-through) ---
+        debug_oracle_gt_stitch: bool = False,
+        debug_incremental_stitch_curve: bool = False,
+        debug_overlap_postcheck: bool = False,
+        debug_cycle_closure: bool = False,
+        debug_scale_compression: bool = False,
+        # --- DEBUG/ABLATION FLAGS (pass-through) ---
+        debug_gen_vs_noise: bool = False,
+        ablate_use_generator_init: bool = False,
+        ablate_use_pure_noise_init: bool = False,
+
     ) -> Dict[str, torch.Tensor]:
 
 
@@ -1082,17 +1086,16 @@ class GEMSModel:
             dgso_phase1_iters=dgso_phase1_iters,
             dgso_phase1_anchor_mult=dgso_phase1_anchor_mult,
             # --- ANCHORED SEQUENTIAL SAMPLING ---
-            anchor_sampling_mode=anchor_sampling_mode,
-            anchor_min_overlap_start=anchor_min_overlap_start,
-            anchor_min_overlap_floor=anchor_min_overlap_floor,
-            commit_frac=commit_frac,
-            seq_align_dim=seq_align_dim,
-            inference_mode=inference_mode,
-            coldstart_diag=coldstart_diag,
-            anchor_channel_sensitivity_diag=anchor_channel_sensitivity_diag,
-            anchor_bit_only_diag=anchor_bit_only_diag,
-            anchor_bit_scale=anchor_bit_scale,
-            probe_style_patch_sampling=probe_style_patch_sampling,
+            # --- NEW DEBUG FLAGS (pass-through) ---
+            debug_oracle_gt_stitch=debug_oracle_gt_stitch,
+            debug_incremental_stitch_curve=debug_incremental_stitch_curve,
+            debug_overlap_postcheck=debug_overlap_postcheck,
+            debug_cycle_closure=debug_cycle_closure,
+            debug_scale_compression=debug_scale_compression,
+            # --- DEBUG/ABLATION FLAGS (pass-through) ---
+            debug_gen_vs_noise=debug_gen_vs_noise,
+            ablate_use_generator_init=ablate_use_generator_init,
+            ablate_use_pure_noise_init=ablate_use_pure_noise_init,
         )
         return res
 

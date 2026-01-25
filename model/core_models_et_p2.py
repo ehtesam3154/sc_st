@@ -2374,6 +2374,7 @@ def train_stageC_diffusion_generator(
     st_dataset: Optional['STSetDataset'],
     sc_dataset: Optional['SCSetDataset'],
     prototype_bank: Dict,
+    encoder: Optional['SharedEncoder'] = None,
     n_epochs: int = 1000,
     batch_size: int = 4,
     lr: float = 1e-4,
@@ -9100,6 +9101,7 @@ def train_stageC_diffusion_generator(
 
 
         # --- save checkpoints only on rank-0 ---
+        # --- save checkpoints only on rank-0 ---
         if (epoch + 1) % 100 == 0:
             if fabric is None or fabric.is_global_zero:
                 ckpt = {
@@ -9116,6 +9118,9 @@ def train_stageC_diffusion_generator(
                     'sigma_min': sigma_min,
                     'sigma_max': sigma_max,
                 }
+                if encoder is not None:
+                    encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
+                    ckpt['encoder'] = encoder_to_save.state_dict()
                 torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
     
     # Save final checkpoint after training loop
@@ -9134,6 +9139,9 @@ def train_stageC_diffusion_generator(
             'sigma_min': sigma_min,
             'sigma_max': sigma_max,
         }
+        if encoder is not None:
+            encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
+            ckpt_final['encoder'] = encoder_to_save.state_dict()
         torch.save(ckpt_final, os.path.join(outf, 'ckpt_final.pt'))
         print(f"Saved final checkpoint at epoch {epoch+1}")
 
@@ -10908,7 +10916,19 @@ def sample_sc_edm_patchwise(
     dgso_phase1_iters: int = 200,
     dgso_phase1_anchor_mult: float = 10.0,
     coldstart_diag: bool = False,
+    # --- NEW DEBUG FLAGS (no behavior change) ---
+    debug_oracle_gt_stitch: bool = False,
+    debug_incremental_stitch_curve: bool = False,
+    debug_overlap_postcheck: bool = False,
+    debug_cycle_closure: bool = False,
+    debug_scale_compression: bool = False,
+    # --- DEBUG/ABLATION FLAGS ---
+    debug_gen_vs_noise: bool = False,
+    ablate_use_generator_init: bool = False,
+    ablate_use_pure_noise_init: bool = False,
+
 ) -> Dict[str, torch.Tensor]:
+
 
     """
     Stage D: Patch-based SC inference via global alignment.
@@ -11940,6 +11960,7 @@ def sample_sc_edm_patchwise(
     with torch.no_grad():
         for k in tqdm(range(K), desc="Sampling patches"):
             S_k = patch_indices[k]
+
             m_k = S_k.numel()
             Z_k = Z_all[S_k].to(device)         # (m_k, h)
 
@@ -11972,10 +11993,34 @@ def sample_sc_edm_patchwise(
 
 
             # Start from generator proposal + noise (refinement mode)
+            # Start from generator proposal + noise (refinement mode)
             V_gen = generator(H_k, mask_k)  # Generator proposal
-            V_t = V_gen + torch.randn_like(V_gen) * sigmas[0]
+
+            # Ablations (init only)
+            if ablate_use_generator_init:
+                if DEBUG_FLAG:
+                    print("[ABLATE] ablate_use_generator_init=True → V_gen set to 0")
+                V_gen = torch.zeros_like(V_gen)
+
+            noise = torch.randn_like(V_gen) * sigmas[0]
+
+            if ablate_use_pure_noise_init:
+                if DEBUG_FLAG:
+                    print("[ABLATE] ablate_use_pure_noise_init=True → init = pure noise")
+                V_t = noise
+            else:
+                V_t = V_gen + noise
+
             V_t = V_t * mask_k.unsqueeze(-1).float()  # Mask out invalid positions
 
+            # Debug prints: generator vs noise
+            if debug_gen_vs_noise and DEBUG_FLAG:
+                rms_gen = V_gen.pow(2).mean().sqrt().item()
+                rms_noise = noise.pow(2).mean().sqrt().item()
+                rms_vt = V_t.pow(2).mean().sqrt().item()
+                ratio = rms_gen / (rms_noise + 1e-8)
+                init_mode = "init+noise" if not ablate_use_pure_noise_init else "pure_noise"
+                print(f"[GEN-VS-NOISE] mode={init_mode} rms_gen={rms_gen:.4f} rms_noise={rms_noise:.4f} rms_vt={rms_vt:.4f} ratio={ratio:.3f}")
 
             
             # EDM Euler + Heun sampler
@@ -11988,6 +12033,12 @@ def sample_sc_edm_patchwise(
                 # x0 predictions with CFG
                 # x0 predictions with CFG + SELF-CONDITIONING
                 x0_c = _forward_edm_self_cond(score_net, V_t, sigma_b, H_k, mask_k, sigma_data)
+
+                if debug_gen_vs_noise and DEBUG_FLAG and i == len(sigmas) // 2:
+                    rms_x0 = x0_c.pow(2).mean().sqrt().item()
+                    rms_vt_mid = V_t.pow(2).mean().sqrt().item()
+                    print(f"[GEN-VS-NOISE] mid-step i={i} rms_x0={rms_x0:.4f} rms_vt={rms_vt_mid:.4f}")
+
 
                 if guidance_scale != 1.0:
                     H_null = torch.zeros_like(H_k)
@@ -12882,6 +12933,244 @@ def sample_sc_edm_patchwise(
     else:
         print(f"[PGSO-A] Skipping PCA projection (no patch_coords available)")
 
+    # ===================================================================
+    # DEBUG: ORACLE GT STITCH / INCREMENTAL CURVE / SCALE COMPRESSION (pre-PGSO)
+    # ===================================================================
+    if DEBUG_FLAG and debug_knn and gt_coords is not None:
+        gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+
+        # ---------- CHANGE B: Oracle GT stitch ----------
+        if debug_oracle_gt_stitch and len(patch_coords_2d) > 0 and global_knn_stage_subset is not None:
+            print("\n" + "=" * 70)
+            print("[ORACLE-GT-STITCH] Similarity-to-GT per patch + GT-frame merge")
+            print("=" * 70)
+
+            def rigid_procrustes_2d(X_src, X_tgt, weights=None):
+                n = X_src.shape[0]
+                if weights is None:
+                    weights = torch.ones(n, 1, device=X_src.device)
+                else:
+                    weights = weights.view(-1, 1)
+
+                w_sum = weights.sum()
+                mu_src = (weights * X_src).sum(dim=0, keepdim=True) / w_sum
+                mu_tgt = (weights * X_tgt).sum(dim=0, keepdim=True) / w_sum
+
+                Xc = X_src - mu_src
+                Yc = X_tgt - mu_tgt
+
+                w_sqrt = weights.sqrt()
+                Xc_w = Xc * w_sqrt
+                Yc_w = Yc * w_sqrt
+
+                C = Yc_w.T @ Xc_w
+                U, S_vals, Vh = torch.linalg.svd(C, full_matrices=False)
+                R = U @ Vh
+                if torch.det(R) < 0:
+                    U[:, -1] *= -1
+                    R = U @ Vh
+
+                s = torch.tensor(1.0, device=X_src.device)
+                t = (mu_tgt - (mu_src @ R.T)).squeeze(0)
+                X_hat = (X_src @ R.T) + t
+                residual = ((X_hat - X_tgt) ** 2).sum(dim=1).sqrt().mean()
+                return R, s, t, residual
+
+            X_oracle = torch.zeros(n_sc, 2, device=device)
+            W_oracle = torch.zeros(n_sc, 1, device=device)
+
+            n_test = min(K, debug_max_patches, len(patch_coords_2d))
+            for k in range(n_test):
+                if k >= len(patch_coords_2d):
+                    continue
+                S_k = patch_indices[k]
+                m_k = S_k.numel()
+                if m_k < 5:
+                    continue
+
+                pred_k = patch_coords_2d[k].float().to(device)  # (m_k, 2)
+                gt_k = gt_coords_t[S_k]  # (m_k, 2)
+
+                R_sim, s_sim, t_sim, res_sim = weighted_procrustes_2d(pred_k, gt_k)
+                R_r, s_r, t_r, res_r = rigid_procrustes_2d(pred_k, gt_k)
+
+                # rotation angle in degrees
+                theta = torch.atan2(R_sim[1, 0], R_sim[0, 0]).item() * 180.0 / np.pi
+
+                print(f"  [ORACLE] patch={k:03d} n={m_k:4d} "
+                      f"res_sim={res_sim.item():.4f} res_rigid={res_r.item():.4f} "
+                      f"s={s_sim.item():.3f} rot_deg={theta:+.1f}")
+
+                # Ensure indices are on the same device as X_oracle / pred_gt
+                S_k = patch_indices[k].to(device)
+
+                # Apply similarity-to-GT and merge in GT frame
+                pred_gt = s_sim * (pred_k @ R_sim.T) + t_sim  # (m_k, 2)
+
+                # centrality weights (same logic as normal merge)
+                center_k = pred_gt.mean(dim=0, keepdim=True)
+                dists = torch.norm(pred_gt - center_k, dim=1, keepdim=True)
+                max_d = dists.max().clamp_min(1e-6)
+                weights_k = 1.0 - (dists / (max_d * 1.2))
+                weights_k = weights_k.clamp(min=0.01)
+
+                X_oracle.index_add_(0, S_k, pred_gt * weights_k)
+                W_oracle.index_add_(0, S_k, weights_k)
+
+
+            mask_seen = W_oracle.squeeze(-1) > 0
+            X_oracle[mask_seen] /= W_oracle[mask_seen]
+            X_oracle = X_oracle - X_oracle.mean(dim=0, keepdim=True)
+
+            # rescale to rms_target for fair kNN comparison
+            rms_oracle = X_oracle.pow(2).mean().sqrt().item()
+            scale_oracle = (rms_target / (rms_oracle + 1e-8))
+            X_oracle = X_oracle * scale_oracle
+
+            # kNN on same global subset
+            X_oracle_subset = X_oracle[global_knn_stage_subset, :2].float()
+            oracle_knn_scores = {}
+            for k_val in debug_k_list:
+                if len(global_knn_stage_subset) > k_val + 1:
+                    knn_pred, _ = _knn_indices_dists(X_oracle_subset, k_val)
+                    knn_gt, _ = _knn_indices_dists(global_knn_stage_gt, k_val)
+                    overlap = _knn_overlap_score(knn_pred, knn_gt)
+                    oracle_knn_scores[k_val] = overlap.mean().item()
+
+            knn_str = " ".join([f"kNN@{k}={v:.3f}" for k, v in oracle_knn_scores.items()])
+            print(f"[ORACLE-GT-STITCH] oracle merge: {knn_str}")
+
+            print("[ORACLE-GT-STITCH] Interpretation:")
+            print("  - If oracle kNN is low → patch geometry is the bottleneck.")
+            print("  - If oracle kNN is high but normal is low → stitching/merge is the bottleneck.")
+            print("=" * 70 + "\n")
+
+        # ---------- CHANGE D: Incremental stitch curve ----------
+        if debug_incremental_stitch_curve and len(patch_coords_2d) > 0 and global_knn_stage_subset is not None:
+            print("\n" + "=" * 70)
+            print("[INCR-STITCH] Incremental stitch curve (kNN vs #patches)")
+            print("=" * 70)
+
+            # Build overlap graph (simple)
+            min_overlap_curve = 20
+            neighbors = {k: [] for k in range(K)}
+            for i in range(K):
+                Si = set(patch_indices[i].tolist())
+                for j in range(i + 1, K):
+                    Sj = set(patch_indices[j].tolist())
+                    if len(Si & Sj) >= min_overlap_curve:
+                        neighbors[i].append(j)
+                        neighbors[j].append(i)
+
+            # Pick a starting patch: lowest anisotropy if available
+            if len(patch_eig_ratios_2d) == K:
+                start = int(np.argmin(np.array(patch_eig_ratios_2d)))
+            else:
+                start = 0
+
+            # BFS order if connected; fallback to 0..K-1
+            order = []
+            seen = set([start])
+            queue = [start]
+            while queue:
+                u = queue.pop(0)
+                order.append(u)
+                for v in neighbors.get(u, []):
+                    if v not in seen:
+                        seen.add(v)
+                        queue.append(v)
+            if len(order) < K:
+                order = list(range(K))
+
+            prev_knn = None
+            biggest_drop = (None, 0.0)
+
+            for t in range(1, K + 1):
+                X_partial = torch.zeros(n_sc, 2, device=device)
+                W_partial = torch.zeros(n_sc, 1, device=device)
+
+                for idx in order[:t]:
+                    if idx >= len(patch_coords_2d):
+                        continue
+                    S_k = patch_indices[idx]
+                    V_k = patch_coords_2d[idx].float().to(device)
+
+                    center_k = V_k.mean(dim=0, keepdim=True)
+                    dists = torch.norm(V_k - center_k, dim=1, keepdim=True)
+                    max_d = dists.max().clamp_min(1e-6)
+                    weights_k = 1.0 - (dists / (max_d * 1.2))
+                    weights_k = weights_k.clamp(min=0.01)
+
+                    # Ensure indices are on the same device as X_partial / V_k
+                    S_k = patch_indices[idx].to(device)
+
+                    X_partial.index_add_(0, S_k, V_k * weights_k)
+                    W_partial.index_add_(0, S_k, weights_k)
+
+
+                mask_seen = W_partial.squeeze(-1) > 0
+                X_partial[mask_seen] /= W_partial[mask_seen]
+                X_partial = X_partial - X_partial.mean(dim=0, keepdim=True)
+
+                # rescale to rms_target
+                rms_partial = X_partial.pow(2).mean().sqrt().item()
+                X_partial = X_partial * (rms_target / (rms_partial + 1e-8))
+
+                covered = int(mask_seen.sum().item())
+                X_sub = X_partial[global_knn_stage_subset, :2].float()
+                knn_scores = {}
+                for k_val in debug_k_list:
+                    if len(global_knn_stage_subset) > k_val + 1:
+                        knn_pred, _ = _knn_indices_dists(X_sub, k_val)
+                        knn_gt, _ = _knn_indices_dists(global_knn_stage_gt, k_val)
+                        overlap = _knn_overlap_score(knn_pred, knn_gt)
+                        knn_scores[k_val] = overlap.mean().item()
+
+                knn10 = knn_scores.get(debug_k_list[0], float('nan'))
+                knn20 = knn_scores.get(debug_k_list[1], float('nan'))
+                print(f"[INCR-STITCH] t={t:03d} covered={covered:5d} kNN@{debug_k_list[0]}={knn10:.3f} kNN@{debug_k_list[1]}={knn20:.3f}")
+
+                if prev_knn is not None and not np.isnan(knn10):
+                    drop = prev_knn - knn10
+                    if drop > biggest_drop[1]:
+                        biggest_drop = (t, drop)
+                prev_knn = knn10
+
+            if biggest_drop[0] is not None:
+                print(f"[INCR-STITCH] Biggest drop at t={biggest_drop[0]}: ΔkNN@{debug_k_list[0]}={biggest_drop[1]:.3f}")
+            print("=" * 70 + "\n")
+
+        # ---------- CHANGE E (patch-level): scale compression ----------
+        if debug_scale_compression and len(patch_coords_2d) > 0:
+            scale_ratios = []
+            k_scale = 10
+            n_test = min(K, debug_max_patches, len(patch_coords_2d))
+
+            for k in range(n_test):
+                if k >= len(patch_coords_2d):
+                    continue
+                S_k = patch_indices[k]
+                S_k = patch_indices[k].to(device)
+
+                m_k = S_k.numel()
+                if m_k <= k_scale + 1:
+                    continue
+
+                pred_k = patch_coords_2d[k].float().to(device)
+                gt_k = gt_coords_t[S_k]
+
+                _, d_pred = _knn_indices_dists(pred_k, k_scale)
+                _, d_gt = _knn_indices_dists(gt_k, k_scale)
+
+                pred_scale = torch.median(d_pred[:, -1]).item()
+                gt_scale = torch.median(d_gt[:, -1]).item()
+                if gt_scale > 1e-8:
+                    scale_ratios.append(pred_scale / gt_scale)
+
+            if scale_ratios:
+                sr = np.array(scale_ratios)
+                print(f"[SCALE-COMP] patch scale ratio (pred/gt): "
+                      f"p10={np.percentile(sr,10):.3f} p50={np.median(sr):.3f} p90={np.percentile(sr,90):.3f}")
 
     # ===================================================================
     # [PATCH-KNN-VS-GT-2D] Patch kNN vs GT in PCA-projected 2D space
@@ -12909,6 +13198,8 @@ def sample_sc_edm_patchwise(
                 if k >= len(patch_coords_2d) or k >= len(patch_coords):
                     continue
                 S_k = patch_indices[k]
+                S_k = patch_indices[k].to(device)
+
                 m_k = S_k.numel()
 
                 if m_k < max(debug_k_list) + 5:
@@ -13239,6 +13530,85 @@ def sample_sc_edm_patchwise(
     n_edges = len(edges)
     print(f"[PGSO-A] Using {n_edges} overlap edges (min_overlap={MIN_OVERLAP_FOR_EDGE})")
 
+    # ===================================================================
+    # DEBUG: Cycle-closure error on overlap graph
+    # ===================================================================
+    if DEBUG_FLAG and debug_cycle_closure and n_edges > 0:
+        print("\n" + "=" * 70)
+        print("[CYCLE-CLOSURE] Pose-graph consistency (Sim(2) loops)")
+        print("=" * 70)
+
+        # Build quick lookup for transforms
+        edge_map = {}
+        for e in edges:
+            edge_map[(e['a'], e['b'])] = (e['R_ab'], e['s_ab'], e['t_ab'])
+
+        def invert_sim2(R, s, t):
+            s_inv = 1.0 / s
+            R_inv = R.T
+            t_inv = (-t @ R) * s_inv
+            return R_inv, s_inv, t_inv
+
+        def get_sim2(a, b):
+            if (a, b) in edge_map:
+                return edge_map[(a, b)]
+            if (b, a) in edge_map:
+                R_ab, s_ab, t_ab = edge_map[(b, a)]
+                return invert_sim2(R_ab, s_ab, t_ab)
+            return None
+
+        def compose_sim2(R1, s1, t1, R2, s2, t2):
+            # X -> s1*(X@R1.T)+t1, then s2*(X@R2.T)+t2
+            R = R2 @ R1
+            s = s2 * s1
+            t = s2 * (t1 @ R2.T) + t2
+            return R, s, t
+
+        # Sample triangles
+        import random
+        nodes = list(range(K))
+        triangles = []
+        max_tri = min(100, n_edges)
+        tries = 0
+        while len(triangles) < max_tri and tries < 1000:
+            a = random.choice(nodes)
+            b = random.choice(nodes)
+            c = random.choice(nodes)
+            if a == b or b == c or a == c:
+                tries += 1
+                continue
+            if get_sim2(a, b) and get_sim2(b, c) and get_sim2(c, a):
+                triangles.append((a, b, c))
+            tries += 1
+
+        rot_errs = []
+        logscale_errs = []
+        trans_errs = []
+
+        for (a, b, c) in triangles:
+            Rab, sab, tab = get_sim2(a, b)
+            Rbc, sbc, tbc = get_sim2(b, c)
+            Rca, sca, tca = get_sim2(c, a)
+
+            R1, s1, t1 = compose_sim2(Rab, sab, tab, Rbc, sbc, tbc)
+            R_loop, s_loop, t_loop = compose_sim2(R1, s1, t1, Rca, sca, tca)
+
+            theta = np.arctan2(R_loop[1, 0].item(), R_loop[0, 0].item()) * 180.0 / np.pi
+            rot_errs.append(theta)
+            logscale_errs.append(np.log(max(s_loop.item(), 1e-8)))
+            trans_errs.append(torch.norm(t_loop).item())
+
+        if rot_errs:
+            print(f"[CYCLE-CLOSURE] rot_deg: p50={np.median(np.abs(rot_errs)):.2f} "
+                  f"p90={np.percentile(np.abs(rot_errs),90):.2f}")
+            print(f"[CYCLE-CLOSURE] log-scale: p50={np.median(np.abs(logscale_errs)):.4f} "
+                  f"p90={np.percentile(np.abs(logscale_errs),90):.4f}")
+            print(f"[CYCLE-CLOSURE] trans_norm: p50={np.median(trans_errs):.4f} "
+                  f"p90={np.percentile(trans_errs,90):.4f}")
+        else:
+            print("[CYCLE-CLOSURE] No triangles found (graph too sparse).")
+
+        print("=" * 70 + "\n")
 
     if DEBUG_FLAG and n_edges > 0:
         residuals = [e['residual'] for e in edges]
@@ -13719,6 +14089,70 @@ def sample_sc_edm_patchwise(
               f"p50={trans_errors.median().item():.4f} "
               f"p90={trans_errors.quantile(0.9).item():.4f}")
 
+
+
+    # ===================================================================
+    # DEBUG: Post-PGSO overlap sanity decomposition
+    # ===================================================================
+    if DEBUG_FLAG and debug_overlap_postcheck and len(patch_coords_transformed) > 0 and len(edges) > 0:
+        print("\n" + "=" * 70)
+        print("[POSTCHECK] Overlap mismatch after PGSO transforms")
+        print("=" * 70)
+
+        mismatch_norms = []
+        proc_residuals = []
+
+        edges_to_check = edges[:min(100, len(edges))]
+        for e in edges_to_check:
+            a, b = e['a'], e['b']
+            if a >= len(patch_coords_transformed) or b >= len(patch_coords_transformed):
+                continue
+
+            Sa = set(patch_indices[a].tolist())
+            Sb = set(patch_indices[b].tolist())
+            shared = list(Sa & Sb)
+            if len(shared) < 10:
+                continue
+
+            pos_a = {int(cid): p for p, cid in enumerate(patch_indices[a].tolist())}
+            pos_b = {int(cid): p for p, cid in enumerate(patch_indices[b].tolist())}
+
+            idx_a = torch.tensor([pos_a[c] for c in shared], dtype=torch.long)
+            idx_b = torch.tensor([pos_b[c] for c in shared], dtype=torch.long)
+
+            Xa = patch_coords_transformed[a][idx_a].to(device)
+            Xb = patch_coords_transformed[b][idx_b].to(device)
+
+
+            mismatch_raw = torch.norm(Xa - Xb, dim=1).mean().item()
+            mismatch_norm = mismatch_raw / (rms_target + 1e-8)
+            mismatch_norms.append(mismatch_norm)
+
+            # Procrustes residual AFTER transform
+            _, _, _, res = weighted_procrustes_2d(Xa, Xb)
+            proc_residuals.append(res.item())
+
+        if mismatch_norms:
+            mm = np.array(mismatch_norms)
+            pr = np.array(proc_residuals)
+
+            print(f"[POSTCHECK] mismatch_norm: p10={np.percentile(mm,10):.3f} "
+                  f"p50={np.median(mm):.3f} p90={np.percentile(mm,90):.3f}")
+            print(f"[POSTCHECK] procrustes_residual: p10={np.percentile(pr,10):.4f} "
+                  f"p50={np.median(pr):.4f} p90={np.percentile(pr,90):.4f}")
+
+            if len(mm) > 2:
+                corr = np.corrcoef(mm, pr)[0, 1]
+                print(f"[POSTCHECK] corr(mismatch_norm, procrustes_residual)={corr:.3f}")
+
+            print("[POSTCHECK] Interpretation:")
+            print("  - mismatch large, procrustes small → likely indexing/bookkeeping error")
+            print("  - both large → overlap geometry is non‑rigid inconsistent")
+        else:
+            print("[POSTCHECK] No valid overlap edges to check.")
+
+        print("=" * 70 + "\n")
+
     # ===================================================================
     # PGSO-D: Merge transformed patches (simple weighted mean)
     # ===================================================================
@@ -14110,6 +14544,8 @@ def sample_sc_edm_patchwise(
             if k >= len(patch_coords_2d):
                 continue
             S_k = patch_indices[k]
+            S_k = patch_indices[k].to(device)
+
             V_k_2d = patch_coords_2d[k]  # Patch coords in 2D
             X_k_global = X_global[S_k, :2].cpu()  # Current global coords for this patch's cells
 
@@ -14347,6 +14783,8 @@ def sample_sc_edm_patchwise(
             if k >= len(patch_coords_transformed):
                 continue
             S_k = patch_indices[k]
+            S_k = patch_indices[k].to(device)
+
             # USE TRANSFORMED COORDS (post-PGSO) instead of raw patch_coords_2d
             V_k_transformed = patch_coords_transformed[k].to(device)  # (m_k, 2)
             m_k = V_k_transformed.shape[0]
@@ -15441,6 +15879,26 @@ def sample_sc_edm_patchwise(
             result["coords_canon"] = coords_canon
 
     
+    # ===================================================================
+    # DEBUG: Global scale compression (final coords)
+    # ===================================================================
+    if DEBUG_FLAG and debug_scale_compression and debug_knn and gt_coords is not None and global_knn_stage_subset is not None:
+        gt_coords_t = gt_coords.float().to(device) if not gt_coords.is_cuda else gt_coords.float()
+        k_scale = 10
+
+        Xg = X_global[global_knn_stage_subset, :2].float()
+        Gg = gt_coords_t[global_knn_stage_subset, :2].float()
+
+        if Xg.shape[0] > k_scale + 1:
+            _, d_pred = _knn_indices_dists(Xg, k_scale)
+            _, d_gt = _knn_indices_dists(Gg, k_scale)
+
+            pred_scale = torch.median(d_pred[:, -1]).item()
+            gt_scale = torch.median(d_gt[:, -1]).item()
+            ratio = pred_scale / max(gt_scale, 1e-8)
+
+            print(f"[SCALE-COMP] global scale ratio (pred/gt) on subset: {ratio:.3f}")
+
     if "cuda" in device:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
