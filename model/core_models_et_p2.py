@@ -8257,8 +8257,9 @@ def train_stageC_diffusion_generator(
                     eps = eps[idx_keep]
 
                     # DEBUG: gate + sigma stats (rank0 only)
-                    if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                        print(f"\n[OVLP-GATE] step={global_step} epoch={epoch}")
+                    if global_step % overlap_debug_every == 0:
+                        rank = dist.get_rank() if dist.is_initialized() else 0
+                        print(f"\n[OVLP-GATE][rank={rank}] step={global_step} epoch={epoch}")
                         print(f"  ov_keep: {ov_keep.sum().item()}/{ov_keep.numel()} kept")
                         print(f"  sigma_pair: min={sigma_pair.min().item():.4f}, "
                             f"median={sigma_pair.median().item():.4f}, "
@@ -8304,19 +8305,56 @@ def train_stageC_diffusion_generator(
                             kl_tau=overlap_kl_tau,
                         )
 
-                        if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                            print(f"  valid_batch_count={ov_loss_dict['valid_batch_count']}")
+                        # Apply overlap losses if valid
+                        if ov_loss_dict['valid_batch_count'] > 0:
+                            L_ov_shape_batch = ov_loss_dict['L_ov_shape']
+                            L_ov_scale_batch = ov_loss_dict['L_ov_scale']
+                            L_ov_kl_batch = ov_loss_dict['L_ov_kl']
+
+                            # Add to total loss
+                            L_total = (
+                                L_total
+                                + overlap_loss_weight_shape * L_ov_shape_batch
+                                + overlap_loss_weight_scale * L_ov_scale_batch
+                                + overlap_loss_weight_kl * L_ov_kl_batch
+                            )
+
+                            # Track epoch stats
+                            ov_apply_count += 1
+                            ov_loss_sum['shape'] += float(L_ov_shape_batch.item())
+                            ov_loss_sum['scale'] += float(L_ov_scale_batch.item())
+                            ov_loss_sum['kl'] += float(L_ov_kl_batch.item())
+                            ov_loss_sum['total'] += float(
+                                L_ov_shape_batch.item()
+                                + L_ov_scale_batch.item()
+                                + L_ov_kl_batch.item()
+                            )
+
+                            # Debug stats
                             if ov_loss_dict['debug_info']['I_sizes']:
-                                print(f"  I_sizes: min={min(ov_loss_dict['debug_info']['I_sizes'])}, "
+                                ov_I_sizes.extend(ov_loss_dict['debug_info']['I_sizes'])
+                            if ov_loss_dict['debug_info']['jaccard_k10']:
+                                ov_jaccard_k10.extend(ov_loss_dict['debug_info']['jaccard_k10'])
+                        else:
+                            ov_no_valid += 1
+
+                        if global_step % overlap_debug_every == 0:
+                            rank = dist.get_rank() if dist.is_initialized() else 0
+                            print(f"  [rank={rank}] valid_batch_count={ov_loss_dict['valid_batch_count']}")
+                            if ov_loss_dict['debug_info']['I_sizes']:
+                                print(f"  [rank={rank}] I_sizes: min={min(ov_loss_dict['debug_info']['I_sizes'])}, "
                                     f"mean={np.mean(ov_loss_dict['debug_info']['I_sizes']):.1f}")
+
 
                 else:
                     ov_skipped_sigma += 1
-                    if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                        print(f"[OVLP] step={global_step} SKIPPED (sigma > {overlap_sigma_thresh})")
-                        print(f"  sigma_pair: min={sigma_pair.min().item():.4f}, "
+                    if global_step % overlap_debug_every == 0:
+                        rank = dist.get_rank() if dist.is_initialized() else 0
+                        print(f"[OVLP][rank={rank}] step={global_step} SKIPPED (sigma > {overlap_sigma_thresh})")
+                        print(f"  [rank={rank}] sigma_pair: min={sigma_pair.min().item():.4f}, "
                             f"median={sigma_pair.median().item():.4f}, "
                             f"max={sigma_pair.max().item():.4f}")
+
 
 
             # Track overlap losses in epoch_losses
@@ -9231,14 +9269,14 @@ def train_stageC_diffusion_generator(
                 avg_ov_total = ov_loss_sum['total'] / ov_apply_count
                 ov_apply_rate = ov_apply_count / max(n_batches, 1)
 
-                # Track in history
-                if 'ov_shape' not in history['epoch_avg']:
-                    history['epoch_avg']['ov_shape'] = []
-                    history['epoch_avg']['ov_scale'] = []
-                    history['epoch_avg']['ov_kl'] = []
-                    history['epoch_avg']['ov_total'] = []
-                    history['epoch_avg']['ov_jaccard_k10'] = []
-                    history['epoch_avg']['ov_I_size_mean'] = []
+                # Track in history (safe init for partially populated dicts)
+                history['epoch_avg'].setdefault('ov_shape', [])
+                history['epoch_avg'].setdefault('ov_scale', [])
+                history['epoch_avg'].setdefault('ov_kl', [])
+                history['epoch_avg'].setdefault('ov_total', [])
+                history['epoch_avg'].setdefault('ov_jaccard_k10', [])
+                history['epoch_avg'].setdefault('ov_I_size_mean', [])
+
 
                 history['epoch_avg']['ov_shape'].append(avg_ov_shape)
                 history['epoch_avg']['ov_scale'].append(avg_ov_scale)
