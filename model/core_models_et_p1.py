@@ -2032,6 +2032,516 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'anchor_cond_debug': anchor_cond_debug_batch,
     }
 
+
+# ==============================================================================
+# PAIRED OVERLAPPING MINISETS DATASET (Candidate 1)
+# ==============================================================================
+
+class STPairSetDataset(Dataset):
+    """
+    ST mini-sets with PAIRED overlapping cores for overlap-consistency training.
+
+    Each __getitem__ returns TWO minisets from the SAME slide with a controlled
+    overlap in their core points. This enables overlap-consistency losses that
+    enforce the model produces consistent geometry for shared cells across
+    different context sets.
+
+    Key differences from STSetDataset:
+    1. Returns a pair (view1, view2) instead of a single miniset
+    2. Core points have controlled overlap (alpha fraction shared)
+    3. Overlap mapping (idx1_I, idx2_I) tracks which indices correspond
+    4. Extras are sampled independently for each view
+    """
+
+    def __init__(
+        self,
+        targets_dict: Dict[int, STTargets],
+        encoder: 'SharedEncoder',
+        st_gene_expr_dict: Dict[int, torch.Tensor],
+        n_min: int = 64,
+        n_max: int = 256,
+        D_latent: int = 16,
+        num_samples: int = 10000,
+        knn_k: int = 12,
+        device: str = 'cuda',
+        landmarks_L: int = 32,
+        pool_mult: float = 4.0,
+        stochastic_tau: float = 1.0,
+        # ========== Paired overlap params ==========
+        pair_overlap_alpha: float = 0.5,
+        pair_overlap_min_I: int = 16,
+        # ========== Competitor training params ==========
+        compete_train: bool = False,
+        compete_n_extra: int = 128,
+        compete_n_rand: int = 64,
+        compete_n_hard: int = 64,
+        compete_use_pos_closure: bool = True,
+        compete_k_pos: int = 10,
+        compete_expr_knn_k: int = 50,
+        compete_anchor_only: bool = True,
+    ):
+        self.targets_dict = targets_dict
+        self.encoder = encoder
+        self.st_gene_expr_dict = st_gene_expr_dict
+        self.n_min = n_min
+        self.n_max = n_max
+        self.D_latent = D_latent
+        self.num_samples = num_samples
+        self.knn_k = knn_k
+        self.device = device
+        self.slide_ids = list(targets_dict.keys())
+        self.landmarks_L = 0  # Disable landmarks for pair mode
+
+        # Paired overlap params
+        self.pair_overlap_alpha = pair_overlap_alpha
+        self.pair_overlap_min_I = pair_overlap_min_I
+
+        # Stochastic sampling params
+        self.pool_mult = pool_mult
+        self.stochastic_tau = stochastic_tau
+
+        # Competitor training params
+        self.compete_train = compete_train
+        self.compete_n_extra = compete_n_extra
+        self.compete_n_rand = compete_n_rand
+        self.compete_n_hard = compete_n_hard
+        self.compete_use_pos_closure = compete_use_pos_closure
+        self.compete_k_pos = compete_k_pos
+        self.compete_expr_knn_k = compete_expr_knn_k
+        self.compete_anchor_only = compete_anchor_only
+
+        # Precompute encoder embeddings for all slides
+        self.Z_dict = {}
+        self.expr_knn_indices = {}
+
+        with torch.no_grad():
+            for slide_id, st_expr in st_gene_expr_dict.items():
+                Z = encoder(st_expr.to(device))
+                self.Z_dict[slide_id] = Z.cpu()
+
+                # Precompute expression kNN for hard negatives
+                if compete_train and compete_n_hard > 0:
+                    n_spots = Z.shape[0]
+                    Z_norm = F.normalize(Z, p=2, dim=1)
+                    sim_matrix = Z_norm @ Z_norm.T
+                    sim_matrix.fill_diagonal_(-float('inf'))
+                    k_expr = min(compete_expr_knn_k, n_spots - 1)
+                    _, expr_knn_idx = torch.topk(sim_matrix, k=k_expr, dim=1)
+                    self.expr_knn_indices[slide_id] = expr_knn_idx.cpu()
+
+        print(f"[STPairSetDataset] Created with alpha={pair_overlap_alpha}, "
+              f"min_I={pair_overlap_min_I}, n_range=[{n_min},{n_max}]")
+
+    def __len__(self):
+        return self.num_samples
+
+    def _sample_core_patch(self, targets, m, n_core, center_idx=None):
+        """
+        Sample a core patch of n_core points from a slide with m total points.
+        Uses stochastic kNN sampling from a pool around the center.
+
+        Returns: indices_core (tensor of indices), center_idx (int)
+        """
+        if center_idx is None:
+            center_idx = np.random.randint(0, m)
+
+        D_row = targets.D[center_idx]
+        all_idx = torch.arange(m)
+        mask_self = all_idx != center_idx
+        dists = D_row[mask_self]
+        idx_no_self = all_idx[mask_self]
+
+        if idx_no_self.numel() == 0:
+            return all_idx[:n_core], center_idx
+
+        sort_order = torch.argsort(dists)
+        sorted_neighbors = idx_no_self[sort_order]
+        sorted_dists = dists[sort_order]
+
+        n_neighbors_needed = n_core - 1
+        K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_core))
+        K_pool = max(K_pool, n_neighbors_needed)
+
+        pool = sorted_neighbors[:K_pool]
+        pool_d = sorted_dists[:K_pool]
+
+        if pool.numel() <= n_neighbors_needed:
+            neighbors = pool
+        else:
+            weights = torch.softmax(-pool_d / self.stochastic_tau, dim=0)
+            sampled_idx = torch.multinomial(weights, n_neighbors_needed, replacement=False)
+            neighbors = pool[sampled_idx]
+
+        indices_core = torch.cat([
+            torch.tensor([center_idx], dtype=torch.long),
+            neighbors
+        ])
+
+        return indices_core, center_idx
+
+    def _add_competitor_extras(self, targets, indices_core, slide_id, m):
+        """
+        Add competitor extras (positive closure, random, hard negatives) to a core.
+        Returns indices_all, anchor_mask
+        """
+        n_core = indices_core.numel()
+        indices_extra = []
+        already_included = set(indices_core.tolist())
+
+        if not self.compete_train:
+            anchor_mask = torch.ones(n_core, dtype=torch.bool)
+            return indices_core, anchor_mask
+
+        # 1) Positive closure
+        if self.compete_use_pos_closure and self.compete_k_pos > 0:
+            pos_closure_candidates = []
+            for local_i in range(n_core):
+                global_i = indices_core[local_i].item()
+                gt_neighbors = targets.knn_spatial[global_i]
+                for neighbor in gt_neighbors.tolist():
+                    if neighbor >= 0 and neighbor not in already_included:
+                        pos_closure_candidates.append(neighbor)
+
+            pos_closure_candidates = list(set(pos_closure_candidates))
+            n_pos_max = self.compete_n_extra // 2
+            if len(pos_closure_candidates) > n_pos_max:
+                perm = torch.randperm(len(pos_closure_candidates))[:n_pos_max]
+                pos_closure_candidates = [pos_closure_candidates[i] for i in perm.tolist()]
+
+            if pos_closure_candidates:
+                pos_tensor = torch.tensor(pos_closure_candidates, dtype=torch.long)
+                indices_extra.append(pos_tensor)
+                already_included.update(pos_closure_candidates)
+
+        # 2) Random distractors
+        if self.compete_n_rand > 0:
+            available = [i for i in range(m) if i not in already_included]
+            n_rand = min(self.compete_n_rand, len(available))
+            if n_rand > 0:
+                rand_idx = torch.randperm(len(available))[:n_rand]
+                rand_distractors = torch.tensor([available[i] for i in rand_idx.tolist()],
+                                                dtype=torch.long)
+                indices_extra.append(rand_distractors)
+                already_included.update(rand_distractors.tolist())
+
+        # 3) Hard negatives
+        if self.compete_n_hard > 0 and slide_id in self.expr_knn_indices:
+            expr_knn = self.expr_knn_indices[slide_id]
+            hard_candidates = []
+            anchor_indices = indices_core[:min(10, n_core)]
+            for anchor in anchor_indices.tolist():
+                expr_neighbors = expr_knn[anchor].tolist()
+                for neighbor in expr_neighbors:
+                    if neighbor not in already_included:
+                        hard_candidates.append(neighbor)
+
+            hard_candidates = list(set(hard_candidates))
+            n_hard = min(self.compete_n_hard, len(hard_candidates))
+            if n_hard > 0:
+                perm = torch.randperm(len(hard_candidates))[:n_hard]
+                hard_distractors = torch.tensor([hard_candidates[i] for i in perm.tolist()],
+                                                dtype=torch.long)
+                indices_extra.append(hard_distractors)
+
+        # Combine core + extra
+        if indices_extra:
+            indices_extra_cat = torch.cat(indices_extra)
+            indices_all = torch.cat([indices_core, indices_extra_cat])
+            indices_all = torch.unique(indices_all)
+        else:
+            indices_all = indices_core
+
+        # Cap total size
+        n_total_max = n_core + self.compete_n_extra
+        if indices_all.numel() > n_total_max:
+            core_set = set(indices_core.tolist())
+            extras_in_all = [i.item() for i in indices_all if i.item() not in core_set]
+            n_extras_to_keep = n_total_max - n_core
+            if n_extras_to_keep > 0 and len(extras_in_all) > n_extras_to_keep:
+                perm = torch.randperm(len(extras_in_all))[:n_extras_to_keep]
+                extras_to_keep = [extras_in_all[i] for i in perm.tolist()]
+            else:
+                extras_to_keep = extras_in_all[:n_extras_to_keep]
+            indices_all = torch.cat([indices_core, torch.tensor(extras_to_keep, dtype=torch.long)])
+
+        # Create anchor mask
+        anchor_mask = torch.zeros(indices_all.numel(), dtype=torch.bool)
+        core_set = set(indices_core.tolist())
+        for i, idx in enumerate(indices_all.tolist()):
+            if idx in core_set:
+                anchor_mask[i] = True
+
+        return indices_all, anchor_mask
+
+    def _build_miniset_dict(self, targets, indices, anchor_mask, slide_id):
+        """
+        Build the miniset dictionary from indices (same structure as STSetDataset).
+        """
+        n_total = indices.numel()
+        m = targets.y_hat.shape[0]
+
+        # Build kNN mappings
+        global_to_local = torch.full((m,), -1, dtype=torch.long)
+        global_to_local[indices] = torch.arange(n_total, dtype=torch.long)
+
+        knn_global = targets.knn_indices[indices]
+        knn_local = global_to_local[knn_global]
+
+        knn_spatial_global = targets.knn_spatial[indices]
+        knn_spatial_local = global_to_local[knn_spatial_global]
+
+        # Extract embeddings and coords
+        Z_set = self.Z_dict[slide_id][indices]
+        y_hat_subset = targets.y_hat[indices]
+
+        # Compute targets
+        y_hat_centered = y_hat_subset - y_hat_subset.mean(dim=0, keepdim=True)
+        G_subset = y_hat_centered @ y_hat_centered.t()
+        D_subset = targets.D[indices][:, indices]
+        V_target = uet.factor_from_gram(G_subset, self.D_latent)
+
+        # Histogram
+        triu_mask = torch.triu(torch.ones_like(D_subset, dtype=torch.bool), diagonal=1)
+        d_95 = torch.quantile(D_subset[triu_mask], 0.95) if triu_mask.any() else 1.0
+        bins = torch.linspace(0, float(d_95), 64)
+        H_subset = uet.compute_distance_hist(D_subset, bins)
+
+        # Triplets
+        triplets_subset = uet.sample_ordinal_triplets(D_subset, n_triplets=min(500, n_total), margin_ratio=0.05)
+
+        # L_info
+        edge_index, edge_weight = uet.build_knn_graph(y_hat_subset, k=self.knn_k)
+        L_subset = uet.compute_graph_laplacian(edge_index, edge_weight, n_nodes=n_total)
+        L_info = {'L': L_subset, 't_list': targets.t_list}
+
+        # Topo info
+        y_hat_miniset = targets.y_hat[indices].cpu().numpy()
+        topo_result = uet.compute_persistent_pairs(
+            y_hat_miniset,
+            max_pairs_0d=min(20, n_total // 4),
+            max_pairs_1d=min(10, n_total // 8)
+        )
+        topo_info = {
+            'pairs_0': torch.from_numpy(topo_result['pairs_0']).long(),
+            'dists_0': torch.from_numpy(topo_result['dists_0']).float(),
+            'pairs_1': torch.from_numpy(topo_result['pairs_1']).long(),
+            'dists_1': torch.from_numpy(topo_result['dists_1']).float(),
+        }
+
+        # Global UIDs
+        global_uid = (slide_id << 32) + indices.long()
+
+        # No landmarks in pair mode
+        is_landmark = torch.zeros(n_total, dtype=torch.bool)
+
+        # No anchor_cond_mask in pair mode (not using anchored training)
+        anchor_cond_mask = torch.zeros(n_total, dtype=torch.bool)
+
+        return {
+            'Z_set': Z_set,
+            'is_landmark': is_landmark,
+            'V_target': V_target,
+            'G_target': G_subset,
+            'D_target': D_subset,
+            'H_target': H_subset,
+            'H_bins': bins,
+            'L_info': L_info,
+            'triplets': triplets_subset,
+            'n': n_total,
+            'overlap_info': {'slide_id': slide_id, 'indices': indices, 'global_uid': global_uid},
+            'knn_indices': knn_local,
+            'topo_info': topo_info,
+            'knn_spatial': knn_spatial_local,
+            'anchor_mask': anchor_mask,
+            'global_indices': global_uid,
+            'spot_indices': indices,
+            'compete_debug': {},
+            'anchor_cond_mask': anchor_cond_mask,
+            'anchor_cond_debug': {},
+        }
+
+    def __getitem__(self, idx):
+        """
+        Return a PAIR of minisets from the same slide with controlled core overlap.
+        """
+        # Pick a slide
+        slide_id = np.random.choice(self.slide_ids)
+        targets = self.targets_dict[slide_id]
+        m = targets.y_hat.shape[0]
+
+        # Sample miniset size for both views
+        n = np.random.randint(self.n_min, self.n_max + 1)
+        n = min(n, m)
+
+        # Compute overlap size
+        n_overlap = max(self.pair_overlap_min_I, int(self.pair_overlap_alpha * n))
+        n_overlap = min(n_overlap, n - 4)  # Leave room for non-overlapping points
+
+        # Sample a center point (shared by both views for locality)
+        center_idx = np.random.randint(0, m)
+
+        # Build a shared pool of candidates near the center
+        D_row = targets.D[center_idx]
+        all_idx = torch.arange(m)
+        mask_self = all_idx != center_idx
+        dists = D_row[mask_self]
+        idx_no_self = all_idx[mask_self]
+
+        sort_order = torch.argsort(dists)
+        sorted_neighbors = idx_no_self[sort_order]
+        sorted_dists = dists[sort_order]
+
+        # Pool size: enough for 2 views with overlap
+        n_unique_needed = 2 * n - n_overlap  # Total unique points across both views
+        K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_unique_needed))
+        K_pool = max(K_pool, n_unique_needed)
+
+        pool = sorted_neighbors[:K_pool]
+        pool_d = sorted_dists[:K_pool]
+
+        # Sample OVERLAP set (I) - shared core points
+        # These are the closest points to center for maximum locality
+        if pool.numel() >= n_overlap:
+            # Stochastic sampling for overlap
+            weights_I = torch.softmax(-pool_d / self.stochastic_tau, dim=0)
+            if pool.numel() >= n_overlap:
+                sampled_I = torch.multinomial(weights_I, n_overlap, replacement=False)
+                I_indices = pool[sampled_I]
+            else:
+                I_indices = pool[:n_overlap]
+        else:
+            I_indices = pool
+            n_overlap = I_indices.numel()
+
+        # Points available after overlap
+        I_set = set(I_indices.tolist())
+        remaining_pool = torch.tensor([p.item() for p in pool if p.item() not in I_set], dtype=torch.long)
+
+        # Sample non-overlapping points for view1 (A) and view2 (B)
+        n_A = n - n_overlap - 1  # -1 for center
+        n_B = n - n_overlap - 1
+
+        if remaining_pool.numel() >= n_A + n_B:
+            # Shuffle and split
+            perm = torch.randperm(remaining_pool.numel())
+            A_exclusive = remaining_pool[perm[:n_A]]
+            B_exclusive = remaining_pool[perm[n_A:n_A + n_B]]
+        else:
+            # Not enough points - use what we have
+            half = remaining_pool.numel() // 2
+            A_exclusive = remaining_pool[:half]
+            B_exclusive = remaining_pool[half:]
+
+        # Build core indices for each view
+        center_tensor = torch.tensor([center_idx], dtype=torch.long)
+        indices_core_1 = torch.cat([center_tensor, I_indices, A_exclusive])
+        indices_core_2 = torch.cat([center_tensor, I_indices, B_exclusive])
+
+        # Shuffle cores
+        indices_core_1 = indices_core_1[torch.randperm(indices_core_1.numel())]
+        indices_core_2 = indices_core_2[torch.randperm(indices_core_2.numel())]
+
+        # Add competitor extras independently to each view
+        indices_all_1, anchor_mask_1 = self._add_competitor_extras(
+            targets, indices_core_1, slide_id, m
+        )
+        indices_all_2, anchor_mask_2 = self._add_competitor_extras(
+            targets, indices_core_2, slide_id, m
+        )
+
+        # Build miniset dicts
+        view1 = self._build_miniset_dict(targets, indices_all_1, anchor_mask_1, slide_id)
+        view2 = self._build_miniset_dict(targets, indices_all_2, anchor_mask_2, slide_id)
+
+        # Compute overlap mapping (using global_uid for safety)
+        # Find where I_indices appear in each view
+        I_global_uids = (slide_id << 32) + I_indices.long()
+
+        # Build index mapping: for each point in I, find its position in view1 and view2
+        idx1_I = []
+        idx2_I = []
+
+        global_uid_1 = view1['global_indices']
+        global_uid_2 = view2['global_indices']
+
+        uid_to_pos_1 = {uid.item(): pos for pos, uid in enumerate(global_uid_1)}
+        uid_to_pos_2 = {uid.item(): pos for pos, uid in enumerate(global_uid_2)}
+
+        for uid in I_global_uids.tolist():
+            if uid in uid_to_pos_1 and uid in uid_to_pos_2:
+                idx1_I.append(uid_to_pos_1[uid])
+                idx2_I.append(uid_to_pos_2[uid])
+
+        idx1_I = torch.tensor(idx1_I, dtype=torch.long)
+        idx2_I = torch.tensor(idx2_I, dtype=torch.long)
+
+        # Overlap info
+        overlap_mapping = {
+            'idx1_I': idx1_I,  # Positions in view1 of shared points
+            'idx2_I': idx2_I,  # Positions in view2 of shared points
+            'I_size': len(idx1_I),
+            'slide_id': slide_id,
+        }
+
+        return {
+            'view1': view1,
+            'view2': view2,
+            'overlap_mapping': overlap_mapping,
+        }
+
+
+def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+    """
+    Collate paired minisets with padding.
+
+    Returns a batch dict with:
+    - 'view1': collated batch for first view (same structure as collate_minisets output)
+    - 'view2': collated batch for second view
+    - 'idx1_I': (batch_size, max_I) positions in view1 of overlap points
+    - 'idx2_I': (batch_size, max_I) positions in view2 of overlap points
+    - 'I_mask': (batch_size, max_I) validity mask for overlap points
+    - 'I_sizes': (batch_size,) number of overlap points per sample
+    """
+    batch_size = len(batch)
+
+    # Collect views
+    view1_list = [item['view1'] for item in batch]
+    view2_list = [item['view2'] for item in batch]
+    overlap_list = [item['overlap_mapping'] for item in batch]
+
+    # Collate each view using standard collate
+    view1_batch = collate_minisets(view1_list)
+    view2_batch = collate_minisets(view2_list)
+
+    # Collate overlap mappings
+    device = view1_batch['Z_set'].device
+    max_I = max(om['I_size'] for om in overlap_list)
+    max_I = max(max_I, 1)  # At least 1 to avoid empty tensors
+
+    idx1_I_batch = torch.full((batch_size, max_I), -1, dtype=torch.long, device=device)
+    idx2_I_batch = torch.full((batch_size, max_I), -1, dtype=torch.long, device=device)
+    I_mask_batch = torch.zeros(batch_size, max_I, dtype=torch.bool, device=device)
+    I_sizes_batch = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    for i, om in enumerate(overlap_list):
+        I_size = om['I_size']
+        if I_size > 0:
+            idx1_I_batch[i, :I_size] = om['idx1_I']
+            idx2_I_batch[i, :I_size] = om['idx2_I']
+            I_mask_batch[i, :I_size] = True
+        I_sizes_batch[i] = I_size
+
+    return {
+        'view1': view1_batch,
+        'view2': view2_batch,
+        'idx1_I': idx1_I_batch,
+        'idx2_I': idx2_I_batch,
+        'I_mask': I_mask_batch,
+        'I_sizes': I_sizes_batch,
+        'is_pair_batch': True,
+    }
+
+
 # class SCSetDataset(Dataset):
 #     """
 #     SC mini-sets with intentional overlap, using a prebuilt K-NN index.

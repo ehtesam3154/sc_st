@@ -26,7 +26,7 @@ import json
 from datetime import datetime
 
 from torch.utils.data import DataLoader
-from core_models_et_p1 import collate_minisets, collate_sc_minisets
+from core_models_et_p1 import collate_minisets, collate_sc_minisets, STPairSetDataset, collate_pair_minisets
 from tqdm.auto import tqdm
 import sys
 
@@ -52,7 +52,7 @@ from scipy.stats import spearmanr, pearsonr
 DEBUG = False #master switch for debug logging
 
 
-#debug tracking variables 
+#debug tracking variables
 debug_state = {
     'score_bins': None,
     'score_bin_sum': None,
@@ -61,8 +61,197 @@ debug_state = {
     'dbg_overlap_pairs': 0,
     'dbg_k_mean': 0.0,
     'overlap_count_this_epoch': 0,
-    'last_gram_trace_ratio': 85.0 
+    'last_gram_trace_ratio': 85.0
 }
+
+
+# ==============================================================================
+# OVERLAP CONSISTENCY LOSS FUNCTIONS (Candidate 1)
+# ==============================================================================
+
+def compute_overlap_losses(
+    x0_pred_1: torch.Tensor,  # (B, N1, D) denoised predictions for view1
+    x0_pred_2: torch.Tensor,  # (B, N2, D) denoised predictions for view2
+    idx1_I: torch.Tensor,     # (B, max_I) positions in view1 of overlap points
+    idx2_I: torch.Tensor,     # (B, max_I) positions in view2 of overlap points
+    I_mask: torch.Tensor,     # (B, max_I) validity mask for overlap points
+    mask_1: torch.Tensor,     # (B, N1) validity mask for view1
+    mask_2: torch.Tensor,     # (B, N2) validity mask for view2
+    kl_tau: float = 0.5,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute overlap consistency losses for paired minisets.
+
+    Returns dict with:
+    - L_ov_shape: Scale-free Gram consistency loss
+    - L_ov_scale: Log-trace scale consistency loss
+    - L_ov_kl: Symmetric KL divergence of neighbor distributions
+    - debug_dict: Diagnostic information
+    """
+    B = x0_pred_1.shape[0]
+    device = x0_pred_1.device
+
+    # Initialize losses
+    L_ov_shape = torch.tensor(0.0, device=device)
+    L_ov_scale = torch.tensor(0.0, device=device)
+    L_ov_kl = torch.tensor(0.0, device=device)
+
+    valid_batch_count = 0
+    debug_info = {
+        'I_sizes': [],
+        'trG1': [],
+        'trG2': [],
+        'log_tr_diff': [],
+        'mean_pairwise_dist1': [],
+        'mean_pairwise_dist2': [],
+        'jaccard_k10': [],
+    }
+
+    for b in range(B):
+        # Get overlap indices for this batch element
+        I_valid = I_mask[b]  # (max_I,) bool
+        n_I = I_valid.sum().item()
+
+        if n_I < 4:  # Need at least 4 points for meaningful overlap loss
+            continue
+
+        # Extract overlap point indices
+        idx1 = idx1_I[b, I_valid]  # (n_I,) positions in view1
+        idx2 = idx2_I[b, I_valid]  # (n_I,) positions in view2
+
+        # Extract predictions for overlap points
+        V1_I = x0_pred_1[b, idx1]  # (n_I, D)
+        V2_I = x0_pred_2[b, idx2]  # (n_I, D)
+
+        # Center predictions (remove translation)
+        V1_centered = V1_I - V1_I.mean(dim=0, keepdim=True)
+        V2_centered = V2_I - V2_I.mean(dim=0, keepdim=True)
+
+        # Compute Gram matrices
+        G1 = V1_centered @ V1_centered.T  # (n_I, n_I)
+        G2 = V2_centered @ V2_centered.T  # (n_I, n_I)
+
+        tr_G1 = G1.trace() + eps
+        tr_G2 = G2.trace() + eps
+
+        # (1) Shape loss: normalized Gram Frobenius distance (scale-free)
+        G1_norm = G1 / tr_G1
+        G2_norm = G2 / tr_G2
+        shape_loss_b = (G1_norm - G2_norm).pow(2).sum()
+        L_ov_shape = L_ov_shape + shape_loss_b
+
+        # (2) Scale loss: squared log-trace difference
+        log_tr_diff = (torch.log(tr_G1) - torch.log(tr_G2)).pow(2)
+        L_ov_scale = L_ov_scale + log_tr_diff
+
+        # (3) KL neighbor distribution loss
+        # Compute pairwise squared distances
+        D1_sq = torch.cdist(V1_centered, V1_centered).pow(2)  # (n_I, n_I)
+        D2_sq = torch.cdist(V2_centered, V2_centered).pow(2)  # (n_I, n_I)
+
+        # Build soft neighbor distributions (excluding self)
+        # P1[i,j] = softmax(-d1[i,j]^2 / tau) over j != i
+        # Mask out diagonal with large value before softmax
+        D1_masked = D1_sq.clone()
+        D2_masked = D2_sq.clone()
+        diag_mask = torch.eye(n_I, device=device, dtype=torch.bool)
+        D1_masked[diag_mask] = float('inf')
+        D2_masked[diag_mask] = float('inf')
+
+        P1 = F.softmax(-D1_masked / kl_tau, dim=1)  # (n_I, n_I)
+        P2 = F.softmax(-D2_masked / kl_tau, dim=1)  # (n_I, n_I)
+
+        # Clamp for numerical stability
+        P1 = P1.clamp(min=eps)
+        P2 = P2.clamp(min=eps)
+
+        # Symmetric KL divergence: (KL(P1||P2) + KL(P2||P1)) / 2
+        # KL(P||Q) = sum(P * log(P/Q))
+        kl_12 = (P1 * (torch.log(P1) - torch.log(P2))).sum(dim=1).mean()  # Mean over points
+        kl_21 = (P2 * (torch.log(P2) - torch.log(P1))).sum(dim=1).mean()
+        kl_sym = (kl_12 + kl_21) / 2
+        L_ov_kl = L_ov_kl + kl_sym
+
+        valid_batch_count += 1
+
+        # Debug info
+        debug_info['I_sizes'].append(n_I)
+        debug_info['trG1'].append(tr_G1.item())
+        debug_info['trG2'].append(tr_G2.item())
+        debug_info['log_tr_diff'].append(log_tr_diff.sqrt().item())
+
+        # Mean pairwise distances (for collapse detection)
+        D1_upper = D1_sq[torch.triu(torch.ones_like(D1_sq, dtype=torch.bool), diagonal=1)]
+        D2_upper = D2_sq[torch.triu(torch.ones_like(D2_sq, dtype=torch.bool), diagonal=1)]
+        if D1_upper.numel() > 0:
+            debug_info['mean_pairwise_dist1'].append(D1_upper.mean().sqrt().item())
+            debug_info['mean_pairwise_dist2'].append(D2_upper.mean().sqrt().item())
+
+        # Jaccard@10 as diagnostic (training-time proxy)
+        if n_I >= 10:
+            k = min(10, n_I - 1)
+            _, knn1 = torch.topk(D1_sq, k=k+1, largest=False, dim=1)  # Include self
+            _, knn2 = torch.topk(D2_sq, k=k+1, largest=False, dim=1)
+            knn1 = knn1[:, 1:]  # Exclude self
+            knn2 = knn2[:, 1:]
+
+            jaccard_sum = 0.0
+            for i in range(n_I):
+                set1 = set(knn1[i].tolist())
+                set2 = set(knn2[i].tolist())
+                intersection = len(set1 & set2)
+                union = len(set1 | set2)
+                if union > 0:
+                    jaccard_sum += intersection / union
+            jaccard_mean = jaccard_sum / n_I
+            debug_info['jaccard_k10'].append(jaccard_mean)
+
+    # Normalize by valid batch count
+    if valid_batch_count > 0:
+        L_ov_shape = L_ov_shape / valid_batch_count
+        L_ov_scale = L_ov_scale / valid_batch_count
+        L_ov_kl = L_ov_kl / valid_batch_count
+
+    return {
+        'L_ov_shape': L_ov_shape,
+        'L_ov_scale': L_ov_scale,
+        'L_ov_kl': L_ov_kl,
+        'valid_batch_count': valid_batch_count,
+        'debug_info': debug_info,
+    }
+
+
+def apply_coupled_noise(
+    eps_1: torch.Tensor,      # (B, N1, D) noise for view1
+    eps_2: torch.Tensor,      # (B, N2, D) noise for view2
+    idx1_I: torch.Tensor,     # (B, max_I) positions in view1 of overlap points
+    idx2_I: torch.Tensor,     # (B, max_I) positions in view2 of overlap points
+    I_mask: torch.Tensor,     # (B, max_I) validity mask for overlap points
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply coupled noise: for overlapping points, copy noise from view1 to view2.
+    This ensures the same noise is used for the same physical points across views.
+
+    Returns: (eps_1, eps_2_coupled) where eps_2 has matching noise for overlap points.
+    """
+    B = eps_1.shape[0]
+    eps_2_coupled = eps_2.clone()
+
+    for b in range(B):
+        I_valid = I_mask[b]  # (max_I,) bool
+        n_I = I_valid.sum().item()
+
+        if n_I == 0:
+            continue
+
+        idx1 = idx1_I[b, I_valid]  # (n_I,) positions in view1
+        idx2 = idx2_I[b, I_valid]  # (n_I,) positions in view2
+
+        # Copy noise from view1 to corresponding positions in view2
+        eps_2_coupled[b, idx2] = eps_1[b, idx1]
+
+    return eps_1, eps_2_coupled
 
 
 def apply_z_ln(Z_set: torch.Tensor, context_encoder: nn.Module) -> torch.Tensor:
@@ -2436,6 +2625,17 @@ def train_stageC_diffusion_generator(
     ctx_debug_every: int = 100,
     # ========== SELF-CONDITIONING MODE ==========
     self_cond_mode: str = 'standard',
+    # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
+    train_pair_overlap: bool = False,
+    pair_overlap_alpha: float = 0.5,
+    pair_overlap_min_I: int = 16,
+    overlap_loss_weight_shape: float = 1.0,
+    overlap_loss_weight_scale: float = 0.5,
+    overlap_loss_weight_kl: float = 1.0,
+    overlap_kl_tau: float = 0.5,
+    overlap_sigma_thresh: float = 0.5,
+    disable_ctx_loss_when_overlap: bool = True,
+    overlap_debug_every: int = 100,
 
 ):
     
@@ -2741,14 +2941,24 @@ def train_stageC_diffusion_generator(
  
     # DataLoaders - OPTIMIZED
     from torch.utils.data import DataLoader
-    from core_models_et_p1 import collate_minisets, collate_sc_minisets
+    from core_models_et_p1 import collate_minisets, collate_sc_minisets, STPairSetDataset, collate_pair_minisets
 
     if fabric is not None:
         device = str(fabric.device)
-    
+
+    # ========== PAIRED OVERLAP TRAINING SETUP ==========
+    # When enabled, disable ctx_loss to avoid competing objectives
+    effective_ctx_loss_weight = ctx_loss_weight
+    if train_pair_overlap and disable_ctx_loss_when_overlap:
+        effective_ctx_loss_weight = 0.0
+        if fabric is None or fabric.is_global_zero:
+            print(f"[PAIR-OVERLAP] Disabling ctx_loss (weight {ctx_loss_weight} -> 0.0) to avoid competing objectives")
+
     #compute data deriven bin edges form ST coords
     # ST loader (conditional)
     use_st = (st_dataset is not None)
+    st_pair_loader = None  # Will be set if train_pair_overlap is enabled
+
     if use_st:
         #compute data deriven bin edges form ST coords
         all_st_coords = []
@@ -2767,11 +2977,49 @@ def train_stageC_diffusion_generator(
         #register in score_net
         score_net.st_dist_bin_edges = st_dist_bin_edges
 
+        # ========== CREATE PAIRED DATASET IF ENABLED ==========
+        if train_pair_overlap:
+            st_pair_dataset = STPairSetDataset(
+                targets_dict=st_dataset.targets_dict,
+                encoder=st_dataset.encoder,
+                st_gene_expr_dict=st_dataset.st_gene_expr_dict,
+                n_min=st_dataset.n_min,
+                n_max=st_dataset.n_max,
+                D_latent=st_dataset.D_latent,
+                num_samples=st_dataset.num_samples,
+                knn_k=st_dataset.knn_k,
+                device=st_dataset.device,
+                pool_mult=st_dataset.pool_mult,
+                stochastic_tau=st_dataset.stochastic_tau,
+                pair_overlap_alpha=pair_overlap_alpha,
+                pair_overlap_min_I=pair_overlap_min_I,
+                compete_train=st_dataset.compete_train,
+                compete_n_extra=st_dataset.compete_n_extra,
+                compete_n_rand=st_dataset.compete_n_rand,
+                compete_n_hard=st_dataset.compete_n_hard,
+                compete_use_pos_closure=st_dataset.compete_use_pos_closure,
+                compete_k_pos=st_dataset.compete_k_pos,
+                compete_expr_knn_k=st_dataset.compete_expr_knn_k,
+                compete_anchor_only=st_dataset.compete_anchor_only,
+            )
+            st_pair_loader = DataLoader(
+                st_pair_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=collate_pair_minisets,
+                num_workers=0,
+                pin_memory=False
+            )
+            if fabric is None or fabric.is_global_zero:
+                print(f"[PAIR-OVERLAP] Created paired ST dataset: alpha={pair_overlap_alpha}, min_I={pair_overlap_min_I}")
+                print(f"[PAIR-OVERLAP] Overlap loss weights: shape={overlap_loss_weight_shape}, scale={overlap_loss_weight_scale}, kl={overlap_loss_weight_kl}")
+                print(f"[PAIR-OVERLAP] KL tau={overlap_kl_tau}, sigma_thresh={overlap_sigma_thresh}")
+
         st_loader = DataLoader(
-            st_dataset, 
-            batch_size=batch_size, 
-            shuffle=True, 
-            collate_fn=collate_minisets, 
+            st_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_minisets,
             num_workers=0,
             pin_memory=False
         )
@@ -3050,7 +3298,11 @@ def train_stageC_diffusion_generator(
         'topo': 0.0,
         'shape_spec': 0.0,
         'subspace': 0.5,       # NEW: add this key for Patch 7
-        'ctx_edge': 0.05
+        'ctx_edge': 0.05,
+        # ========== OVERLAP CONSISTENCY LOSSES (Candidate 1) ==========
+        'ov_shape': 0.0,       # Weight set dynamically via overlap_loss_weight_shape
+        'ov_scale': 0.0,       # Weight set dynamically via overlap_loss_weight_scale
+        'ov_kl': 0.0,          # Weight set dynamically via overlap_loss_weight_kl
     }
 
     # ========== CONTEXT INVARIANCE LOSS CONFIG ==========
@@ -3528,7 +3780,8 @@ def train_stageC_diffusion_generator(
 
         st_iter = iter(st_loader) if use_st else None
         sc_iter = iter(sc_loader) if use_sc else None
-        
+        st_pair_iter = iter(st_pair_loader) if (train_pair_overlap and st_pair_loader is not None) else None
+
         epoch_losses = {k: 0.0 for k in WEIGHTS.keys()}
         epoch_losses['total'] = 0.0
 
@@ -3538,6 +3791,13 @@ def train_stageC_diffusion_generator(
         ctx_snr_sum = 0.0
         ctx_hard_sim_sum = 0.0
         ctx_perm_fixed_sum = 0.0
+
+        # ========== OVERLAP CONSISTENCY LOSS TRACKING (Candidate 1) ==========
+        ov_loss_sum = {'shape': 0.0, 'scale': 0.0, 'kl': 0.0, 'total': 0.0}
+        ov_apply_count = 0
+        ov_skipped_sigma = 0
+        ov_I_sizes = []
+        ov_jaccard_k10 = []
 
         n_batches = 0
         c_overlap = 0
@@ -7873,9 +8133,9 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['sw_st'] * L_sw_st +
                     WEIGHTS['sw_sc'] * L_sw_sc +
                     WEIGHTS['overlap'] * L_overlap +
-                    WEIGHTS['ordinal_sc'] * L_ordinal_sc + 
+                    WEIGHTS['ordinal_sc'] * L_ordinal_sc +
                     WEIGHTS['st_dist'] * L_st_dist +
-                    WEIGHTS['edm_tail'] * L_edm_tail +      
+                    WEIGHTS['edm_tail'] * L_edm_tail +
                     WEIGHTS['gen_align'] * L_gen_align +
                     WEIGHTS.get('gen_scale', 0) * L_gen_scale +  # PATCH 8
                     WEIGHTS['dim'] * L_dim +
@@ -7884,17 +8144,162 @@ def train_stageC_diffusion_generator(
                     WEIGHTS.get('knn_scale', 0) * L_knn_scale +
                     WEIGHTS['radial'] * L_radial +
                     WEIGHTS['repel'] * L_repel +
-                    WEIGHTS['shape'] * L_shape + 
+                    WEIGHTS['shape'] * L_shape +
                     WEIGHTS['edge'] * L_edge +
                     WEIGHTS['topo'] * L_topo +
                     WEIGHTS['shape_spec'] * L_shape_spec +
                     WEIGHTS.get('subspace', 0) * L_subspace +  # PATCH 7
                     WEIGHTS.get('ctx_edge', 0) * L_ctx_edge +
-                    ctx_loss_weight * L_ctx_replace)   # NEW: context invariance
-            
+                    effective_ctx_loss_weight * L_ctx_replace)   # NEW: context invariance
+
             # Add SC dimension prior if this is an SC batch
             if is_sc:
                 L_total = L_total + WEIGHTS['dim'] * L_dim_sc + WEIGHTS['triangle'] * L_triangle_sc
+
+            # ==============================================================================
+            # PAIRED OVERLAP TRAINING (Candidate 1)
+            # ==============================================================================
+            L_ov_shape_batch = torch.tensor(0.0, device=device)
+            L_ov_scale_batch = torch.tensor(0.0, device=device)
+            L_ov_kl_batch = torch.tensor(0.0, device=device)
+
+            if train_pair_overlap and st_pair_iter is not None and not is_sc:
+                # Fetch a paired batch
+                pair_batch = next(st_pair_iter, None)
+                if pair_batch is None:
+                    st_pair_iter = iter(st_pair_loader)
+                    pair_batch = next(st_pair_iter, None)
+
+                if pair_batch is not None:
+                    # Extract paired batch data
+                    view1 = pair_batch['view1']
+                    view2 = pair_batch['view2']
+                    idx1_I = pair_batch['idx1_I'].to(device)
+                    idx2_I = pair_batch['idx2_I'].to(device)
+                    I_mask = pair_batch['I_mask'].to(device)
+                    I_sizes = pair_batch['I_sizes'].to(device)
+
+                    # Move view data to device
+                    Z_set_1 = view1['Z_set'].to(device)
+                    Z_set_2 = view2['Z_set'].to(device)
+                    mask_1 = view1['mask'].to(device)
+                    mask_2 = view2['mask'].to(device)
+                    V_target_1 = view1['V_target'].to(device)
+                    V_target_2 = view2['V_target'].to(device)
+
+                    B_pair = Z_set_1.shape[0]
+
+                    # SNR gating: only apply overlap loss at low/mid noise
+                    # Sample same sigma for both views (for consistency)
+                    with torch.no_grad():
+                        t_pair = torch.rand(B_pair, device=device)
+                        log_sigma_pair = P_mean + P_std * torch.randn(B_pair, device=device)
+                        sigma_pair = log_sigma_pair.exp().clamp(sigma_min, sigma_refine_max)
+                        sigma_pair_3d = sigma_pair.view(B_pair, 1, 1)
+
+                    # SNR gate check
+                    apply_ov_loss = (sigma_pair <= overlap_sigma_thresh).any()
+
+                    if apply_ov_loss:
+                        # Sample noise for both views
+                        eps_1 = torch.randn_like(V_target_1)
+                        eps_2 = torch.randn_like(V_target_2)
+
+                        # Apply coupled noise: make noise identical for overlapping points
+                        eps_1, eps_2 = apply_coupled_noise(eps_1, eps_2, idx1_I, idx2_I, I_mask)
+
+                        # Add noise to targets
+                        V_t_1 = V_target_1 + sigma_pair_3d * eps_1
+                        V_t_2 = V_target_2 + sigma_pair_3d * eps_2
+                        V_t_1 = V_t_1 * mask_1.unsqueeze(-1).float()
+                        V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
+
+                        # Encode contexts
+                        with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                            H_1 = context_encoder(Z_set_1, mask_1)
+                            H_2 = context_encoder(Z_set_2, mask_2)
+
+                            # Forward pass through score network (no self-cond for simplicity)
+                            sigma_flat_pair = sigma_pair.view(B_pair)
+
+                            x0_pred_1_result = score_net.forward_edm(
+                                V_t_1, sigma_flat_pair, H_1, mask_1, sigma_data,
+                                self_cond=None, return_debug=False
+                            )
+                            x0_pred_2_result = score_net.forward_edm(
+                                V_t_2, sigma_flat_pair, H_2, mask_2, sigma_data,
+                                self_cond=None, return_debug=False
+                            )
+
+                            if isinstance(x0_pred_1_result, tuple):
+                                x0_pred_1 = x0_pred_1_result[0]
+                            else:
+                                x0_pred_1 = x0_pred_1_result
+
+                            if isinstance(x0_pred_2_result, tuple):
+                                x0_pred_2 = x0_pred_2_result[0]
+                            else:
+                                x0_pred_2 = x0_pred_2_result
+
+                            # Compute overlap losses
+                            ov_loss_dict = compute_overlap_losses(
+                                x0_pred_1, x0_pred_2,
+                                idx1_I, idx2_I, I_mask,
+                                mask_1, mask_2,
+                                kl_tau=overlap_kl_tau,
+                            )
+
+                            L_ov_shape_batch = ov_loss_dict['L_ov_shape']
+                            L_ov_scale_batch = ov_loss_dict['L_ov_scale']
+                            L_ov_kl_batch = ov_loss_dict['L_ov_kl']
+
+                            # Track for logging
+                            if ov_loss_dict['valid_batch_count'] > 0:
+                                ov_loss_sum['shape'] += L_ov_shape_batch.item()
+                                ov_loss_sum['scale'] += L_ov_scale_batch.item()
+                                ov_loss_sum['kl'] += L_ov_kl_batch.item()
+                                L_ov_total = (overlap_loss_weight_shape * L_ov_shape_batch +
+                                              overlap_loss_weight_scale * L_ov_scale_batch +
+                                              overlap_loss_weight_kl * L_ov_kl_batch)
+                                ov_loss_sum['total'] += L_ov_total.item()
+                                ov_apply_count += 1
+                                ov_I_sizes.extend(ov_loss_dict['debug_info']['I_sizes'])
+                                if ov_loss_dict['debug_info']['jaccard_k10']:
+                                    ov_jaccard_k10.extend(ov_loss_dict['debug_info']['jaccard_k10'])
+
+                                # Add to total loss
+                                L_total = L_total + L_ov_total
+
+                            # Debug logging
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                debug_info = ov_loss_dict['debug_info']
+                                print(f"\n[OVLP] step={global_step} epoch={epoch}")
+                                print(f"  I_sizes: min={min(debug_info['I_sizes']) if debug_info['I_sizes'] else 0}, "
+                                      f"mean={np.mean(debug_info['I_sizes']) if debug_info['I_sizes'] else 0:.1f}")
+                                print(f"  L_ov_shape={L_ov_shape_batch.item():.6f}, "
+                                      f"L_ov_scale={L_ov_scale_batch.item():.6f}, "
+                                      f"L_ov_kl={L_ov_kl_batch.item():.6f}")
+                                print(f"  sigma_pair: min={sigma_pair.min().item():.4f}, "
+                                      f"max={sigma_pair.max().item():.4f}, "
+                                      f"thresh={overlap_sigma_thresh}")
+                                if debug_info['jaccard_k10']:
+                                    print(f"  [KNN-DIAG-OVLP] Jaccard@10: {np.mean(debug_info['jaccard_k10']):.4f}")
+                                if debug_info['trG1'] and debug_info['trG2']:
+                                    tr_ratio = np.mean(debug_info['trG1']) / (np.mean(debug_info['trG2']) + 1e-8)
+                                    print(f"  tr(G1)/tr(G2) ratio: {tr_ratio:.4f}")
+                                if debug_info['mean_pairwise_dist1'] and debug_info['mean_pairwise_dist2']:
+                                    d1 = np.mean(debug_info['mean_pairwise_dist1'])
+                                    d2 = np.mean(debug_info['mean_pairwise_dist2'])
+                                    print(f"  mean_pairwise_dist: view1={d1:.4f}, view2={d2:.4f}")
+                    else:
+                        ov_skipped_sigma += 1
+                        if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                            print(f"[OVLP] step={global_step} SKIPPED (sigma > {overlap_sigma_thresh})")
+
+            # Track overlap losses in epoch_losses
+            epoch_losses['ov_shape'] = epoch_losses.get('ov_shape', 0.0) + L_ov_shape_batch.item()
+            epoch_losses['ov_scale'] = epoch_losses.get('ov_scale', 0.0) + L_ov_scale_batch.item()
+            epoch_losses['ov_kl'] = epoch_losses.get('ov_kl', 0.0) + L_ov_kl_batch.item()
     
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
@@ -8795,9 +9200,39 @@ def train_stageC_diffusion_generator(
             history['epoch_avg']['ctx_hard_sim'].append(avg_ctx_hard_sim)
             history['epoch_avg']['ctx_perm_fixed'].append(avg_ctx_perm_fixed)
 
+            # ========== OVERLAP CONSISTENCY LOSS EPOCH SUMMARY ==========
+            if train_pair_overlap and ov_apply_count > 0:
+                avg_ov_shape = ov_loss_sum['shape'] / ov_apply_count
+                avg_ov_scale = ov_loss_sum['scale'] / ov_apply_count
+                avg_ov_kl = ov_loss_sum['kl'] / ov_apply_count
+                avg_ov_total = ov_loss_sum['total'] / ov_apply_count
+                ov_apply_rate = ov_apply_count / max(n_batches, 1)
 
-            
-            
+                # Track in history
+                if 'ov_shape' not in history['epoch_avg']:
+                    history['epoch_avg']['ov_shape'] = []
+                    history['epoch_avg']['ov_scale'] = []
+                    history['epoch_avg']['ov_kl'] = []
+                    history['epoch_avg']['ov_total'] = []
+                    history['epoch_avg']['ov_jaccard_k10'] = []
+                    history['epoch_avg']['ov_I_size_mean'] = []
+
+                history['epoch_avg']['ov_shape'].append(avg_ov_shape)
+                history['epoch_avg']['ov_scale'].append(avg_ov_scale)
+                history['epoch_avg']['ov_kl'].append(avg_ov_kl)
+                history['epoch_avg']['ov_total'].append(avg_ov_total)
+
+                avg_I_size = np.mean(ov_I_sizes) if ov_I_sizes else 0.0
+                avg_jaccard = np.mean(ov_jaccard_k10) if ov_jaccard_k10 else 0.0
+                history['epoch_avg']['ov_I_size_mean'].append(avg_I_size)
+                history['epoch_avg']['ov_jaccard_k10'].append(avg_jaccard)
+
+                print(f"\n[OVLP-EPOCH] Epoch {epoch+1} Overlap Loss Summary:")
+                print(f"  L_ov_shape={avg_ov_shape:.6f}, L_ov_scale={avg_ov_scale:.6f}, "
+                      f"L_ov_kl={avg_ov_kl:.6f}, L_ov_total={avg_ov_total:.6f}")
+                print(f"  apply_rate={ov_apply_rate:.2%}, skipped_sigma={ov_skipped_sigma}")
+                print(f"  avg_I_size={avg_I_size:.1f}, Jaccard@10={avg_jaccard:.4f}")
+
             # Print detailed losses every 5 epochs, simple summary otherwise
             if (epoch + 1) % 5 == 0:
                 avg_gram_scale = epoch_losses['gram_scale'] / max(n_batches, 1)
