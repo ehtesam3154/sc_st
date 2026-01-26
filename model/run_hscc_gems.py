@@ -164,6 +164,28 @@ def parse_args():
     parser.add_argument('--self_cond_mode', type=str, default='standard',
                         choices=['none', 'standard'],
                         help='Self-conditioning mode: none (disabled) or standard (two-pass)')
+    
+    # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
+    parser.add_argument('--train_pair_overlap', action=argparse.BooleanOptionalAction, default=False,
+                        help='Enable paired overlapping minisets for overlap-consistency training')
+    parser.add_argument('--pair_overlap_alpha', type=float, default=0.5,
+                        help='Fraction of core points that overlap between paired minisets (0.3-0.7 recommended)')
+    parser.add_argument('--pair_overlap_min_I', type=int, default=16,
+                        help='Minimum number of overlapping core points required')
+    parser.add_argument('--overlap_loss_weight_shape', type=float, default=1.0,
+                        help='Weight for overlap shape consistency loss (scale-free Gram)')
+    parser.add_argument('--overlap_loss_weight_scale', type=float, default=0.5,
+                        help='Weight for overlap scale consistency loss (log-trace difference)')
+    parser.add_argument('--overlap_loss_weight_kl', type=float, default=1.0,
+                        help='Weight for overlap KL neighbor distribution loss (targets Jaccard)')
+    parser.add_argument('--overlap_kl_tau', type=float, default=0.5,
+                        help='Temperature for soft neighbor distribution in KL loss')
+    parser.add_argument('--overlap_sigma_thresh', type=float, default=0.5,
+                        help='Max sigma for overlap loss (SNR gating - only apply at low/mid noise)')
+    parser.add_argument('--disable_ctx_loss_when_overlap', action=argparse.BooleanOptionalAction, default=True,
+                        help='Disable context replacement loss when using paired overlap training')
+    parser.add_argument('--overlap_debug_every', type=int, default=100,
+                        help='Debug print frequency for overlap loss')
 
     # ========== NEW: Stage A VICReg + Adversary Arguments ==========
     parser.add_argument('--stageA_obj', type=str, default='geom',
@@ -642,8 +664,18 @@ def main(args=None):
         ctx_debug_every=args.ctx_debug_every,
         # ========== SELF-CONDITIONING MODE ==========
         self_cond_mode=args.self_cond_mode,
+        # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
+        train_pair_overlap=args.train_pair_overlap,
+        pair_overlap_alpha=args.pair_overlap_alpha,
+        pair_overlap_min_I=args.pair_overlap_min_I,
+        overlap_loss_weight_shape=args.overlap_loss_weight_shape,
+        overlap_loss_weight_scale=args.overlap_loss_weight_scale,
+        overlap_loss_weight_kl=args.overlap_loss_weight_kl,
+        overlap_kl_tau=args.overlap_kl_tau,
+        overlap_sigma_thresh=args.overlap_sigma_thresh,
+        disable_ctx_loss_when_overlap=args.disable_ctx_loss_when_overlap,
+        overlap_debug_every=args.overlap_debug_every,
     )
-
 
     
     fabric.barrier()
@@ -759,6 +791,19 @@ def main(args=None):
             z_noise_std=0.0,       # Optional: could add 0.02 for robustness
             z_dropout_rate=0.0,    # Optional: could add 0.1 for robustness
             aug_prob=0.0,          # Optional: could add 0.5 for robustness
+            # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
+            # Note: In Phase 2 (SC fine-tune), overlap training may be less relevant
+            # but we pass through for consistency
+            train_pair_overlap=args.train_pair_overlap,
+            pair_overlap_alpha=args.pair_overlap_alpha,
+            pair_overlap_min_I=args.pair_overlap_min_I,
+            overlap_loss_weight_shape=args.overlap_loss_weight_shape,
+            overlap_loss_weight_scale=args.overlap_loss_weight_scale,
+            overlap_loss_weight_kl=args.overlap_loss_weight_kl,
+            overlap_kl_tau=args.overlap_kl_tau,
+            overlap_sigma_thresh=args.overlap_sigma_thresh,
+            disable_ctx_loss_when_overlap=args.disable_ctx_loss_when_overlap,
+            overlap_debug_every=args.overlap_debug_every,
         )
         
         fabric.barrier()

@@ -436,7 +436,17 @@ class GEMSModel:
         ctx_debug_every: int = 100,
         # ========== SELF-CONDITIONING MODE ==========
         self_cond_mode: str = 'standard',
-
+        # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
+        train_pair_overlap: bool = False,
+        pair_overlap_alpha: float = 0.5,
+        pair_overlap_min_I: int = 16,
+        overlap_loss_weight_shape: float = 1.0,
+        overlap_loss_weight_scale: float = 0.5,
+        overlap_loss_weight_kl: float = 1.0,
+        overlap_kl_tau: float = 0.5,
+        overlap_sigma_thresh: float = 0.5,
+        disable_ctx_loss_when_overlap: bool = True,
+        overlap_debug_every: int = 100,
     ):
 
 
@@ -610,6 +620,17 @@ class GEMSModel:
             ctx_debug_every=ctx_debug_every,
             # ========== SELF-CONDITIONING MODE ==========
             self_cond_mode=self_cond_mode,
+            # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
+            train_pair_overlap=train_pair_overlap,
+            pair_overlap_alpha=pair_overlap_alpha,
+            pair_overlap_min_I=pair_overlap_min_I,
+            overlap_loss_weight_shape=overlap_loss_weight_shape,
+            overlap_loss_weight_scale=overlap_loss_weight_scale,
+            overlap_loss_weight_kl=overlap_loss_weight_kl,
+            overlap_kl_tau=overlap_kl_tau,
+            overlap_sigma_thresh=overlap_sigma_thresh,
+            disable_ctx_loss_when_overlap=disable_ctx_loss_when_overlap,
+            overlap_debug_every=overlap_debug_every,
         )
 
 
