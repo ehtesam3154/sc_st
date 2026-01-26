@@ -8212,6 +8212,7 @@ def train_stageC_diffusion_generator(
             L_ov_shape_batch = torch.tensor(0.0, device=device)
             L_ov_scale_batch = torch.tensor(0.0, device=device)
             L_ov_kl_batch = torch.tensor(0.0, device=device)
+            L_score_2_batch = torch.tensor(0.0, device=device)  # View2 score loss (scale anchor)
 
             if train_pair_overlap and pair_batch_full is not None and not is_sc:
                 ov_pair_batches += 1
@@ -8297,6 +8298,21 @@ def train_stageC_diffusion_generator(
                         else:
                             x0_pred_2 = x0_pred_2_result
 
+                        # ============================================================
+                        # FIX: Add score loss for view2 to prevent scale drift
+                        # Without this, view2 has no scale supervision - only overlap
+                        # consistency. This allows view2 scale to drift arbitrarily,
+                        # and the overlap scale loss then pulls view1 down with it.
+                        # ============================================================
+                        mask_2_f = mask_2.unsqueeze(-1).float()
+                        score_error_2 = (x0_pred_2 - V_target_2) * mask_2_f
+                        L_score_2 = score_error_2.pow(2).sum() / mask_2_f.sum().clamp(min=1.0)
+
+                        # Add view2 score loss with same weight as main score loss
+                        # This anchors view2's scale to its target
+                        L_total = L_total + WEIGHTS.get('score', 1.0) * L_score_2
+                        L_score_2_batch = L_score_2  # Store for epoch tracking
+
                         # Compute overlap losses
                         ov_loss_dict = compute_overlap_losses(
                             x0_pred_1, x0_pred_2,
@@ -8341,6 +8357,7 @@ def train_stageC_diffusion_generator(
                         if global_step % overlap_debug_every == 0:
                             rank = dist.get_rank() if dist.is_initialized() else 0
                             print(f"  [rank={rank}] valid_batch_count={ov_loss_dict['valid_batch_count']}")
+                            print(f"  [rank={rank}] L_score_2={L_score_2.item():.6f} (view2 scale anchor)")
                             if ov_loss_dict['debug_info']['I_sizes']:
                                 print(f"  [rank={rank}] I_sizes: min={min(ov_loss_dict['debug_info']['I_sizes'])}, "
                                     f"mean={np.mean(ov_loss_dict['debug_info']['I_sizes']):.1f}")
@@ -8361,6 +8378,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['ov_shape'] = epoch_losses.get('ov_shape', 0.0) + L_ov_shape_batch.item()
             epoch_losses['ov_scale'] = epoch_losses.get('ov_scale', 0.0) + L_ov_scale_batch.item()
             epoch_losses['ov_kl'] = epoch_losses.get('ov_kl', 0.0) + L_ov_kl_batch.item()
+            epoch_losses['score_2'] = epoch_losses.get('score_2', 0.0) + L_score_2_batch.item()  # View2 scale anchor
     
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
