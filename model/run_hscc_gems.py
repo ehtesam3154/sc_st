@@ -792,6 +792,19 @@ def main(args=None):
             z_noise_std=0.0,       # Optional: could add 0.02 for robustness
             z_dropout_rate=0.0,    # Optional: could add 0.1 for robustness
             aug_prob=0.0,          # Optional: could add 0.5 for robustness
+            # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
+            # Note: In Phase 2 (SC fine-tune), overlap training may be less relevant
+            # but we pass through for consistency
+            train_pair_overlap=args.train_pair_overlap,
+            pair_overlap_alpha=args.pair_overlap_alpha,
+            pair_overlap_min_I=args.pair_overlap_min_I,
+            overlap_loss_weight_shape=args.overlap_loss_weight_shape,
+            overlap_loss_weight_scale=args.overlap_loss_weight_scale,
+            overlap_loss_weight_kl=args.overlap_loss_weight_kl,
+            overlap_kl_tau=args.overlap_kl_tau,
+            overlap_sigma_thresh=args.overlap_sigma_thresh,
+            disable_ctx_loss_when_overlap=args.disable_ctx_loss_when_overlap,
+            overlap_debug_every=args.overlap_debug_every,
         )
         
         fabric.barrier()
