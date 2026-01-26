@@ -3395,7 +3395,7 @@ def train_stageC_diffusion_generator(
             'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],
             'dim': [], 'triangle': [], 'radial': [],
             'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': [],
-            'ov_shape': [], 'ov_scale': [], 'ov_kl': [],
+            'ov_shape': [], 'ov_scale': [], 'ov_kl': [], 'score_2': [],
             'ctx_edge': [],  # NEW: context invariance loss
             'ctx_replace': [],
             'ctx_snr_med': [],
@@ -3436,6 +3436,7 @@ def train_stageC_diffusion_generator(
                 history['epoch_avg'].setdefault('ov_shape', [])
                 history['epoch_avg'].setdefault('ov_scale', [])
                 history['epoch_avg'].setdefault('ov_kl', [])
+                history['epoch_avg'].setdefault('score_2', [])
 
         if 'sigma_data' in ckpt:
             sigma_data = ckpt['sigma_data']
@@ -8212,6 +8213,7 @@ def train_stageC_diffusion_generator(
             L_ov_shape_batch = torch.tensor(0.0, device=device)
             L_ov_scale_batch = torch.tensor(0.0, device=device)
             L_ov_kl_batch = torch.tensor(0.0, device=device)
+            L_score_2_batch = torch.tensor(0.0, device=device)
 
             if train_pair_overlap and pair_batch_full is not None and not is_sc:
                 ov_pair_batches += 1
@@ -8249,22 +8251,47 @@ def train_stageC_diffusion_generator(
                     I_mask = I_mask[idx_keep]
                     I_sizes = I_sizes[idx_keep]
 
-                    # Also slice view1 tensors to match
+                    # Also slice view1 tensors to match - use _ov suffix to avoid corrupting originals
+                    # HYGIENE FIX: Don't overwrite mask/eps which may be used later in the iteration
                     x0_pred_1 = x0_pred[idx_keep]
-                    mask = mask[idx_keep]
-                    sigma_pair = sigma_pair[idx_keep]
-                    sigma_pair_3d = sigma_pair_3d[idx_keep]
-                    eps = eps[idx_keep]
-
-                    # DEBUG: gate + sigma stats (rank0 only)
+                    mask_ov = mask[idx_keep]  # Was: mask = mask[idx_keep]
+                    sigma_pair_ov = sigma_pair[idx_keep]  # Was: sigma_pair = sigma_pair[idx_keep]
+                    sigma_pair_3d_ov = sigma_pair_3d[idx_keep]  # Was: sigma_pair_3d = sigma_pair_3d[idx_keep]
+                    eps_ov = eps[idx_keep]  # Was: eps = eps[idx_keep]
+ 
+                    # DEBUG: gate + sigma stats
                     if global_step % overlap_debug_every == 0:
                         rank = dist.get_rank() if dist.is_initialized() else 0
                         print(f"\n[OVLP-GATE][rank={rank}] step={global_step} epoch={epoch}")
                         print(f"  ov_keep: {ov_keep.sum().item()}/{ov_keep.numel()} kept")
-                        print(f"  sigma_pair: min={sigma_pair.min().item():.4f}, "
-                            f"median={sigma_pair.median().item():.4f}, "
-                            f"max={sigma_pair.max().item():.4f}, "
+                        print(f"  sigma_pair: min={sigma_pair_ov.min().item():.4f}, "
+                            f"median={sigma_pair_ov.median().item():.4f}, "
+                            f"max={sigma_pair_ov.max().item():.4f}, "
                             f"thresh={overlap_sigma_thresh}")
+
+                        # ============ [VTGT-PAIR] Target consistency check ============
+                        with torch.no_grad():
+                            V_tgt_1 = V_target[idx_keep]
+                            m1_f = mask_ov.unsqueeze(-1).float()
+                            m2_f = mask_2.unsqueeze(-1).float()
+                            
+                            rms_tgt_1 = (V_tgt_1.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                            rms_tgt_1 = rms_tgt_1.sqrt().item()
+                            rms_tgt_2 = (V_target_2.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
+                            rms_tgt_2 = rms_tgt_2.sqrt().item()
+                            
+                            # Gram traces
+                            G_tgt_1 = V_tgt_1 @ V_tgt_1.transpose(1, 2)
+                            G_tgt_2 = V_target_2 @ V_target_2.transpose(1, 2)
+                            tr_tgt_1 = (G_tgt_1.diagonal(dim1=1, dim2=2) * mask_ov.float()).sum(dim=1).mean().item()
+                            tr_tgt_2 = (G_tgt_2.diagonal(dim1=1, dim2=2) * mask_2.float()).sum(dim=1).mean().item()
+                            
+                            print(f"\n[VTGT-PAIR] step={global_step}")
+                            print(f"  rms(V_target_1)={rms_tgt_1:.4f} rms(V_target_2)={rms_tgt_2:.4f}")
+                            print(f"  trace(G_tgt_1)={tr_tgt_1:.4f} trace(G_tgt_2)={tr_tgt_2:.4f}")
+                            if rms_tgt_2 > 0:
+                                print(f"  target_rms_ratio={rms_tgt_1/rms_tgt_2:.4f} (should be ~1.0)")
+
 
                     # Sample noise for view2
                     eps_2 = torch.randn_like(V_target_2)
@@ -8276,19 +8303,19 @@ def train_stageC_diffusion_generator(
                         if n_I > 0:
                             idx1 = idx1_I[b, I_valid]
                             idx2 = idx2_I[b, I_valid]
-                            eps_2[b, idx2] = eps[b, idx1]
-
+                            eps_2[b, idx2] = eps_ov[b, idx1]  # Use sliced eps_ov
+ 
                     # Add noise to view2 target
-                    V_t_2 = V_target_2 + sigma_pair_3d * eps_2
+                    V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
                     V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
-
+ 
                     # Encode view2 context
                     with torch.autocast(device_type='cuda', dtype=amp_dtype):
                         H_2 = context_encoder(Z_set_2, mask_2)
-
+ 
                         # Forward pass for view2
                         x0_pred_2_result = score_net.forward_edm(
-                            V_t_2, sigma_pair, H_2, mask_2, sigma_data,
+                            V_t_2, sigma_pair_ov, H_2, mask_2, sigma_data,  # Use sliced sigma_pair_ov
                             self_cond=None, return_debug=False
                         )
 
@@ -8297,11 +8324,26 @@ def train_stageC_diffusion_generator(
                         else:
                             x0_pred_2 = x0_pred_2_result
 
+                        # ============================================================
+                        # FIX: Add score loss for view2 to prevent scale drift
+                        # Without this, view2 has no scale supervision - only overlap
+                        # consistency. This allows view2 scale to drift arbitrarily,
+                        # and the overlap scale loss then pulls view1 down with it.
+                        # ============================================================
+                        mask_2_f = mask_2.unsqueeze(-1).float()
+                        score_error_2 = (x0_pred_2 - V_target_2) * mask_2_f
+                        L_score_2 = score_error_2.pow(2).sum() / mask_2_f.sum().clamp(min=1.0)
+
+                        # Add view2 score loss with same weight as main score loss
+                        # This anchors view2's scale to its target
+                        L_total = L_total + WEIGHTS.get('score', 1.0) * L_score_2
+                        L_score_2_batch = L_score_2  # Store for epoch tracking
+
                         # Compute overlap losses
                         ov_loss_dict = compute_overlap_losses(
                             x0_pred_1, x0_pred_2,
                             idx1_I, idx2_I, I_mask,
-                            mask, mask_2,
+                            mask_ov, mask_2,
                             kl_tau=overlap_kl_tau,
                         )
 
@@ -8335,15 +8377,155 @@ def train_stageC_diffusion_generator(
                                 ov_I_sizes.extend(ov_loss_dict['debug_info']['I_sizes'])
                             if ov_loss_dict['debug_info']['jaccard_k10']:
                                 ov_jaccard_k10.extend(ov_loss_dict['debug_info']['jaccard_k10'])
+
+                            # ============ [OVLP-VS-GLOBAL] Overlap vs Global health ============
+                            if global_step % overlap_debug_every == 0:
+                                with torch.no_grad():
+                                    # Get overlap Jaccard from the debug info
+                                    ov_jacc = ov_loss_dict['debug_info'].get('jaccard_k10', [])
+                                    ov_jacc_mean = np.mean(ov_jacc) if ov_jacc else 0.0
+                                    
+                                    # Get overlap scale ratio from loss dict
+                                    ov_scale_r = ov_loss_dict.get('debug_scale_ratio', 1.0)
+                                    
+                                    # Compute GLOBAL Jaccard@10 on view1 (full set, not just overlap)
+                                    global_jacc_sum = 0.0
+                                    global_jacc_cnt = 0
+                                    for b in range(min(4, x0_pred_1.shape[0])):
+                                        m_b = mask_ov[b].bool()
+                                        n_valid = int(m_b.sum().item())
+                                        if n_valid < 15:
+                                            continue
+                                        
+                                        pred_b = x0_pred_1[b, m_b]
+                                        tgt_b = V_target[idx_keep][b, m_b]
+                                        
+                                        D_pred = torch.cdist(pred_b, pred_b)
+                                        D_tgt = torch.cdist(tgt_b, tgt_b)
+                                        
+                                        k_j = min(10, n_valid - 1)
+                                        _, knn_pred = D_pred.topk(k_j + 1, largest=False)
+                                        _, knn_tgt = D_tgt.topk(k_j + 1, largest=False)
+                                        knn_pred = knn_pred[:, 1:]
+                                        knn_tgt = knn_tgt[:, 1:]
+                                        
+                                        for i in range(n_valid):
+                                            set_pred = set(knn_pred[i].tolist())
+                                            set_tgt = set(knn_tgt[i].tolist())
+                                            inter = len(set_pred & set_tgt)
+                                            union = len(set_pred | set_tgt)
+                                            if union > 0:
+                                                global_jacc_sum += inter / union
+                                                global_jacc_cnt += 1
+                                    
+                                    global_jacc_mean = global_jacc_sum / max(global_jacc_cnt, 1)
+                                    
+                                    # Global scale ratio
+                                    m1_f = mask_ov.unsqueeze(-1).float()
+                                    rms_pred_g = (x0_pred_1.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                    rms_pred_g = rms_pred_g.sqrt().item()
+                                    rms_tgt_g = (V_target[idx_keep].pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                    rms_tgt_g = rms_tgt_g.sqrt().item()
+                                    global_scale_r = rms_pred_g / max(rms_tgt_g, 1e-8)
+                                    
+                                    print(f"\n[OVLP-VS-GLOBAL] step={global_step}")
+                                    print(f"  Overlap:  Jacc@10={ov_jacc_mean:.4f}")
+                                    print(f"  Global:   Jacc@10={global_jacc_mean:.4f} scale_r={global_scale_r:.4f}")
+                                    print(f"  Delta:    ov-global Jacc={ov_jacc_mean - global_jacc_mean:.4f}")
+                                    if ov_jacc_mean > global_jacc_mean + 0.1:
+                                        print(f"  WARNING: Overlap much better than global - possible degenerate solution!")
+
                         else:
                             ov_no_valid += 1
 
                         if global_step % overlap_debug_every == 0:
                             rank = dist.get_rank() if dist.is_initialized() else 0
                             print(f"  [rank={rank}] valid_batch_count={ov_loss_dict['valid_batch_count']}")
+                            print(f"  [rank={rank}] L_score_2={L_score_2.item():.6f} (view2 scale anchor)")
                             if ov_loss_dict['debug_info']['I_sizes']:
                                 print(f"  [rank={rank}] I_sizes: min={min(ov_loss_dict['debug_info']['I_sizes'])}, "
                                     f"mean={np.mean(ov_loss_dict['debug_info']['I_sizes']):.1f}")
+
+                            # ============ [PAIR-SCALE] View1 vs View2 scale comparison ============
+                            with torch.no_grad():
+                                m1_f = mask_ov.unsqueeze(-1).float()
+                                m2_f = mask_2.unsqueeze(-1).float()
+                                
+                                rms_pred_1 = (x0_pred_1.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                rms_pred_1 = rms_pred_1.sqrt().item()
+                                rms_tgt_1 = (V_target[idx_keep].pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                rms_tgt_1 = rms_tgt_1.sqrt().item()
+                                scale_r_1 = rms_pred_1 / max(rms_tgt_1, 1e-8)
+                                
+                                rms_pred_2 = (x0_pred_2.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
+                                rms_pred_2 = rms_pred_2.sqrt().item()
+                                rms_tgt_2 = (V_target_2.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
+                                rms_tgt_2 = rms_tgt_2.sqrt().item()
+                                scale_r_2 = rms_pred_2 / max(rms_tgt_2, 1e-8)
+                                
+                                scale_gap = abs(np.log(scale_r_1 + 1e-8) - np.log(scale_r_2 + 1e-8))
+                                
+                                print(f"\n[PAIR-SCALE] step={global_step}")
+                                print(f"  View1: rms_pred={rms_pred_1:.4f} rms_tgt={rms_tgt_1:.4f} scale_r={scale_r_1:.4f}")
+                                print(f"  View2: rms_pred={rms_pred_2:.4f} rms_tgt={rms_tgt_2:.4f} scale_r={scale_r_2:.4f}")
+                                print(f"  scale_gap (|log diff|)={scale_gap:.4f} (want < 0.1)")
+
+                            # ============ [PAIR-LOSS] Loss component breakdown ============
+                            L_score_1_val = L_score.item() if isinstance(L_score, torch.Tensor) else 0.0
+                            L_score_2_val = L_score_2.item()
+                            L_ov_total = L_ov_shape_batch.item() + L_ov_scale_batch.item() + L_ov_kl_batch.item()
+                            w_score = WEIGHTS.get('score', 1.0)
+                            w_ov = overlap_loss_weight_shape + overlap_loss_weight_scale + overlap_loss_weight_kl
+                            
+                            score_contrib = w_score * (L_score_1_val + L_score_2_val)
+                            ov_contrib = w_ov * L_ov_total if L_ov_total > 0 else 0.0
+                            ratio_ov_score = ov_contrib / max(score_contrib, 1e-8)
+                            
+                            print(f"\n[PAIR-LOSS] step={global_step}")
+                            print(f"  L_score_1={L_score_1_val:.6f} L_score_2={L_score_2_val:.6f}")
+                            print(f"  L_ov: shape={L_ov_shape_batch.item():.6f} scale={L_ov_scale_batch.item():.6f} kl={L_ov_kl_batch.item():.6f}")
+                            print(f"  weighted_ratio (ov/score)={ratio_ov_score:.4f} (watch if >> 1 early)")
+
+                            # ============ [BLOB-CHECK] Collapse detection ============
+                            with torch.no_grad():
+                                # View1 blob check
+                                pred_1_valid = x0_pred_1[mask_ov.bool()]
+                                if pred_1_valid.numel() > 0:
+                                    var_per_dim_1 = pred_1_valid.var(dim=0).mean().item()
+                                    # Sample pairwise distances (subsample if large)
+                                    n_pts_1 = min(pred_1_valid.shape[0], 500)
+                                    idx_sub = torch.randperm(pred_1_valid.shape[0])[:n_pts_1]
+                                    d_pred_1 = torch.cdist(pred_1_valid[idx_sub], pred_1_valid[idx_sub])
+                                    d_pred_1_med = d_pred_1[d_pred_1 > 0].median().item() if (d_pred_1 > 0).any() else 0.0
+                                    
+                                    tgt_1_valid = V_target[idx_keep][mask_ov.bool()]
+                                    d_tgt_1 = torch.cdist(tgt_1_valid[idx_sub], tgt_1_valid[idx_sub])
+                                    d_tgt_1_med = d_tgt_1[d_tgt_1 > 0].median().item() if (d_tgt_1 > 0).any() else 0.0
+                                else:
+                                    var_per_dim_1, d_pred_1_med, d_tgt_1_med = 0.0, 0.0, 0.0
+                                
+                                # View2 blob check
+                                pred_2_valid = x0_pred_2[mask_2.bool()]
+                                if pred_2_valid.numel() > 0:
+                                    var_per_dim_2 = pred_2_valid.var(dim=0).mean().item()
+                                    n_pts_2 = min(pred_2_valid.shape[0], 500)
+                                    idx_sub_2 = torch.randperm(pred_2_valid.shape[0])[:n_pts_2]
+                                    d_pred_2 = torch.cdist(pred_2_valid[idx_sub_2], pred_2_valid[idx_sub_2])
+                                    d_pred_2_med = d_pred_2[d_pred_2 > 0].median().item() if (d_pred_2 > 0).any() else 0.0
+                                    
+                                    tgt_2_valid = V_target_2[mask_2.bool()]
+                                    d_tgt_2 = torch.cdist(tgt_2_valid[idx_sub_2], tgt_2_valid[idx_sub_2])
+                                    d_tgt_2_med = d_tgt_2[d_tgt_2 > 0].median().item() if (d_tgt_2 > 0).any() else 0.0
+                                else:
+                                    var_per_dim_2, d_pred_2_med, d_tgt_2_med = 0.0, 0.0, 0.0
+                                
+                                print(f"\n[BLOB-CHECK] step={global_step}")
+                                print(f"  View1: var_per_dim={var_per_dim_1:.6f} d_pred_med={d_pred_1_med:.4f} d_tgt_med={d_tgt_1_med:.4f}")
+                                print(f"  View2: var_per_dim={var_per_dim_2:.6f} d_pred_med={d_pred_2_med:.4f} d_tgt_med={d_tgt_2_med:.4f}")
+                                if d_tgt_1_med > 0:
+                                    print(f"  View1 dist_ratio={d_pred_1_med/d_tgt_1_med:.4f} (blob if << 1)")
+                                if d_tgt_2_med > 0:
+                                    print(f"  View2 dist_ratio={d_pred_2_med/d_tgt_2_med:.4f} (blob if << 1)")
 
 
                 else:
@@ -8361,6 +8543,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['ov_shape'] = epoch_losses.get('ov_shape', 0.0) + L_ov_shape_batch.item()
             epoch_losses['ov_scale'] = epoch_losses.get('ov_scale', 0.0) + L_ov_scale_batch.item()
             epoch_losses['ov_kl'] = epoch_losses.get('ov_kl', 0.0) + L_ov_kl_batch.item()
+            epoch_losses['score_2'] = epoch_losses.get('score_2', 0.0) + L_score_2_batch.item()  # View2 scale anchor
     
             
             # ==================== GRADIENT PROBE (IMPROVED) ====================
@@ -8884,8 +9067,12 @@ def train_stageC_diffusion_generator(
         # =====================================================================
         # FIXED-BATCH EVALUATION AT FIXED SIGMAS (once per epoch)
         # =====================================================================
-        if (fabric is None or fabric.is_global_zero) and use_st and (epoch % 5 == 0):
+        # Run fixed-batch eval at epochs 1,3,5,10 for early detection, then every 5 epochs
+        early_eval_epochs = {0, 2, 4, 9}  # 0-indexed: epochs 1,3,5,10
+        run_fixed_eval = (epoch % 5 == 0) or (epoch in early_eval_epochs)
+        if (fabric is None or fabric.is_global_zero) and use_st and run_fixed_eval:
             fixed_eval_sigmas = [0.05, 0.15, 0.40, 0.70, 1.20, 2.40]
+
             
             fixed_batch_data = edm_debug_state.get('fixed_batch', None)
             
