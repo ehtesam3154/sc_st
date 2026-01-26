@@ -3068,10 +3068,15 @@ def train_stageC_diffusion_generator(
                 )
                 batch = next(iter(st_loader_temp))
             
+            # If paired batch, use view1 for main losses
+            if isinstance(batch, dict) and batch.get('is_pair_batch', False):
+                batch = batch['view1']
+
             V_target = batch['V_target'].to(device)
             mask = batch['mask'].to(device)
             A_ref = loss_triangle._compute_avg_triangle_area(V_target, mask)
             triangle_refs.extend(A_ref.cpu().tolist())
+
     
     # triangle_epsilon_st = 1.0 * float(torch.tensor(triangle_refs).median())
     areas = np.array(triangle_refs)
@@ -3096,6 +3101,10 @@ def train_stageC_diffusion_generator(
             except StopIteration:
                 st_iter_repel = iter(st_loader)
                 batch = next(st_iter_repel)
+
+            # If paired batch, use view1 for main losses
+            if isinstance(batch, dict) and batch.get('is_pair_batch', False):
+                batch = batch['view1']
             
             D_target = batch['D_target'].to(device)
             mask = batch['mask'].to(device)
@@ -3386,6 +3395,7 @@ def train_stageC_diffusion_generator(
             'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],
             'dim': [], 'triangle': [], 'radial': [],
             'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': [],
+            'ov_shape': [], 'ov_scale': [], 'ov_kl': [],
             'ctx_edge': [],  # NEW: context invariance loss
             'ctx_replace': [],
             'ctx_snr_med': [],
@@ -3422,6 +3432,10 @@ def train_stageC_diffusion_generator(
 
         if 'history' in ckpt:
             history = ckpt['history']
+            if 'epoch_avg' in history:
+                history['epoch_avg'].setdefault('ov_shape', [])
+                history['epoch_avg'].setdefault('ov_scale', [])
+                history['epoch_avg'].setdefault('ov_kl', [])
 
         if 'sigma_data' in ckpt:
             sigma_data = ckpt['sigma_data']
@@ -3513,6 +3527,10 @@ def train_stageC_diffusion_generator(
                     sample_batch = next(it, None)
                     if sample_batch is None:
                         break
+
+                    if isinstance(sample_batch, dict) and sample_batch.get('is_pair_batch', False):
+                        sample_batch = sample_batch['view1']
+
                     V_batch = sample_batch['V_target'].to(device, non_blocking=True)
                     mask_batch = sample_batch['mask'].to(device, non_blocking=True)
                     for i in range(min(4, V_batch.shape[0])):
@@ -3547,6 +3565,10 @@ def train_stageC_diffusion_generator(
         # Phase 0.3: Store fixed evaluation batch
         try:
             fixed_batch_raw = next(iter(st_loader))
+
+            if isinstance(fixed_batch_raw, dict) and fixed_batch_raw.get('is_pair_batch', False):
+                fixed_batch_raw = fixed_batch_raw['view1']
+
             edm_debug_state['fixed_batch'] = {
                 'Z_set': fixed_batch_raw['Z_set'].cpu(),
                 'mask': fixed_batch_raw['mask'].cpu(),
@@ -3557,6 +3579,7 @@ def train_stageC_diffusion_generator(
             print("[PHASE 0] Fixed evaluation batch stored")
         except:
             print("[PHASE 0] WARNING: Could not store fixed batch")
+
         
         # 1.1 Target stats (masked, per-set)
         print("\n[PHASE 1.1] Target Statistics (V_target):")
@@ -3569,6 +3592,10 @@ def train_stageC_diffusion_generator(
                 batch_temp = next(it_temp)
             except:
                 break
+
+            if isinstance(batch_temp, dict) and batch_temp.get('is_pair_batch', False):
+                batch_temp = batch_temp['view1']
+
             V_temp = batch_temp['V_target'].to(device)
             mask_temp = batch_temp['mask'].to(device)
             
@@ -3580,6 +3607,7 @@ def train_stageC_diffusion_generator(
                 V_b = V_temp[b, m_b]  # (n_valid, D)
                 v_target_stds.append(V_b.std().item())
                 v_target_rms_list.append(V_b.pow(2).mean().sqrt().item())
+
         
         if v_target_stds:
             v_std_arr = np.array(v_target_stds)
@@ -3607,12 +3635,17 @@ def train_stageC_diffusion_generator(
                 batch_bl = next(it_baseline)
             except:
                 break
+
+            if isinstance(batch_bl, dict) and batch_bl.get('is_pair_batch', False):
+                batch_bl = batch_bl['view1']
+
             V_bl = batch_bl['V_target'].to(device)
             mask_bl = batch_bl['mask'].to(device)
             
             eps_bl = torch.randn_like(V_bl)
             V_t_bl = V_bl + sigma_test * eps_bl
             V_t_bl = V_t_bl * mask_bl.unsqueeze(-1).float()
+
             
             # Baseline: no denoising (x0_baseline = V_t)
             err_bl = (V_t_bl - V_bl).pow(2).sum(dim=-1)  # (B, N)
@@ -3799,6 +3832,8 @@ def train_stageC_diffusion_generator(
         ov_loss_sum = {'shape': 0.0, 'scale': 0.0, 'kl': 0.0, 'total': 0.0}
         ov_apply_count = 0
         ov_skipped_sigma = 0
+        ov_pair_batches = 0
+        ov_no_valid = 0
         ov_I_sizes = []
         ov_jaccard_k10 = []
 
@@ -5447,10 +5482,11 @@ def train_stageC_diffusion_generator(
             L_ctx_replace = torch.tensor(0.0, device=device)
 
             if (not is_sc and 
-                ctx_loss_weight > 0 and 
+                effective_ctx_loss_weight > 0 and 
                 'anchor_mask' in batch and 
                 'knn_spatial' in batch and
-                not anchor_train):  # Only apply in unanchored mode
+                not anchor_train):
+
                 
                 # Get core mask (anchor_mask marks core vs extras regardless of anchor_train)
                 core_mask = batch['anchor_mask'].to(device).bool() & mask
@@ -8178,6 +8214,7 @@ def train_stageC_diffusion_generator(
             L_ov_kl_batch = torch.tensor(0.0, device=device)
 
             if train_pair_overlap and pair_batch_full is not None and not is_sc:
+                ov_pair_batches += 1
                 # Use the paired batch we already have (view1 was used for main losses above)
                 view2 = pair_batch_full['view2']
                 idx1_I = pair_batch_full['idx1_I'].to(device)
@@ -8197,16 +8234,42 @@ def train_stageC_diffusion_generator(
                 sigma_pair_3d = sigma_t  # Reuse the 3D version
 
                 # SNR gate check
-                apply_ov_loss = (sigma_pair <= overlap_sigma_thresh).any()
+                # Per-sample gate: only apply overlap loss to samples with sigma <= threshold
+                ov_keep = (sigma_pair <= overlap_sigma_thresh)  # (B,)
+                if ov_keep.any():
+                    idx_keep = ov_keep.nonzero(as_tuple=True)[0]
 
-                if apply_ov_loss:
-                    # We already have eps for view1 from the main training - that's 'eps'
-                    # Sample new noise for view2
+                    # Slice paired tensors to only the valid samples
+                    Z_set_2 = Z_set_2[idx_keep]
+                    mask_2 = mask_2[idx_keep]
+                    V_target_2 = V_target_2[idx_keep]
+
+                    idx1_I = idx1_I[idx_keep]
+                    idx2_I = idx2_I[idx_keep]
+                    I_mask = I_mask[idx_keep]
+                    I_sizes = I_sizes[idx_keep]
+
+                    # Also slice view1 tensors to match
+                    x0_pred_1 = x0_pred[idx_keep]
+                    mask = mask[idx_keep]
+                    sigma_pair = sigma_pair[idx_keep]
+                    sigma_pair_3d = sigma_pair_3d[idx_keep]
+                    eps = eps[idx_keep]
+
+                    # DEBUG: gate + sigma stats (rank0 only)
+                    if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                        print(f"\n[OVLP-GATE] step={global_step} epoch={epoch}")
+                        print(f"  ov_keep: {ov_keep.sum().item()}/{ov_keep.numel()} kept")
+                        print(f"  sigma_pair: min={sigma_pair.min().item():.4f}, "
+                            f"median={sigma_pair.median().item():.4f}, "
+                            f"max={sigma_pair.max().item():.4f}, "
+                            f"thresh={overlap_sigma_thresh}")
+
+                    # Sample noise for view2
                     eps_2 = torch.randn_like(V_target_2)
 
-                    # Apply coupled noise: copy view1 noise to corresponding view2 overlap positions
-                    # View1's noise is 'eps', view1's indices are idx1_I
-                    for b in range(B_pair):
+                    # Apply coupled noise: copy view1 noise to view2 overlap positions
+                    for b in range(Z_set_2.shape[0]):
                         I_valid = I_mask[b]
                         n_I = I_valid.sum().item()
                         if n_I > 0:
@@ -8233,56 +8296,27 @@ def train_stageC_diffusion_generator(
                         else:
                             x0_pred_2 = x0_pred_2_result
 
-                        # x0_pred for view1 is already computed as 'x0_pred' from main training
-                        x0_pred_1 = x0_pred
-
                         # Compute overlap losses
                         ov_loss_dict = compute_overlap_losses(
                             x0_pred_1, x0_pred_2,
                             idx1_I, idx2_I, I_mask,
-                            mask, mask_2,  # mask is view1's mask
+                            mask, mask_2,
                             kl_tau=overlap_kl_tau,
                         )
 
-                        L_ov_shape_batch = ov_loss_dict['L_ov_shape']
-                        L_ov_scale_batch = ov_loss_dict['L_ov_scale']
-                        L_ov_kl_batch = ov_loss_dict['L_ov_kl']
-
-                        # Track for logging
-                        if ov_loss_dict['valid_batch_count'] > 0:
-                            ov_loss_sum['shape'] += L_ov_shape_batch.item()
-                            ov_loss_sum['scale'] += L_ov_scale_batch.item()
-                            ov_loss_sum['kl'] += L_ov_kl_batch.item()
-                            L_ov_total = (overlap_loss_weight_shape * L_ov_shape_batch +
-                                          overlap_loss_weight_scale * L_ov_scale_batch +
-                                          overlap_loss_weight_kl * L_ov_kl_batch)
-                            ov_loss_sum['total'] += L_ov_total.item()
-                            ov_apply_count += 1
-                            ov_I_sizes.extend(ov_loss_dict['debug_info']['I_sizes'])
-                            if ov_loss_dict['debug_info']['jaccard_k10']:
-                                ov_jaccard_k10.extend(ov_loss_dict['debug_info']['jaccard_k10'])
-
-                            # Add to total loss
-                            L_total = L_total + L_ov_total
-
-                        # Debug logging
                         if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                            debug_info = ov_loss_dict['debug_info']
-                            print(f"\n[OVLP] step={global_step} epoch={epoch}")
-                            print(f"  I_sizes: min={min(debug_info['I_sizes']) if debug_info['I_sizes'] else 0}, "
-                                  f"mean={np.mean(debug_info['I_sizes']) if debug_info['I_sizes'] else 0:.1f}")
-                            print(f"  L_ov_shape={L_ov_shape_batch.item():.6f}, "
-                                  f"L_ov_scale={L_ov_scale_batch.item():.6f}, "
-                                  f"L_ov_kl={L_ov_kl_batch.item():.6f}")
-                            print(f"  sigma: min={sigma_pair.min().item():.4f}, "
-                                  f"max={sigma_pair.max().item():.4f}, "
-                                  f"thresh={overlap_sigma_thresh}")
-                            if debug_info['jaccard_k10']:
-                                print(f"  [KNN-DIAG-OVLP] Jaccard@10: {np.mean(debug_info['jaccard_k10']):.4f}")
+                            print(f"  valid_batch_count={ov_loss_dict['valid_batch_count']}")
+                            if ov_loss_dict['debug_info']['I_sizes']:
+                                print(f"  I_sizes: min={min(ov_loss_dict['debug_info']['I_sizes'])}, "
+                                    f"mean={np.mean(ov_loss_dict['debug_info']['I_sizes']):.1f}")
+
                 else:
                     ov_skipped_sigma += 1
                     if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
                         print(f"[OVLP] step={global_step} SKIPPED (sigma > {overlap_sigma_thresh})")
+                        print(f"  sigma_pair: min={sigma_pair.min().item():.4f}, "
+                            f"median={sigma_pair.median().item():.4f}, "
+                            f"max={sigma_pair.max().item():.4f}")
 
 
             # Track overlap losses in epoch_losses
@@ -9373,7 +9407,7 @@ def train_stageC_diffusion_generator(
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
-            if key == 'overlap':
+            if key in ('overlap', 'ov_shape', 'ov_scale', 'ov_kl'):
                 return sum_overlap_batches
             return sum_batches  # 'total' and 'score'
 

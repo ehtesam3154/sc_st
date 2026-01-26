@@ -2375,7 +2375,13 @@ class STPairSetDataset(Dataset):
 
         # Compute overlap size
         n_overlap = max(self.pair_overlap_min_I, int(self.pair_overlap_alpha * n))
+
+        # If n is too small to satisfy min overlap, bump n up
+        if n - 4 < self.pair_overlap_min_I:
+            n = min(m, self.pair_overlap_min_I + 4)
+
         n_overlap = min(n_overlap, n - 4)  # Leave room for non-overlapping points
+
 
         # Sample a center point (shared by both views for locality)
         center_idx = np.random.randint(0, m)
@@ -2454,8 +2460,10 @@ class STPairSetDataset(Dataset):
         view2 = self._build_miniset_dict(targets, indices_all_2, anchor_mask_2, slide_id)
 
         # Compute overlap mapping (using global_uid for safety)
-        # Find where I_indices appear in each view
-        I_global_uids = (slide_id << 32) + I_indices.long()
+        # Include center_idx as shared overlap point
+        I_indices_with_center = torch.cat([I_indices, torch.tensor([center_idx], dtype=torch.long)])
+        I_global_uids = (slide_id << 32) + I_indices_with_center.long()
+
 
         # Build index mapping: for each point in I, find its position in view1 and view2
         idx1_I = []

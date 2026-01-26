@@ -1,6 +1,14 @@
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 import numpy as np
+
+# Detailed sanity checks for ST/SC subset creation.
+# Safe to import anywhere; prints only from rank-0 if you pass is_global_zero=True.
+
+import torch, numpy as np, math, json, os, textwrap, time
+from typing import Dict, Any, List, Optional
 
 def _safe(name, fn, default=None):
     try:
@@ -20,183 +28,6 @@ def _edm_psd_violations(D, max_m=128):
     B = -0.5 * (J @ (Dm**2) @ J)
     eigs = torch.linalg.eigvalsh(B)
     return float(torch.relu(-eigs).mean().item())
-
-def check_st_batch(batch, encoder=None, device="cuda"):
-    """
-    Expected keys: Z_set (B,N,h), mask (B,N), n (B,), G_target (B,N,N),
-                   L_info (list of dicts with 'L' if provided)
-    """
-    rep = {}
-    Z = batch["Z_set"]; M = batch["mask"]; n_list = batch["n"]
-    Gt = batch.get("G_target", None)
-    Linfo = batch.get("L_info", None)
-
-    B, N, _ = Z.shape
-    rep["B"] = B; rep["N_max"] = int(N)
-    rep["valid_counts"] = [int(m.sum().item()) for m in M]
-    rep["valid_min_max"] = (min(rep["valid_counts"]), max(rep["valid_counts"]))
-
-    # mask/n consistency
-    rep["n_equals_masksum_%"] = float(np.mean([abs(n_list[i].item() - M[i].sum().item()) < 1e-6 for i in range(B)]))
-
-    if Gt is not None:
-        # symmetry, diagonals >= 0, triangle inequality (rough), EDM PSD
-        sym_err = (Gt - Gt.transpose(1,2)).abs().amax(dim=(1,2))
-        rep["gram_sym_maxerr"] = float(sym_err.max().item())
-        diag_min = Gt.diagonal(dim1=1, dim2=2).amin(dim=1)
-        rep["gram_diag_min"] = float(diag_min.min().item())
-
-        # reconstruct a factor and recheck EDM
-        i = 0
-        n_i = int(n_list[i].item())
-        Gi = Gt[i,:n_i,:n_i].to(device).float()
-        Vi = torch.linalg.cholesky(Gi + 1e-6*torch.eye(n_i, device=device), upper=False)
-        Di = torch.cdist(Vi, Vi)
-        rep["edm_psd_hinge_mean"] = _edm_psd_violations(Di).__float__()
-
-    if isinstance(Linfo, list) and len(Linfo)>0 and "L" in Linfo[0]:
-        # Laplacian should be symmetric and pos. semidefinite on subspace
-        Li = Linfo[0]["L"].to_dense().float().to(device) if Linfo[0]["L"].layout!=torch.strided else Linfo[0]["L"].float().to(device)
-        rep["L_sym_err"] = float((Li - Li.T).abs().max().item())
-        rep["L_row_sum_max"] = float(Li.sum(dim=1).abs().max().item())
-
-    return rep
-
-def check_sc_batch(batch, device="cuda"):
-    """
-    Expected keys: Z_set (B,N,h), mask (B,N), n (B,),
-                   sc_global_indices (B,N) >=0 for valid,
-                   pair_idxA/B (P,), shared_A_idx/shared_B_idx (P,K), optional is_landmark (B,N)
-    """
-    rep = {}
-
-    Z = batch["Z_set"]; M = batch["mask"]; n_list = batch["n"]
-    global_idx = batch.get("sc_global_indices", None)
-    pairA = batch.get("pair_idxA", None)
-    pairB = batch.get("pair_idxB", None)
-    SA = batch.get("shared_A_idx", None)
-    SB = batch.get("shared_B_idx", None)
-    is_lmk = batch.get("is_landmark", None)
-
-    B, N, h = Z.shape
-    rep["B"] = B; rep["N_max"] = int(N)
-    rep["valid_counts"] = [int(m.sum().item()) for m in M]
-    rep["valid_min_max"] = (min(rep["valid_counts"]), max(rep["valid_counts"]))
-    rep["n_equals_masksum_%"] = float(np.mean([abs(n_list[i].item() - M[i].sum().item()) < 1e-6 for i in range(B)]))
-
-    if global_idx is not None:
-        ok_nonneg = (global_idx[M].min().item() >= 0)
-        rep["global_indices_nonneg"] = bool(ok_nonneg)
-
-    if (pairA is not None) and (pairB is not None) and (SA is not None) and (SB is not None):
-        P, Kmax = SA.shape
-        rep["overlap_Pairs"] = int(P); rep["overlap_Kmax"] = int(Kmax)
-
-        # compute real overlap sizes
-        Ks = []
-        bad_maps = 0
-        for p in range(P):
-            i = int(pairA[p]); j = int(pairB[p])
-            n_i = int(n_list[i].item()); n_j = int(n_list[j].item())
-            gi = global_idx[i,:n_i]; gj = global_idx[j,:n_j]
-
-            ai = SA[p].clamp_min(0); bi = SB[p].clamp_min(0)
-            maskA = SA[p] >= 0; maskB = SB[p] >= 0
-            gi_sel = gi[ai[maskA]]
-            gj_sel = gj[bi[maskB]]
-
-            # match count
-            common = torch.tensor(np.intersect1d(gi_sel.cpu().numpy(), gj_sel.cpu().numpy())).to(device)
-            Ks.append(int(common.numel()))
-            # ensure mapping really corresponds to same globals (iff both present)
-            if common.numel() > 0:
-                # gather the mapped globals and check equality setwise
-                pass_ok = True  # if needed, add strict index matching check
-            else:
-                pass_ok = True  # zero-overlap is allowed but should be rare
-            bad_maps += (0 if pass_ok else 1)
-
-        rep["overlap_K_mean"] = float(np.mean(Ks)) if len(Ks)>0 else 0.0
-        rep["overlap_K_minmax"] = (int(min(Ks)) if Ks else 0, int(max(Ks)) if Ks else 0)
-        rep["overlap_zero_frac"] = float(np.mean([k==0 for k in Ks])) if Ks else 1.0
-        rep["overlap_bad_maps"] = int(bad_maps)
-
-        # optional: near-identity check in Z for shared cells across the two sets
-        # pick first pair with K>=5
-        pair_ok = None
-        for p in range(P):
-            i = int(pairA[p]); j = int(pairB[p])
-            ai = SA[p]; bi = SB[p]
-            mA = ai >= 0; mB = bi >= 0
-            if mA.sum().item() < 5 or mB.sum().item() < 5: 
-                continue
-            gi = global_idx[i][ai[mA]]
-            gj = global_idx[j][bi[mB]]
-            common = torch.tensor(np.intersect1d(gi.cpu(), gj.cpu())).to(device)
-            if common.numel() >= 5:
-                pair_ok = (p, common); break
-
-        if pair_ok is not None:
-            p, common = pair_ok
-            i = int(pairA[p]); j = int(pairB[p])
-            ai = SA[p]; bi = SB[p]
-            mA = ai >= 0; mB = bi >= 0
-            gi = global_idx[i][ai[mA]]; gj = global_idx[j][bi[mB]]
-
-            # positions of 'common' in each set
-            posA = torch.tensor([torch.nonzero(gi==g, as_tuple=False)[0,0].item() for g in common], device=device)
-            posB = torch.tensor([torch.nonzero(gj==g, as_tuple=False)[0,0].item() for g in common], device=device)
-
-            # compare Z at those positions across sets: should match (same cell)
-            Zi = Z[i][mA][posA]
-            Zj = Z[j][mB][posB]
-            zdiff = (Zi - Zj).norm(dim=1).mean().item()
-            rep["overlap_Z_consistency_mean||Δ||"] = float(zdiff)
-
-    if is_lmk is not None:
-        # distribution of landmarks per set
-        cnts = (is_lmk & M).sum(dim=1).float().cpu().numpy().tolist()
-        rep["landmarks_min_max"] = (int(min(cnts)), int(max(cnts)))
-
-    return rep
-
-@torch.no_grad()
-def sample_dataloader_and_report(st_loader=None, sc_loader=None, batches=4, device="cuda"):
-    summary = {"st": [], "sc": []}
-    if st_loader is not None:
-        it = iter(st_loader)
-        for _ in range(batches):
-            b = next(it, None)
-            if b is None: break
-            summary["st"].append(check_st_batch(b, device=device))
-    if sc_loader is not None:
-        it = iter(sc_loader)
-        for _ in range(batches):
-            b = next(it, None)
-            if b is None: break
-            summary["sc"].append(check_sc_batch(b, device=device))
-    return summary
-
-def pretty_print_summary(summary):
-    import pprint
-    pp = pprint.PrettyPrinter(indent=2, width=120, compact=False)
-    print("\n====== ST SUMMARY ======")
-    for i,rep in enumerate(summary["st"]):
-        print(f"[ST batch {i}]")
-        pp.pprint(rep)
-    print("\n====== SC SUMMARY ======")
-    for i,rep in enumerate(summary["sc"]):
-        print(f"[SC batch {i}]")
-        pp.pprint(rep)
-
-
-# utils_debug_minisets.py
-# Detailed sanity checks for ST/SC subset creation.
-# Safe to import anywhere; prints only from rank-0 if you pass is_global_zero=True.
-
-from __future__ import annotations
-import torch, numpy as np, math, json, os, textwrap, time
-from typing import Dict, Any, List, Optional
 
 # ------------------------------- utilities -----------------------------------
 
@@ -278,28 +109,51 @@ def check_st_batch(
         Gt = Gt.to(device).float()
         sym_err = (Gt - Gt.transpose(1,2)).abs().amax(dim=(1,2))
         diag = Gt.diagonal(dim1=1, dim2=2)
+
+        # rep["gram_sym_maxerr"] = float(sym_err.max().item())
+        # rep["gram_diag_min"] = float(diag.amin().item())
+
+        # NEW (CORRECT - only valid regions):
         rep["gram_sym_maxerr"] = float(sym_err.max().item())
-        rep["gram_diag_min"] = float(diag.amin().item())
+
+        # Only check diagonal in valid regions
+        diag_mins = []
+        for i in range(B):
+            n_i = int(n_list[i].item())
+            diag_i = torch.diag(Gt[i, :n_i, :n_i])
+            diag_mins.append(diag_i.min().item())
+        rep["gram_diag_min"] = float(min(diag_mins))
 
         # One example: factorize → recompute distances → EDM hinge
         i = 0
         n_i = int(n_list[i].item())
+        
+        # Gi = Gt[i, :n_i, :n_i]
+        # # numerically robust factorization
+        # Gi = Gi + 1e-6 * torch.eye(n_i, device=device)
+        # try:
+        #     Vi = torch.linalg.cholesky(Gi, upper=False)
+        # except RuntimeError:
+        #     # fallback to eigh if cholesky fails
+        #     w, U = torch.linalg.eigh(Gi)
+        #     w = torch.clamp(w, min=1e-12).sqrt()
+        #     Vi = (U * w.unsqueeze(0)).T
+        # Di = torch.cdist(Vi, Vi)
+
         Gi = Gt[i, :n_i, :n_i]
-        # numerically robust factorization
-        Gi = Gi + 1e-6 * torch.eye(n_i, device=device)
-        try:
-            Vi = torch.linalg.cholesky(Gi, upper=False)
-        except RuntimeError:
-            # fallback to eigh if cholesky fails
-            w, U = torch.linalg.eigh(Gi)
-            w = torch.clamp(w, min=1e-12).sqrt()
-            Vi = (U * w.unsqueeze(0)).T
-        Di = torch.cdist(Vi, Vi)
+        # Compute distances from Gram using CORRECT formula: d_ij^2 = G_ii + G_jj - 2*G_ij
+        G_diag = torch.diag(Gi).unsqueeze(0)  # (1, n_i)
+        D_squared = G_diag.T + G_diag - 2 * Gi  # (n_i, n_i)
+        Di = torch.sqrt(torch.clamp(D_squared, min=0))
+
         rep["edm_psd_hinge_mean"] = _edm_psd_hinge(Di)
 
         # Distance scale (approx percentiles on sample)
         d_samp = _upper_triangle_sample(Di)
         rep["D_p50_p90_p95"] = dict(p50=_safe_q(d_samp,0.50), p90=_safe_q(d_samp,0.90), p95=_safe_q(d_samp,0.95))
+        rep["edm_psd_hinge_mean"] = _edm_psd_hinge(Di)
+
+
 
     # Laplacian (if provided in L_info)
     Linfo = batch.get("L_info", None)
@@ -388,8 +242,11 @@ def check_sc_batch(
             posA = torch.tensor([mapA[int(g.item())] for g in common], device=device)
             posB = torch.tensor([mapB[int(g.item())] for g in common], device=device)
 
-            Zi = Z[i][mA][posA]
-            Zj = Z[j][mB][posB]
+            # Zi = Z[i][mA][posA]
+            # Zj = Z[j][mB][posB]
+
+            Zi = Z[i][ai[mA]][posA]
+            Zj = Z[j][bi[mB]][posB]
             z_consistency.append(float((Zi - Zj).norm(dim=1).mean().item()))
 
         rep["overlap_K_stats"] = _summ(Ks)
@@ -423,10 +280,18 @@ def sample_dataloader_and_report(
     out: Dict[str, Any] = dict(st=[], sc=[])
     if st_loader is not None:
         it = iter(st_loader)
-        for b in range(batches):
-            batch = next(it, None)
-            if batch is None: break
-            out["st"].append(check_st_batch(batch, device=device))
+        if st_loader is not None:
+            it = iter(st_loader)
+            for b in range(batches):
+                batch = next(it, None)
+                if batch is None:
+                    break
+
+                # Paired ST batches: unwrap view1 for standard checks
+                if isinstance(batch, dict) and batch.get("is_pair_batch", False):
+                    batch = batch["view1"]
+
+                out["st"].append(check_st_batch(batch, device=device))
     if sc_loader is not None:
         it = iter(sc_loader)
         for b in range(batches):

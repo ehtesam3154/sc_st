@@ -5278,164 +5278,117 @@ def edge_consistency_loss(
     return loss_edge.sum() / denom
 
 def core_edge_log_invariance_loss(
-    x0_full: torch.Tensor,      # (B, N, D) - prediction with original context
+    x0_full: torch.Tensor,      # (B, N, D) - prediction with original context  
     x0_rep: torch.Tensor,       # (B, N, D) - prediction with replaced context
     core_mask: torch.Tensor,    # (B, N) bool - which points are core
     knn_spatial: torch.Tensor,  # (B, N, K) long - kNN indices (local, can be -1 for invalid)
     mask: torch.Tensor,         # (B, N) bool - valid points
     eps: float = 1e-8,
     huber_delta: float = 0.1,
-    scale_weight: float = 1.0,  # Weight for scale term relative to shape term
 ) -> tuple:
     """
     Compute edge-length invariance loss on core→core edges.
-
-    UPDATED: Now returns BOTH shape loss (centered) AND scale loss.
-
-    Shape loss: Penalizes differences in CENTERED log edge lengths (scale-invariant).
-    Scale loss: Penalizes the global scale shift (median log-edge difference).
-
-    Total loss = shape_loss + scale_weight * scale_loss
-
-    This allows training to penalize BOTH shape distortion AND scale drift.
-
-    Returns:
-        shape_losses: (B,) per-sample shape losses (centered, scale-invariant)
-        scale_losses: (B,) per-sample scale losses (delta_scale squared)
+    
+    For each core→core edge, penalizes the difference in CENTERED log edge lengths
+    between predictions from original vs replaced context.
+    
+    Centering removes global scale sensitivity - only penalizes shape differences.
+    
+    This is gauge-safe (invariant to rotation/translation/scale).
+    
+    Returns: 
+        losses: (B,) per-sample losses
         n_edges: (B,) number of core→core edges per sample
-        debug_info: dict with diagnostic scalars for logging
     """
     B, N, D = x0_full.shape
     K = knn_spatial.shape[-1]
     device = x0_full.device
-
-    shape_losses = torch.zeros(B, device=device)
-    scale_losses = torch.zeros(B, device=device)
+    
+    losses = torch.zeros(B, device=device)
     n_edges_per_sample = torch.zeros(B, device=device)
-
-    # Debug accumulators
-    delta_scale_list = []  # Per-sample scale shifts
-    raw_log_diff_list = []  # Per-sample mean raw log diff (before centering)
-    shape_residual_list = []  # Per-sample shape residuals (after centering)
-
+    
     for b in range(B):
         m_b = mask[b]
         n_valid = int(m_b.sum().item())
-
+        
         if n_valid < 2:
             continue
-
+        
         # Get core mask for valid points only
         core_b = core_mask[b, m_b]  # (n_valid,) bool
         n_core = int(core_b.sum().item())
-
+        
         if n_core < 2:
             continue
-
+        
         # Extract predictions and kNN for valid points
         x0_full_b = x0_full[b, m_b]    # (n_valid, D)
         x0_rep_b = x0_rep[b, m_b]      # (n_valid, D)
         knn_b = knn_spatial[b, m_b]    # (n_valid, K)
-
+        
         # Build edge list: only core→core edges
         # i_local indexes into [0, n_valid), knn_b values are also in [0, n_valid)
         i_local = torch.arange(n_valid, device=device).unsqueeze(1).expand(n_valid, K)
-
+        
         # Valid edges: neighbor exists, not self-loop, both endpoints are core
         valid_neighbors = (knn_b >= 0) & (knn_b < n_valid) & (i_local != knn_b)
-
+        
         # Check both endpoints are core
         i_is_core = core_b.unsqueeze(1).expand(n_valid, K)  # (n_valid, K)
         # For j, we need to check if knn_b[i,k] is core - careful with invalid indices
         j_is_core = torch.zeros_like(valid_neighbors)
         valid_j_idx = valid_neighbors.clone()
         j_is_core[valid_j_idx] = core_b[knn_b[valid_j_idx]]
-
+        
         # Final edge mask: valid AND both core
         edge_mask = valid_neighbors & i_is_core & j_is_core
-
+        
         if not edge_mask.any():
             continue
-
+        
         i_edges = i_local[edge_mask]
         j_edges = knn_b[edge_mask]
-
+        
         n_edges = i_edges.numel()
         if n_edges == 0:
             continue
-
+        
         # Compute edge lengths for both predictions
         d2_full = (x0_full_b[i_edges] - x0_full_b[j_edges]).pow(2).sum(dim=-1)
         d2_rep = (x0_rep_b[i_edges] - x0_rep_b[j_edges]).pow(2).sum(dim=-1)
-
+        
         d_full = torch.sqrt(d2_full + eps)
         d_rep = torch.sqrt(d2_rep + eps)
-
+        
         # Skip degenerate edges
         valid_edges = (d_full > 1e-6) & (d_rep > 1e-6)
         if not valid_edges.any():
             continue
-
+        
         d_full = d_full[valid_edges]
         d_rep = d_rep[valid_edges]
-
+        
         # Log edge lengths
         log_d_full = torch.log(d_full)
         log_d_rep = torch.log(d_rep)
-
-        # ===== SCALE COMPONENT =====
-        # delta_scale = median(log_d_full) - median(log_d_rep)
-        # This captures global scale shift: if x0_full ≈ s * x0_rep, then delta_scale ≈ log(s)
-        med_full = log_d_full.median()
-        med_rep = log_d_rep.median()
-        delta_scale = med_full - med_rep  # Scalar: log(scale_ratio)
-
-        # Scale loss: penalize scale drift (Huber for robustness)
-        abs_delta = delta_scale.abs()
-        if abs_delta <= huber_delta:
-            scale_loss_b = 0.5 * delta_scale.pow(2)
-        else:
-            scale_loss_b = huber_delta * (abs_delta - 0.5 * huber_delta)
-
-        # ===== SHAPE COMPONENT =====
-        # Center to remove global scale - only compare relative edge proportions
-        log_d_full_centered = log_d_full - med_full
-        log_d_rep_centered = log_d_rep - med_rep
-
+        
+        # CENTER to remove global scale sensitivity (key fix!)
+        # After centering, we only compare relative edge proportions
+        log_d_full_centered = log_d_full - log_d_full.median()
+        log_d_rep_centered = log_d_rep - log_d_rep.median()
+        
         # Difference in centered log-edge-lengths (should be ~0 if shape is preserved)
-        log_diff_centered = log_d_full_centered - log_d_rep_centered
-
+        log_diff = log_d_full_centered - log_d_rep_centered
+        
         # Huber loss for robustness
-        abs_diff = log_diff_centered.abs()
-        huber_shape = torch.where(
+        abs_diff = log_diff.abs()
+        huber = torch.where(
             abs_diff <= huber_delta,
-            0.5 * log_diff_centered.pow(2),
+            0.5 * log_diff.pow(2),
             huber_delta * (abs_diff - 0.5 * huber_delta)
         )
-
-        shape_losses[b] = huber_shape.mean()
-        scale_losses[b] = scale_loss_b
+        
+        losses[b] = huber.mean()
         n_edges_per_sample[b] = valid_edges.sum().float()
-
-        # Debug: track raw differences BEFORE centering
-        raw_log_diff = log_d_full - log_d_rep  # This includes scale
-        delta_scale_list.append(delta_scale.item())
-        raw_log_diff_list.append(raw_log_diff.mean().item())
-        shape_residual_list.append(log_diff_centered.abs().mean().item())
-
-    # Build debug info dict
-    debug_info = {
-        'n_valid_samples': len(delta_scale_list),
-        'delta_scale_mean': sum(delta_scale_list) / max(len(delta_scale_list), 1),
-        'delta_scale_abs_mean': sum(abs(x) for x in delta_scale_list) / max(len(delta_scale_list), 1),
-        'raw_log_diff_mean': sum(raw_log_diff_list) / max(len(raw_log_diff_list), 1),
-        'shape_residual_mean': sum(shape_residual_list) / max(len(shape_residual_list), 1),
-    }
-
-    # Add percentiles if we have enough samples
-    if len(delta_scale_list) >= 3:
-        sorted_ds = sorted([abs(x) for x in delta_scale_list])
-        debug_info['delta_scale_abs_p90'] = sorted_ds[int(0.9 * len(sorted_ds))]
-        debug_info['delta_scale_abs_max'] = sorted_ds[-1]
-
-    return shape_losses, scale_losses, n_edges_per_sample, debug_info
+    
+    return losses, n_edges_per_sample
