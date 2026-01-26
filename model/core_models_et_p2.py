@@ -8250,21 +8250,22 @@ def train_stageC_diffusion_generator(
                     I_mask = I_mask[idx_keep]
                     I_sizes = I_sizes[idx_keep]
 
-                    # Also slice view1 tensors to match
+                    # Also slice view1 tensors to match - use _ov suffix to avoid corrupting originals
+                    # HYGIENE FIX: Don't overwrite mask/eps which may be used later in the iteration
                     x0_pred_1 = x0_pred[idx_keep]
-                    mask = mask[idx_keep]
-                    sigma_pair = sigma_pair[idx_keep]
-                    sigma_pair_3d = sigma_pair_3d[idx_keep]
-                    eps = eps[idx_keep]
+                    mask_ov = mask[idx_keep]  # Was: mask = mask[idx_keep]
+                    sigma_pair_ov = sigma_pair[idx_keep]  # Was: sigma_pair = sigma_pair[idx_keep]
+                    sigma_pair_3d_ov = sigma_pair_3d[idx_keep]  # Was: sigma_pair_3d = sigma_pair_3d[idx_keep]
+                    eps_ov = eps[idx_keep]  # Was: eps = eps[idx_keep]
 
                     # DEBUG: gate + sigma stats (rank0 only)
                     if global_step % overlap_debug_every == 0:
                         rank = dist.get_rank() if dist.is_initialized() else 0
                         print(f"\n[OVLP-GATE][rank={rank}] step={global_step} epoch={epoch}")
                         print(f"  ov_keep: {ov_keep.sum().item()}/{ov_keep.numel()} kept")
-                        print(f"  sigma_pair: min={sigma_pair.min().item():.4f}, "
-                            f"median={sigma_pair.median().item():.4f}, "
-                            f"max={sigma_pair.max().item():.4f}, "
+                        print(f"  sigma_pair: min={sigma_pair_ov.min().item():.4f}, "
+                            f"median={sigma_pair_ov.median().item():.4f}, "
+                            f"max={sigma_pair_ov.max().item():.4f}, "
                             f"thresh={overlap_sigma_thresh}")
 
                     # Sample noise for view2
@@ -8277,10 +8278,10 @@ def train_stageC_diffusion_generator(
                         if n_I > 0:
                             idx1 = idx1_I[b, I_valid]
                             idx2 = idx2_I[b, I_valid]
-                            eps_2[b, idx2] = eps[b, idx1]
+                            eps_2[b, idx2] = eps_ov[b, idx1]  # Use sliced eps_ov
 
                     # Add noise to view2 target
-                    V_t_2 = V_target_2 + sigma_pair_3d * eps_2
+                    V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
                     V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
 
                     # Encode view2 context
@@ -8289,7 +8290,7 @@ def train_stageC_diffusion_generator(
 
                         # Forward pass for view2
                         x0_pred_2_result = score_net.forward_edm(
-                            V_t_2, sigma_pair, H_2, mask_2, sigma_data,
+                            V_t_2, sigma_pair_ov, H_2, mask_2, sigma_data,  # Use sliced sigma_pair_ov
                             self_cond=None, return_debug=False
                         )
 
@@ -8317,7 +8318,7 @@ def train_stageC_diffusion_generator(
                         ov_loss_dict = compute_overlap_losses(
                             x0_pred_1, x0_pred_2,
                             idx1_I, idx2_I, I_mask,
-                            mask, mask_2,
+                            mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
                         )
 
