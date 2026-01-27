@@ -80,14 +80,20 @@ def compute_overlap_losses(
     mask_2: torch.Tensor,     # (B, N2) validity mask for view2
     kl_tau: float = 0.5,
     eps: float = 1e-8,
+    # NEW: for high-σ scale anchor
+    sigma_t: torch.Tensor = None,      # (B, 1, 1) or (B,) noise level
+    V_target_1: torch.Tensor = None,   # (B, N1, D) ground truth for view1
+    V_target_2: torch.Tensor = None,   # (B, N2, D) ground truth for view2
+    sigma_0_hi: float = 0.5,           # threshold for high-σ scale anchor
 ) -> Dict[str, torch.Tensor]:
     """
     Compute overlap consistency losses for paired minisets.
 
     Returns dict with:
     - L_ov_shape: Scale-free Gram consistency loss
-    - L_ov_scale: Log-trace scale consistency loss
+    - L_ov_scale: Log-trace scale consistency loss (between views)
     - L_ov_kl: Symmetric KL divergence of neighbor distributions
+    - L_hi_scale: Direct high-σ log-RMS anchor loss (pred vs target) [NEW]
     - debug_dict: Diagnostic information
     """
     B = x0_pred_1.shape[0]
@@ -97,8 +103,10 @@ def compute_overlap_losses(
     L_ov_shape = torch.tensor(0.0, device=device)
     L_ov_scale = torch.tensor(0.0, device=device)
     L_ov_kl = torch.tensor(0.0, device=device)
+    L_hi_scale = torch.tensor(0.0, device=device)  # NEW: direct high-σ scale anchor
 
     valid_batch_count = 0
+    hi_scale_count = 0  # NEW: track high-σ samples separately
     debug_info = {
         'I_sizes': [],
         'trG1': [],
@@ -107,7 +115,9 @@ def compute_overlap_losses(
         'mean_pairwise_dist1': [],
         'mean_pairwise_dist2': [],
         'jaccard_k10': [],
+        'hi_scale_ratio': [],  # NEW: pred_rms / tgt_rms for high-σ
     }
+
 
     for b in range(B):
         # Get overlap indices for this batch element
@@ -142,9 +152,53 @@ def compute_overlap_losses(
         shape_loss_b = (G1_norm - G2_norm).pow(2).sum()
         L_ov_shape = L_ov_shape + shape_loss_b
 
-        # (2) Scale loss: squared log-trace difference
+        # (2) Scale loss: squared log-trace difference (between views)
         log_tr_diff = (torch.log(tr_G1) - torch.log(tr_G2)).pow(2)
         L_ov_scale = L_ov_scale + log_tr_diff
+
+        # (2b) NEW: Direct high-σ scale anchor (pred vs target)
+        # CRITICAL: Use GLOBAL masked RMS (all points), not overlap-only!
+        # This prevents the "fix overlap, shrink global" shortcut.
+        if sigma_t is not None and V_target_1 is not None and V_target_2 is not None:
+            sigma_b = sigma_t[b].view(-1)[0] if sigma_t.dim() > 1 else sigma_t[b]
+            if sigma_b > sigma_0_hi:
+                # Get masks for this batch element
+                m1 = mask_1[b].float()  # (N1,)
+                m2 = mask_2[b].float()  # (N2,)
+                
+                # GLOBAL predictions and targets (full miniset, not overlap-only)
+                V1_pred_full = x0_pred_1[b]  # (N1, D)
+                V2_pred_full = x0_pred_2[b]  # (N2, D)
+                V1_tgt_full = V_target_1[b]  # (N1, D)
+                V2_tgt_full = V_target_2[b]  # (N2, D)
+                
+                # Masked RMS: sqrt(sum(m * |V|^2) / sum(m))
+                # View 1
+                V1_pred_sq = (V1_pred_full ** 2).sum(dim=-1)  # (N1,)
+                V1_tgt_sq = (V1_tgt_full ** 2).sum(dim=-1)    # (N1,)
+                n1 = m1.sum().clamp(min=1.0)
+                rms_pred_1 = ((m1 * V1_pred_sq).sum() / n1).sqrt() + eps
+                rms_tgt_1 = ((m1 * V1_tgt_sq).sum() / n1).sqrt() + eps
+                
+                # View 2
+                V2_pred_sq = (V2_pred_full ** 2).sum(dim=-1)  # (N2,)
+                V2_tgt_sq = (V2_tgt_full ** 2).sum(dim=-1)    # (N2,)
+                n2 = m2.sum().clamp(min=1.0)
+                rms_pred_2 = ((m2 * V2_pred_sq).sum() / n2).sqrt() + eps
+                rms_tgt_2 = ((m2 * V2_tgt_sq).sum() / n2).sqrt() + eps
+
+                # Log-RMS scale anchor loss: (log(rms_pred) - log(rms_tgt))^2
+                hi_scale_1 = (torch.log(rms_pred_1) - torch.log(rms_tgt_1)).pow(2)
+                hi_scale_2 = (torch.log(rms_pred_2) - torch.log(rms_tgt_2)).pow(2)
+                L_hi_scale = L_hi_scale + (hi_scale_1 + hi_scale_2) / 2
+                hi_scale_count += 1
+
+                # Debug: track scale ratio (global, not overlap-only)
+                debug_info['hi_scale_ratio'].append(
+                    ((rms_pred_1 / rms_tgt_1).item() + (rms_pred_2 / rms_tgt_2).item()) / 2
+                )
+
+
 
         # (3) KL neighbor distribution loss
         # Compute pairwise squared distances
@@ -213,12 +267,16 @@ def compute_overlap_losses(
         L_ov_shape = L_ov_shape / valid_batch_count
         L_ov_scale = L_ov_scale / valid_batch_count
         L_ov_kl = L_ov_kl / valid_batch_count
+    if hi_scale_count > 0:
+        L_hi_scale = L_hi_scale / hi_scale_count
 
     return {
         'L_ov_shape': L_ov_shape,
         'L_ov_scale': L_ov_scale,
         'L_ov_kl': L_ov_kl,
+        'L_hi_scale': L_hi_scale,  # NEW
         'valid_batch_count': valid_batch_count,
+        'hi_scale_count': hi_scale_count,  # NEW
         'debug_info': debug_info,
     }
 
@@ -3288,8 +3346,8 @@ def train_stageC_diffusion_generator(
         'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
         'gram': 2.0,           # was 1.0
         'gram_scale': 2.0,     # was 1.0
-        'out_scale': 1.0,
-        'gram_learn': 1.0,
+        'out_scale': 2.0,
+        'gram_learn': 2.0,
         'knn_scale': 0.2,     # NEW: kNN distance scale calibration
         'heat': 0.0,
         'sw_st': 0.0,
@@ -3997,6 +4055,8 @@ def train_stageC_diffusion_generator(
                     if global_step % 20 == 0 and (fabric is None or fabric.is_global_zero):
                         print(f"\n[PHASE 2] Sigma Sampling (step {global_step}):")
                         print(f"  sigma: min={sigma.min():.6f} median={sigma.median():.6f} max={sigma.max():.6f}")
+
+                        import math
                         
                         log_sigma = sigma.log()
                         log_min = math.log(sigma_min)
@@ -4020,6 +4080,7 @@ def train_stageC_diffusion_generator(
                         print(f"  t_norm: min={t_norm_check.min():.4f} median={t_norm_check.median():.4f} max={t_norm_check.max():.4f}")
                     
                     # Create t_norm proxy for gating/debug (log-space normalization)
+                    import math
                     log_sigma = sigma.log()
                     log_min = math.log(sigma_min)
                     log_max = math.log(sigma_refine_max)
@@ -4733,7 +4794,17 @@ def train_stageC_diffusion_generator(
                     sigma_flat = sigma_t.view(-1).float()  # (B,)
 
                     # EDM weight: (σ² + σ_d²) / (σ · σ_d)²  (returns (B,))
+                    # EDM weight: (σ² + σ_d²) / (σ · σ_d)²  (returns (B,))
                     w_raw = uet.edm_loss_weight(sigma_flat, sigma_data).float()
+
+                    # --- HIGH-SIGMA COMPENSATION: g(σ) = (σ/σ₀)^p for σ > σ₀ ---
+                    # This compensates for high-σ scale collapse by boosting loss weight
+                    SIGMA_0 = 0.5   # threshold above which we boost
+                    HI_SIGMA_P = 2.0  # exponent (try 1.0 to 3.0)
+                    g_sigma = torch.ones_like(sigma_flat)
+                    hi_mask = sigma_flat > SIGMA_0
+                    g_sigma[hi_mask] = (sigma_flat[hi_mask] / SIGMA_0).pow(HI_SIGMA_P)
+                    w_raw = w_raw * g_sigma  # λ̃(σ) = λ(σ) · g(σ)
 
                     # --- Adaptive soft-cap (data-driven) instead of fixed 50 ---
                     # This prevents low-σ explosion while avoiding a hard plateau at a fixed constant.
@@ -4867,9 +4938,29 @@ def train_stageC_diffusion_generator(
                             is_tail = torch.zeros_like(sigma_flat, dtype=torch.bool)
                         
                         w_eff = w_eff * boost
-
+                    # ============================================================
+                    # CHANGE: AGGRESSIVE HIGH-σ SCALE COMPENSATION
+                    # The EDM weight λ(σ) underweights high-σ samples by ~3x.
+                    # This direct multiplier compensates to ensure high-σ samples
+                    # get enough gradient to learn correct scale.
+                    # ============================================================
+                    HI_SIGMA_THRESHOLD = 0.5  # σ above which we boost
+                    HI_SIGMA_MULT = 3.0       # Multiplier for high-σ samples
+                    
+                    hi_sigma_mask = (sigma_flat > HI_SIGMA_THRESHOLD)
+                    if hi_sigma_mask.any():
+                        # Apply additional multiplier to high-σ samples
+                        hi_mult = torch.ones_like(w_eff)
+                        hi_mult[hi_sigma_mask] = HI_SIGMA_MULT
+                        w_eff = w_eff * hi_mult
                         
-                        # Debug logging
+                        if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
+                            n_hi = hi_sigma_mask.sum().item()
+                            w_hi_mean = w_eff[hi_sigma_mask].mean().item()
+                            w_lo_mean = w_eff[~hi_sigma_mask].mean().item() if (~hi_sigma_mask).any() else 0
+                            print(f"[HI-SIGMA-MULT] step={global_step} n_hi={n_hi}/{len(sigma_flat)} "
+                                  f"w_hi={w_hi_mean:.2f} w_lo={w_lo_mean:.2f} ratio={w_hi_mean/max(w_lo_mean,1e-8):.2f}")
+
                         # Debug logging
                         if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
                             thr_val = score_hi_gate.thr
@@ -4903,6 +4994,7 @@ def train_stageC_diffusion_generator(
                         L_score = (w_eff * err2_sample).mean()
                     
                     # Debug: Log WNORM effect
+                    # Debug: Log WNORM effect
                     if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             L_score_mean = (w_eff * err2_sample).mean().item()
@@ -4910,6 +5002,50 @@ def train_stageC_diffusion_generator(
                             print(f"[SCORE-AGG] step={global_step} L_score_mean={L_score_mean:.4f} "
                                   f"L_score_wnorm={L_score_wnorm:.4f} ratio={L_score_mean/max(L_score_wnorm,1e-8):.2f} "
                                   f"w_sum={w_eff.sum().item():.1f} w_mean={w_eff.mean().item():.2f}")
+
+                    # ============================================================
+                    # [SIGMA-BIN-*] Debug tags per ChatGPT recommendation
+                    # Track per-bin counts, weights, contributions, and scale
+                    # ============================================================
+                    if (global_step % 100 == 0) and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            sigma_bins_debug = [
+                                (0.02, 0.25, "[0.02-0.25)"),
+                                (0.25, 0.70, "[0.25-0.70)"),
+                                (0.70, 1.00, "[0.70-1.00)"),
+                                (1.00, 2.00, "[1.00-2.00)"),
+                                (2.00, 5.00, "[2.00-5.00)"),
+                            ]
+                            
+                            # Compute per-sample scale ratio
+                            m_f = mask.unsqueeze(-1).float()
+                            rms_pred_ps = (x0_pred.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
+                            rms_pred_ps = rms_pred_ps.sqrt()
+                            rms_tgt_ps = (V_target.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
+                            rms_tgt_ps = rms_tgt_ps.sqrt()
+                            scale_r_ps = rms_pred_ps / rms_tgt_ps.clamp(min=1e-8)
+                            
+                            # Gradient proxy: w * (pred - tgt)
+                            grad_proxy = (w_eff.unsqueeze(-1).unsqueeze(-1) * (x0_pred - V_target)).pow(2) * m_f
+                            grad_proxy_ps = grad_proxy.sum(dim=(1,2)).sqrt()
+                            
+                            print(f"\n[SIGMA-BIN-STATS] step={global_step}")
+                            print(f"  {'Bin':>12} | {'n':>4} | {'w_mean':>8} | {'w*err2':>10} | {'scale_r':>8} | {'grad_prx':>10}")
+                            print(f"  {'-'*12} | {'-'*4} | {'-'*8} | {'-'*10} | {'-'*8} | {'-'*10}")
+                            
+                            for lo, hi, label in sigma_bins_debug:
+                                in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
+                                if in_bin.any():
+                                    n_bin = in_bin.sum().item()
+                                    w_bin_mean = w_eff[in_bin].mean().item()
+                                    werr2_bin = (w_eff[in_bin] * err2_sample[in_bin]).mean().item()
+                                    scale_r_bin = scale_r_ps[in_bin].mean().item()
+                                    grad_prx_bin = grad_proxy_ps[in_bin].mean().item()
+                                    
+                                    print(f"  {label:>12} | {n_bin:>4} | {w_bin_mean:>8.2f} | {werr2_bin:>10.6f} | {scale_r_bin:>8.3f} | {grad_prx_bin:>10.4f}")
+                            
+                            print(f"  TARGET: scale_r should be ~1.0 across ALL bins")
+
 
 
                     
@@ -5455,6 +5591,43 @@ def train_stageC_diffusion_generator(
                                 valid_frac = (knn_test >= 0).float().mean().item()
                                 print(f"  [KNN-INDEX-CHECK] knn_max={knn_max}, N={n_max_batch}, "
                                       f"valid_neighbor_frac={valid_frac:.2%}")
+
+                                # ============ [CLAMP-HIDDEN-ERROR] Per-σ bin error hiding ============
+                                # Shows how much scale error is hidden by clamping at each σ level
+                                sigma_flat_che = sigma_t.view(-1)
+                                che_bins = [(0.0, 0.3, "low"), (0.3, 0.7, "mid"), (0.7, 1.5, "high"), (1.5, 5.0, "v.high")]
+                                
+                                print(f"\n[CLAMP-HIDDEN-ERROR] step={global_step}")
+                                print(f"  {'σ-range':>10} | {'n':>4} | {'raw_ratio':>10} | {'geom_ratio':>11} | {'hidden_err':>10}")
+                                print(f"  {'-'*10} | {'-'*4} | {'-'*10} | {'-'*11} | {'-'*10}")
+                                
+                                for lo_b, hi_b, label in che_bins:
+                                    in_bin = (sigma_flat_che >= lo_b) & (sigma_flat_che < hi_b)
+                                    if in_bin.any():
+                                        n_bin = in_bin.sum().item()
+                                        
+                                        # Raw ratio from V_hat_centered
+                                        raw_r = ratio_raw[in_bin].mean().item()
+                                        
+                                        # Post-clamp ratio from V_geom
+                                        m_f_che = m_float[in_bin]
+                                        v_geom_bin = V_geom[in_bin]
+                                        v_tgt_bin = V_target[in_bin]
+                                        rms_geom = (v_geom_bin.pow(2) * m_f_che).sum() / m_f_che.sum().clamp(min=1)
+                                        rms_geom = rms_geom.sqrt().item()
+                                        rms_tgt = (v_tgt_bin.pow(2) * m_f_che).sum() / m_f_che.sum().clamp(min=1)
+                                        rms_tgt = rms_tgt.sqrt().item()
+                                        geom_r = rms_geom / max(rms_tgt, 1e-8)
+                                        
+                                        # Hidden error = difference in log-scale
+                                        import math
+                                        hidden = abs(math.log(geom_r + 1e-8) - math.log(raw_r + 1e-8))
+                                        
+                                        bin_label = f"{label}[{lo_b},{hi_b})"
+                                        print(f"  {bin_label:>10} | {n_bin:>4} | {raw_r:>10.3f} | {geom_r:>11.3f} | {hidden:>10.3f}")
+                                
+                                print(f"  BEFORE FIX: high-σ 'hidden_err' >> 0 (error being masked)")
+                                print(f"  AFTER FIX:  L_out_scale/L_gram_learn now see raw error")
 
                 else:
                     # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
@@ -6236,7 +6409,13 @@ def train_stageC_diffusion_generator(
                             V_c_gl, _ = uet.center_only(V_t, mask)  # (B, N, D)
                             
                             # LEARNED BRANCH OUTPUT: V_out = V_hat_centered - c_skip * V_c
-                            V_out_gl = (V_geom - c_skip_gl * V_c_gl) * m_float  # (B, N, D)
+                            # V_out_gl = (V_geom - c_skip_gl * V_c_gl) * m_float  # (B, N, D)
+
+                            # FIX: Use V_hat_centered (RAW) not V_geom (clamped)
+                            # V_geom has clamping that HIDES high-σ scale error from this loss
+                            # L_gram_learn needs to see the TRUE learned branch output
+                            V_out_gl = (V_hat_centered - c_skip_gl * V_c_gl) * m_float  # (B, N, D)
+
                             
                             # CORRECT TARGET for learned branch: x0_centered - c_skip * x_c
                             V_tgt_c_gl, _ = uet.center_only(V_target, mask)
@@ -6431,7 +6610,13 @@ def train_stageC_diffusion_generator(
                                 x0_c, _ = uet.center_only(V_target, mask)  # Centered clean target
                                 
                                 # V_geom = centered(x0_pred) is already computed above
-                                x0_pred_c = V_geom  # (B, N, D)
+                                # x0_pred_c = V_geom  # (B, N, D)
+
+                                # FIX: Use V_hat_centered (RAW) not V_geom (clamped)
+                                # V_geom has scale correction applied which HIDES the high-σ scale error
+                                # L_out_scale needs to see the TRUE scale error to fix it
+                                x0_pred_c = V_hat_centered  # (B, N, D) - RAW, not clamped
+
                                 
                                 # CORRECT learned contribution (centered): c_out * F_x = x0_pred - c_skip * x_c
                                 V_out_pred = (x0_pred_c - c_skip_b * x_c) * m_float
@@ -8340,18 +8525,31 @@ def train_stageC_diffusion_generator(
                         L_score_2_batch = L_score_2  # Store for epoch tracking
 
                         # Compute overlap losses
+                        # Slice V_target to match the filtered batch
+                        V_target_1_ov = V_target[idx_keep]
+                        
                         ov_loss_dict = compute_overlap_losses(
                             x0_pred_1, x0_pred_2,
                             idx1_I, idx2_I, I_mask,
-                            mask_ov, mask_2,
+                            mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
+                            # NEW: for high-σ scale anchor
+                            sigma_t=sigma_pair_3d_ov,
+                            V_target_1=V_target_1_ov,
+                            V_target_2=V_target_2,
+                            sigma_0_hi=0.5,  # threshold for high-σ anchor
                         )
+
 
                         # Apply overlap losses if valid
                         if ov_loss_dict['valid_batch_count'] > 0:
                             L_ov_shape_batch = ov_loss_dict['L_ov_shape']
                             L_ov_scale_batch = ov_loss_dict['L_ov_scale']
                             L_ov_kl_batch = ov_loss_dict['L_ov_kl']
+                            L_hi_scale_batch = ov_loss_dict['L_hi_scale']  # NEW
+
+                            # Weight for new high-σ scale anchor (tune this!)
+                            HI_SCALE_WEIGHT = 1.0  # Start at 1.0, can increase if needed
 
                             # Add to total loss
                             L_total = (
@@ -8359,7 +8557,9 @@ def train_stageC_diffusion_generator(
                                 + overlap_loss_weight_shape * L_ov_shape_batch
                                 + overlap_loss_weight_scale * L_ov_scale_batch
                                 + overlap_loss_weight_kl * L_ov_kl_batch
+                                + HI_SCALE_WEIGHT * L_hi_scale_batch  # NEW: high-σ scale anchor
                             )
+
 
                             # Track epoch stats
                             ov_apply_count += 1
@@ -8441,7 +8641,11 @@ def train_stageC_diffusion_generator(
                         if global_step % overlap_debug_every == 0:
                             rank = dist.get_rank() if dist.is_initialized() else 0
                             print(f"  [rank={rank}] valid_batch_count={ov_loss_dict['valid_batch_count']}")
+                            print(f"  [rank={rank}] hi_scale_count={ov_loss_dict['hi_scale_count']}")  # NEW
                             print(f"  [rank={rank}] L_score_2={L_score_2.item():.6f} (view2 scale anchor)")
+                            print(f"  [rank={rank}] L_hi_scale={ov_loss_dict['L_hi_scale'].item():.6f} (high-σ scale anchor)")  # NEW
+                            if ov_loss_dict['debug_info']['hi_scale_ratio']:  # NEW
+                                print(f"  [rank={rank}] hi_scale_ratio: mean={np.mean(ov_loss_dict['debug_info']['hi_scale_ratio']):.4f}")
                             if ov_loss_dict['debug_info']['I_sizes']:
                                 print(f"  [rank={rank}] I_sizes: min={min(ov_loss_dict['debug_info']['I_sizes'])}, "
                                     f"mean={np.mean(ov_loss_dict['debug_info']['I_sizes']):.1f}")
@@ -9216,7 +9420,37 @@ def train_stageC_diffusion_generator(
 
                     
                     # Restore RNG state
+                    # Restore RNG state
                     torch.set_rng_state(rng_state)
+                    
+                    # ============ [HI-SIGMA-PROBE] Single-step denoise at high σ ============
+                    # Quick diagnostic: does one denoise step at σ=1.2 and σ=2.4 improve scale?
+                    for sigma_probe in [1.2, 2.4]:
+                        torch.manual_seed(42 + int(sigma_probe * 1000))
+                        sigma_p = torch.full((B_fixed,), sigma_probe, device=device)
+                        sigma_p_3d = sigma_p.view(-1, 1, 1)
+                        
+                        eps_p = torch.randn_like(V_target_fixed)
+                        V_t_p = V_target_fixed + sigma_p_3d * eps_p
+                        V_t_p = V_t_p * mask_fixed.unsqueeze(-1).float()
+                        
+                        x0_p = score_net.forward_edm(V_t_p, sigma_p, H_fixed, mask_fixed, sigma_data, self_cond=None)
+                        if isinstance(x0_p, tuple):
+                            x0_p = x0_p[0]
+                        
+                        # Scale ratio
+                        V_p_c, _ = uet.center_only(x0_p, mask_fixed)
+                        rms_p = (V_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
+                        rms_t = (V_tgt_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
+                        scale_r_p = rms_p / max(rms_t, 1e-8)
+                        
+                        # Compare to noisy input scale
+                        V_t_p_c, _ = uet.center_only(V_t_p, mask_fixed)
+                        rms_noisy = (V_t_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
+                        
+                        print(f"\n[HI-SIGMA-PROBE] σ={sigma_probe}: scale_r={scale_r_p:.3f} (want ~1.0), "
+                              f"rms_pred={rms_p:.4f}, rms_tgt={rms_t:.4f}, rms_noisy={rms_noisy:.4f}")
+                
                 
                 # Restore training mode
                 if was_training_score:
