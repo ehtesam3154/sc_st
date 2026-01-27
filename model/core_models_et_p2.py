@@ -6233,9 +6233,11 @@ def train_stageC_diffusion_generator(
                             
                             # Centered noisy input (same as forward_edm)
                             V_c_gl, _ = uet.center_only(V_t, mask)  # (B, N, D)
-                            
+
                             # LEARNED BRANCH OUTPUT: V_out = V_hat_centered - c_skip * V_c
-                            V_out_gl = (V_geom - c_skip_gl * V_c_gl) * m_float  # (B, N, D)
+                            # FIX: Use V_hat_centered (RAW) instead of V_geom (CLAMPED)
+                            # The clamp hides scale error, making this loss ineffective at fixing high-σ shrink
+                            V_out_gl = (V_hat_centered - c_skip_gl * V_c_gl) * m_float  # (B, N, D) - RAW!
                             
                             # CORRECT TARGET for learned branch: x0_centered - c_skip * x_c
                             V_tgt_c_gl, _ = uet.center_only(V_target, mask)
@@ -6425,12 +6427,14 @@ def train_stageC_diffusion_generator(
                                 # c_skip_b, c_out_b: (B, 1, 1)
                                 
                                 # Center noisy input and clean target in the SAME way as V_geom
-                                # V_geom is already centered(x0_pred) from the global geometry block
+                                # Center noisy input and clean target
                                 x_c, _ = uet.center_only(V_t, mask)       # Centered noisy input
                                 x0_c, _ = uet.center_only(V_target, mask)  # Centered clean target
-                                
-                                # V_geom = centered(x0_pred) is already computed above
-                                x0_pred_c = V_geom  # (B, N, D)
+
+                                # FIX: Use V_hat_centered (RAW) instead of V_geom (CLAMPED)
+                                # The clamp hides ~33% of the scale error, weakening gradient signal
+                                # This loss must see the TRUE scale deficit to fix it
+                                x0_pred_c = V_hat_centered  # (B, N, D) - RAW, not clamped!
                                 
                                 # CORRECT learned contribution (centered): c_out * F_x = x0_pred - c_skip * x_c
                                 V_out_pred = (x0_pred_c - c_skip_b * x_c) * m_float
