@@ -4516,10 +4516,11 @@ def train_stageC_diffusion_generator(
                                     # Initialize EMA from buffer
                                     purifier_state['gen_err_ema'] = float(np.mean(purifier_state['gen_err_buffer']))
                                     purifier_state['gen_err_q90_ema'] = float(np.percentile(purifier_state['gen_err_buffer'], 90))
-                                    purifier_state['sigma_ref_adaptive'] = np.clip(
+                                    # Track actual q90 error - no hard ceiling clip
+                                    # Only apply floor to prevent σ from going too low
+                                    purifier_state['sigma_ref_adaptive'] = max(
                                         purifier_state['gen_err_q90_ema'],
-                                        purifier_sigma_ref_min,
-                                        purifier_sigma_ref_max
+                                        purifier_sigma_ref_min
                                     )
                                     purifier_state['warmup_done'] = True
                                     purifier_state['gen_err_buffer'] = []  # Free memory
@@ -4528,10 +4529,11 @@ def train_stageC_diffusion_generator(
                                 ema_beta = 0.99
                                 purifier_state['gen_err_ema'] = ema_beta * purifier_state['gen_err_ema'] + (1 - ema_beta) * gen_err_mean
                                 purifier_state['gen_err_q90_ema'] = ema_beta * purifier_state['gen_err_q90_ema'] + (1 - ema_beta) * gen_err_q90
-                                purifier_state['sigma_ref_adaptive'] = np.clip(
+                                # Track actual q90 error - no hard ceiling clip
+                                # Only apply floor to prevent σ from going too low
+                                purifier_state['sigma_ref_adaptive'] = max(
                                     purifier_state['gen_err_q90_ema'],
-                                    purifier_sigma_ref_min,
-                                    purifier_sigma_ref_max
+                                    purifier_sigma_ref_min
                                 )
 
                             # Debug logging
@@ -4542,7 +4544,7 @@ def train_stageC_diffusion_generator(
                                 print(f"\n[PURIFIER-ERR] step={global_step}")
                                 print(f"  gen_err_rms: mean={gen_err_mean:.4f} q90={gen_err_q90:.4f}")
                                 print(f"  sigma_ref_adaptive={sigma_ref_curr:.4f} "
-                                      f"(range=[{purifier_sigma_ref_min:.2f}, {purifier_sigma_ref_max:.2f}])")
+                                      f"(floor={purifier_sigma_ref_min:.2f}, tracking actual q90)")
                                 print(f"  warmup_done={purifier_state['warmup_done']}")
                 else:
                     # STANDARD: noise around ground truth
@@ -7517,7 +7519,7 @@ def train_stageC_diffusion_generator(
                                         noise_diagnostics.append((noise_point_std, noise_point_mean_norm, sig_b))
                                         sigma_list.append(sig_b)
 
-                                if not noise_diagnostics:
+                                if noise_diagnostics:
                                     # Compute per-sample ratios (the TRUE test of noise correctness)
                                     ratios = [d[0] / max(d[2], 1e-8) for d in noise_diagnostics]
                                     ratio_med = torch.tensor(ratios).median().item()
@@ -8765,7 +8767,7 @@ def train_stageC_diffusion_generator(
             # After pretrain, diffusion learns to refine the generator's output.
             # ==============================================================================
             in_pretrain_phase = (global_step < gen_pretrain_steps) and (gen_pretrain_steps > 0)
-            diffusion_loss_mult = 0.1 if in_pretrain_phase else 1.0  # 10% during pretrain
+            diffusion_loss_mult = 0.0 if in_pretrain_phase else 1.0  # 0% during pretrain - fully freeze denoiser
 
             if in_pretrain_phase and global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                 print(f"\n[GEN-PRETRAIN] step={global_step}/{gen_pretrain_steps}")
