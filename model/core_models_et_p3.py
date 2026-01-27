@@ -464,6 +464,15 @@ class GEMSModel:
         gen_overlap_weight: float = 0.5,
         gen_pretrain_steps: int = 0,
         gen_trust_eval_every: int = 500,
+        # ========== AUTO-GATE FOR GENERATOR PRETRAIN (ChatGPT recommendation) ==========
+        gen_pretrain_auto_gate: bool = True,
+        gen_pretrain_j_inst_min: float = 0.25,
+        gen_pretrain_j_ema_min: float = 0.20,
+        gen_pretrain_e90_max: float = 1.0,
+        gen_pretrain_k_consecutive: int = 3,
+        gen_pretrain_max_steps: int = 5000,
+        gen_pretrain_no_progress_evals: int = 5,
+        gen_pretrain_no_progress_delta: float = 0.03,
     ):
 
 
@@ -665,6 +674,15 @@ class GEMSModel:
             gen_overlap_weight=gen_overlap_weight,
             gen_pretrain_steps=gen_pretrain_steps,
             gen_trust_eval_every=gen_trust_eval_every,
+            # ========== AUTO-GATE FOR GENERATOR PRETRAIN ==========
+            gen_pretrain_auto_gate=gen_pretrain_auto_gate,
+            gen_pretrain_j_inst_min=gen_pretrain_j_inst_min,
+            gen_pretrain_j_ema_min=gen_pretrain_j_ema_min,
+            gen_pretrain_e90_max=gen_pretrain_e90_max,
+            gen_pretrain_k_consecutive=gen_pretrain_k_consecutive,
+            gen_pretrain_max_steps=gen_pretrain_max_steps,
+            gen_pretrain_no_progress_evals=gen_pretrain_no_progress_evals,
+            gen_pretrain_no_progress_delta=gen_pretrain_no_progress_delta,
         )
 
 

@@ -2792,8 +2792,17 @@ def train_stageC_diffusion_generator(
     gen_geometry_weight: float = 1.0,      # Weight for generator geometry loss
     gen_overlap_at_sigma0: bool = True,    # Apply overlap on V_gen outputs (not noisy states)
     gen_overlap_weight: float = 0.5,       # Weight for generator overlap loss
-    gen_pretrain_steps: int = 0,           # Steps of generator-only training before diffusion
+    gen_pretrain_steps: int = 0,           # DEPRECATED: Use auto-gate instead (kept for backwards compat)
     gen_trust_eval_every: int = 500,       # How often to evaluate generator trustworthiness
+    # ========== AUTO-GATE FOR GENERATOR PRETRAIN (ChatGPT recommendation) ==========
+    gen_pretrain_auto_gate: bool = True,   # Enable automatic gate based on GEN-TRUST metrics
+    gen_pretrain_j_inst_min: float = 0.25, # J_inst threshold for pass (instant Jaccard@10)
+    gen_pretrain_j_ema_min: float = 0.20,  # J_ema threshold for gate (EMA Jaccard@10)
+    gen_pretrain_e90_max: float = 1.0,     # Max e90 (RMS error q90) for pass
+    gen_pretrain_k_consecutive: int = 3,   # Number of consecutive passes required
+    gen_pretrain_max_steps: int = 5000,    # Hard fallback: start denoiser after this many steps
+    gen_pretrain_no_progress_evals: int = 5,  # N evals without improvement triggers stop
+    gen_pretrain_no_progress_delta: float = 0.03,  # Min improvement in J_ema over window
 
 ):
     
@@ -2830,6 +2839,12 @@ def train_stageC_diffusion_generator(
         'err_q90': None,                  # 90th percentile error
         'eval_count': 0,
         'history': [],                   # Track over training
+        # --- AUTO-GATE for generator pretrain ---
+        'pass_streak': 0,                # Consecutive passes (J_inst >= threshold AND e90 <= max)
+        'j_ema_history': [],             # Rolling window of J_ema for progress detection
+        'pretrain_ended': False,         # Flag: has generator pretrain ended?
+        'pretrain_end_reason': None,     # 'auto_gate', 'max_steps', 'no_progress', or 'disabled'
+        'pretrain_end_step': None,       # Step at which pretrain ended
     }
 
     slide_d15_medians = []
@@ -8272,6 +8287,82 @@ def train_stageC_diffusion_generator(
                                         print(f"  ⚠ Generator is MARGINAL (Jaccard@10 = 0.25-0.4)")
                                     else:
                                         print(f"  ✗ Generator is UNRELIABLE (Jaccard@10 < 0.25)")
+
+                                    # ==============================================================================
+                                    # [AUTO-GATE] Automatic generator pretrain gate with hysteresis
+                                    # ==============================================================================
+                                    # Gate conditions (all must be true for K consecutive evals):
+                                    # 1. J_inst >= gen_pretrain_j_inst_min
+                                    # 2. e90 <= gen_pretrain_e90_max
+                                    # Plus: J_ema >= gen_pretrain_j_ema_min (checked once at gate time)
+                                    # ==============================================================================
+                                    if gen_pretrain_auto_gate and not gen_trust_state['pretrain_ended']:
+                                        # Check instant pass condition
+                                        j_inst_pass = jaccard_mean >= gen_pretrain_j_inst_min
+                                        e90_pass = err_q90 <= gen_pretrain_e90_max
+                                        instant_pass = j_inst_pass and e90_pass
+
+                                        if instant_pass:
+                                            gen_trust_state['pass_streak'] += 1
+                                        else:
+                                            gen_trust_state['pass_streak'] = 0
+
+                                        # Track J_ema history for no-progress detection
+                                        gen_trust_state['j_ema_history'].append(gen_trust_state['jaccard_k10_ema'])
+                                        # Keep only last N+1 evals for progress comparison
+                                        max_history = gen_pretrain_no_progress_evals + 1
+                                        if len(gen_trust_state['j_ema_history']) > max_history:
+                                            gen_trust_state['j_ema_history'] = gen_trust_state['j_ema_history'][-max_history:]
+
+                                        # Check gate conditions
+                                        j_ema_pass = gen_trust_state['jaccard_k10_ema'] >= gen_pretrain_j_ema_min
+                                        streak_pass = gen_trust_state['pass_streak'] >= gen_pretrain_k_consecutive
+
+                                        # Check for no-progress (J_ema not improving)
+                                        no_progress = False
+                                        if len(gen_trust_state['j_ema_history']) >= gen_pretrain_no_progress_evals:
+                                            oldest_ema = gen_trust_state['j_ema_history'][0]
+                                            newest_ema = gen_trust_state['j_ema_history'][-1]
+                                            improvement = newest_ema - oldest_ema
+                                            if improvement < gen_pretrain_no_progress_delta:
+                                                no_progress = True
+
+                                        # Print gate status
+                                        print(f"\n  [AUTO-GATE] streak={gen_trust_state['pass_streak']}/{gen_pretrain_k_consecutive} "
+                                              f"j_inst_pass={j_inst_pass} e90_pass={e90_pass} j_ema_pass={j_ema_pass}")
+                                        print(f"  [AUTO-GATE] thresholds: j_inst>={gen_pretrain_j_inst_min:.2f} "
+                                              f"j_ema>={gen_pretrain_j_ema_min:.2f} e90<={gen_pretrain_e90_max:.2f}")
+
+                                        # Check if gate should open
+                                        gate_open = False
+                                        end_reason = None
+
+                                        if streak_pass and j_ema_pass:
+                                            gate_open = True
+                                            end_reason = 'auto_gate'
+                                            print(f"  ✓ [AUTO-GATE] PASSED! Generator pretrain complete (sustained quality)")
+                                        elif global_step >= gen_pretrain_max_steps:
+                                            gate_open = True
+                                            end_reason = 'max_steps'
+                                            print(f"  ⚠ [AUTO-GATE] MAX STEPS reached ({gen_pretrain_max_steps}). "
+                                                  f"Starting denoiser training anyway.")
+                                        elif no_progress:
+                                            gate_open = True
+                                            end_reason = 'no_progress'
+                                            print(f"  ⚠ [AUTO-GATE] NO PROGRESS detected over {gen_pretrain_no_progress_evals} evals. "
+                                                  f"J_ema improved by only {improvement:.4f} < {gen_pretrain_no_progress_delta}")
+
+                                        if gate_open:
+                                            gen_trust_state['pretrain_ended'] = True
+                                            gen_trust_state['pretrain_end_reason'] = end_reason
+                                            gen_trust_state['pretrain_end_step'] = global_step
+                                            print(f"\n{'='*60}")
+                                            print(f"[AUTO-GATE] Generator pretrain ENDED at step {global_step}")
+                                            print(f"[AUTO-GATE] Reason: {end_reason}")
+                                            print(f"[AUTO-GATE] Final J_ema={gen_trust_state['jaccard_k10_ema']:.4f} "
+                                                  f"e90={err_q90:.4f}")
+                                            print(f"[AUTO-GATE] Denoiser training now ENABLED")
+                                            print(f"{'='*60}\n")
                 else:
                     L_gen_align = torch.tensor(0.0, device=device)
                     L_gen_gram = torch.tensor(0.0, device=device)
@@ -8762,16 +8853,44 @@ def train_stageC_diffusion_generator(
             # ==============================================================================
             # [GEN-TRUST] PRETRAIN PHASE: Scale down diffusion losses during generator pretrain
             # ==============================================================================
-            # During pretrain (global_step < gen_pretrain_steps), focus on generator losses.
-            # Diffusion score loss is scaled down to let generator establish proper geometry first.
-            # After pretrain, diffusion learns to refine the generator's output.
+            # Two modes:
+            # 1. AUTO-GATE (gen_pretrain_auto_gate=True): Use GEN-TRUST metrics to decide when
+            #    generator is good enough. Pretrain ends when: J_inst passes K times consecutively,
+            #    J_ema >= threshold, AND e90 <= threshold. Hard fallback at max_steps.
+            # 2. STEP-BASED (gen_pretrain_auto_gate=False): Use gen_pretrain_steps (deprecated).
+            # During pretrain, diffusion losses are zeroed to let generator establish geometry.
             # ==============================================================================
-            in_pretrain_phase = (global_step < gen_pretrain_steps) and (gen_pretrain_steps > 0)
+            if gen_pretrain_auto_gate:
+                # AUTO-GATE: pretrain continues until gen_trust_state['pretrain_ended'] is True
+                # Mark as disabled immediately if disabled at start
+                if not gen_trust_state.get('_auto_gate_initialized', False):
+                    gen_trust_state['_auto_gate_initialized'] = True
+                    # If auto-gate is disabled (max_steps=0), end pretrain immediately
+                    if gen_pretrain_max_steps == 0:
+                        gen_trust_state['pretrain_ended'] = True
+                        gen_trust_state['pretrain_end_reason'] = 'disabled'
+                        gen_trust_state['pretrain_end_step'] = 0
+
+                in_pretrain_phase = not gen_trust_state['pretrain_ended']
+            else:
+                # STEP-BASED (deprecated): use gen_pretrain_steps
+                in_pretrain_phase = (global_step < gen_pretrain_steps) and (gen_pretrain_steps > 0)
+
             diffusion_loss_mult = 0.0 if in_pretrain_phase else 1.0  # 0% during pretrain - fully freeze denoiser
 
             if in_pretrain_phase and global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
-                print(f"\n[GEN-PRETRAIN] step={global_step}/{gen_pretrain_steps}")
-                print(f"  diffusion_loss_mult={diffusion_loss_mult} (generator-focused training)")
+                if gen_pretrain_auto_gate:
+                    j_ema = gen_trust_state.get('jaccard_k10_ema', 0.0) or 0.0
+                    e90 = gen_trust_state.get('err_q90', 999.0) or 999.0
+                    streak = gen_trust_state.get('pass_streak', 0)
+                    print(f"\n[GEN-PRETRAIN] step={global_step} (AUTO-GATE mode)")
+                    print(f"  J_ema={j_ema:.4f}/{gen_pretrain_j_ema_min:.2f} "
+                          f"e90={e90:.4f}/{gen_pretrain_e90_max:.2f} "
+                          f"streak={streak}/{gen_pretrain_k_consecutive}")
+                    print(f"  max_steps={gen_pretrain_max_steps} | diffusion_loss_mult={diffusion_loss_mult}")
+                else:
+                    print(f"\n[GEN-PRETRAIN] step={global_step}/{gen_pretrain_steps}")
+                    print(f"  diffusion_loss_mult={diffusion_loss_mult} (generator-focused training)")
 
             L_total = (WEIGHTS['score'] * score_multiplier * L_score * diffusion_loss_mult +
                     WEIGHTS['gram'] * L_gram * diffusion_loss_mult +

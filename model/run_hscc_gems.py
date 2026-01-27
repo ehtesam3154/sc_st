@@ -217,9 +217,27 @@ def parse_args():
     parser.add_argument('--gen_overlap_weight', type=float, default=0.5,
                         help='Weight for generator overlap loss')
     parser.add_argument('--gen_pretrain_steps', type=int, default=0,
-                        help='Steps of generator-only training before diffusion (0=disabled)')
+                        help='DEPRECATED: Use auto-gate instead (kept for backwards compat)')
     parser.add_argument('--gen_trust_eval_every', type=int, default=500,
                         help='How often to evaluate generator trustworthiness')
+
+    # ========== AUTO-GATE FOR GENERATOR PRETRAIN (ChatGPT recommendation) ==========
+    parser.add_argument('--gen_pretrain_auto_gate', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable automatic gate based on GEN-TRUST metrics')
+    parser.add_argument('--gen_pretrain_j_inst_min', type=float, default=0.25,
+                        help='J_inst threshold for pass (instant Jaccard@10)')
+    parser.add_argument('--gen_pretrain_j_ema_min', type=float, default=0.20,
+                        help='J_ema threshold for gate (EMA Jaccard@10)')
+    parser.add_argument('--gen_pretrain_e90_max', type=float, default=1.0,
+                        help='Max e90 (RMS error q90) for pass')
+    parser.add_argument('--gen_pretrain_k_consecutive', type=int, default=3,
+                        help='Number of consecutive passes required')
+    parser.add_argument('--gen_pretrain_max_steps', type=int, default=5000,
+                        help='Hard fallback: start denoiser after this many steps (0=no pretrain)')
+    parser.add_argument('--gen_pretrain_no_progress_evals', type=int, default=5,
+                        help='N evals without improvement triggers stop')
+    parser.add_argument('--gen_pretrain_no_progress_delta', type=float, default=0.03,
+                        help='Min improvement in J_ema over window')
 
     # ========== NEW: Stage A VICReg + Adversary Arguments ==========
     parser.add_argument('--stageA_obj', type=str, default='geom',
@@ -726,6 +744,15 @@ def main(args=None):
         gen_overlap_weight=args.gen_overlap_weight,
         gen_pretrain_steps=args.gen_pretrain_steps,
         gen_trust_eval_every=args.gen_trust_eval_every,
+        # ========== AUTO-GATE FOR GENERATOR PRETRAIN ==========
+        gen_pretrain_auto_gate=args.gen_pretrain_auto_gate,
+        gen_pretrain_j_inst_min=args.gen_pretrain_j_inst_min,
+        gen_pretrain_j_ema_min=args.gen_pretrain_j_ema_min,
+        gen_pretrain_e90_max=args.gen_pretrain_e90_max,
+        gen_pretrain_k_consecutive=args.gen_pretrain_k_consecutive,
+        gen_pretrain_max_steps=args.gen_pretrain_max_steps,
+        gen_pretrain_no_progress_evals=args.gen_pretrain_no_progress_evals,
+        gen_pretrain_no_progress_delta=args.gen_pretrain_no_progress_delta,
     )
 
 
@@ -872,6 +899,15 @@ def main(args=None):
             gen_overlap_weight=args.gen_overlap_weight,
             gen_pretrain_steps=args.gen_pretrain_steps,
             gen_trust_eval_every=args.gen_trust_eval_every,
+            # ========== AUTO-GATE FOR GENERATOR PRETRAIN ==========
+            gen_pretrain_auto_gate=args.gen_pretrain_auto_gate,
+            gen_pretrain_j_inst_min=args.gen_pretrain_j_inst_min,
+            gen_pretrain_j_ema_min=args.gen_pretrain_j_ema_min,
+            gen_pretrain_e90_max=args.gen_pretrain_e90_max,
+            gen_pretrain_k_consecutive=args.gen_pretrain_k_consecutive,
+            gen_pretrain_max_steps=args.gen_pretrain_max_steps,
+            gen_pretrain_no_progress_evals=args.gen_pretrain_no_progress_evals,
+            gen_pretrain_no_progress_delta=args.gen_pretrain_no_progress_delta,
         )
 
         fabric.barrier()
