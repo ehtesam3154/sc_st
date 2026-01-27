@@ -447,6 +447,23 @@ class GEMSModel:
         overlap_sigma_thresh: float = 0.5,
         disable_ctx_loss_when_overlap: bool = True,
         overlap_debug_every: int = 100,
+        # ========== PURIFIER FORMULATION (ChatGPT architecture fix) ==========
+        purifier_mode: bool = True,
+        purifier_sigma_from_gen_err: bool = True,
+        purifier_sigma_ref_min: float = 0.4,
+        purifier_sigma_ref_max: float = 1.2,
+        purifier_sigma_tail_frac: float = 0.15,
+        # ========== OVERLAP TEACHER-STUDENT (prevent collapse) ==========
+        overlap_teacher_student: bool = True,
+        overlap_warmup_steps: int = 2000,
+        overlap_kl_delay_steps: int = 3000,
+        # ========== GENERATOR TRUST (ChatGPT recommendations) ==========
+        gen_geometry_at_sigma0: bool = True,
+        gen_geometry_weight: float = 1.0,
+        gen_overlap_at_sigma0: bool = True,
+        gen_overlap_weight: float = 0.5,
+        gen_pretrain_steps: int = 0,
+        gen_trust_eval_every: int = 500,
     ):
 
 
@@ -631,6 +648,23 @@ class GEMSModel:
             overlap_sigma_thresh=overlap_sigma_thresh,
             disable_ctx_loss_when_overlap=disable_ctx_loss_when_overlap,
             overlap_debug_every=overlap_debug_every,
+            # ========== PURIFIER FORMULATION ==========
+            purifier_mode=purifier_mode,
+            purifier_sigma_from_gen_err=purifier_sigma_from_gen_err,
+            purifier_sigma_ref_min=purifier_sigma_ref_min,
+            purifier_sigma_ref_max=purifier_sigma_ref_max,
+            purifier_sigma_tail_frac=purifier_sigma_tail_frac,
+            # ========== OVERLAP TEACHER-STUDENT ==========
+            overlap_teacher_student=overlap_teacher_student,
+            overlap_warmup_steps=overlap_warmup_steps,
+            overlap_kl_delay_steps=overlap_kl_delay_steps,
+            # ========== GENERATOR TRUST ==========
+            gen_geometry_at_sigma0=gen_geometry_at_sigma0,
+            gen_geometry_weight=gen_geometry_weight,
+            gen_overlap_at_sigma0=gen_overlap_at_sigma0,
+            gen_overlap_weight=gen_overlap_weight,
+            gen_pretrain_steps=gen_pretrain_steps,
+            gen_trust_eval_every=gen_trust_eval_every,
         )
 
 

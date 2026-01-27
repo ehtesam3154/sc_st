@@ -187,6 +187,40 @@ def parse_args():
     parser.add_argument('--overlap_debug_every', type=int, default=100,
                         help='Debug print frequency for overlap loss')
 
+    # ========== PURIFIER FORMULATION (ChatGPT architecture fix) ==========
+    parser.add_argument('--purifier_mode', action=argparse.BooleanOptionalAction, default=True,
+                        help='Train as refiner around V_gen (not V_target)')
+    parser.add_argument('--purifier_sigma_from_gen_err', action=argparse.BooleanOptionalAction, default=True,
+                        help='Adapt sigma_max to generator error distribution')
+    parser.add_argument('--purifier_sigma_ref_min', type=float, default=0.4,
+                        help='Min sigma_ref_max floor')
+    parser.add_argument('--purifier_sigma_ref_max', type=float, default=1.2,
+                        help='Max sigma_ref_max ceiling')
+    parser.add_argument('--purifier_sigma_tail_frac', type=float, default=0.15,
+                        help='Fraction of samples in high-sigma tail')
+
+    # ========== OVERLAP TEACHER-STUDENT (prevent collapse) ==========
+    parser.add_argument('--overlap_teacher_student', action=argparse.BooleanOptionalAction, default=True,
+                        help='Detach one view in overlap loss (teacher-student)')
+    parser.add_argument('--overlap_warmup_steps', type=int, default=2000,
+                        help='Steps before overlap ramps to full weight')
+    parser.add_argument('--overlap_kl_delay_steps', type=int, default=3000,
+                        help='Steps before KL loss activates')
+
+    # ========== GENERATOR TRUST (ChatGPT recommendations) ==========
+    parser.add_argument('--gen_geometry_at_sigma0', action=argparse.BooleanOptionalAction, default=True,
+                        help='Apply gram/geom loss directly on V_gen (not noisy)')
+    parser.add_argument('--gen_geometry_weight', type=float, default=1.0,
+                        help='Weight for generator geometry loss')
+    parser.add_argument('--gen_overlap_at_sigma0', action=argparse.BooleanOptionalAction, default=True,
+                        help='Apply overlap on V_gen outputs (not noisy states)')
+    parser.add_argument('--gen_overlap_weight', type=float, default=0.5,
+                        help='Weight for generator overlap loss')
+    parser.add_argument('--gen_pretrain_steps', type=int, default=0,
+                        help='Steps of generator-only training before diffusion (0=disabled)')
+    parser.add_argument('--gen_trust_eval_every', type=int, default=500,
+                        help='How often to evaluate generator trustworthiness')
+
     # ========== NEW: Stage A VICReg + Adversary Arguments ==========
     parser.add_argument('--stageA_obj', type=str, default='geom',
                         choices=['geom', 'vicreg_adv'],
@@ -675,9 +709,26 @@ def main(args=None):
         overlap_sigma_thresh=args.overlap_sigma_thresh,
         disable_ctx_loss_when_overlap=args.disable_ctx_loss_when_overlap,
         overlap_debug_every=args.overlap_debug_every,
+        # ========== PURIFIER FORMULATION ==========
+        purifier_mode=args.purifier_mode,
+        purifier_sigma_from_gen_err=args.purifier_sigma_from_gen_err,
+        purifier_sigma_ref_min=args.purifier_sigma_ref_min,
+        purifier_sigma_ref_max=args.purifier_sigma_ref_max,
+        purifier_sigma_tail_frac=args.purifier_sigma_tail_frac,
+        # ========== OVERLAP TEACHER-STUDENT ==========
+        overlap_teacher_student=args.overlap_teacher_student,
+        overlap_warmup_steps=args.overlap_warmup_steps,
+        overlap_kl_delay_steps=args.overlap_kl_delay_steps,
+        # ========== GENERATOR TRUST ==========
+        gen_geometry_at_sigma0=args.gen_geometry_at_sigma0,
+        gen_geometry_weight=args.gen_geometry_weight,
+        gen_overlap_at_sigma0=args.gen_overlap_at_sigma0,
+        gen_overlap_weight=args.gen_overlap_weight,
+        gen_pretrain_steps=args.gen_pretrain_steps,
+        gen_trust_eval_every=args.gen_trust_eval_every,
     )
 
-    
+
     fabric.barrier()
     
     # ========== SAVE ST CHECKPOINT (Phase 1 complete) ==========
@@ -804,10 +855,27 @@ def main(args=None):
             overlap_sigma_thresh=args.overlap_sigma_thresh,
             disable_ctx_loss_when_overlap=args.disable_ctx_loss_when_overlap,
             overlap_debug_every=args.overlap_debug_every,
+            # ========== PURIFIER FORMULATION ==========
+            purifier_mode=args.purifier_mode,
+            purifier_sigma_from_gen_err=args.purifier_sigma_from_gen_err,
+            purifier_sigma_ref_min=args.purifier_sigma_ref_min,
+            purifier_sigma_ref_max=args.purifier_sigma_ref_max,
+            purifier_sigma_tail_frac=args.purifier_sigma_tail_frac,
+            # ========== OVERLAP TEACHER-STUDENT ==========
+            overlap_teacher_student=args.overlap_teacher_student,
+            overlap_warmup_steps=args.overlap_warmup_steps,
+            overlap_kl_delay_steps=args.overlap_kl_delay_steps,
+            # ========== GENERATOR TRUST ==========
+            gen_geometry_at_sigma0=args.gen_geometry_at_sigma0,
+            gen_geometry_weight=args.gen_geometry_weight,
+            gen_overlap_at_sigma0=args.gen_overlap_at_sigma0,
+            gen_overlap_weight=args.gen_overlap_weight,
+            gen_pretrain_steps=args.gen_pretrain_steps,
+            gen_trust_eval_every=args.gen_trust_eval_every,
         )
-        
+
         fabric.barrier()
-        
+
         if fabric.is_global_zero:
             print("\n" + "="*70)
             print("PHASE 2 COMPLETE")
