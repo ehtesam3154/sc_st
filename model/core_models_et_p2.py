@@ -2787,6 +2787,13 @@ def train_stageC_diffusion_generator(
     overlap_teacher_student: bool = True,  # Detach one view in overlap loss
     overlap_warmup_steps: int = 2000,      # Steps before overlap ramps to full weight
     overlap_kl_delay_steps: int = 3000,    # Steps before KL loss activates
+    # ========== GENERATOR TRUST (ChatGPT recommendations) ==========
+    gen_geometry_at_sigma0: bool = True,   # Apply gram/geom loss directly on V_gen (not noisy)
+    gen_geometry_weight: float = 1.0,      # Weight for generator geometry loss
+    gen_overlap_at_sigma0: bool = True,    # Apply overlap on V_gen outputs (not noisy states)
+    gen_overlap_weight: float = 0.5,       # Weight for generator overlap loss
+    gen_pretrain_steps: int = 0,           # Steps of generator-only training before diffusion
+    gen_trust_eval_every: int = 500,       # How often to evaluate generator trustworthiness
 
 ):
     
@@ -2811,6 +2818,18 @@ def train_stageC_diffusion_generator(
         'sigma_ref_adaptive': None,   # Current adaptive sigma_ref_max
         'gen_err_buffer': [],         # Buffer for warmup
         'warmup_done': False,
+    }
+
+    # ==============================================================================
+    # [GEN-TRUST] State tracking for generator trustworthiness
+    # ==============================================================================
+    gen_trust_state = {
+        'procrustes_mse_ema': None,      # EMA of Procrustes-aligned MSE
+        'jaccard_k10_ema': None,         # EMA of Global Jaccard@10
+        'err_q50': None,                  # Median error (for sigma_start)
+        'err_q90': None,                  # 90th percentile error
+        'eval_count': 0,
+        'history': [],                   # Track over training
     }
 
     slide_d15_medians = []
@@ -8121,8 +8140,137 @@ def train_stageC_diffusion_generator(
                             )
                             # Combine global and local scale supervision
                             L_gen_scale = L_gen_scale + 0.5 * L_gen_scale_local
+
+                        # ==============================================================================
+                        # [GEN-TRUST] GENERATOR GEOMETRY LOSS AT σ=0 (ChatGPT recommendation)
+                        # ==============================================================================
+                        # Apply Gram consistency directly on V_gen vs V_target (no noise!)
+                        # This ensures generator learns correct global geometry, not just alignment.
+                        # Without this, generator can be "roughly correct" but wrong in neighborhoods.
+                        # ==============================================================================
+                        L_gen_gram = torch.tensor(0.0, device=device)
+                        if gen_geometry_at_sigma0:
+                            # Gram loss on generator output at σ=0
+                            # Use centered V_gen (no noise added)
+                            G_gen = torch.bmm(V_gen_centered_L, V_gen_centered_L.transpose(1, 2))  # (B, N, N)
+                            G_tgt = torch.bmm(V_target_batch.float(), V_target_batch.float().transpose(1, 2))  # (B, N, N)
+
+                            # Masked Gram difference
+                            mask_2d = mask.unsqueeze(1).float() * mask.unsqueeze(2).float()  # (B, N, N)
+                            gram_diff = (G_gen - G_tgt).pow(2) * mask_2d
+
+                            # Normalize by number of valid pairs
+                            n_pairs = mask_2d.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
+                            L_gen_gram = (gram_diff.sum(dim=(1, 2)) / n_pairs).mean()
+
+                            # Debug logging
+                            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                                print(f"\n[GEN-GRAM-σ0] step={global_step}")
+                                print(f"  L_gen_gram={L_gen_gram.item():.6f} weight={gen_geometry_weight}")
+                                with torch.no_grad():
+                                    tr_gen = G_gen.diagonal(dim1=1, dim2=2).sum(dim=1).mean().item()
+                                    tr_tgt = G_tgt.diagonal(dim1=1, dim2=2).sum(dim=1).mean().item()
+                                    print(f"  trace(G_gen)={tr_gen:.4f} trace(G_tgt)={tr_tgt:.4f} ratio={tr_gen/max(tr_tgt,1e-6):.4f}")
+
+                        # ==============================================================================
+                        # [GEN-TRUST] GENERATOR TRUSTWORTHINESS EVALUATION
+                        # ==============================================================================
+                        # Track: Procrustes-aligned MSE, Global Jaccard@k, error quantiles
+                        # This tells you if generator is reliable enough for purifier mode.
+                        # ==============================================================================
+                        if global_step % gen_trust_eval_every == 0:
+                            with torch.no_grad():
+                                # Sample up to 4 batch elements for evaluation
+                                n_eval = min(4, batch_size_real)
+
+                                jaccard_k10_list = []
+                                procrustes_mse_list = []
+                                rms_err_list = []
+
+                                for b_idx in range(n_eval):
+                                    m_b = mask[b_idx].bool()
+                                    n_valid = m_b.sum().item()
+                                    if n_valid < 20:
+                                        continue
+
+                                    v_gen = V_gen_centered_L[b_idx, m_b].float()  # (n_valid, D)
+                                    v_tgt = V_target_batch[b_idx, m_b].float()    # (n_valid, D)
+
+                                    # 1. Procrustes-aligned MSE (rotation-only)
+                                    # Center both
+                                    v_gen_c = v_gen - v_gen.mean(dim=0, keepdim=True)
+                                    v_tgt_c = v_tgt - v_tgt.mean(dim=0, keepdim=True)
+
+                                    # SVD for rotation
+                                    H_svd = v_tgt_c.T @ v_gen_c
+                                    U, S, Vt = torch.linalg.svd(H_svd)
+                                    R = Vt.T @ U.T
+                                    v_gen_aligned = v_gen_c @ R
+
+                                    procrustes_mse = (v_gen_aligned - v_tgt_c).pow(2).mean().item()
+                                    procrustes_mse_list.append(procrustes_mse)
+
+                                    # 2. RMS error (for sigma_start)
+                                    rms_err = (v_gen_aligned - v_tgt_c).pow(2).sum(dim=1).sqrt().mean().item()
+                                    rms_err_list.append(rms_err)
+
+                                    # 3. Global Jaccard@10
+                                    D_gen = torch.cdist(v_gen_c, v_gen_c)
+                                    D_tgt = torch.cdist(v_tgt_c, v_tgt_c)
+
+                                    k = min(10, n_valid - 1)
+                                    _, knn_gen = D_gen.topk(k + 1, largest=False, dim=1)
+                                    _, knn_tgt = D_tgt.topk(k + 1, largest=False, dim=1)
+                                    knn_gen = knn_gen[:, 1:]  # Exclude self
+                                    knn_tgt = knn_tgt[:, 1:]
+
+                                    jaccard_sum = 0.0
+                                    for i in range(n_valid):
+                                        set_gen = set(knn_gen[i].tolist())
+                                        set_tgt = set(knn_tgt[i].tolist())
+                                        intersection = len(set_gen & set_tgt)
+                                        union = len(set_gen | set_tgt)
+                                        if union > 0:
+                                            jaccard_sum += intersection / union
+                                    jaccard_k10_list.append(jaccard_sum / n_valid)
+
+                                # Update gen_trust_state
+                                if jaccard_k10_list:
+                                    jaccard_mean = float(np.mean(jaccard_k10_list))
+                                    procrustes_mean = float(np.mean(procrustes_mse_list))
+                                    err_q50 = float(np.median(rms_err_list))
+                                    err_q90 = float(np.percentile(rms_err_list, 90)) if len(rms_err_list) > 1 else err_q50
+
+                                    # EMA update
+                                    ema_beta = 0.95
+                                    if gen_trust_state['jaccard_k10_ema'] is None:
+                                        gen_trust_state['jaccard_k10_ema'] = jaccard_mean
+                                        gen_trust_state['procrustes_mse_ema'] = procrustes_mean
+                                    else:
+                                        gen_trust_state['jaccard_k10_ema'] = ema_beta * gen_trust_state['jaccard_k10_ema'] + (1 - ema_beta) * jaccard_mean
+                                        gen_trust_state['procrustes_mse_ema'] = ema_beta * gen_trust_state['procrustes_mse_ema'] + (1 - ema_beta) * procrustes_mean
+
+                                    gen_trust_state['err_q50'] = err_q50
+                                    gen_trust_state['err_q90'] = err_q90
+                                    gen_trust_state['eval_count'] += 1
+
+                                    # Print trustworthiness report
+                                    print(f"\n[GEN-TRUST] step={global_step} eval_count={gen_trust_state['eval_count']}")
+                                    print(f"  Jaccard@10 (gen-only): instant={jaccard_mean:.4f} ema={gen_trust_state['jaccard_k10_ema']:.4f}")
+                                    print(f"  Procrustes MSE: instant={procrustes_mean:.6f} ema={gen_trust_state['procrustes_mse_ema']:.6f}")
+                                    print(f"  RMS error: q50={err_q50:.4f} q90={err_q90:.4f}")
+                                    print(f"  Recommended σ_start for inference: {err_q90:.4f}")
+
+                                    # Trust assessment
+                                    if gen_trust_state['jaccard_k10_ema'] > 0.4:
+                                        print(f"  ✓ Generator is TRUSTWORTHY (Jaccard@10 > 0.4)")
+                                    elif gen_trust_state['jaccard_k10_ema'] > 0.25:
+                                        print(f"  ⚠ Generator is MARGINAL (Jaccard@10 = 0.25-0.4)")
+                                    else:
+                                        print(f"  ✗ Generator is UNRELIABLE (Jaccard@10 < 0.25)")
                 else:
                     L_gen_align = torch.tensor(0.0, device=device)
+                    L_gen_gram = torch.tensor(0.0, device=device)
 
                 # ==================== NEW MANIFOLD-AWARE REGULARIZERS ====================
                 # B1: Intrinsic dimension regularizer
@@ -8607,24 +8755,39 @@ def train_stageC_diffusion_generator(
                     print(f"  scale_ratio_mean={hi_scale_debug.get('scale_ratio_mean', 1.0):.4f} (should be ~1.0)")
                     print(f"  L_hi_scale_standalone={L_hi_scale_standalone.item():.6f}")
 
-            L_total = (WEIGHTS['score'] * score_multiplier * L_score +
-                    WEIGHTS['gram'] * L_gram +
-                    WEIGHTS['gram_scale'] * L_gram_scale +
-                    WEIGHTS.get('out_scale', 0) * L_out_scale +
-                    WEIGHTS.get('gram_learn', 0) * L_gram_learn +
+            # ==============================================================================
+            # [GEN-TRUST] PRETRAIN PHASE: Scale down diffusion losses during generator pretrain
+            # ==============================================================================
+            # During pretrain (global_step < gen_pretrain_steps), focus on generator losses.
+            # Diffusion score loss is scaled down to let generator establish proper geometry first.
+            # After pretrain, diffusion learns to refine the generator's output.
+            # ==============================================================================
+            in_pretrain_phase = (global_step < gen_pretrain_steps) and (gen_pretrain_steps > 0)
+            diffusion_loss_mult = 0.1 if in_pretrain_phase else 1.0  # 10% during pretrain
+
+            if in_pretrain_phase and global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                print(f"\n[GEN-PRETRAIN] step={global_step}/{gen_pretrain_steps}")
+                print(f"  diffusion_loss_mult={diffusion_loss_mult} (generator-focused training)")
+
+            L_total = (WEIGHTS['score'] * score_multiplier * L_score * diffusion_loss_mult +
+                    WEIGHTS['gram'] * L_gram * diffusion_loss_mult +
+                    WEIGHTS['gram_scale'] * L_gram_scale * diffusion_loss_mult +
+                    WEIGHTS.get('out_scale', 0) * L_out_scale * diffusion_loss_mult +
+                    WEIGHTS.get('gram_learn', 0) * L_gram_learn * diffusion_loss_mult +
                     WEIGHTS['heat'] * L_heat +
                     WEIGHTS['sw_st'] * L_sw_st +
                     WEIGHTS['sw_sc'] * L_sw_sc +
                     WEIGHTS['overlap'] * L_overlap +
                     WEIGHTS['ordinal_sc'] * L_ordinal_sc +
                     WEIGHTS['st_dist'] * L_st_dist +
-                    WEIGHTS['edm_tail'] * L_edm_tail +
-                    WEIGHTS['gen_align'] * L_gen_align +
-                    WEIGHTS.get('gen_scale', 0) * L_gen_scale +  # PATCH 8
+                    WEIGHTS['edm_tail'] * L_edm_tail * diffusion_loss_mult +
+                    WEIGHTS['gen_align'] * L_gen_align +  # Generator losses NOT scaled down
+                    WEIGHTS.get('gen_scale', 0) * L_gen_scale +  # Generator losses NOT scaled down
+                    gen_geometry_weight * L_gen_gram +  # [GEN-TRUST] Generator geometry at σ=0
                     WEIGHTS['dim'] * L_dim +
                     WEIGHTS['triangle'] * L_triangle +
-                    WEIGHTS['knn_nca'] * L_knn_nca +
-                    WEIGHTS.get('knn_scale', 0) * L_knn_scale +
+                    WEIGHTS['knn_nca'] * L_knn_nca * diffusion_loss_mult +
+                    WEIGHTS.get('knn_scale', 0) * L_knn_scale * diffusion_loss_mult +
                     WEIGHTS['radial'] * L_radial +
                     WEIGHTS['repel'] * L_repel +
                     WEIGHTS['shape'] * L_shape +
@@ -8634,7 +8797,7 @@ def train_stageC_diffusion_generator(
                     WEIGHTS.get('subspace', 0) * L_subspace +  # PATCH 7
                     WEIGHTS.get('ctx_edge', 0) * L_ctx_edge +
                     effective_ctx_loss_weight * L_ctx_replace +
-                    HI_SCALE_STANDALONE_WEIGHT * L_hi_scale_standalone)  # [PURIFIER-FIX] Standalone hi-σ anchor
+                    HI_SCALE_STANDALONE_WEIGHT * L_hi_scale_standalone * diffusion_loss_mult)  # [PURIFIER-FIX]
 
             # Add SC dimension prior if this is an SC batch
             if is_sc:
@@ -8745,7 +8908,83 @@ def train_stageC_diffusion_generator(
                     # Encode view2 context
                     with torch.autocast(device_type='cuda', dtype=amp_dtype):
                         H_2 = context_encoder(Z_set_2, mask_2)
- 
+
+                        # ==============================================================================
+                        # [GEN-TRUST] GENERATOR OVERLAP AT σ=0 (ChatGPT recommendation)
+                        # ==============================================================================
+                        # Apply overlap on V_gen outputs (not noisy states).
+                        # This avoids "agreement under ambiguity" shortcut that causes shrink.
+                        # Teacher-student: detach view1, train view2 to match (or vice versa).
+                        # ==============================================================================
+                        L_gen_ov = torch.tensor(0.0, device=device)
+                        if gen_overlap_at_sigma0 and V_gen is not None:
+                            # Compute V_gen for view2 (no noise!)
+                            V_gen_2 = generator(H_2, mask_2)
+
+                            # Get V_gen for view1 (sliced to match idx_keep)
+                            V_gen_1 = V_gen[idx_keep]
+
+                            # Center both
+                            m1_f = mask_ov.unsqueeze(-1).float()
+                            m2_f = mask_2.unsqueeze(-1).float()
+                            n1 = m1_f.sum(dim=(1,2), keepdim=True).clamp(min=1)
+                            n2 = m2_f.sum(dim=(1,2), keepdim=True).clamp(min=1)
+
+                            V_gen_1_c = (V_gen_1 - (V_gen_1 * m1_f).sum(dim=1, keepdim=True) / n1) * m1_f
+                            V_gen_2_c = (V_gen_2 - (V_gen_2 * m2_f).sum(dim=1, keepdim=True) / n2) * m2_f
+
+                            # Teacher-student: detach view1 (view2 learns to match view1)
+                            V_gen_1_teacher = V_gen_1_c.detach()
+
+                            # Extract overlap points
+                            B_ov = V_gen_1.shape[0]
+                            gen_ov_losses = []
+
+                            for b in range(B_ov):
+                                I_valid = I_mask[b]
+                                n_I = I_valid.sum().item()
+                                if n_I < 4:
+                                    continue
+
+                                idx1 = idx1_I[b, I_valid]
+                                idx2 = idx2_I[b, I_valid]
+
+                                # Overlap points from each view
+                                v1_ov = V_gen_1_teacher[b, idx1]  # (n_I, D) - teacher (detached)
+                                v2_ov = V_gen_2_c[b, idx2]        # (n_I, D) - student (learns)
+
+                                # Center overlap points
+                                v1_ov_c = v1_ov - v1_ov.mean(dim=0, keepdim=True)
+                                v2_ov_c = v2_ov - v2_ov.mean(dim=0, keepdim=True)
+
+                                # Gram consistency (scale-free)
+                                G1 = v1_ov_c @ v1_ov_c.T
+                                G2 = v2_ov_c @ v2_ov_c.T
+
+                                tr1 = G1.trace().clamp(min=1e-6)
+                                tr2 = G2.trace().clamp(min=1e-6)
+
+                                G1_norm = G1 / tr1
+                                G2_norm = G2 / tr2
+
+                                shape_loss = (G1_norm - G2_norm).pow(2).mean()
+                                scale_loss = (torch.log(tr1) - torch.log(tr2)).pow(2)
+
+                                gen_ov_losses.append(shape_loss + 0.5 * scale_loss)
+
+                            if gen_ov_losses:
+                                L_gen_ov = torch.stack(gen_ov_losses).mean()
+
+                            # Debug logging
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                print(f"\n[GEN-OVERLAP-σ0] step={global_step}")
+                                print(f"  L_gen_ov={L_gen_ov.item():.6f} weight={gen_overlap_weight}")
+                                print(f"  n_valid_pairs={len(gen_ov_losses)}/{B_ov}")
+                                print(f"  teacher_student=True (view1 detached)")
+
+                            # Add to total loss
+                            L_total = L_total + gen_overlap_weight * L_gen_ov
+
                         # Forward pass for view2
                         x0_pred_2_result = score_net.forward_edm(
                             V_t_2, sigma_pair_ov, H_2, mask_2, sigma_data,  # Use sliced sigma_pair_ov
