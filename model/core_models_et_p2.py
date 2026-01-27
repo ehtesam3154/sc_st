@@ -132,8 +132,13 @@ def compute_overlap_losses(
         idx2 = idx2_I[b, I_valid]  # (n_I,) positions in view2
 
         # Extract predictions for overlap points
-        V1_I = x0_pred_1[b, idx1]  # (n_I, D)
-        V2_I = x0_pred_2[b, idx2]  # (n_I, D)
+        # FIX #2a: Stop-grad on view1 (teacher-student)
+        # View1 is the "teacher" - gradients only flow through view2.
+        # This prevents overlap losses from corrupting view1's learning.
+        # Note: L_hi_scale (ground-truth anchored) uses x0_pred_1[b] directly,
+        # not V1_I, so it's unaffected by this detach.
+        V1_I = x0_pred_1[b, idx1].detach()  # (n_I, D) - no gradients
+        V2_I = x0_pred_2[b, idx2]  # (n_I, D) - gradients flow here
 
         # Center predictions (remove translation)
         V1_centered = V1_I - V1_I.mean(dim=0, keepdim=True)
@@ -8478,17 +8483,13 @@ def train_stageC_diffusion_generator(
                                 print(f"  target_rms_ratio={rms_tgt_1/rms_tgt_2:.4f} (should be ~1.0)")
 
 
-                    # Sample noise for view2
+                    # Sample noise for view2 - INDEPENDENT from view1
+                    # FIX #1: Do NOT couple noise on overlap points.
+                    # Coupled noise creates a shortcut where the model can satisfy
+                    # overlap consistency via the skip connection without learning
+                    # proper denoising. Independent noise forces the model to actually
+                    # denoise to achieve overlap consistency.
                     eps_2 = torch.randn_like(V_target_2)
-
-                    # Apply coupled noise: copy view1 noise to view2 overlap positions
-                    for b in range(Z_set_2.shape[0]):
-                        I_valid = I_mask[b]
-                        n_I = I_valid.sum().item()
-                        if n_I > 0:
-                            idx1 = idx1_I[b, I_valid]
-                            idx2 = idx2_I[b, I_valid]
-                            eps_2[b, idx2] = eps_ov[b, idx1]  # Use sliced eps_ov
  
                     # Add noise to view2 target
                     V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
@@ -8510,15 +8511,26 @@ def train_stageC_diffusion_generator(
                             x0_pred_2 = x0_pred_2_result
 
                         # ============================================================
-                        # FIX: Add score loss for view2 to prevent scale drift
-                        # Without this, view2 has no scale supervision - only overlap
-                        # consistency. This allows view2 scale to drift arbitrarily,
-                        # and the overlap scale loss then pulls view1 down with it.
+                        # FIX #2b: View2 score loss with SAME EDM weighting as view1
+                        # Previously: raw MSE normalized by mask count (no σ-weighting)
+                        # Now: same per-sample MSE + EDM weight pipeline as view1
+                        # This ensures view2 gets proper σ-dependent ground-truth supervision.
                         # ============================================================
-                        mask_2_f = mask_2.unsqueeze(-1).float()
-                        score_error_2 = (x0_pred_2 - V_target_2) * mask_2_f
-                        L_score_2 = score_error_2.pow(2).sum() / mask_2_f.sum().clamp(min=1.0)
-
+ 
+                        # Compute per-node MSE (same as view1: mean over dims)
+                        err2_node_2 = (x0_pred_2 - V_target_2).pow(2).mean(dim=-1)  # (B_keep, N2)
+ 
+                        # Per-sample normalization (same as view1)
+                        mask_2_f = mask_2.float()  # (B_keep, N2)
+                        den_2 = mask_2_f.sum(dim=1).clamp_min(1.0)  # (B_keep,)
+                        err2_sample_2 = (err2_node_2 * mask_2_f).sum(dim=1) / den_2  # (B_keep,)
+ 
+                        # Slice w_eff to match the paired subset (same σ → same weights)
+                        w_eff_2 = w_eff[idx_keep]  # (B_keep,)
+ 
+                        # Apply WNORM (same as view1 when EXP_SCORE_WNORM=True)
+                        L_score_2 = (w_eff_2 * err2_sample_2).sum() / w_eff_2.sum().clamp(min=1e-8)
+ 
                         # Add view2 score loss with same weight as main score loss
                         # This anchors view2's scale to its target
                         L_total = L_total + WEIGHTS.get('score', 1.0) * L_score_2
