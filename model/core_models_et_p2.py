@@ -6993,13 +6993,29 @@ def train_stageC_diffusion_generator(
                             point_weight = mask.float() * anchor_mask_batch.float()
                         else:
                             point_weight = None  # All valid points contribute
-                        
-                        # Compute NCA loss with point weighting
+
+                        # ==============================================================================
+                        # [CHATGPT-FIX] Use raw V_hat_centered for NCA, NOT scale-corrected V_geom_L
+                        # ==============================================================================
+                        # Rationale: Training on V_geom_L (which has local s_corr applied) allows
+                        # the model to satisfy NCA loss while producing garbage raw output.
+                        # Use global RMS normalization for scale invariance instead.
+                        # ==============================================================================
+                        m_float_nca = mask.unsqueeze(-1).float()
+                        valid_elements_nca = m_float_nca.sum() * V_hat_centered.shape[-1]
+                        rms_pred_nca = (V_hat_centered.pow(2) * m_float_nca).sum().div(valid_elements_nca + 1e-8).sqrt()
+                        V_hat_normalized = V_hat_centered / (rms_pred_nca + 1e-8)  # Global RMS normalization
+
+                        # Normalize target the same way for fair comparison
+                        rms_tgt_nca = (V_target.float().pow(2) * m_float_nca).sum().div(valid_elements_nca + 1e-8).sqrt()
+                        V_target_normalized = V_target.float() / (rms_tgt_nca + 1e-8)
+
+                        # Compute NCA loss on normalized raw tensors
                         L_knn_per = uet.knn_nca_loss(
-                            V_geom_L,              # Clamped structure tensor
-                            V_target.float(),    # Raw target
-                            mask, 
-                            k=15, 
+                            V_hat_normalized,        # Raw centered, globally normalized
+                            V_target_normalized,     # Target, globally normalized
+                            mask,
+                            k=15,
                             temperature=tau_reference,
                             return_per_sample=True,
                             scale_compensate=True,
@@ -7406,20 +7422,29 @@ def train_stageC_diffusion_generator(
                         # PATCH 5: Use log-ratio edge loss for multiplicative error
                         # Use adaptive gate for edge
                         gate_sum_edge = geo_gate_edge.sum().clamp(min=1.0)
-                        
-                        # L_edge_per = uet.edge_log_ratio_loss(
-                        #     V_pred=x0_pred.float() if use_edm else V_hat.float(),
-                        #     V_tgt=V_target.float(),
-                        #     knn_idx=knn_indices_batch,
-                        #     mask=mask
-                        # )
-                        # CHANGE 3: Use V_geom (clamped) for edge loss
-                        # Edge is a STRUCTURE loss - it measures local neighborhood shape
-                        # Using clamped V_geom removes systematic scale bias from gradients
-                        # Scale learning happens via knn_scale on V_hat_centered
+
+                        # ==============================================================================
+                        # [CHATGPT-FIX] Use raw V_hat_centered for edge, NOT scale-corrected V_geom_L
+                        # ==============================================================================
+                        # Rationale: Same as NCA - training on V_geom_L allows model to satisfy
+                        # edge loss while producing garbage raw output. Use global RMS normalization
+                        # for scale invariance instead of local s_corr.
+                        # ==============================================================================
+                        # Re-use normalized tensors from NCA (or compute if not available)
+                        if 'V_hat_normalized' not in dir():
+                            m_float_edge = mask.unsqueeze(-1).float()
+                            valid_elements_edge = m_float_edge.sum() * V_hat_centered.shape[-1]
+                            rms_pred_edge = (V_hat_centered.pow(2) * m_float_edge).sum().div(valid_elements_edge + 1e-8).sqrt()
+                            V_hat_normalized_edge = V_hat_centered / (rms_pred_edge + 1e-8)
+                            rms_tgt_edge = (V_target.float().pow(2) * m_float_edge).sum().div(valid_elements_edge + 1e-8).sqrt()
+                            V_target_normalized_edge = V_target.float() / (rms_tgt_edge + 1e-8)
+                        else:
+                            V_hat_normalized_edge = V_hat_normalized
+                            V_target_normalized_edge = V_target_normalized
+
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=V_geom_L,  # Clamped structure tensor, NOT raw x0_pred
-                            V_tgt=V_target.float(),
+                            V_pred=V_hat_normalized_edge,  # Raw centered, globally normalized
+                            V_tgt=V_target_normalized_edge,
                             knn_idx=knn_indices_batch,
                             mask=mask
                         )
@@ -7509,12 +7534,20 @@ def train_stageC_diffusion_generator(
                                     
                                     return sum(scores) / len(scores) if scores else 0.0
 
-                                # --- C. Compute Jaccard ---
+                                # --- C. Compute Jaccard (DUAL: raw vs corrected) ---
                                 k_check = 10
                                 score_sanity = run_jaccard_check(Tgt, Tgt, mask_orig, k=k_check, name="Sanity")
                                 score_noise = run_jaccard_check(V_t, Tgt, mask_orig, k=k_check, name="Input_Noise")
-                                score_pred = run_jaccard_check(V_hat, Tgt, mask_orig, k=k_check, name="Prediction")
-                                
+                                # RAW: V_hat (what model actually outputs)
+                                score_pred_raw = run_jaccard_check(V_hat, Tgt, mask_orig, k=k_check, name="Prediction_Raw")
+                                # CORRECTED: V_geom_L (with local scale correction + anchor clamping)
+                                # Need to center Tgt to match V_geom_L frame
+                                Tgt_centered, _ = uet.center_only(Tgt.float(), mask_orig)
+                                score_pred_corrected = run_jaccard_check(V_geom_L, Tgt_centered, mask_orig, k=k_check, name="Prediction_Corrected")
+
+                                # For backwards compatibility, keep score_pred as raw
+                                score_pred = score_pred_raw
+
                                 # --- D. Print Report ---
                                 sigma_val = sigma_t_orig.mean().item()
                                 print(f"\n[KNN DIAGNOSTIC] step={global_step} (sigma_avg={sigma_val:.3f})")
@@ -7583,22 +7616,29 @@ def train_stageC_diffusion_generator(
                                 print(f"  RMS(Error): {rms_pred:.4f} (Output |V_hat - Tgt|)")
                                 
                                 print(f"  --- Jaccard Scores (k={k_check}) ---")
-                                print(f"  1. GT  vs GT   (Sanity): {score_sanity:.4f}")
-                                print(f"  2. V_t vs GT   (Input):  {score_noise:.4f}")
-                                print(f"  3. Pred vs GT  (Output): {score_pred:.4f}")
-                                
+                                print(f"  1. GT  vs GT   (Sanity):     {score_sanity:.4f}")
+                                print(f"  2. V_t vs GT   (Input):      {score_noise:.4f}")
+                                print(f"  3. Pred vs GT  (RAW):        {score_pred_raw:.4f}  ← what model outputs")
+                                print(f"  4. Pred vs GT  (CORRECTED):  {score_pred_corrected:.4f}  ← after s_corr")
+
+                                # Check if s_corr is "repairing" real problems
+                                repair_delta = score_pred_corrected - score_pred_raw
+                                if abs(repair_delta) > 0.02:
+                                    print(f"  ⚠️ s_corr is {'HIDING' if repair_delta > 0 else 'HURTING'} "
+                                          f"Jaccard by {repair_delta:+.4f}")
+
                                 if score_sanity < 0.99:
                                     print("  🔴 FAIL: Sanity check < 1.0. Indices misaligned!")
                                 elif rms_hat < 0.1 * rms_tgt:
                                     print(f"  🔴 FAIL: Model COLLAPSED to zero (RMS ratio {rms_hat/rms_tgt:.3f})")
                                 elif rms_pred > rms_noise:
                                     print(f"  ⚠️ WARNING: Destructive! Output error ({rms_pred:.3f}) > Input noise ({rms_noise:.3f})")
-                                elif score_pred < score_noise:
-                                    print("  ⚠️ WARNING: Jaccard WORSE than input. Geometry scrambled.")
-                                elif score_pred > score_noise + 0.05:
-                                    print(f"  ✅ PASS: Improving structure (+{score_pred - score_noise:.3f})")
+                                elif score_pred_raw < score_noise:
+                                    print("  ⚠️ WARNING: RAW Jaccard WORSE than input. Geometry scrambled.")
+                                elif score_pred_raw > score_noise + 0.05:
+                                    print(f"  ✅ PASS: RAW improving structure (+{score_pred_raw - score_noise:.3f})")
                                 else:
-                                    print("  ⚪ NEUTRAL: Output ≈ Input.")
+                                    print("  ⚪ NEUTRAL: RAW output ≈ Input.")
                                 print("="*60)
 
 
