@@ -4536,7 +4536,9 @@ def train_stageC_diffusion_generator(
 
                             # Debug logging
                             if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
-                                sigma_ref_curr = purifier_state.get('sigma_ref_adaptive', sigma_refine_max)
+                                sigma_ref_curr = purifier_state.get('sigma_ref_adaptive')
+                                if sigma_ref_curr is None:
+                                    sigma_ref_curr = sigma_refine_max  # Fallback during warmup
                                 print(f"\n[PURIFIER-ERR] step={global_step}")
                                 print(f"  gen_err_rms: mean={gen_err_mean:.4f} q90={gen_err_q90:.4f}")
                                 print(f"  sigma_ref_adaptive={sigma_ref_curr:.4f} "
