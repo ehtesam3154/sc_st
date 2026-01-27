@@ -281,6 +281,88 @@ def compute_overlap_losses(
     }
 
 
+# ==============================================================================
+# [PURIFIER-FIX] STANDALONE HIGH-SIGMA SCALE ANCHOR LOSS
+# ==============================================================================
+# This is DECOUPLED from overlap gating - runs on ALL high-sigma samples in main path.
+# Prevents "learn overlap but shrink global" failure mode.
+# ==============================================================================
+
+def compute_hi_scale_loss_standalone(
+    x0_pred: torch.Tensor,      # (B, N, D) denoised predictions
+    V_target: torch.Tensor,     # (B, N, D) ground truth
+    mask: torch.Tensor,         # (B, N) validity mask
+    sigma_flat: torch.Tensor,   # (B,) noise levels
+    sigma_0_hi: float = 0.5,    # threshold for high-σ anchor
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    """
+    Compute high-sigma scale anchor loss OUTSIDE overlap block.
+
+    This is the key fix: L_hi_scale must apply to ALL samples with σ > sigma_0_hi,
+    not just those that pass the overlap_sigma_thresh gate (which filters OUT high-σ).
+
+    Math:
+        RMS_pred = sqrt(sum(mask * |V_pred|^2) / sum(mask))
+        RMS_tgt  = sqrt(sum(mask * |V_tgt|^2) / sum(mask))
+        L_hi_scale = (log(RMS_pred) - log(RMS_tgt))^2
+
+    Returns:
+        L_hi_scale: scalar loss (mean over qualifying samples)
+        hi_scale_count: tensor with count of samples that contributed
+        debug_dict: diagnostic info
+    """
+    device = x0_pred.device
+    B = x0_pred.shape[0]
+
+    # Gate: only high-sigma samples
+    hi_mask = (sigma_flat > sigma_0_hi)  # (B,) bool
+    n_hi = hi_mask.sum().item()
+
+    debug_dict = {
+        'n_hi_samples': n_hi,
+        'sigma_hi_mean': sigma_flat[hi_mask].mean().item() if n_hi > 0 else 0.0,
+        'scale_ratios': [],
+    }
+
+    if n_hi == 0:
+        return (
+            torch.tensor(0.0, device=device),
+            torch.tensor(0, device=device),
+            debug_dict
+        )
+
+    # Slice to high-sigma samples only
+    x0_hi = x0_pred[hi_mask]       # (n_hi, N, D)
+    V_tgt_hi = V_target[hi_mask]   # (n_hi, N, D)
+    mask_hi = mask[hi_mask]        # (n_hi, N)
+
+    # Compute masked RMS per sample
+    mask_f = mask_hi.unsqueeze(-1).float()  # (n_hi, N, 1)
+    n_valid = mask_f.sum(dim=(1, 2)).clamp(min=1.0)  # (n_hi,)
+
+    # RMS = sqrt(sum(|V|^2 * mask) / n_valid)
+    sq_pred = (x0_hi ** 2).sum(dim=-1)  # (n_hi, N)
+    sq_tgt = (V_tgt_hi ** 2).sum(dim=-1)  # (n_hi, N)
+
+    rms_pred = ((sq_pred * mask_hi.float()).sum(dim=1) / n_valid.squeeze(-1)).sqrt() + eps  # (n_hi,)
+    rms_tgt = ((sq_tgt * mask_hi.float()).sum(dim=1) / n_valid.squeeze(-1)).sqrt() + eps   # (n_hi,)
+
+    # Log-RMS loss: (log(rms_pred) - log(rms_tgt))^2
+    log_ratio = torch.log(rms_pred) - torch.log(rms_tgt)
+    L_hi_per_sample = log_ratio.pow(2)  # (n_hi,)
+
+    # Mean over qualifying samples
+    L_hi_scale = L_hi_per_sample.mean()
+
+    # Debug: track scale ratios
+    scale_ratios = (rms_pred / rms_tgt).detach().cpu().tolist()
+    debug_dict['scale_ratios'] = scale_ratios
+    debug_dict['scale_ratio_mean'] = float(np.mean(scale_ratios)) if scale_ratios else 1.0
+
+    return L_hi_scale, torch.tensor(n_hi, device=device), debug_dict
+
+
 def apply_coupled_noise(
     eps_1: torch.Tensor,      # (B, N1, D) noise for view1
     eps_2: torch.Tensor,      # (B, N2, D) noise for view2
@@ -2695,6 +2777,16 @@ def train_stageC_diffusion_generator(
     overlap_sigma_thresh: float = 0.5,
     disable_ctx_loss_when_overlap: bool = True,
     overlap_debug_every: int = 100,
+    # ========== PURIFIER FORMULATION (ChatGPT architecture fix) ==========
+    purifier_mode: bool = True,           # Train as refiner around V_gen (not V_target)
+    purifier_sigma_from_gen_err: bool = True,  # Adapt sigma_max to generator error
+    purifier_sigma_ref_min: float = 0.4,  # Min sigma_ref_max (floor)
+    purifier_sigma_ref_max: float = 1.2,  # Max sigma_ref_max (ceiling)
+    purifier_sigma_tail_frac: float = 0.15,  # Fraction of samples in high-sigma tail
+    # ========== OVERLAP TEACHER-STUDENT (prevent collapse) ==========
+    overlap_teacher_student: bool = True,  # Detach one view in overlap loss
+    overlap_warmup_steps: int = 2000,      # Steps before overlap ramps to full weight
+    overlap_kl_delay_steps: int = 3000,    # Steps before KL loss activates
 
 ):
     
@@ -2708,6 +2800,17 @@ def train_stageC_diffusion_generator(
         'dbg_overlap_pairs': 0,
         'dbg_k_mean': 0.0,
         'overlap_count_this_epoch': 0
+    }
+
+    # ==============================================================================
+    # [PURIFIER-FIX] State tracking for adaptive sigma from generator error
+    # ==============================================================================
+    purifier_state = {
+        'gen_err_ema': None,          # EMA of generator RMS error
+        'gen_err_q90_ema': None,      # EMA of 90th percentile error
+        'sigma_ref_adaptive': None,   # Current adaptive sigma_ref_max
+        'gen_err_buffer': [],         # Buffer for warmup
+        'warmup_done': False,
     }
 
     slide_d15_medians = []
@@ -4039,15 +4142,60 @@ def train_stageC_diffusion_generator(
                 # === Define self-conditioning flag ONCE ===
                 use_self_cond = (torch.rand(1, device=device).item() < p_sc)
 
-                # === EDM: sample sigma from log-normal ===
+                # ==============================================================================
+                # [PURIFIER-FIX] EDM sigma sampling - adapted to generator error
+                # ==============================================================================
+                # PURIFIER MODE: σ ~ LogUniform(σ_min, σ_ref_adaptive) for 85%
+                #                σ ~ LogUniform(σ_ref_adaptive, σ_train_max) for 15% (optional tail)
+                # This matches the noise to what diffusion actually needs to correct.
+                #
+                # STANDARD MODE: Original stratified log-normal sampling
+                # ==============================================================================
                 if use_edm:
-                    # sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
-                    sigma = uet.sample_sigma_lognormal_stratified(
-                        batch_size_real, P_mean, P_std,
-                        high_sigma_fraction=0.4,  # 25% of batch guaranteed high-σ
-                        high_sigma_threshold=0.5,  # σ >= 0.5 is "high"
-                        device=device
-                    )
+                    # Get current sigma_ref (adaptive if purifier warmup done, else default)
+                    sigma_ref_curr = sigma_refine_max  # Default
+                    if purifier_mode and purifier_sigma_from_gen_err:
+                        if purifier_state.get('warmup_done', False) and purifier_state.get('sigma_ref_adaptive') is not None:
+                            sigma_ref_curr = purifier_state['sigma_ref_adaptive']
+
+                    if purifier_mode and purifier_state.get('warmup_done', False):
+                        # PURIFIER SIGMA SAMPLING: Mixture of main band + optional tail
+                        # Main band: LogUniform(sigma_min, sigma_ref_curr) - 85%
+                        # Tail band: LogUniform(sigma_ref_curr, sigma_refine_max) - 15%
+                        n_main = int(batch_size_real * (1.0 - purifier_sigma_tail_frac))
+                        n_tail = batch_size_real - n_main
+
+                        # Log-uniform sampling: exp(U(log(a), log(b)))
+                        log_sigma_min = math.log(sigma_min)
+                        log_sigma_ref = math.log(max(sigma_ref_curr, sigma_min + 1e-6))
+                        log_sigma_max = math.log(sigma_refine_max)
+
+                        # Main band samples
+                        u_main = torch.rand(n_main, device=device)
+                        sigma_main = torch.exp(log_sigma_min + u_main * (log_sigma_ref - log_sigma_min))
+
+                        # Tail band samples (optional robustness at higher σ)
+                        if n_tail > 0 and sigma_ref_curr < sigma_refine_max - 0.01:
+                            u_tail = torch.rand(n_tail, device=device)
+                            sigma_tail = torch.exp(log_sigma_ref + u_tail * (log_sigma_max - log_sigma_ref))
+                            sigma = torch.cat([sigma_main, sigma_tail], dim=0)
+                            # Shuffle to mix main and tail samples
+                            perm = torch.randperm(batch_size_real, device=device)
+                            sigma = sigma[perm]
+                        else:
+                            sigma = sigma_main
+                            # Pad if n_tail > 0 but range is tiny
+                            if len(sigma) < batch_size_real:
+                                sigma = torch.cat([sigma, sigma[:batch_size_real - len(sigma)]], dim=0)
+                    else:
+                        # STANDARD: Original stratified log-normal sampling
+                        sigma = uet.sample_sigma_lognormal_stratified(
+                            batch_size_real, P_mean, P_std,
+                            high_sigma_fraction=0.4,  # 40% of batch guaranteed high-σ
+                            high_sigma_threshold=0.5,  # σ >= 0.5 is "high"
+                            device=device
+                        )
+
                     sigma = sigma.clamp(sigma_min, sigma_refine_max)
                     sigma_t = sigma.view(-1, 1, 1)
 
@@ -4187,8 +4335,10 @@ def train_stageC_diffusion_generator(
                         probe_state['st_ident_results'] = ident_results
 
                     
-                    # Optional: Compute generator output for alignment training
-                    if WEIGHTS['gen_align'] > 0:
+                    # ==============================================================================
+                    # [PURIFIER-FIX] Always compute V_gen for purifier mode or gen_align training
+                    # ==============================================================================
+                    if purifier_mode or WEIGHTS['gen_align'] > 0:
                         V_gen = generator(H, mask)
                     else:
                         V_gen = None  # Don't waste compute if not training it
@@ -4306,10 +4456,77 @@ def train_stageC_diffusion_generator(
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
                 
-                # ===== NOISE AROUND GROUND TRUTH (not generator!) =====
+                # ==============================================================================
+                # [PURIFIER-FIX] FORWARD NOISING: Choose base (V_gen or V_target)
+                # ==============================================================================
+                # PURIFIER MODE: V_t = stopgrad(V_gen) + σ * ε
+                #   - Trains diffusion to REFINE generator output → clean target
+                #   - σ should match generator error magnitude (not arbitrary σ_max=3)
+                #   - Denoiser learns: "given imperfect coordinates, correct them"
+                #
+                # STANDARD MODE: V_t = V_target + σ * ε
+                #   - Trains diffusion to denoise from scratch
+                #   - Requires working at all σ levels including very high
+                # ==============================================================================
                 eps = torch.randn_like(V_target)
-                # eps = eps * mask.unsqueeze(-1).float()
-                V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
+
+                if purifier_mode and V_gen is not None and not is_sc:
+                    # PURIFIER: noise around generator output (detached!)
+                    V_base = V_gen.detach()  # stopgrad - don't backprop diffusion through generator
+                    V_t = V_base + sigma_t * eps
+
+                    # ==============================================================================
+                    # [PURIFIER-DEBUG] Track generator error for adaptive sigma
+                    # ==============================================================================
+                    if purifier_sigma_from_gen_err:
+                        with torch.no_grad():
+                            # Compute per-sample RMS error: ||V_gen - V_target||_rms
+                            mask_f = mask.unsqueeze(-1).float()
+                            diff = (V_gen - V_target) * mask_f
+                            n_valid = mask_f.sum(dim=(1, 2)).clamp(min=1.0)
+                            gen_err_rms = (diff.pow(2).sum(dim=(1, 2)) / n_valid).sqrt()  # (B,)
+
+                            # Update EMA of generator error statistics
+                            gen_err_mean = gen_err_rms.mean().item()
+                            gen_err_q90 = gen_err_rms.quantile(0.9).item()
+
+                            # Warmup: buffer errors until we have enough samples
+                            if not purifier_state['warmup_done']:
+                                purifier_state['gen_err_buffer'].append(gen_err_q90)
+                                if len(purifier_state['gen_err_buffer']) >= 100:
+                                    # Initialize EMA from buffer
+                                    purifier_state['gen_err_ema'] = float(np.mean(purifier_state['gen_err_buffer']))
+                                    purifier_state['gen_err_q90_ema'] = float(np.percentile(purifier_state['gen_err_buffer'], 90))
+                                    purifier_state['sigma_ref_adaptive'] = np.clip(
+                                        purifier_state['gen_err_q90_ema'],
+                                        purifier_sigma_ref_min,
+                                        purifier_sigma_ref_max
+                                    )
+                                    purifier_state['warmup_done'] = True
+                                    purifier_state['gen_err_buffer'] = []  # Free memory
+                            else:
+                                # Update EMA
+                                ema_beta = 0.99
+                                purifier_state['gen_err_ema'] = ema_beta * purifier_state['gen_err_ema'] + (1 - ema_beta) * gen_err_mean
+                                purifier_state['gen_err_q90_ema'] = ema_beta * purifier_state['gen_err_q90_ema'] + (1 - ema_beta) * gen_err_q90
+                                purifier_state['sigma_ref_adaptive'] = np.clip(
+                                    purifier_state['gen_err_q90_ema'],
+                                    purifier_sigma_ref_min,
+                                    purifier_sigma_ref_max
+                                )
+
+                            # Debug logging
+                            if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                                sigma_ref_curr = purifier_state.get('sigma_ref_adaptive', sigma_refine_max)
+                                print(f"\n[PURIFIER-ERR] step={global_step}")
+                                print(f"  gen_err_rms: mean={gen_err_mean:.4f} q90={gen_err_q90:.4f}")
+                                print(f"  sigma_ref_adaptive={sigma_ref_curr:.4f} "
+                                      f"(range=[{purifier_sigma_ref_min:.2f}, {purifier_sigma_ref_max:.2f}])")
+                                print(f"  warmup_done={purifier_state['warmup_done']}")
+                else:
+                    # STANDARD: noise around ground truth
+                    V_t = V_target + sigma_t * eps
+
                 V_t = V_t * mask.unsqueeze(-1).float()
                 
                 # ========== NEW: Anchored training - clamp anchor positions to clean values ==========
@@ -8360,6 +8577,36 @@ def train_stageC_diffusion_generator(
                         print(f"  ⚠️ Edge hit rate outside 5-30% range")
 
 
+            # ==============================================================================
+            # [PURIFIER-FIX] STANDALONE HIGH-SIGMA SCALE ANCHOR (outside overlap block!)
+            # ==============================================================================
+            # CRITICAL: This loss was previously INSIDE overlap gating, which filters OUT
+            # high-σ samples (overlap_sigma_thresh=0.5). So L_hi_scale never applied to
+            # the samples that actually need scale anchoring (σ > 0.5).
+            #
+            # Now it runs on ALL ST samples with σ > sigma_0_hi, regardless of overlap.
+            # ==============================================================================
+            L_hi_scale_standalone = torch.tensor(0.0, device=device)
+            hi_scale_standalone_count = torch.tensor(0, device=device)
+            HI_SCALE_STANDALONE_WEIGHT = 2.0  # Weight for standalone hi-scale loss
+
+            if not is_sc and use_edm:
+                L_hi_scale_standalone, hi_scale_standalone_count, hi_scale_debug = compute_hi_scale_loss_standalone(
+                    x0_pred=x0_pred,
+                    V_target=V_target,
+                    mask=mask,
+                    sigma_flat=sigma_flat,
+                    sigma_0_hi=0.5,  # Same threshold as before, but now actually applied!
+                )
+
+                # Debug logging
+                if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                    print(f"\n[HI-SCALE-STANDALONE] step={global_step}")
+                    print(f"  n_hi_samples={hi_scale_debug['n_hi_samples']} / {batch_size_real}")
+                    print(f"  sigma_hi_mean={hi_scale_debug['sigma_hi_mean']:.4f}")
+                    print(f"  scale_ratio_mean={hi_scale_debug.get('scale_ratio_mean', 1.0):.4f} (should be ~1.0)")
+                    print(f"  L_hi_scale_standalone={L_hi_scale_standalone.item():.6f}")
+
             L_total = (WEIGHTS['score'] * score_multiplier * L_score +
                     WEIGHTS['gram'] * L_gram +
                     WEIGHTS['gram_scale'] * L_gram_scale +
@@ -8386,7 +8633,8 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['shape_spec'] * L_shape_spec +
                     WEIGHTS.get('subspace', 0) * L_subspace +  # PATCH 7
                     WEIGHTS.get('ctx_edge', 0) * L_ctx_edge +
-                    effective_ctx_loss_weight * L_ctx_replace)   # NEW: context invariance
+                    effective_ctx_loss_weight * L_ctx_replace +
+                    HI_SCALE_STANDALONE_WEIGHT * L_hi_scale_standalone)  # [PURIFIER-FIX] Standalone hi-σ anchor
 
             # Add SC dimension prior if this is an SC batch
             if is_sc:
@@ -8524,12 +8772,30 @@ def train_stageC_diffusion_generator(
                         L_total = L_total + WEIGHTS.get('score', 1.0) * L_score_2
                         L_score_2_batch = L_score_2  # Store for epoch tracking
 
-                        # Compute overlap losses
-                        # Slice V_target to match the filtered batch
+                        # ==============================================================================
+                        # [PURIFIER-FIX] OVERLAP LOSSES WITH TEACHER-STUDENT + WARMUP
+                        # ==============================================================================
+                        # TEACHER-STUDENT: Detach view2 predictions so loss only updates view1.
+                        #   - Symmetric "pull both together" encourages shared shrink solutions.
+                        #   - Asymmetric "view1 learns from frozen view2" is more stable.
+                        #
+                        # WARMUP RAMP: Start with overlap weights near 0, ramp up over training.
+                        #   - Phase 1 (early): overlap weights ≈ 0 (let score loss establish scale)
+                        #   - Phase 2 (mid): linearly ramp to target weights
+                        #
+                        # KL DELAY: KL on neighbor distributions is most collapse-prone.
+                        #   - Delay KL activation until later in training.
+                        # ==============================================================================
                         V_target_1_ov = V_target[idx_keep]
-                        
+
+                        # TEACHER-STUDENT: detach view2 predictions
+                        if overlap_teacher_student:
+                            x0_pred_2_for_loss = x0_pred_2.detach()  # View2 is "teacher" (frozen)
+                        else:
+                            x0_pred_2_for_loss = x0_pred_2  # Symmetric (original)
+
                         ov_loss_dict = compute_overlap_losses(
-                            x0_pred_1, x0_pred_2,
+                            x0_pred_1, x0_pred_2_for_loss,
                             idx1_I, idx2_I, I_mask,
                             mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
@@ -8546,18 +8812,47 @@ def train_stageC_diffusion_generator(
                             L_ov_shape_batch = ov_loss_dict['L_ov_shape']
                             L_ov_scale_batch = ov_loss_dict['L_ov_scale']
                             L_ov_kl_batch = ov_loss_dict['L_ov_kl']
-                            L_hi_scale_batch = ov_loss_dict['L_hi_scale']  # NEW
+                            L_hi_scale_batch = ov_loss_dict['L_hi_scale']  # NOTE: Now handled by standalone
 
-                            # Weight for new high-σ scale anchor (tune this!)
-                            HI_SCALE_WEIGHT = 1.0  # Start at 1.0, can increase if needed
+                            # ==============================================================================
+                            # WARMUP RAMP: Scale overlap weights by training progress
+                            # ==============================================================================
+                            # Phase 1: [0, overlap_warmup_steps] -> weight_mult ramps 0 → 1
+                            # This lets score loss establish proper scale before overlap kicks in.
+                            warmup_progress = min(1.0, global_step / max(overlap_warmup_steps, 1))
+                            ov_weight_mult = warmup_progress  # Linear ramp
 
-                            # Add to total loss
+                            # ==============================================================================
+                            # KL DELAY: Don't activate KL until later in training
+                            # ==============================================================================
+                            # KL on neighbor distributions is most collapse-prone when geometry is ambiguous.
+                            kl_active = (global_step >= overlap_kl_delay_steps)
+                            kl_weight_mult = 1.0 if kl_active else 0.0
+
+                            # Effective weights with warmup and KL delay
+                            eff_ov_shape_w = overlap_loss_weight_shape * ov_weight_mult
+                            eff_ov_scale_w = overlap_loss_weight_scale * ov_weight_mult
+                            eff_ov_kl_w = overlap_loss_weight_kl * ov_weight_mult * kl_weight_mult
+
+                            # Debug: log effective weights
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                print(f"\n[OVERLAP-WARMUP] step={global_step}")
+                                print(f"  warmup_progress={warmup_progress:.3f} ov_weight_mult={ov_weight_mult:.3f}")
+                                print(f"  kl_active={kl_active} (delay_steps={overlap_kl_delay_steps})")
+                                print(f"  eff_weights: shape={eff_ov_shape_w:.3f} scale={eff_ov_scale_w:.3f} kl={eff_ov_kl_w:.3f}")
+                                print(f"  teacher_student={overlap_teacher_student}")
+
+                            # NOTE: HI_SCALE inside overlap is now redundant - handled by standalone
+                            # Keep it at 0 to avoid double-counting
+                            HI_SCALE_WEIGHT_OVERLAP = 0.0  # Disabled - using standalone L_hi_scale
+
+                            # Add to total loss with ramped weights
                             L_total = (
                                 L_total
-                                + overlap_loss_weight_shape * L_ov_shape_batch
-                                + overlap_loss_weight_scale * L_ov_scale_batch
-                                + overlap_loss_weight_kl * L_ov_kl_batch
-                                + HI_SCALE_WEIGHT * L_hi_scale_batch  # NEW: high-σ scale anchor
+                                + eff_ov_shape_w * L_ov_shape_batch
+                                + eff_ov_scale_w * L_ov_scale_batch
+                                + eff_ov_kl_w * L_ov_kl_batch
+                                + HI_SCALE_WEIGHT_OVERLAP * L_hi_scale_batch  # Disabled (using standalone)
                             )
 
 
