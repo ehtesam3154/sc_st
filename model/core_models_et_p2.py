@@ -8759,26 +8759,37 @@ def train_stageC_diffusion_generator(
                     # points so that F_x matching isolates context dependence
                     # (not "different denoising tasks").
                     # σ_switch = max(2.3 × σ_data, 0.8 × σ_cap)
+                    #
+                    # TOGGLE: Set ENABLE_FIX2A_SAME_NOISE = True to enable
+                    # Default OFF to preserve Fix #1 (independent noise) behavior
+                    # Turn ON if you see noisy/non-monotone residual loss at high σ
                     # ============================================================
-                    curr_stage_noise = curriculum_state['current_stage']
-                    curr_mult_noise = curriculum_state['sigma_cap_mults'][curr_stage_noise]
-                    sigma_cap_noise = curr_mult_noise * sigma_data
-                    sigma_switch_noise = max(2.3 * sigma_data, 0.8 * sigma_cap_noise)
+                    ENABLE_FIX2A_SAME_NOISE = False  # Toggle: True to enable same-noise at high σ
 
-                    # Per-sample high-σ mask (shape: B_keep)
-                    hi_sigma_mask = (sigma_pair_ov > sigma_switch_noise)  # (B_keep,)
+                    if ENABLE_FIX2A_SAME_NOISE:
+                        curr_stage_noise = curriculum_state['current_stage']
+                        curr_mult_noise = curriculum_state['sigma_cap_mults'][curr_stage_noise]
+                        sigma_cap_noise = curr_mult_noise * sigma_data
+                        sigma_switch_noise = max(2.3 * sigma_data, 0.8 * sigma_cap_noise)
 
-                    # Apply same-noise coupling ONLY for high-σ samples on overlap points
-                    if hi_sigma_mask.any():
-                        for b in range(hi_sigma_mask.shape[0]):
-                            if hi_sigma_mask[b]:
-                                # Get valid overlap indices for this sample
-                                I_valid_b = I_mask[b]  # (max_I,)
-                                if I_valid_b.sum() > 0:
-                                    idx1_b = idx1_I[b, I_valid_b]  # Positions in view1
-                                    idx2_b = idx2_I[b, I_valid_b]  # Positions in view2
-                                    # Copy noise from view1 overlap points to view2
-                                    eps_2[b, idx2_b] = eps_ov[b, idx1_b]
+                        # Per-sample high-σ mask (shape: B_keep)
+                        hi_sigma_mask = (sigma_pair_ov > sigma_switch_noise)  # (B_keep,)
+
+                        # Apply same-noise coupling ONLY for high-σ samples on overlap points
+                        if hi_sigma_mask.any():
+                            for b in range(hi_sigma_mask.shape[0]):
+                                if hi_sigma_mask[b]:
+                                    # Get valid overlap indices for this sample
+                                    I_valid_b = I_mask[b]  # (max_I,)
+                                    if I_valid_b.sum() > 0:
+                                        idx1_b = idx1_I[b, I_valid_b]  # Positions in view1
+                                        idx2_b = idx2_I[b, I_valid_b]  # Positions in view2
+                                        # Copy noise from view1 overlap points to view2
+                                        eps_2[b, idx2_b] = eps_ov[b, idx1_b]
+
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                print(f"[FIX2A] Same-noise coupling: {hi_sigma_mask.sum().item()}/{hi_sigma_mask.shape[0]} "
+                                      f"high-σ samples (σ > {sigma_switch_noise:.3f})")
 
                     # Add noise to view2 target
                     V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
