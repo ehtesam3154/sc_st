@@ -10035,16 +10035,17 @@ def train_stageC_diffusion_generator(
                 # Evaluate at sigma_cap (or closest available)
                 closest_sigma = min(fixed_eval_sigmas, key=lambda x: abs(x - sigma_cap_curr))
 
-                # [FIX 1] Save RNG state before promotion eval to avoid contaminating training
-                promo_rng_state = torch.get_rng_state()
-                if torch.cuda.is_available():
-                    promo_cuda_rng_state = torch.cuda.get_rng_state()
+                # Cache eps_promo ONCE per run (deterministic, no RNG contamination)
+                if 'eps_promo_cached' not in edm_debug_state:
+                    promo_gen = torch.Generator(device=device)
+                    promo_gen.manual_seed(42)
+                    edm_debug_state['eps_promo_cached'] = torch.randn(
+                        V_target_fixed.shape, generator=promo_gen, device=device, dtype=V_target_fixed.dtype
+                    )
 
-                # Re-evaluate at closest_sigma to get metrics for promotion check
-                torch.manual_seed(42 + int(closest_sigma * 1000))
                 sigma_promo = torch.full((B_fixed,), closest_sigma, device=device)
                 sigma_promo_3d = sigma_promo.view(-1, 1, 1)
-                eps_promo = torch.randn_like(V_target_fixed)
+                eps_promo = edm_debug_state['eps_promo_cached']
                 V_t_promo = V_target_fixed + sigma_promo_3d * eps_promo
                 V_t_promo = V_t_promo * mask_fixed.unsqueeze(-1).float()
 
@@ -10134,24 +10135,38 @@ def train_stageC_diffusion_generator(
                         curriculum_state['generator_stable'] = True
                         print(f"\n[GEN-WARMUP] Generator is now STABLE after {epoch+1} epochs!")
 
-                # Promotion logic
-                if all_pass:
-                    curriculum_state['consecutive_passes'] += 1
-                    curriculum_state['stall_count'] = 0
-                else:
-                    curriculum_state['consecutive_passes'] = 0
-                    curriculum_state['stall_count'] += 1
+                # Promotion logic: windowed "5 of last 6" instead of strict consecutive
+                # This avoids one borderline epoch resetting all progress
+                if 'promo_pass_window' not in curriculum_state:
+                    curriculum_state['promo_pass_window'] = []
 
-                # Promote if enough consecutive passes
+                curriculum_state['promo_pass_window'].append(all_pass)
+                # Keep only last 6
+                window_size = 6
+                if len(curriculum_state['promo_pass_window']) > window_size:
+                    curriculum_state['promo_pass_window'] = curriculum_state['promo_pass_window'][-window_size:]
+
+                window = curriculum_state['promo_pass_window']
+                passes_in_window = sum(window)
+                required_passes = curriculum_state['promotion_threshold']  # 5
+
+                # Update stall_count: stall if <2 passes in last 6
+                if len(window) >= window_size and passes_in_window < 2:
+                    curriculum_state['stall_count'] += 1
+                elif all_pass:
+                    curriculum_state['stall_count'] = 0
+
+                # Promote if enough passes in window
                 promoted = False
-                if curriculum_state['consecutive_passes'] >= curriculum_state['promotion_threshold']:
+                if passes_in_window >= required_passes and len(window) >= required_passes:
                     if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
                         curriculum_state['current_stage'] += 1
-                        curriculum_state['consecutive_passes'] = 0
+                        curriculum_state['promo_pass_window'] = []  # Reset window
                         promoted = True
                         new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
-                        print(f"\n[CURRICULUM] 🎉 PROMOTED to stage {curriculum_state['current_stage']} "
-                              f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})")
+                        print(f"\n[CURRICULUM] PROMOTED to stage {curriculum_state['current_stage']} "
+                              f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})"
+                              f" [{passes_in_window}/{len(window)} passes in window]")
 
                         # [THREE-GATE] Reset stage-local tracking on promotion
                         curriculum_state['steps_in_stage'] = 0
@@ -10171,7 +10186,10 @@ def train_stageC_diffusion_generator(
                       f"trace_r={trace_r_promo:.3f} ({'✓' if trace_ok else '✗'}) "
                       f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'}) (min={jacc_min:.2f})")
                 print(f"  Jacc trend: {'✓ stable/improving' if jacc_not_decreasing else '✗ decreasing'}")
-                print(f"  Consecutive passes: {curriculum_state['consecutive_passes']}/{curriculum_state['promotion_threshold']}")
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                print(f"  Promotion window: {sum(promo_window)}/{len(promo_window)} passes "
+                      f"(need {curriculum_state['promotion_threshold']}/{window_size})"
+                      f" [{' '.join('✓' if p else '✗' for p in promo_window)}]")
                 print(f"  Generator stable: {curriculum_state['generator_stable']}")
                 if curriculum_state['stall_count'] > 0:
                     print(f"  ⚠️ Stall count: {curriculum_state['stall_count']}/{curriculum_state['stall_limit']}")
@@ -10234,10 +10252,7 @@ def train_stageC_diffusion_generator(
                 print(f"  [THREE-GATE] Steps in stage: {curriculum_state['steps_in_stage']} "
                       f"(min={curriculum_state['min_steps_per_stage']})")
 
-                # [FIX 1] Restore RNG state after promotion eval to avoid contaminating training
-                torch.set_rng_state(promo_rng_state)
-                if torch.cuda.is_available():
-                    torch.cuda.set_rng_state(promo_cuda_rng_state)
+                # No need to restore RNG state - eps_promo is cached, no global RNG touched
 
                 print(f"{'='*70}\n")
 
