@@ -2834,15 +2834,6 @@ def train_stageC_diffusion_generator(
         'best_cap_band_loss': float('inf'),  # Best cap-band loss at current stage
     }
 
-    if fabric is None or fabric.is_global_zero:
-        print(f"\n[CURRICULUM CONFIG]")
-        print(f"  stages: {curriculum_state['sigma_cap_mults']} (× σ_data={sigma_data:.4f})")
-        print(f"  target_stage: {curriculum_state['target_stage']} / {len(curriculum_state['sigma_cap_mults'])-1}")
-        print(f"  min_epochs: {curriculum_state['min_epochs']}")
-        print(f"  three-gate early stop: {curriculum_state.get('curriculum_early_stop', True)}")
-        print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
-              f"default={curriculum_state['cap_band_frac_default']}")
-
     slide_d15_medians = []
     for slide_id in st_dataset.targets_dict:
         y_hat = st_dataset.targets_dict[slide_id].y_hat.to(device)  # (n_slide, 2)
@@ -3758,6 +3749,15 @@ def train_stageC_diffusion_generator(
 
     # Store sigma_data on score_net for reference in forward pass
     print(f"[StageC] sigma_data = {sigma_data:.4f}")
+
+    if fabric is None or fabric.is_global_zero:
+        print(f"\n[CURRICULUM CONFIG]")
+        print(f"  stages: {curriculum_state['sigma_cap_mults']} (× σ_data={sigma_data:.4f})")
+        print(f"  target_stage: {curriculum_state['target_stage']} / {len(curriculum_state['sigma_cap_mults'])-1}")
+        print(f"  min_epochs: {curriculum_state['min_epochs']}")
+        print(f"  three-gate early stop: {curriculum_state.get('curriculum_early_stop', True)}")
+        print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
+              f"default={curriculum_state['cap_band_frac_default']}")
     
     # Store sigma_data on score_net (handle DDP/Fabric wrapper)
     if hasattr(score_net, 'module'):
