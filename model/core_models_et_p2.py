@@ -5588,8 +5588,9 @@ def train_stageC_diffusion_generator(
                                     
                                     print(f"  [CLAMP-COVERAGE] pin_rate low(<0.40)={pin_rate_low:.1%} (n={n_low}), "
                                           f"high(>=0.60)={pin_rate_high:.1%} (n={n_high})")
-                            
+
                             # --- kNN INDEXING VERIFICATION ---
+                            # MOVED OUTSIDE the valid_scale conditional so it always runs
                             # Check more frequently early in training (every 25 steps for first 500)
                             knn_check_interval = 25 if global_step < 500 else 100
                             if global_step % knn_check_interval == 0:
@@ -5618,11 +5619,12 @@ def train_stageC_diffusion_generator(
                                     print(f"     knn_nca/edge losses are INEFFECTIVE with invalid indices.")
                                     print(f"     This cripples local structure learning.")
 
-                                # ============ [CLAMP-HIDDEN-ERROR] Per-σ bin error hiding ============
-                                # Shows how much scale error is hidden by clamping at each σ level
+                            # ============ [CLAMP-HIDDEN-ERROR] Per-σ bin error hiding ============
+                            # Only run if valid_scale has any True values (need ratio_raw etc.)
+                            if valid_scale.any() and global_step % 100 == 0:
                                 sigma_flat_che = sigma_t.view(-1)
                                 che_bins = [(0.0, 0.3, "low"), (0.3, 0.7, "mid"), (0.7, 1.5, "high"), (1.5, 5.0, "v.high")]
-                                
+
                                 print(f"\n[CLAMP-HIDDEN-ERROR] step={global_step}")
                                 print(f"  {'σ-range':>10} | {'n':>4} | {'raw_ratio':>10} | {'geom_ratio':>11} | {'hidden_err':>10}")
                                 print(f"  {'-'*10} | {'-'*4} | {'-'*10} | {'-'*11} | {'-'*10}")
