@@ -85,16 +85,25 @@ def compute_overlap_losses(
     V_target_1: torch.Tensor = None,   # (B, N1, D) ground truth for view1
     V_target_2: torch.Tensor = None,   # (B, N2, D) ground truth for view2
     sigma_0_hi: float = 0.5,           # threshold for high-σ scale anchor
+    # NEW: for per-sample SNR gating (Try 2)
+    sigma_data: float = 0.5,           # EDM sigma_data for c_skip computation
+    kl_gate_power: float = 2.0,        # power for c_skip^p gating
 ) -> Dict[str, torch.Tensor]:
     """
     Compute overlap consistency losses for paired minisets.
 
+    [TRY 2] Per-sample SNR gating for KL loss:
+    - Computes c_skip_i = sigma_data^2 / (sigma_i^2 + sigma_data^2) per sample
+    - Gates KL: L_ov_kl_gated = (1/B) * sum(c_skip_i^p * kl_i)
+    - This REDUCES KL pressure at high σ (not just reweights)
+
     Returns dict with:
-    - L_ov_shape: Scale-free Gram consistency loss
-    - L_ov_scale: Log-trace scale consistency loss (between views)
-    - L_ov_kl: Symmetric KL divergence of neighbor distributions
-    - L_hi_scale: Direct high-σ log-RMS anchor loss (pred vs target) [NEW]
-    - debug_dict: Diagnostic information
+    - L_ov_shape: Scale-free Gram consistency loss (ungated)
+    - L_ov_scale: Log-trace scale consistency loss (ungated)
+    - L_ov_kl: Symmetric KL divergence (ungated, for logging)
+    - L_ov_kl_gated: Per-sample SNR-gated KL (for training loss)
+    - L_hi_scale: Direct high-σ log-RMS anchor loss (pred vs target)
+    - debug_dict: Diagnostic information including gating stats
     """
     B = x0_pred_1.shape[0]
     device = x0_pred_1.device
@@ -102,11 +111,16 @@ def compute_overlap_losses(
     # Initialize losses
     L_ov_shape = torch.tensor(0.0, device=device)
     L_ov_scale = torch.tensor(0.0, device=device)
-    L_ov_kl = torch.tensor(0.0, device=device)
-    L_hi_scale = torch.tensor(0.0, device=device)  # NEW: direct high-σ scale anchor
+    L_ov_kl = torch.tensor(0.0, device=device)           # Ungated (for logging)
+    L_ov_kl_gated = torch.tensor(0.0, device=device)     # [TRY 2] Per-sample gated (for training)
+    L_hi_scale = torch.tensor(0.0, device=device)        # Direct high-σ scale anchor
 
     valid_batch_count = 0
-    hi_scale_count = 0  # NEW: track high-σ samples separately
+    hi_scale_count = 0  # Track high-σ samples separately
+
+    # [TRY 2] Per-sample gating accumulators
+    gate_sum = 0.0  # For debug: sum of gates (to see how much gating is applied)
+
     debug_info = {
         'I_sizes': [],
         'trG1': [],
@@ -115,7 +129,10 @@ def compute_overlap_losses(
         'mean_pairwise_dist1': [],
         'mean_pairwise_dist2': [],
         'jaccard_k10': [],
-        'hi_scale_ratio': [],  # NEW: pred_rms / tgt_rms for high-σ
+        'hi_scale_ratio': [],  # pred_rms / tgt_rms for high-σ
+        # [TRY 2] Per-sample gating debug
+        'kl_gates': [],        # Per-sample c_skip^p values
+        'sigmas': [],          # Per-sample sigma values
     }
 
 
@@ -231,7 +248,30 @@ def compute_overlap_losses(
         kl_12 = (P1 * (torch.log(P1) - torch.log(P2))).sum(dim=1).mean()  # Mean over points
         kl_21 = (P2 * (torch.log(P2) - torch.log(P1))).sum(dim=1).mean()
         kl_sym = (kl_12 + kl_21) / 2
-        L_ov_kl = L_ov_kl + kl_sym
+
+        # [TRY 2] Per-sample SNR gating for KL
+        # c_skip = sigma_data^2 / (sigma^2 + sigma_data^2)
+        # gate = c_skip^p (p=2 by default)
+        # This REDUCES KL pressure at high σ (not just reweights)
+        if sigma_t is not None:
+            sigma_b = sigma_t[b].view(-1)[0] if sigma_t.dim() > 1 else sigma_t[b]
+            sigma_sq = sigma_b ** 2
+            c_skip_b = (sigma_data ** 2) / (sigma_sq + sigma_data ** 2)
+            gate_b = c_skip_b ** kl_gate_power
+
+            # Debug: track gating info
+            debug_info['kl_gates'].append(gate_b.item())
+            debug_info['sigmas'].append(sigma_b.item())
+            gate_sum += gate_b.item()
+        else:
+            gate_b = 1.0  # No gating if sigma not provided
+            debug_info['kl_gates'].append(1.0)
+            debug_info['sigmas'].append(0.0)
+            gate_sum += 1.0
+
+        # Accumulate BOTH gated and ungated KL
+        L_ov_kl = L_ov_kl + kl_sym                    # Ungated (for logging)
+        L_ov_kl_gated = L_ov_kl_gated + gate_b * kl_sym  # Gated (for training)
 
         valid_batch_count += 1
 
@@ -268,20 +308,29 @@ def compute_overlap_losses(
             debug_info['jaccard_k10'].append(jaccard_mean)
 
     # Normalize by valid batch count
+    # [TRY 2] IMPORTANT: Divide gated KL by B (valid_batch_count), NOT by sum(gates)
+    # This makes KL *truly weaker* when gates are small (high σ)
     if valid_batch_count > 0:
         L_ov_shape = L_ov_shape / valid_batch_count
         L_ov_scale = L_ov_scale / valid_batch_count
-        L_ov_kl = L_ov_kl / valid_batch_count
+        L_ov_kl = L_ov_kl / valid_batch_count              # Ungated average (for logging)
+        L_ov_kl_gated = L_ov_kl_gated / valid_batch_count  # Gated average (for training)
     if hi_scale_count > 0:
         L_hi_scale = L_hi_scale / hi_scale_count
+
+    # [TRY 2] Compute gating statistics for debug
+    mean_gate = gate_sum / max(valid_batch_count, 1)
+    debug_info['mean_kl_gate'] = mean_gate
+    debug_info['gate_sum'] = gate_sum
 
     return {
         'L_ov_shape': L_ov_shape,
         'L_ov_scale': L_ov_scale,
-        'L_ov_kl': L_ov_kl,
-        'L_hi_scale': L_hi_scale,  # NEW
+        'L_ov_kl': L_ov_kl,                    # Ungated (for logging)
+        'L_ov_kl_gated': L_ov_kl_gated,        # [TRY 2] Gated (for training)
+        'L_hi_scale': L_hi_scale,
         'valid_batch_count': valid_batch_count,
-        'hi_scale_count': hi_scale_count,  # NEW
+        'hi_scale_count': hi_scale_count,
         'debug_info': debug_info,
     }
 
@@ -3083,6 +3132,7 @@ def train_stageC_diffusion_generator(
                 print(f"[PAIR-OVERLAP] Using ONLY paired minisets for ST training")
                 print(f"[PAIR-OVERLAP] alpha={pair_overlap_alpha}, min_I={pair_overlap_min_I}")
                 print(f"[PAIR-OVERLAP] Overlap loss weights: shape={overlap_loss_weight_shape}, scale={overlap_loss_weight_scale}, kl={overlap_loss_weight_kl}")
+                print(f"[PAIR-OVERLAP] [TRY2] Per-sample SNR gating for KL enabled (c_skip^2, divide by B not sum(gate))")
         else:
             # Standard unpaired training
             st_loader = DataLoader(
@@ -3896,7 +3946,7 @@ def train_stageC_diffusion_generator(
         ctx_perm_fixed_sum = 0.0
 
         # ========== OVERLAP CONSISTENCY LOSS TRACKING (Candidate 1) ==========
-        ov_loss_sum = {'shape': 0.0, 'scale': 0.0, 'kl': 0.0, 'total': 0.0}
+        ov_loss_sum = {'shape': 0.0, 'scale': 0.0, 'kl': 0.0, 'kl_gated': 0.0, 'total': 0.0}  # [TRY2] added kl_gated
         ov_apply_count = 0
         ov_skipped_sigma = 0
         ov_pair_batches = 0
@@ -8673,11 +8723,14 @@ def train_stageC_diffusion_generator(
                             idx1_I, idx2_I, I_mask,
                             mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
-                            # NEW: for high-σ scale anchor
+                            # For high-σ scale anchor
                             sigma_t=sigma_pair_3d_ov,
                             V_target_1=V_target_1_ov,
                             V_target_2=V_target_2,
                             sigma_0_hi=0.5,  # threshold for high-σ anchor
+                            # [TRY 2] Per-sample SNR gating for KL
+                            sigma_data=sigma_data,
+                            kl_gate_power=2.0,  # c_skip^2 gating
                         )
 
 
@@ -8685,55 +8738,64 @@ def train_stageC_diffusion_generator(
                         if ov_loss_dict['valid_batch_count'] > 0:
                             L_ov_shape_batch = ov_loss_dict['L_ov_shape']
                             L_ov_scale_batch = ov_loss_dict['L_ov_scale']
-                            L_ov_kl_batch = ov_loss_dict['L_ov_kl']
-                            L_hi_scale_batch = ov_loss_dict['L_hi_scale']  # NEW
+                            L_ov_kl_batch = ov_loss_dict['L_ov_kl']          # Ungated (for logging)
+                            L_ov_kl_gated = ov_loss_dict['L_ov_kl_gated']    # [TRY 2] Per-sample gated
+                            L_hi_scale_batch = ov_loss_dict['L_hi_scale']
 
-                            # Weight for new high-σ scale anchor (tune this!)
-                            HI_SCALE_WEIGHT = 1.0  # Start at 1.0, can increase if needed
+                            # Weight for high-σ scale anchor
+                            HI_SCALE_WEIGHT = 1.0
 
                             # ============================================================
-                            # SNR-GATE FOR OVERLAP KL LOSS (Try A from diagnosis)
-                            # KL loss can be minimized by both views becoming "flat/uniform"
-                            # which destroys neighbor identity. Gate it by c_skip so it's
-                            # strong at low σ (where denoising is reliable) and weak at
-                            # high σ (where it would encourage "invariant blur").
-                            # c_skip = σ_data² / (σ² + σ_data²)
+                            # [TRY 2] SNR-GATE FOR OVERLAP KL LOSS (Per-sample gating)
+                            # KL is now gated INSIDE compute_overlap_losses with per-sample c_skip^2
+                            # L_ov_kl_gated = (1/B) * sum_i(c_skip_i^2 * kl_i)
+                            # This REDUCES KL pressure at high σ (not just reweights)
                             # ============================================================
-                            with torch.no_grad():
-                                sigma_ov_mean = sigma_pair_ov.mean()
-                                c_skip_ov = (sigma_data ** 2) / (sigma_ov_mean ** 2 + sigma_data ** 2)
-                                # Gate: w_kl = c_skip^p, p=2 (aggressive gating)
-                                KL_GATE_POWER = 2.0
-                                kl_gate = c_skip_ov ** KL_GATE_POWER
 
-                            # Apply gated KL weight
-                            effective_kl_weight = overlap_loss_weight_kl * kl_gate.item()
-
-                            # Add to total loss
+                            # Add to total loss (KL is already per-sample gated)
                             L_total = (
                                 L_total
-                                + overlap_loss_weight_shape * L_ov_shape_batch
-                                + overlap_loss_weight_scale * L_ov_scale_batch
-                                + effective_kl_weight * L_ov_kl_batch  # GATED by c_skip
-                                + HI_SCALE_WEIGHT * L_hi_scale_batch  # NEW: high-σ scale anchor
+                                + overlap_loss_weight_shape * L_ov_shape_batch   # Ungated
+                                + overlap_loss_weight_scale * L_ov_scale_batch   # Ungated
+                                + overlap_loss_weight_kl * L_ov_kl_gated         # [TRY 2] Per-sample gated
+                                + HI_SCALE_WEIGHT * L_hi_scale_batch             # High-σ scale anchor
                             )
 
-                            # Debug: log gating effect
+                            # [TRY 2] Debug: log per-sample gating effect
                             if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                                print(f"[OV-KL-GATE] σ_mean={sigma_ov_mean.item():.3f} c_skip={c_skip_ov.item():.4f} "
-                                      f"kl_gate={kl_gate.item():.4f} effective_kl_weight={effective_kl_weight:.4f} "
-                                      f"(base={overlap_loss_weight_kl:.2f})")
+                                mean_gate = ov_loss_dict['debug_info'].get('mean_kl_gate', 1.0)
+                                kl_gates = ov_loss_dict['debug_info'].get('kl_gates', [])
+                                sigmas_dbg = ov_loss_dict['debug_info'].get('sigmas', [])
+
+                                # Compute stats for debug
+                                if kl_gates:
+                                    min_gate = min(kl_gates)
+                                    max_gate = max(kl_gates)
+                                    min_sigma = min(sigmas_dbg) if sigmas_dbg else 0
+                                    max_sigma = max(sigmas_dbg) if sigmas_dbg else 0
+                                else:
+                                    min_gate = max_gate = mean_gate
+                                    min_sigma = max_sigma = 0
+
+                                # Key ratio: gated_kl / ungated_kl shows how much KL is reduced
+                                kl_reduction = L_ov_kl_gated.item() / (L_ov_kl_batch.item() + 1e-8)
+
+                                print(f"[TRY2-KL-GATE] B={len(kl_gates)} σ=[{min_sigma:.3f},{max_sigma:.3f}] "
+                                      f"gate=[{min_gate:.4f},{max_gate:.4f}] mean_gate={mean_gate:.4f}")
+                                print(f"[TRY2-KL-GATE] kl_ungated={L_ov_kl_batch.item():.6f} "
+                                      f"kl_gated={L_ov_kl_gated.item():.6f} reduction={kl_reduction:.4f}")
 
 
                             # Track epoch stats
                             ov_apply_count += 1
                             ov_loss_sum['shape'] += float(L_ov_shape_batch.item())
                             ov_loss_sum['scale'] += float(L_ov_scale_batch.item())
-                            ov_loss_sum['kl'] += float(L_ov_kl_batch.item())
+                            ov_loss_sum['kl'] += float(L_ov_kl_batch.item())           # Ungated
+                            ov_loss_sum['kl_gated'] = ov_loss_sum.get('kl_gated', 0.0) + float(L_ov_kl_gated.item())  # [TRY2]
                             ov_loss_sum['total'] += float(
                                 L_ov_shape_batch.item()
                                 + L_ov_scale_batch.item()
-                                + L_ov_kl_batch.item()
+                                + L_ov_kl_gated.item()  # Use gated KL in total
                             )
 
                             # Debug stats
@@ -9850,14 +9912,19 @@ def train_stageC_diffusion_generator(
             if train_pair_overlap and ov_apply_count > 0:
                 avg_ov_shape = ov_loss_sum['shape'] / ov_apply_count
                 avg_ov_scale = ov_loss_sum['scale'] / ov_apply_count
-                avg_ov_kl = ov_loss_sum['kl'] / ov_apply_count
+                avg_ov_kl = ov_loss_sum['kl'] / ov_apply_count                # Ungated
+                avg_ov_kl_gated = ov_loss_sum['kl_gated'] / ov_apply_count    # [TRY2] Gated
                 avg_ov_total = ov_loss_sum['total'] / ov_apply_count
                 ov_apply_rate = ov_apply_count / max(n_batches, 1)
+
+                # [TRY2] Compute KL gating reduction ratio
+                kl_gating_ratio = avg_ov_kl_gated / (avg_ov_kl + 1e-8)
 
                 # Track in history (safe init for partially populated dicts)
                 history['epoch_avg'].setdefault('ov_shape', [])
                 history['epoch_avg'].setdefault('ov_scale', [])
                 history['epoch_avg'].setdefault('ov_kl', [])
+                history['epoch_avg'].setdefault('ov_kl_gated', [])  # [TRY2]
                 history['epoch_avg'].setdefault('ov_total', [])
                 history['epoch_avg'].setdefault('ov_jaccard_k10', [])
                 history['epoch_avg'].setdefault('ov_I_size_mean', [])
@@ -9866,6 +9933,7 @@ def train_stageC_diffusion_generator(
                 history['epoch_avg']['ov_shape'].append(avg_ov_shape)
                 history['epoch_avg']['ov_scale'].append(avg_ov_scale)
                 history['epoch_avg']['ov_kl'].append(avg_ov_kl)
+                history['epoch_avg']['ov_kl_gated'].append(avg_ov_kl_gated)  # [TRY2]
                 history['epoch_avg']['ov_total'].append(avg_ov_total)
 
                 avg_I_size = np.mean(ov_I_sizes) if ov_I_sizes else 0.0
@@ -9874,8 +9942,10 @@ def train_stageC_diffusion_generator(
                 history['epoch_avg']['ov_jaccard_k10'].append(avg_jaccard)
 
                 print(f"\n[OVLP-EPOCH] Epoch {epoch+1} Overlap Loss Summary:")
-                print(f"  L_ov_shape={avg_ov_shape:.6f}, L_ov_scale={avg_ov_scale:.6f}, "
-                      f"L_ov_kl={avg_ov_kl:.6f}, L_ov_total={avg_ov_total:.6f}")
+                print(f"  L_ov_shape={avg_ov_shape:.6f}, L_ov_scale={avg_ov_scale:.6f}")
+                print(f"  [TRY2] L_ov_kl_ungated={avg_ov_kl:.6f}, L_ov_kl_gated={avg_ov_kl_gated:.6f}, "
+                      f"gating_ratio={kl_gating_ratio:.4f}")
+                print(f"  L_ov_total={avg_ov_total:.6f}")
                 print(f"  apply_rate={ov_apply_rate:.2%}, skipped_sigma={ov_skipped_sigma}")
                 print(f"  avg_I_size={avg_I_size:.1f}, Jaccard@10={avg_jaccard:.4f}")
         
