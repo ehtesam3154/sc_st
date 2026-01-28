@@ -5589,36 +5589,6 @@ def train_stageC_diffusion_generator(
                                     print(f"  [CLAMP-COVERAGE] pin_rate low(<0.40)={pin_rate_low:.1%} (n={n_low}), "
                                           f"high(>=0.60)={pin_rate_high:.1%} (n={n_high})")
 
-                            # --- kNN INDEXING VERIFICATION ---
-                            # MOVED OUTSIDE the valid_scale conditional so it always runs
-                            # Check more frequently early in training (every 25 steps for first 500)
-                            knn_check_interval = 25 if global_step < 500 else 100
-                            if global_step % knn_check_interval == 0:
-                                knn_max = knn_spatial_for_scale.max().item()
-                                n_max_batch = mask.shape[1]
-
-                                # Check ALL batch elements, not just b=0
-                                total_valid = 0
-                                total_entries = 0
-                                for b_chk in range(min(8, mask.shape[0])):
-                                    m_chk = mask[b_chk].bool()
-                                    if m_chk.sum() < 5:
-                                        continue
-                                    knn_chk = knn_spatial_for_scale[b_chk, m_chk, :]
-                                    total_valid += (knn_chk >= 0).sum().item()
-                                    total_entries += knn_chk.numel()
-
-                                valid_frac = total_valid / max(total_entries, 1)
-
-                                print(f"\n  [KNN-INDEX-CHECK] step={global_step} knn_max={knn_max}, N={n_max_batch}, "
-                                      f"valid_neighbor_frac={valid_frac:.2%}")
-
-                                # CRITICAL WARNING if validity is too low
-                                if valid_frac < 0.50:
-                                    print(f"  ⚠️ WARNING: valid_neighbor_frac={valid_frac:.1%} is VERY LOW!")
-                                    print(f"     knn_nca/edge losses are INEFFECTIVE with invalid indices.")
-                                    print(f"     This cripples local structure learning.")
-
                             # ============ [CLAMP-HIDDEN-ERROR] Per-σ bin error hiding ============
                             # Only run if valid_scale has any True values (need ratio_raw etc.)
                             if valid_scale.any() and global_step % 100 == 0:
@@ -5656,6 +5626,37 @@ def train_stageC_diffusion_generator(
                                 
                                 print(f"  BEFORE FIX: high-σ 'hidden_err' >> 0 (error being masked)")
                                 print(f"  AFTER FIX:  L_out_scale/L_gram_learn now see raw error")
+
+                    # --- kNN INDEXING VERIFICATION (INDEPENDENT INTERVAL) ---
+                    # This block runs on its OWN schedule, NOT inside the global_step % 100 block
+                    # Check more frequently early in training (every 25 steps for first 500)
+                    knn_check_interval = 25 if global_step < 500 else 100
+                    if global_step % knn_check_interval == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            knn_max = knn_spatial_for_scale.max().item()
+                            n_max_batch = mask.shape[1]
+
+                            # Check ALL batch elements, not just b=0
+                            total_valid = 0
+                            total_entries = 0
+                            for b_chk in range(min(8, mask.shape[0])):
+                                m_chk = mask[b_chk].bool()
+                                if m_chk.sum() < 5:
+                                    continue
+                                knn_chk = knn_spatial_for_scale[b_chk, m_chk, :]
+                                total_valid += (knn_chk >= 0).sum().item()
+                                total_entries += knn_chk.numel()
+
+                            valid_frac = total_valid / max(total_entries, 1)
+
+                            print(f"\n  [KNN-INDEX-CHECK] step={global_step} knn_max={knn_max}, N={n_max_batch}, "
+                                  f"valid_neighbor_frac={valid_frac:.2%}")
+
+                            # CRITICAL WARNING if validity is too low
+                            if valid_frac < 0.50:
+                                print(f"  ⚠️ WARNING: valid_neighbor_frac={valid_frac:.1%} is VERY LOW!")
+                                print(f"     knn_nca/edge losses are INEFFECTIVE with invalid indices.")
+                                print(f"     This cripples local structure learning.")
 
                 else:
                     # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
