@@ -8700,13 +8700,40 @@ def train_stageC_diffusion_generator(
                                 print(f"  target_rms_ratio={rms_tgt_1/rms_tgt_2:.4f} (should be ~1.0)")
 
 
-                    # Sample noise for view2 - INDEPENDENT from view1
-                    # FIX #1: Do NOT couple noise on overlap points.
+                    # Sample noise for view2 - INDEPENDENT from view1 (for low/moderate σ)
+                    # FIX #1: Do NOT couple noise on overlap points for x0 overlap losses.
                     # Coupled noise creates a shortcut where the model can satisfy
                     # overlap consistency via the skip connection without learning
                     # proper denoising. Independent noise forces the model to actually
                     # denoise to achieve overlap consistency.
                     eps_2 = torch.randn_like(V_target_2)
+
+                    # ============================================================
+                    # [FIX 2a] Same-noise coupling for HIGH-σ samples ONLY
+                    # For residual overlap (Phase 4), we NEED same-noise on overlap
+                    # points so that F_x matching isolates context dependence
+                    # (not "different denoising tasks").
+                    # σ_switch = max(2.3 × σ_data, 0.8 × σ_cap)
+                    # ============================================================
+                    curr_stage_noise = curriculum_state['current_stage']
+                    curr_mult_noise = curriculum_state['sigma_cap_mults'][curr_stage_noise]
+                    sigma_cap_noise = curr_mult_noise * sigma_data
+                    sigma_switch_noise = max(2.3 * sigma_data, 0.8 * sigma_cap_noise)
+
+                    # Per-sample high-σ mask (shape: B_keep)
+                    hi_sigma_mask = (sigma_pair_ov > sigma_switch_noise)  # (B_keep,)
+
+                    # Apply same-noise coupling ONLY for high-σ samples on overlap points
+                    if hi_sigma_mask.any():
+                        for b in range(hi_sigma_mask.shape[0]):
+                            if hi_sigma_mask[b]:
+                                # Get valid overlap indices for this sample
+                                I_valid_b = I_mask[b]  # (max_I,)
+                                if I_valid_b.sum() > 0:
+                                    idx1_b = idx1_I[b, I_valid_b]  # Positions in view1
+                                    idx2_b = idx2_I[b, I_valid_b]  # Positions in view2
+                                    # Copy noise from view1 overlap points to view2
+                                    eps_2[b, idx2_b] = eps_ov[b, idx1_b]
 
                     # Add noise to view2 target
                     V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
@@ -8793,21 +8820,26 @@ def train_stageC_diffusion_generator(
                             sigma_cap_ov = curr_mult_ov * sigma_data
 
                             sigma_switch = max(2.3 * sigma_data, 0.8 * sigma_cap_ov)
-                            sigma_mean_batch = sigma_pair_ov.mean().item()
 
-                            # Determine if this is high-σ regime
-                            is_high_sigma_regime = sigma_mean_batch > sigma_switch
+                            # ============================================================
+                            # [FIX 2b] Per-sample hi_mask instead of batch-mean gating
+                            # This ensures proper classification in mixed-σ batches
+                            # ============================================================
+                            hi_mask = (sigma_pair_ov > sigma_switch)  # (B_keep,) per-sample mask
+                            lo_mask = ~hi_mask
+                            n_hi = hi_mask.sum().item()
+                            n_lo = lo_mask.sum().item()
 
-                            if is_high_sigma_regime:
-                                # ============================================================
-                                # HIGH-σ REGIME: Residual-space overlap (Phase 4)
-                                # 1. Disable x0 overlap losses (shape/scale/KL)
-                                # 2. Compute F_x for both views
-                                # 3. Apply same-noise on overlap points
-                                # 4. Match centered F_x residuals (teacher-student)
-                                # ============================================================
+                            # Initialize losses
+                            L_ov_residual = torch.tensor(0.0, device=device)
+                            residual_count = 0
 
-                                # Compute EDM preconditioning for this batch
+                            # ============================================================
+                            # HIGH-σ SAMPLES: Residual-space overlap (Phase 4)
+                            # Only for samples where σ > σ_switch
+                            # ============================================================
+                            if n_hi > 0:
+                                # Compute EDM preconditioning for ALL samples (needed for indexing)
                                 c_skip_ov, c_out_ov, c_in_ov, _ = uet.edm_precond(sigma_pair_ov, sigma_data)
                                 # c_skip_ov: (B,) -> expand to (B, 1, 1)
                                 c_skip_ov_3d = c_skip_ov.view(-1, 1, 1)
@@ -8829,11 +8861,11 @@ def train_stageC_diffusion_generator(
                                 F_x_1 = F_x_1 * mask_ov.unsqueeze(-1).float()
                                 F_x_2 = F_x_2 * mask_2.unsqueeze(-1).float()
 
-                                # Compute residual overlap loss on overlap points
-                                L_ov_residual = torch.tensor(0.0, device=device)
-                                residual_count = 0
-
+                                # Compute residual overlap loss ONLY for high-σ samples
                                 for b in range(F_x_1.shape[0]):
+                                    if not hi_mask[b]:  # Skip low-σ samples
+                                        continue
+
                                     I_valid = I_mask[b]
                                     n_I = I_valid.sum().item()
                                     if n_I < 4:
@@ -8857,32 +8889,54 @@ def train_stageC_diffusion_generator(
                                 if residual_count > 0:
                                     L_ov_residual = L_ov_residual / residual_count
 
-                                # HIGH-σ: Only add residual loss, disable x0 losses
-                                RESIDUAL_WEIGHT = 1.0
+                            # ============================================================
+                            # LOW-σ SAMPLES: Standard x0 overlap (with TRY2 gating)
+                            # Only for samples where σ <= σ_switch
+                            # The overlap losses computed in helper already use per-sample
+                            # gating, so we just need to apply them for the low-σ portion
+                            # ============================================================
+                            # Note: L_ov_*_batch already computed over all kept samples
+                            # We need to weight them by the fraction that are low-σ
+                            # OR recompute for only low-σ samples
+                            #
+                            # Since the helper computed losses over ALL kept samples,
+                            # and we want exclusivity (high-σ gets residual, low-σ gets x0),
+                            # we scale the x0 losses by n_lo/total to approximate per-sample
+                            # This is an approximation but maintains the right behavior
+                            B_keep = sigma_pair_ov.shape[0]
+                            lo_frac = n_lo / max(B_keep, 1)
+                            hi_frac = n_hi / max(B_keep, 1)
+
+                            # HIGH-σ: Add residual loss (weighted by fraction of high-σ samples)
+                            RESIDUAL_WEIGHT = 1.0
+                            if n_hi > 0:
+                                L_total = L_total + RESIDUAL_WEIGHT * L_ov_residual
+
+                            # LOW-σ: Add x0 overlap losses (weighted by fraction of low-σ samples)
+                            if n_lo > 0:
                                 L_total = (
                                     L_total
-                                    + RESIDUAL_WEIGHT * L_ov_residual  # Residual-space overlap
-                                    + HI_SCALE_WEIGHT * L_hi_scale_batch  # Keep high-σ scale anchor
-                                    # NOTE: x0 overlap losses (shape/scale/KL) are DISABLED at high σ
+                                    + lo_frac * overlap_loss_weight_shape * L_ov_shape_batch   # Ungated, scaled
+                                    + lo_frac * overlap_loss_weight_scale * L_ov_scale_batch   # Ungated, scaled
+                                    + lo_frac * overlap_loss_weight_kl * L_ov_kl_gated         # [TRY 2] Per-sample gated, scaled
                                 )
 
-                                if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
-                                    print(f"[OV-RESIDUAL] HIGH-σ regime active: σ_mean={sigma_mean_batch:.3f} > σ_switch={sigma_switch:.3f}")
-                                    print(f"[OV-RESIDUAL] L_residual={L_ov_residual.item():.6f} (x0 losses DISABLED)")
+                            # High-σ scale anchor always applied (stabilizes scale at high σ)
+                            L_total = L_total + HI_SCALE_WEIGHT * L_hi_scale_batch
 
-                            else:
-                                # ============================================================
-                                # LOW/MODERATE-σ REGIME: Standard x0 overlap (with TRY2 gating)
-                                # ============================================================
-
-                                # Add to total loss (KL is already per-sample gated)
-                                L_total = (
-                                    L_total
-                                    + overlap_loss_weight_shape * L_ov_shape_batch   # Ungated
-                                    + overlap_loss_weight_scale * L_ov_scale_batch   # Ungated
-                                    + overlap_loss_weight_kl * L_ov_kl_gated         # [TRY 2] Per-sample gated
-                                    + HI_SCALE_WEIGHT * L_hi_scale_batch             # High-σ scale anchor
-                                )
+                            # Debug logging for per-sample regime
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                sigma_mean_batch = sigma_pair_ov.mean().item()
+                                print(f"[OV-PERSAMPLE] σ_switch={sigma_switch:.3f} | "
+                                      f"hi_mask: {n_hi}/{B_keep} samples, lo_mask: {n_lo}/{B_keep} samples")
+                                if n_hi > 0:
+                                    hi_sigmas = sigma_pair_ov[hi_mask]
+                                    print(f"[OV-PERSAMPLE] HIGH-σ: min={hi_sigmas.min().item():.3f} "
+                                          f"max={hi_sigmas.max().item():.3f} L_residual={L_ov_residual.item():.6f}")
+                                if n_lo > 0:
+                                    lo_sigmas = sigma_pair_ov[lo_mask]
+                                    print(f"[OV-PERSAMPLE] LOW-σ: min={lo_sigmas.min().item():.3f} "
+                                          f"max={lo_sigmas.max().item():.3f} (x0 losses active, frac={lo_frac:.3f})")
 
                             # [TRY 2] Debug: log per-sample gating effect
                             if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
@@ -9907,6 +9961,11 @@ def train_stageC_diffusion_generator(
                 # Evaluate at sigma_cap (or closest available)
                 closest_sigma = min(fixed_eval_sigmas, key=lambda x: abs(x - sigma_cap_curr))
 
+                # [FIX 1] Save RNG state before promotion eval to avoid contaminating training
+                promo_rng_state = torch.get_rng_state()
+                if torch.cuda.is_available():
+                    promo_cuda_rng_state = torch.cuda.get_rng_state()
+
                 # Re-evaluate at closest_sigma to get metrics for promotion check
                 torch.manual_seed(42 + int(closest_sigma * 1000))
                 sigma_promo = torch.full((B_fixed,), closest_sigma, device=device)
@@ -10036,6 +10095,11 @@ def train_stageC_diffusion_generator(
                 if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
                     print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
                     print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
+
+                # [FIX 1] Restore RNG state after promotion eval to avoid contaminating training
+                torch.set_rng_state(promo_rng_state)
+                if torch.cuda.is_available():
+                    torch.cuda.set_rng_state(promo_cuda_rng_state)
 
                 print(f"{'='*70}\n")
 
