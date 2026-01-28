@@ -10198,8 +10198,14 @@ def train_stageC_diffusion_generator(
 
                     # Check for plateau
                     loss_threshold = curriculum_state['loss_plateau_threshold']
-                    if avg_cap_band_loss < curriculum_state['best_cap_band_loss']:
-                        rel_improv = (curriculum_state['best_cap_band_loss'] - avg_cap_band_loss) / max(curriculum_state['best_cap_band_loss'], 1e-8)
+                    best_loss = curriculum_state['best_cap_band_loss']
+
+                    if best_loss == float('inf'):
+                        # First measurement: always set as best, reset counter
+                        curriculum_state['best_cap_band_loss'] = avg_cap_band_loss
+                        curriculum_state['loss_no_improve_count'] = 0
+                    elif avg_cap_band_loss < best_loss:
+                        rel_improv = (best_loss - avg_cap_band_loss) / max(best_loss, 1e-8)
                         if rel_improv > loss_threshold:
                             curriculum_state['best_cap_band_loss'] = avg_cap_band_loss
                             curriculum_state['loss_no_improve_count'] = 0
