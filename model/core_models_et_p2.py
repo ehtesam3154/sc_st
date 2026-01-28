@@ -9762,9 +9762,9 @@ def train_stageC_diffusion_generator(
         # =====================================================================
         # FIXED-BATCH EVALUATION AT FIXED SIGMAS (once per epoch)
         # =====================================================================
-        # Run fixed-batch eval at epochs 1,3,5,10 for early detection, then every 5 epochs
-        early_eval_epochs = {0, 2, 4, 9}  # 0-indexed: epochs 1,3,5,10
-        run_fixed_eval = (epoch % 5 == 0) or (epoch in early_eval_epochs)
+        # Run every epoch so curriculum promotion is responsive
+        # (5 consecutive passes = 5 epochs per stage, not 25)
+        run_fixed_eval = True
         if (fabric is None or fabric.is_global_zero) and use_st and run_fixed_eval:
             fixed_eval_sigmas = [0.05, 0.15, 0.40, 0.70, 1.20, 2.40]
 
