@@ -382,11 +382,15 @@ class GEMSModel:
         precision: str = "16-mixed",
         logger = None,
         log_interval: int = 10,
-        # Early stopping
+        # Early stopping (legacy, non-curriculum)
         enable_early_stop: bool = True,
         early_stop_min_epochs: int = 12,
         early_stop_patience: int = 6,
         early_stop_threshold: float = 0.01,
+        # Curriculum early stopping (three-gate)
+        curriculum_target_stage: int = 6,
+        curriculum_min_epochs: int = 100,
+        curriculum_early_stop: bool = True,
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
         # NEW: Stochastic kNN sampling parameters (for STSetDataset)
         # NOTE: For small slides (<1000 spots), use 1.5-2.0 to maintain spatial locality
@@ -583,6 +587,9 @@ class GEMSModel:
             early_stop_min_epochs=early_stop_min_epochs,
             early_stop_patience=early_stop_patience,
             early_stop_threshold=early_stop_threshold,
+            curriculum_target_stage=curriculum_target_stage,
+            curriculum_min_epochs=curriculum_min_epochs,
+            curriculum_early_stop=curriculum_early_stop,
             # NEW: Context augmentation
             z_noise_std=z_noise_std,
             z_dropout_rate=z_dropout_rate,

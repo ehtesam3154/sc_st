@@ -2689,11 +2689,15 @@ def train_stageC_diffusion_generator(
     precision: str = '16-mixed', # "32-true" | "16-mixed" | "bf16-mixed"
     logger = None,
     log_interval: int = 20,
-    # Early stopping parameters
+    # Early stopping parameters (legacy, non-curriculum)
     enable_early_stop: bool = True,
     early_stop_min_epochs: int = 12,
     early_stop_patience: int = 6,
     early_stop_threshold: float = 0.01,  # 1% relative improvement
+    # Curriculum early stopping (three-gate)
+    curriculum_target_stage: int = 6,
+    curriculum_min_epochs: int = 100,
+    curriculum_early_stop: bool = True,
     # NEW: EDM parameters
     P_mean: float = -1.2,          # Log-normal mean for sigma sampling
     P_std: float = 1.2,            # Log-normal std for sigma sampling
@@ -2807,13 +2811,13 @@ def train_stageC_diffusion_generator(
         # Gate B: metrics stable for K consecutive evals
         # Gate C: cap-band loss plateau (loss for σ near σ_cap stabilized)
         # ============================================================
-        'target_stage': 4,            # Gate A: target stage index (4 = 7.0x σ_data ≈ 1.2)
-                                      # Can adjust. Use len(mults)-1 for full curriculum
+        'target_stage': curriculum_target_stage,  # Gate A: target stage index (CLI arg, default 6 = full)
+        'curriculum_early_stop': curriculum_early_stop,  # Enable/disable three-gate stopping
         'steps_in_stage': 0,          # Reset when promoting to new stage
         'min_steps_per_stage': 1000,  # Minimum steps before promotion/stopping allowed
                                       # For 6000 samples / batch_size=32 ≈ 188 steps/epoch
                                       # 1000 steps ≈ 5.3 epochs minimum per stage
-        'min_epochs': 20,             # Absolute minimum epochs before any stopping
+        'min_epochs': curriculum_min_epochs,  # Absolute minimum epochs before any stopping (CLI arg, default 100)
 
         # Gate B: Metrics stability tracking (K consecutive passes)
         'metrics_history_K': 5,       # Need K consecutive good evals for Gate B
@@ -2829,6 +2833,15 @@ def train_stageC_diffusion_generator(
         'loss_no_improve_count': 0,   # Counter for plateau detection
         'best_cap_band_loss': float('inf'),  # Best cap-band loss at current stage
     }
+
+    if fabric is None or fabric.is_global_zero:
+        print(f"\n[CURRICULUM CONFIG]")
+        print(f"  stages: {curriculum_state['sigma_cap_mults']} (× σ_data={sigma_data:.4f})")
+        print(f"  target_stage: {curriculum_state['target_stage']} / {len(curriculum_state['sigma_cap_mults'])-1}")
+        print(f"  min_epochs: {curriculum_state['min_epochs']}")
+        print(f"  three-gate early stop: {curriculum_state.get('curriculum_early_stop', True)}")
+        print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
+              f"default={curriculum_state['cap_band_frac_default']}")
 
     slide_d15_medians = []
     for slide_id in st_dataset.targets_dict:
@@ -10623,8 +10636,10 @@ def train_stageC_diffusion_generator(
             # ============================================================
             curriculum_enabled = (curriculum_state is not None and
                                   len(curriculum_state.get('sigma_cap_mults', [])) > 0)
+            curriculum_stop_enabled = (curriculum_enabled and
+                                       curriculum_state.get('curriculum_early_stop', True))
 
-            if curriculum_enabled:
+            if curriculum_enabled and curriculum_stop_enabled:
                 final_stage_idx = len(curriculum_state['sigma_cap_mults']) - 1
                 curr_stage = curriculum_state['current_stage']
                 target_stage = curriculum_state.get('target_stage', final_stage_idx)
@@ -10704,7 +10719,7 @@ def train_stageC_diffusion_generator(
                         elif not min_steps_met:
                             print(f"  → Training continues: min steps per stage not met")
 
-            else:
+            elif not curriculum_enabled:
                 # No curriculum: use legacy loss-based early stop
                 if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
                     # Use total weighted loss as validation metric

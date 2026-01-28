@@ -73,13 +73,21 @@ def parse_args():
 
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
-                        help='Enable early stopping')
+                        help='Enable early stopping (legacy, only used when curriculum is disabled)')
     parser.add_argument('--early_stop_min_epochs', type=int, default=12,
                         help='Minimum epochs before early stopping kicks in')
     parser.add_argument('--early_stop_patience', type=int, default=6,
                         help='Epochs to wait without improvement before stopping')
     parser.add_argument('--early_stop_threshold', type=float, default=0.01,
-                        help='Relative improvement threshold (e.g., 0.01 = 1%)')
+                        help='Relative improvement threshold (e.g., 0.01 = 1%%)')
+
+    # ========== CURRICULUM EARLY STOPPING ==========
+    parser.add_argument('--curriculum_target_stage', type=int, default=6,
+                        help='Target curriculum stage for Gate A (0-indexed, default 6 = full curriculum)')
+    parser.add_argument('--curriculum_min_epochs', type=int, default=100,
+                        help='Minimum epochs before three-gate stopping is allowed')
+    parser.add_argument('--curriculum_early_stop', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable three-gate curriculum-aware early stopping (default: enabled)')
 
     parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
                         help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
@@ -634,6 +642,9 @@ def main(args=None):
         early_stop_min_epochs=args.early_stop_min_epochs,
         early_stop_patience=args.early_stop_patience,
         early_stop_threshold=args.early_stop_threshold,
+        curriculum_target_stage=args.curriculum_target_stage,
+        curriculum_min_epochs=args.curriculum_min_epochs,
+        curriculum_early_stop=args.curriculum_early_stop,
         # ========== NEW: Context augmentation ==========
         z_noise_std=0.0,       # No noise for Phase 1 (focus on clean geometry)
         z_dropout_rate=0.0,    # No dropout for Phase 1
