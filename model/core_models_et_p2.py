@@ -2802,8 +2802,10 @@ def train_stageC_diffusion_generator(
         'target_stage': 4,            # Gate A: target stage index (4 = 7.0x σ_data ≈ 1.2)
                                       # Can adjust. Use len(mults)-1 for full curriculum
         'steps_in_stage': 0,          # Reset when promoting to new stage
-        'min_steps_per_stage': 500,   # Minimum steps before promotion/stopping allowed
-        'min_epochs': 15,             # Absolute minimum epochs before any stopping
+        'min_steps_per_stage': 1000,  # Minimum steps before promotion/stopping allowed
+                                      # For 6000 samples / batch_size=32 ≈ 188 steps/epoch
+                                      # 1000 steps ≈ 5.3 epochs minimum per stage
+        'min_epochs': 20,             # Absolute minimum epochs before any stopping
 
         # Gate B: Metrics stability tracking (K consecutive passes)
         'metrics_history_K': 5,       # Need K consecutive good evals for Gate B
