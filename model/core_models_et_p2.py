@@ -2792,6 +2792,32 @@ def train_stageC_diffusion_generator(
         'trace_r_min': 0.60,
         # History for tracking
         'eval_history': [],           # List of (epoch, metrics_dict)
+
+        # ============================================================
+        # THREE-GATE EARLY STOPPING (combined loss + metrics + stage)
+        # Gate A: current_stage >= target_stage
+        # Gate B: metrics stable for K consecutive evals
+        # Gate C: cap-band loss plateau (loss for σ near σ_cap stabilized)
+        # ============================================================
+        'target_stage': 4,            # Gate A: target stage index (4 = 7.0x σ_data ≈ 1.2)
+                                      # Can adjust. Use len(mults)-1 for full curriculum
+        'steps_in_stage': 0,          # Reset when promoting to new stage
+        'min_steps_per_stage': 500,   # Minimum steps before promotion/stopping allowed
+        'min_epochs': 15,             # Absolute minimum epochs before any stopping
+
+        # Gate B: Metrics stability tracking (K consecutive passes)
+        'metrics_history_K': 5,       # Need K consecutive good evals for Gate B
+        'metrics_pass_history': [],   # List of bools (recent eval pass/fail)
+
+        # Gate C: Cap-band loss plateau detection
+        # Track loss for samples with σ ∈ [0.8*σ_cap, σ_cap]
+        'cap_band_loss_sum': 0.0,     # Accumulated cap-band score loss
+        'cap_band_loss_count': 0,     # Number of cap-band samples
+        'cap_band_loss_history': [],  # Per-epoch average cap-band loss
+        'loss_plateau_patience': 6,   # P evals without improvement = plateau
+        'loss_plateau_threshold': 0.02,  # 2% relative improvement threshold
+        'loss_no_improve_count': 0,   # Counter for plateau detection
+        'best_cap_band_loss': float('inf'),  # Best cap-band loss at current stage
     }
 
     slide_d15_medians = []
@@ -5105,7 +5131,24 @@ def train_stageC_diffusion_generator(
                     else:
                         # Classic EDM objective estimate
                         L_score = (w_eff * err2_sample).mean()
-                    
+
+                    # ============================================================
+                    # [THREE-GATE] Track cap-band loss for Gate C
+                    # Cap-band = samples with σ ∈ [0.8*σ_cap, σ_cap]
+                    # This makes loss comparable within a stage (same σ distribution)
+                    # ============================================================
+                    with torch.no_grad():
+                        cap_band_lo = 0.8 * sigma_cap
+                        cap_band_hi = sigma_cap
+                        cap_band_mask = (sigma_flat >= cap_band_lo) & (sigma_flat <= cap_band_hi)
+                        n_cap_band = cap_band_mask.sum().item()
+
+                        if n_cap_band > 0:
+                            # Accumulate cap-band score loss (unweighted for stability)
+                            cap_band_err2 = err2_sample[cap_band_mask].mean().item()
+                            curriculum_state['cap_band_loss_sum'] += cap_band_err2 * n_cap_band
+                            curriculum_state['cap_band_loss_count'] += n_cap_band
+
                     # Debug: Log WNORM effect
                     # Debug: Log WNORM effect
                     if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
@@ -9678,6 +9721,7 @@ def train_stageC_diffusion_generator(
             
             n_batches += 1
             global_step += 1
+            curriculum_state['steps_in_stage'] += 1  # [THREE-GATE] Track steps per stage
             # batch_pbar.update(1)
             # Sync global_step across ranks to prevent divergence
             if dist.is_initialized():
@@ -10096,6 +10140,16 @@ def train_stageC_diffusion_generator(
                         print(f"\n[CURRICULUM] 🎉 PROMOTED to stage {curriculum_state['current_stage']} "
                               f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})")
 
+                        # [THREE-GATE] Reset stage-local tracking on promotion
+                        curriculum_state['steps_in_stage'] = 0
+                        curriculum_state['cap_band_loss_sum'] = 0.0
+                        curriculum_state['cap_band_loss_count'] = 0
+                        curriculum_state['cap_band_loss_history'] = []
+                        curriculum_state['best_cap_band_loss'] = float('inf')
+                        curriculum_state['loss_no_improve_count'] = 0
+                        curriculum_state['metrics_pass_history'] = []
+                        print(f"  [THREE-GATE] Reset stage-local tracking for new stage")
+
                 # Print curriculum status
                 print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
                 print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1} "
@@ -10112,6 +10166,54 @@ def train_stageC_diffusion_generator(
                 if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
                     print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
                     print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
+
+                # ============================================================
+                # [THREE-GATE] Track Gate B (metrics) and Gate C (cap-band loss)
+                # ============================================================
+                # Gate B: Record whether metrics passed this epoch
+                metrics_passed = all_promo_pass
+                curriculum_state['metrics_pass_history'].append(metrics_passed)
+                # Keep only last K entries
+                K = curriculum_state['metrics_history_K']
+                if len(curriculum_state['metrics_pass_history']) > K:
+                    curriculum_state['metrics_pass_history'] = curriculum_state['metrics_pass_history'][-K:]
+
+                # Gate C: Compute average cap-band loss for this epoch
+                if curriculum_state['cap_band_loss_count'] > 0:
+                    avg_cap_band_loss = curriculum_state['cap_band_loss_sum'] / curriculum_state['cap_band_loss_count']
+                    curriculum_state['cap_band_loss_history'].append(avg_cap_band_loss)
+
+                    # Check for plateau
+                    loss_threshold = curriculum_state['loss_plateau_threshold']
+                    if avg_cap_band_loss < curriculum_state['best_cap_band_loss']:
+                        rel_improv = (curriculum_state['best_cap_band_loss'] - avg_cap_band_loss) / max(curriculum_state['best_cap_band_loss'], 1e-8)
+                        if rel_improv > loss_threshold:
+                            curriculum_state['best_cap_band_loss'] = avg_cap_band_loss
+                            curriculum_state['loss_no_improve_count'] = 0
+                        else:
+                            curriculum_state['loss_no_improve_count'] += 1
+                    else:
+                        curriculum_state['loss_no_improve_count'] += 1
+
+                    print(f"  [THREE-GATE] Cap-band loss: {avg_cap_band_loss:.6f} "
+                          f"(best={curriculum_state['best_cap_band_loss']:.6f}, "
+                          f"no_improve={curriculum_state['loss_no_improve_count']}/{curriculum_state['loss_plateau_patience']})")
+                else:
+                    print(f"  [THREE-GATE] Cap-band loss: N/A (no samples in [0.8σ_cap, σ_cap])")
+
+                # Reset cap-band accumulators for next epoch
+                curriculum_state['cap_band_loss_sum'] = 0.0
+                curriculum_state['cap_band_loss_count'] = 0
+
+                # Gate B status
+                recent_passes = curriculum_state['metrics_pass_history']
+                gate_b_ok = len(recent_passes) >= K and all(recent_passes[-K:])
+                print(f"  [THREE-GATE] Gate B: {sum(recent_passes)}/{len(recent_passes)} recent passes "
+                      f"(need {K}/{K} for gate) {'✓' if gate_b_ok else '✗'}")
+
+                # Steps in stage
+                print(f"  [THREE-GATE] Steps in stage: {curriculum_state['steps_in_stage']} "
+                      f"(min={curriculum_state['min_steps_per_stage']})")
 
                 # [FIX 1] Restore RNG state after promotion eval to avoid contaminating training
                 torch.set_rng_state(promo_rng_state)
@@ -10424,9 +10526,11 @@ def train_stageC_diffusion_generator(
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
             # ============================================================
-            # CURRICULUM-AWARE EARLY STOPPING
-            # When curriculum is enabled, loss-based early stop is disabled
-            # until the final stage. Instead, we use curriculum stall/completion.
+            # THREE-GATE EARLY STOPPING (CURRICULUM-AWARE)
+            # Gate A: current_stage >= target_stage
+            # Gate B: metrics stable for K consecutive evals
+            # Gate C: cap-band loss plateau
+            # All three gates must pass, plus minimum epochs/steps
             # ============================================================
             curriculum_enabled = (curriculum_state is not None and
                                   len(curriculum_state.get('sigma_cap_mults', [])) > 0)
@@ -10434,64 +10538,82 @@ def train_stageC_diffusion_generator(
             if curriculum_enabled:
                 final_stage_idx = len(curriculum_state['sigma_cap_mults']) - 1
                 curr_stage = curriculum_state['current_stage']
-                at_final_stage = (curr_stage >= final_stage_idx)
+                target_stage = curriculum_state.get('target_stage', final_stage_idx)
+                min_epochs_curriculum = curriculum_state.get('min_epochs', 15)
+                min_steps_per_stage = curriculum_state.get('min_steps_per_stage', 500)
+                steps_in_stage = curriculum_state.get('steps_in_stage', 0)
+
+                # Gate A: Stage target reached
+                gate_a = (curr_stage >= target_stage)
+
+                # Gate B: Metrics stable for K consecutive evals
+                K = curriculum_state.get('metrics_history_K', 5)
+                recent_passes = curriculum_state.get('metrics_pass_history', [])
+                gate_b = len(recent_passes) >= K and all(recent_passes[-K:])
+
+                # Gate C: Cap-band loss plateau
+                loss_plateau_patience = curriculum_state.get('loss_plateau_patience', 6)
+                loss_no_improve = curriculum_state.get('loss_no_improve_count', 0)
+                gate_c = (loss_no_improve >= loss_plateau_patience)
+
+                # Prerequisites: minimum epochs and steps
+                min_epochs_met = (epoch + 1) >= min_epochs_curriculum
+                min_steps_met = steps_in_stage >= min_steps_per_stage
 
                 # Curriculum-based stopping conditions
                 stall_count = curriculum_state.get('stall_count', 0)
                 stall_limit = curriculum_state.get('stall_limit', 6)
-                consecutive_passes = curriculum_state.get('consecutive_passes', 0)
-                promotion_threshold = curriculum_state.get('promotion_threshold', 5)
 
-                # Condition 1: Curriculum stall (failure at current stage)
-                if stall_count >= stall_limit:
+                # === STOP CONDITION 1: Curriculum stall (failure) ===
+                # Only after min_steps to avoid premature stall
+                if stall_count >= stall_limit and min_steps_met:
                     if fabric is None or fabric.is_global_zero:
-                        print(f"\n[CURRICULUM-STOP] Stall limit reached at stage {curr_stage}")
+                        print(f"\n[THREE-GATE-STOP] Stall limit reached at stage {curr_stage}")
                         print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
                         print(f"  Stopping training (curriculum stall)")
                     should_stop = True
                     early_stopped = True
                     early_stop_epoch = epoch + 1
 
-                # Condition 2: Final stage completion (success)
-                elif at_final_stage and consecutive_passes >= promotion_threshold:
+                # === STOP CONDITION 2: Three-gate success ===
+                # All gates pass + prerequisites met
+                elif gate_a and gate_b and gate_c and min_epochs_met and min_steps_met:
                     if fabric is None or fabric.is_global_zero:
-                        print(f"\n[CURRICULUM-STOP] Final stage {curr_stage} completed!")
-                        print(f"  consecutive_passes={consecutive_passes} >= threshold={promotion_threshold}")
-                        print(f"  Stopping training (curriculum success)")
+                        print(f"\n[THREE-GATE-STOP] All gates passed! 🎉")
+                        print(f"  Gate A (stage >= target): {curr_stage} >= {target_stage} ✓")
+                        print(f"  Gate B (metrics stable): {sum(recent_passes[-K:])}/{K} passes ✓")
+                        print(f"  Gate C (loss plateau): no_improve={loss_no_improve} >= {loss_plateau_patience} ✓")
+                        print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
+                        print(f"  Min steps: {steps_in_stage} >= {min_steps_per_stage} ✓")
+                        print(f"  Stopping training (convergence success)")
                     should_stop = True
                     early_stopped = True
                     early_stop_epoch = epoch + 1
 
-                # Condition 3: At final stage, use metric-based early stop (optional)
-                elif at_final_stage and enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
-                    val_metric = avg_total
-                    if val_metric < early_stop_best:
-                        rel_improv = (early_stop_best - val_metric) / max(early_stop_best, 1e-8)
-                        if rel_improv > early_stop_threshold:
-                            early_stop_best = val_metric
-                            early_stop_no_improve = 0
-                        else:
-                            early_stop_no_improve += 1
-                    else:
-                        early_stop_no_improve += 1
-
-                    if early_stop_no_improve >= early_stop_patience:
-                        if fabric is None or fabric.is_global_zero:
-                            print(f"\n[CURRICULUM-STOP] Metric plateau at final stage {curr_stage}")
-                            print(f"  No improvement for {early_stop_patience} epochs")
-                        should_stop = True
-                        early_stopped = True
-                        early_stop_epoch = epoch + 1
-
-                # Not at final stage: just track best metric, no early stop
+                # === NO STOP: Log gate status ===
                 else:
                     val_metric = avg_total
                     if val_metric < early_stop_best:
                         early_stop_best = val_metric
-                    # Log curriculum status (no early stop)
+
+                    # Log gate status periodically
                     if (fabric is None or fabric.is_global_zero) and (epoch + 1) % 5 == 0:
-                        print(f"[CURRICULUM-ES] Stage {curr_stage}/{final_stage_idx} - "
-                              f"early stop disabled until final stage")
+                        print(f"\n[THREE-GATE] Epoch {epoch+1} Gate Status:")
+                        print(f"  Gate A (stage >= {target_stage}): {curr_stage} {'✓' if gate_a else '✗'}")
+                        print(f"  Gate B (metrics K={K}): {sum(recent_passes[-K:]) if recent_passes else 0}/{K} {'✓' if gate_b else '✗'}")
+                        print(f"  Gate C (loss plateau): {loss_no_improve}/{loss_plateau_patience} {'✓' if gate_c else '✗'}")
+                        print(f"  Min epochs: {epoch+1}/{min_epochs_curriculum} {'✓' if min_epochs_met else '✗'}")
+                        print(f"  Min steps: {steps_in_stage}/{min_steps_per_stage} {'✓' if min_steps_met else '✗'}")
+                        if not gate_a:
+                            print(f"  → Training continues: need to reach target stage {target_stage}")
+                        elif not gate_b:
+                            print(f"  → Training continues: need {K} consecutive metric passes")
+                        elif not gate_c:
+                            print(f"  → Training continues: loss still improving")
+                        elif not min_epochs_met:
+                            print(f"  → Training continues: min epochs not met")
+                        elif not min_steps_met:
+                            print(f"  → Training continues: min steps per stage not met")
 
             else:
                 # No curriculum: use legacy loss-based early stop
@@ -10499,7 +10621,6 @@ def train_stageC_diffusion_generator(
                     # Use total weighted loss as validation metric
                     # This includes all geometry regularizers (dim, triangle, radial)
                     val_metric = avg_total
-
 
                     # Check for improvement
                     if val_metric < early_stop_best:
