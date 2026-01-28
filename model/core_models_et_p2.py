@@ -2838,8 +2838,11 @@ def train_stageC_diffusion_generator(
 
     
     # A/B 3: F_x-space supervision for high-noise (learned branch direct supervision)
-    EXP_SCORE_FX_HI = False
-    FX_HI_WEIGHT = 1.0                 # Multiplier for Fx loss term
+    # ENABLED: This directly supervises the learned branch F_x at high σ, which is
+    # needed because scale improved but structure didn't. The learned branch must
+    # carry correct geometry at high σ (where c_skip ≈ 0).
+    EXP_SCORE_FX_HI = True  # CHANGED from False
+    FX_HI_WEIGHT = 2.0                 # Multiplier for Fx loss term (increased from 1.0)
     FX_USE_COUT2_MATCH = True          # If True, multiply Fx-MSE by c_out^2 (unit-matching)
     
     print(f"[EXP FLAGS] WD0={EXP_SCORE_WD0}, WNORM={EXP_SCORE_WNORM}, HI_BOOST={EXP_SCORE_HI_BOOST}, FX_HI={EXP_SCORE_FX_HI}")
@@ -5587,15 +5590,33 @@ def train_stageC_diffusion_generator(
                                           f"high(>=0.60)={pin_rate_high:.1%} (n={n_high})")
                             
                             # --- kNN INDEXING VERIFICATION ---
-                            if global_step % 100 == 0:
+                            # Check more frequently early in training (every 25 steps for first 500)
+                            knn_check_interval = 25 if global_step < 500 else 100
+                            if global_step % knn_check_interval == 0:
                                 knn_max = knn_spatial_for_scale.max().item()
                                 n_max_batch = mask.shape[1]
-                                b_test = 0
-                                m_test = mask[b_test].bool()
-                                knn_test = knn_spatial_for_scale[b_test, m_test, :]
-                                valid_frac = (knn_test >= 0).float().mean().item()
-                                print(f"  [KNN-INDEX-CHECK] knn_max={knn_max}, N={n_max_batch}, "
+
+                                # Check ALL batch elements, not just b=0
+                                total_valid = 0
+                                total_entries = 0
+                                for b_chk in range(min(8, mask.shape[0])):
+                                    m_chk = mask[b_chk].bool()
+                                    if m_chk.sum() < 5:
+                                        continue
+                                    knn_chk = knn_spatial_for_scale[b_chk, m_chk, :]
+                                    total_valid += (knn_chk >= 0).sum().item()
+                                    total_entries += knn_chk.numel()
+
+                                valid_frac = total_valid / max(total_entries, 1)
+
+                                print(f"\n  [KNN-INDEX-CHECK] step={global_step} knn_max={knn_max}, N={n_max_batch}, "
                                       f"valid_neighbor_frac={valid_frac:.2%}")
+
+                                # CRITICAL WARNING if validity is too low
+                                if valid_frac < 0.50:
+                                    print(f"  ⚠️ WARNING: valid_neighbor_frac={valid_frac:.1%} is VERY LOW!")
+                                    print(f"     knn_nca/edge losses are INEFFECTIVE with invalid indices.")
+                                    print(f"     This cripples local structure learning.")
 
                                 # ============ [CLAMP-HIDDEN-ERROR] Per-σ bin error hiding ============
                                 # Shows how much scale error is hidden by clamping at each σ level
@@ -8562,14 +8583,38 @@ def train_stageC_diffusion_generator(
                             # Weight for new high-σ scale anchor (tune this!)
                             HI_SCALE_WEIGHT = 1.0  # Start at 1.0, can increase if needed
 
+                            # ============================================================
+                            # SNR-GATE FOR OVERLAP KL LOSS (Try A from diagnosis)
+                            # KL loss can be minimized by both views becoming "flat/uniform"
+                            # which destroys neighbor identity. Gate it by c_skip so it's
+                            # strong at low σ (where denoising is reliable) and weak at
+                            # high σ (where it would encourage "invariant blur").
+                            # c_skip = σ_data² / (σ² + σ_data²)
+                            # ============================================================
+                            with torch.no_grad():
+                                sigma_ov_mean = sigma_pair_ov.mean()
+                                c_skip_ov = (sigma_data ** 2) / (sigma_ov_mean ** 2 + sigma_data ** 2)
+                                # Gate: w_kl = c_skip^p, p=2 (aggressive gating)
+                                KL_GATE_POWER = 2.0
+                                kl_gate = c_skip_ov ** KL_GATE_POWER
+
+                            # Apply gated KL weight
+                            effective_kl_weight = overlap_loss_weight_kl * kl_gate.item()
+
                             # Add to total loss
                             L_total = (
                                 L_total
                                 + overlap_loss_weight_shape * L_ov_shape_batch
                                 + overlap_loss_weight_scale * L_ov_scale_batch
-                                + overlap_loss_weight_kl * L_ov_kl_batch
+                                + effective_kl_weight * L_ov_kl_batch  # GATED by c_skip
                                 + HI_SCALE_WEIGHT * L_hi_scale_batch  # NEW: high-σ scale anchor
                             )
+
+                            # Debug: log gating effect
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                print(f"[OV-KL-GATE] σ_mean={sigma_ov_mean.item():.3f} c_skip={c_skip_ov.item():.4f} "
+                                      f"kl_gate={kl_gate.item():.4f} effective_kl_weight={effective_kl_weight:.4f} "
+                                      f"(base={overlap_loss_weight_kl:.2f})")
 
 
                             # Track epoch stats
