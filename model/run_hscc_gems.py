@@ -63,6 +63,14 @@ def parse_args():
     parser.add_argument('--sc_feat_mode', type=str, default='concat', choices=['concat', 'mlp'])
     parser.add_argument('--landmarks_L', type=int, default=16)
 
+    # Miniset sampling parameters
+    parser.add_argument('--pool_mult', type=float, default=2.0,
+                        help='Pool multiplier for stochastic miniset sampling. '
+                             'Lower values (1.5-2.0) give tighter spatial locality. '
+                             'For small slides (<1000 spots), use 1.5-2.0 to avoid pool covering entire slide.')
+    parser.add_argument('--stochastic_tau', type=float, default=1.0,
+                        help='Temperature for stochastic sampling within pool (lower = more deterministic)')
+
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
                         help='Enable early stopping')
@@ -675,6 +683,9 @@ def main(args=None):
         overlap_sigma_thresh=args.overlap_sigma_thresh,
         disable_ctx_loss_when_overlap=args.disable_ctx_loss_when_overlap,
         overlap_debug_every=args.overlap_debug_every,
+        # ========== MINISET SAMPLING ==========
+        pool_mult=args.pool_mult,
+        stochastic_tau=args.stochastic_tau,
     )
 
     

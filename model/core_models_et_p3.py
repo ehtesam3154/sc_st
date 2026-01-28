@@ -389,7 +389,8 @@ class GEMSModel:
         early_stop_threshold: float = 0.01,
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
         # NEW: Stochastic kNN sampling parameters (for STSetDataset)
-        pool_mult: float = 4.0,
+        # NOTE: For small slides (<1000 spots), use 1.5-2.0 to maintain spatial locality
+        pool_mult: float = 2.0,
         stochastic_tau: float = 1.0,
         # NEW: Context augmentation parameters
         z_noise_std: float = 0.02,
