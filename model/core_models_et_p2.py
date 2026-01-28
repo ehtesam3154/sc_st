@@ -10184,7 +10184,7 @@ def train_stageC_diffusion_generator(
                 # [THREE-GATE] Track Gate B (metrics) and Gate C (cap-band loss)
                 # ============================================================
                 # Gate B: Record whether metrics passed this epoch
-                metrics_passed = all_promo_pass
+                metrics_passed = all_pass  # From promotion check above
                 curriculum_state['metrics_pass_history'].append(metrics_passed)
                 # Keep only last K entries
                 K = curriculum_state['metrics_history_K']
