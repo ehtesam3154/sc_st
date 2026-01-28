@@ -8027,12 +8027,12 @@ def train_stageC_diffusion_generator(
                         # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
                         # This ensures generator learns correct local neighborhood distances
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
-                        if knn_spatial_for_gen is not None:
+                        if knn_spatial_for_scale is not None:
                             L_gen_scale_local = uet.knn_scale_loss(
                                 V_gen_centered_L,  # Anchor-clamped generator output
                                 V_target_batch,
                                 struct_mask,       # Only core non-landmarks (valid kNN indices)
-                                knn_indices=knn_spatial_for_gen,
+                                knn_indices=knn_spatial_for_scale,  # Within-miniset kNN
                                 k=15,
                                 return_per_sample=False  # Scalar loss
                             )
