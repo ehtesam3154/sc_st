@@ -750,8 +750,8 @@ def train_encoder(
                     center_coord = st_coords_norm[center_global]
                     dists = torch.norm(coords_slide - center_coord, dim=1)
                     
-                    # Build pool
-                    K_pool = min(int(pool_mult * n_core), n_s - 1)
+                    # Build pool (use ceiling for fractional pool_mult)
+                    K_pool = min(math.ceil(pool_mult * n_core), n_s - 1)
                     K_pool = max(K_pool, n_core - 1)
                     
                     # Sort by distance (exclude self)
@@ -817,9 +817,10 @@ def train_encoder(
                 center_coord = st_coords_norm[center_global]
                 dists = torch.norm(coords_slide - center_coord, dim=1)
                 
-                K_pool = min(int(pool_mult * n_core), n_s - 1)
+                # Use ceiling for fractional pool_mult
+                K_pool = min(math.ceil(pool_mult * n_core), n_s - 1)
                 K_pool = max(K_pool, n_core - 1)
-                
+
                 dists_no_self = dists.clone()
                 dists_no_self[center_local] = float('inf')
                 sorted_idx = torch.argsort(dists_no_self)
@@ -1575,7 +1576,8 @@ class STSetDataset(Dataset):
             sorted_dists = dists[sort_order]
 
             n_neighbors_needed = n - 1
-            K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n))
+            # Use ceiling to handle fractional pool_mult values properly
+            K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n))
             K_pool = max(K_pool, n_neighbors_needed)
 
             pool = sorted_neighbors[:K_pool]
@@ -2159,7 +2161,8 @@ class STPairSetDataset(Dataset):
         sorted_dists = dists[sort_order]
 
         n_neighbors_needed = n_core - 1
-        K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_core))
+        # Use ceiling to handle fractional pool_mult values properly
+        K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n_core))
         K_pool = max(K_pool, n_neighbors_needed)
 
         pool = sorted_neighbors[:K_pool]
@@ -2375,7 +2378,13 @@ class STPairSetDataset(Dataset):
 
         # Compute overlap size
         n_overlap = max(self.pair_overlap_min_I, int(self.pair_overlap_alpha * n))
+
+        # If n is too small to satisfy min overlap, bump n up
+        if n - 4 < self.pair_overlap_min_I:
+            n = min(m, self.pair_overlap_min_I + 4)
+
         n_overlap = min(n_overlap, n - 4)  # Leave room for non-overlapping points
+
 
         # Sample a center point (shared by both views for locality)
         center_idx = np.random.randint(0, m)
@@ -2393,7 +2402,8 @@ class STPairSetDataset(Dataset):
 
         # Pool size: enough for 2 views with overlap
         n_unique_needed = 2 * n - n_overlap  # Total unique points across both views
-        K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_unique_needed))
+        # Use ceiling to handle fractional pool_mult values properly
+        K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n_unique_needed))
         K_pool = max(K_pool, n_unique_needed)
 
         pool = sorted_neighbors[:K_pool]
@@ -2454,8 +2464,10 @@ class STPairSetDataset(Dataset):
         view2 = self._build_miniset_dict(targets, indices_all_2, anchor_mask_2, slide_id)
 
         # Compute overlap mapping (using global_uid for safety)
-        # Find where I_indices appear in each view
-        I_global_uids = (slide_id << 32) + I_indices.long()
+        # Include center_idx as shared overlap point
+        I_indices_with_center = torch.cat([I_indices, torch.tensor([center_idx], dtype=torch.long)])
+        I_global_uids = (slide_id << 32) + I_indices_with_center.long()
+
 
         # Build index mapping: for each point in I, find its position in view1 and view2
         idx1_I = []
@@ -2850,7 +2862,8 @@ class SCSetDataset(Dataset):
             sorted_dists = dists_no_self[sort_order]
 
             n_neighbors_needed = n_set - 1
-            K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_set))
+            # Use ceiling to handle fractional pool_mult values properly
+            K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n_set))
             K_pool = max(K_pool, n_neighbors_needed)
 
             pool = sorted_neighbors[:K_pool]
