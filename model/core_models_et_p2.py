@@ -2764,6 +2764,36 @@ def train_stageC_diffusion_generator(
         'overlap_count_this_epoch': 0
     }
 
+    # =========================================================================
+    # [CURRICULUM] Phase 3: σ curriculum state initialization
+    # Ladder of σ_cap values as multiples of σ_data
+    # For σ_data=0.175: [0.05, 0.16, 0.40, 0.70, 1.23, 2.45, 2.98]
+    # =========================================================================
+    curriculum_state = {
+        'sigma_cap_mults': [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0],  # Multiples of σ_data
+        'current_stage': 0,           # Start at stage 0 (0.3 * σ_data)
+        'consecutive_passes': 0,      # Need 5 consecutive passes for promotion
+        'promotion_threshold': 5,     # User requested 5 instead of 2-3
+        'stall_count': 0,             # Count of failed promotion attempts
+        'stall_limit': 6,             # Stop if stalled for this many evals
+        'generator_stable': False,    # Phase 2: warm-start flag
+        'gen_consecutive_passes': 0,  # Phase 2: generator stability counter
+        # Stricter thresholds at lower σ (tiered)
+        'jacc_min_by_mult': {
+            0.3: 0.15,   # Stricter at low σ
+            0.9: 0.12,   # Still relatively strict
+            2.3: 0.10,
+            4.0: 0.09,
+            7.0: 0.08,
+            14.0: 0.07,
+            17.0: 0.07,
+        },
+        'scale_r_min': 0.80,
+        'trace_r_min': 0.60,
+        # History for tracking
+        'eval_history': [],           # List of (epoch, metrics_dict)
+    }
+
     slide_d15_medians = []
     for slide_id in st_dataset.targets_dict:
         y_hat = st_dataset.targets_dict[slide_id].y_hat.to(device)  # (n_slide, 2)
@@ -4116,42 +4146,50 @@ def train_stageC_diffusion_generator(
 
                 # === EDM: sample sigma from log-normal ===
                 if use_edm:
+                    # [CURRICULUM] Phase 3: Compute current sigma_cap from curriculum state
+                    curr_stage = curriculum_state['current_stage']
+                    curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
+                    sigma_cap = curr_mult * sigma_data  # Dynamic cap based on curriculum
+                    sigma_cap = min(sigma_cap, sigma_refine_max)  # Never exceed original limit
+
                     # sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
                     sigma = uet.sample_sigma_lognormal_stratified(
                         batch_size_real, P_mean, P_std,
-                        high_sigma_fraction=0.4,  # 25% of batch guaranteed high-σ
-                        high_sigma_threshold=0.5,  # σ >= 0.5 is "high"
+                        high_sigma_fraction=0.4,  # 40% of batch guaranteed high-σ
+                        high_sigma_threshold=min(0.5, sigma_cap * 0.5),  # Adjust threshold for curriculum
                         device=device
                     )
-                    sigma = sigma.clamp(sigma_min, sigma_refine_max)
+                    sigma = sigma.clamp(sigma_min, sigma_cap)  # [CURRICULUM] Use sigma_cap instead of sigma_refine_max
                     sigma_t = sigma.view(-1, 1, 1)
 
                     # ========== PHASE 2: SIGMA SAMPLING SANITY ==========
                     if global_step % 20 == 0 and (fabric is None or fabric.is_global_zero):
                         print(f"\n[PHASE 2] Sigma Sampling (step {global_step}):")
+                        print(f"  [CURRICULUM] stage={curr_stage} mult={curr_mult:.1f}x sigma_cap={sigma_cap:.4f} "
+                              f"(sigma_data={sigma_data:.4f})")
                         print(f"  sigma: min={sigma.min():.6f} median={sigma.median():.6f} max={sigma.max():.6f}")
 
                         import math
-                        
+
                         log_sigma = sigma.log()
                         log_min = math.log(sigma_min)
-                        log_refine = math.log(sigma_refine_max)
+                        log_cap = math.log(sigma_cap)
                         print(f"  log(sigma): min={log_sigma.min():.4f} median={log_sigma.median():.4f} max={log_sigma.max():.4f}")
-                        
+
                         # Quantiles
                         print(f"  Quantiles: p05={sigma.quantile(0.05):.6f} p25={sigma.quantile(0.25):.6f} "
                               f"p75={sigma.quantile(0.75):.6f} p95={sigma.quantile(0.95):.6f}")
-                        
+
                         # Clamp hit rates
                         clamp_low = (sigma <= sigma_min + 1e-6).float().mean().item()
-                        clamp_high = (sigma >= sigma_refine_max - 1e-6).float().mean().item()
-                        print(f"  Clamp hit rate: at sigma_min={clamp_low*100:.1f}% at sigma_refine_max={clamp_high*100:.1f}%")
-                        
+                        clamp_high = (sigma >= sigma_cap - 1e-6).float().mean().item()
+                        print(f"  Clamp hit rate: at sigma_min={clamp_low*100:.1f}% at sigma_cap={clamp_high*100:.1f}%")
+
                         if clamp_low > 0.3 or clamp_high > 0.3:
                             print(f"  ⚠️ WARNING: >30% samples hit clamp bounds!")
-                        
+
                         # t_norm mapping sanity (for time-aware architectures)
-                        t_norm_check = ((log_sigma - log_min) / (log_refine - log_min + 1e-8)).clamp(0, 1)
+                        t_norm_check = ((log_sigma - log_min) / (log_cap - log_min + 1e-8)).clamp(0, 1)
                         print(f"  t_norm: min={t_norm_check.min():.4f} median={t_norm_check.median():.4f} max={t_norm_check.max():.4f}")
                     
                     # Create t_norm proxy for gating/debug (log-space normalization)
@@ -8746,20 +8784,105 @@ def train_stageC_diffusion_generator(
                             HI_SCALE_WEIGHT = 1.0
 
                             # ============================================================
-                            # [TRY 2] SNR-GATE FOR OVERLAP KL LOSS (Per-sample gating)
-                            # KL is now gated INSIDE compute_overlap_losses with per-sample c_skip^2
-                            # L_ov_kl_gated = (1/B) * sum_i(c_skip_i^2 * kl_i)
-                            # This REDUCES KL pressure at high σ (not just reweights)
+                            # [PHASE 4] High-σ Residual Overlap
+                            # For σ > σ_switch: disable x0 overlap, use residual (F_x) matching
+                            # σ_switch = max(2.3 * σ_data, 0.8 * σ_cap)
                             # ============================================================
+                            curr_stage_ov = curriculum_state['current_stage']
+                            curr_mult_ov = curriculum_state['sigma_cap_mults'][curr_stage_ov]
+                            sigma_cap_ov = curr_mult_ov * sigma_data
 
-                            # Add to total loss (KL is already per-sample gated)
-                            L_total = (
-                                L_total
-                                + overlap_loss_weight_shape * L_ov_shape_batch   # Ungated
-                                + overlap_loss_weight_scale * L_ov_scale_batch   # Ungated
-                                + overlap_loss_weight_kl * L_ov_kl_gated         # [TRY 2] Per-sample gated
-                                + HI_SCALE_WEIGHT * L_hi_scale_batch             # High-σ scale anchor
-                            )
+                            sigma_switch = max(2.3 * sigma_data, 0.8 * sigma_cap_ov)
+                            sigma_mean_batch = sigma_pair_ov.mean().item()
+
+                            # Determine if this is high-σ regime
+                            is_high_sigma_regime = sigma_mean_batch > sigma_switch
+
+                            if is_high_sigma_regime:
+                                # ============================================================
+                                # HIGH-σ REGIME: Residual-space overlap (Phase 4)
+                                # 1. Disable x0 overlap losses (shape/scale/KL)
+                                # 2. Compute F_x for both views
+                                # 3. Apply same-noise on overlap points
+                                # 4. Match centered F_x residuals (teacher-student)
+                                # ============================================================
+
+                                # Compute EDM preconditioning for this batch
+                                c_skip_ov, c_out_ov, c_in_ov, _ = uet.edm_precond(sigma_pair_ov, sigma_data)
+                                # c_skip_ov: (B,) -> expand to (B, 1, 1)
+                                c_skip_ov_3d = c_skip_ov.view(-1, 1, 1)
+                                c_out_ov_3d = c_out_ov.view(-1, 1, 1)
+
+                                # Get centered noisy inputs (same as forward_edm does)
+                                V_t_1_c, _ = uet.center_only(V_t_1, mask_ov)
+                                V_t_2_c, _ = uet.center_only(V_t_2, mask_2)
+
+                                # Compute learned residual F_x = (x0_pred - c_skip * x_centered) / c_out
+                                # x0_pred is already centered in the forward pass
+                                x0_pred_1_c, _ = uet.center_only(x0_pred_1, mask_ov)
+                                x0_pred_2_c, _ = uet.center_only(x0_pred_2, mask_2)
+
+                                F_x_1 = (x0_pred_1_c - c_skip_ov_3d * V_t_1_c) / c_out_ov_3d.clamp(min=1e-6)
+                                F_x_2 = (x0_pred_2_c - c_skip_ov_3d * V_t_2_c) / c_out_ov_3d.clamp(min=1e-6)
+
+                                # Mask
+                                F_x_1 = F_x_1 * mask_ov.unsqueeze(-1).float()
+                                F_x_2 = F_x_2 * mask_2.unsqueeze(-1).float()
+
+                                # Compute residual overlap loss on overlap points
+                                L_ov_residual = torch.tensor(0.0, device=device)
+                                residual_count = 0
+
+                                for b in range(F_x_1.shape[0]):
+                                    I_valid = I_mask[b]
+                                    n_I = I_valid.sum().item()
+                                    if n_I < 4:
+                                        continue
+
+                                    idx1_b = idx1_I[b, I_valid]
+                                    idx2_b = idx2_I[b, I_valid]
+
+                                    # Extract F_x on overlap points
+                                    F1_I = F_x_1[b, idx1_b].detach()  # Teacher (stop-grad)
+                                    F2_I = F_x_2[b, idx2_b]           # Student (gradients flow)
+
+                                    # Center residuals (translation gauge)
+                                    F1_I_c = F1_I - F1_I.mean(dim=0, keepdim=True)
+                                    F2_I_c = F2_I - F2_I.mean(dim=0, keepdim=True)
+
+                                    # MSE on centered residuals
+                                    L_ov_residual = L_ov_residual + F.mse_loss(F2_I_c, F1_I_c)
+                                    residual_count += 1
+
+                                if residual_count > 0:
+                                    L_ov_residual = L_ov_residual / residual_count
+
+                                # HIGH-σ: Only add residual loss, disable x0 losses
+                                RESIDUAL_WEIGHT = 1.0
+                                L_total = (
+                                    L_total
+                                    + RESIDUAL_WEIGHT * L_ov_residual  # Residual-space overlap
+                                    + HI_SCALE_WEIGHT * L_hi_scale_batch  # Keep high-σ scale anchor
+                                    # NOTE: x0 overlap losses (shape/scale/KL) are DISABLED at high σ
+                                )
+
+                                if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                    print(f"[OV-RESIDUAL] HIGH-σ regime active: σ_mean={sigma_mean_batch:.3f} > σ_switch={sigma_switch:.3f}")
+                                    print(f"[OV-RESIDUAL] L_residual={L_ov_residual.item():.6f} (x0 losses DISABLED)")
+
+                            else:
+                                # ============================================================
+                                # LOW/MODERATE-σ REGIME: Standard x0 overlap (with TRY2 gating)
+                                # ============================================================
+
+                                # Add to total loss (KL is already per-sample gated)
+                                L_total = (
+                                    L_total
+                                    + overlap_loss_weight_shape * L_ov_shape_batch   # Ungated
+                                    + overlap_loss_weight_scale * L_ov_scale_batch   # Ungated
+                                    + overlap_loss_weight_kl * L_ov_kl_gated         # [TRY 2] Per-sample gated
+                                    + HI_SCALE_WEIGHT * L_hi_scale_batch             # High-σ scale anchor
+                                )
 
                             # [TRY 2] Debug: log per-sample gating effect
                             if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
@@ -9338,7 +9461,21 @@ def train_stageC_diffusion_generator(
                           f"step_ratio={ctx_grad/ctx_param:.4e}")
                     print(f"  generator: ||grad||={gen_grad:.4e} ||param||={gen_param:.4e} "
                           f"step_ratio={gen_grad/gen_param:.4e}")
-                    
+
+                    # [GEN-GRAD] Phase 1.2: Log generator loss contribution vs total
+                    gen_align_contrib = WEIGHTS['gen_align'] * L_gen_align.item() if not is_sc else 0.0
+                    gen_scale_contrib = WEIGHTS.get('gen_scale', 0) * L_gen_scale.item() if not is_sc else 0.0
+                    score_contrib = WEIGHTS.get('score', 1.0) * L_score.item()
+                    gen_total_contrib = gen_align_contrib + gen_scale_contrib
+                    total_loss_approx = L_total.item() if L_total is not None else 1.0
+                    gen_pct = 100.0 * gen_total_contrib / max(total_loss_approx, 1e-8)
+
+                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
+                    print(f"  [GEN-GRAD] score_contrib={score_contrib:.4e} gen_total_contrib={gen_total_contrib:.4e} ({gen_pct:.1f}%)")
+
+                    if gen_pct < 1.0 and not is_sc:
+                        print(f"    ⚠️ WARNING: Generator contributes <1% of loss - may not learn!")
+
                     if ctx_grad < score_grad * 0.01:
                         print(f"    ⚠️ WARNING: Context encoder grads are very small!")
                     
@@ -9529,8 +9666,83 @@ def train_stageC_diffusion_generator(
                             score_net.module.D_latent if hasattr(score_net, 'module') else 16
                     
                     H_fixed = context_encoder(Z_fixed, mask_fixed)
-                    
+
                     print(f"  {'σ':>8} | {'scale_r':>8} | {'trace_r':>8} | {'out/tgt':>8} | {'Jacc@10':>8} | {'SC':>6}")
+                    print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*6}")
+
+                    # =====================================================================
+                    # [GEN-EVAL] Generator-only evaluation (Phase 1.1)
+                    # Evaluate generator output without any denoising
+                    # =====================================================================
+                    V_gen_fixed = generator(H_fixed, mask_fixed)
+
+                    # Center generator output
+                    mask_f_gen = mask_fixed.unsqueeze(-1).float()
+                    valid_count_gen = mask_f_gen.sum()
+                    V_gen_c, _ = uet.center_only(V_gen_fixed, mask_fixed)
+                    V_tgt_c_gen, _ = uet.center_only(V_target_fixed, mask_fixed)
+
+                    # scale_r_gen
+                    rms_gen = (V_gen_c.pow(2) * mask_f_gen).sum().div(valid_count_gen).sqrt()
+                    rms_tgt_gen = (V_tgt_c_gen.pow(2) * mask_f_gen).sum().div(valid_count_gen).sqrt()
+                    scale_r_gen = (rms_gen / rms_tgt_gen.clamp(min=1e-8)).item()
+
+                    # trace_r_gen
+                    G_gen = V_gen_c @ V_gen_c.transpose(1, 2)
+                    G_tgt_gen = V_tgt_c_gen @ V_tgt_c_gen.transpose(1, 2)
+                    trace_gen = torch.diagonal(G_gen, dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_tgt_gen = torch.diagonal(G_tgt_gen, dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_r_gen = (trace_gen / trace_tgt_gen.clamp(min=1e-8)).mean().item()
+
+                    # Jacc@10_gen
+                    jaccard_sum_gen = 0.0
+                    jaccard_count_gen = 0
+                    for b in range(min(4, B_fixed)):
+                        m_b = mask_fixed[b].bool()
+                        n_valid = int(m_b.sum().item())
+                        if n_valid < 15:
+                            continue
+
+                        gen_b = V_gen_fixed[b, m_b]
+                        tgt_b = V_target_fixed[b, m_b]
+
+                        D_gen_b = torch.cdist(gen_b, gen_b)
+                        D_tgt_b = torch.cdist(tgt_b, tgt_b)
+
+                        k_j = min(10, n_valid - 1)
+                        _, knn_gen = D_gen_b.topk(k_j + 1, largest=False)
+                        _, knn_tgt = D_tgt_b.topk(k_j + 1, largest=False)
+
+                        knn_gen = knn_gen[:, 1:]  # Exclude self
+                        knn_tgt = knn_tgt[:, 1:]
+
+                        for i in range(n_valid):
+                            set_gen = set(knn_gen[i].tolist())
+                            set_tgt = set(knn_tgt[i].tolist())
+                            inter = len(set_gen & set_tgt)
+                            union = len(set_gen | set_tgt)
+                            if union > 0:
+                                jaccard_sum_gen += inter / union
+                                jaccard_count_gen += 1
+
+                    jaccard_gen = jaccard_sum_gen / max(jaccard_count_gen, 1)
+
+                    # Print generator row (σ=GEN means generator-only, no denoising)
+                    print(f"  {'GEN':>8} | {scale_r_gen:8.3f} | {trace_r_gen:8.3f} | {'N/A':>8} | {jaccard_gen:8.3f} | {'GEN':>6}")
+
+                    # Store for curriculum/warm-start decisions
+                    gen_eval_metrics = {
+                        'scale_r': scale_r_gen,
+                        'trace_r': trace_r_gen,
+                        'jacc10': jaccard_gen
+                    }
+
+                    # [GEN-EVAL] Summary
+                    gen_scale_ok = 0.85 <= scale_r_gen <= 1.15
+                    gen_trace_ok = trace_r_gen >= 0.70
+                    print(f"  [GEN-EVAL] scale_r={scale_r_gen:.3f} ({'OK' if gen_scale_ok else 'FAIL'}) "
+                          f"trace_r={trace_r_gen:.3f} ({'OK' if gen_trace_ok else 'FAIL'}) "
+                          f"Jacc@10={jaccard_gen:.3f}")
                     print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*6}")
 
                     
@@ -9683,7 +9895,148 @@ def train_stageC_diffusion_generator(
                     score_net.train()
                 if was_training_ctx:
                     context_encoder.train()
-                
+
+                # =====================================================================
+                # [CURRICULUM] Phase 3: Promotion logic based on fixed-batch eval
+                # =====================================================================
+                curr_stage = curriculum_state['current_stage']
+                curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
+                sigma_cap_curr = curr_mult * sigma_data
+
+                # Find the closest sigma in fixed_eval_sigmas to current sigma_cap
+                # Evaluate at sigma_cap (or closest available)
+                closest_sigma = min(fixed_eval_sigmas, key=lambda x: abs(x - sigma_cap_curr))
+
+                # Re-evaluate at closest_sigma to get metrics for promotion check
+                torch.manual_seed(42 + int(closest_sigma * 1000))
+                sigma_promo = torch.full((B_fixed,), closest_sigma, device=device)
+                sigma_promo_3d = sigma_promo.view(-1, 1, 1)
+                eps_promo = torch.randn_like(V_target_fixed)
+                V_t_promo = V_target_fixed + sigma_promo_3d * eps_promo
+                V_t_promo = V_t_promo * mask_fixed.unsqueeze(-1).float()
+
+                with torch.no_grad():
+                    x0_promo = score_net.forward_edm(V_t_promo, sigma_promo, H_fixed, mask_fixed, sigma_data, self_cond=None)
+                    if isinstance(x0_promo, tuple):
+                        x0_promo = x0_promo[0]
+
+                    # Compute metrics at sigma_cap
+                    V_promo_c, _ = uet.center_only(x0_promo, mask_fixed)
+                    mask_f_promo = mask_fixed.unsqueeze(-1).float()
+                    valid_cnt_promo = mask_f_promo.sum()
+
+                    rms_promo = (V_promo_c.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
+                    rms_tgt_promo = (V_tgt_c_gen.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
+                    scale_r_promo = (rms_promo / rms_tgt_promo.clamp(min=1e-8)).item()
+
+                    G_promo = V_promo_c @ V_promo_c.transpose(1, 2)
+                    trace_promo = torch.diagonal(G_promo, dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_r_promo = (trace_promo / trace_tgt_gen.clamp(min=1e-8)).mean().item()
+
+                    # Jacc@10 at sigma_cap
+                    jacc_sum_promo = 0.0
+                    jacc_cnt_promo = 0
+                    for b in range(min(4, B_fixed)):
+                        m_b = mask_fixed[b].bool()
+                        n_v = int(m_b.sum().item())
+                        if n_v < 15:
+                            continue
+                        pred_b = x0_promo[b, m_b]
+                        tgt_b = V_target_fixed[b, m_b]
+                        D_pred_b = torch.cdist(pred_b, pred_b)
+                        D_tgt_b = torch.cdist(tgt_b, tgt_b)
+                        k_j = min(10, n_v - 1)
+                        _, knn_pred = D_pred_b.topk(k_j + 1, largest=False)
+                        _, knn_tgt = D_tgt_b.topk(k_j + 1, largest=False)
+                        knn_pred = knn_pred[:, 1:]
+                        knn_tgt = knn_tgt[:, 1:]
+                        for i in range(n_v):
+                            s_pred = set(knn_pred[i].tolist())
+                            s_tgt = set(knn_tgt[i].tolist())
+                            inter = len(s_pred & s_tgt)
+                            union = len(s_pred | s_tgt)
+                            if union > 0:
+                                jacc_sum_promo += inter / union
+                                jacc_cnt_promo += 1
+                    jacc_promo = jacc_sum_promo / max(jacc_cnt_promo, 1)
+
+                # Get tiered Jacc threshold
+                jacc_min = curriculum_state['jacc_min_by_mult'].get(curr_mult, 0.07)
+                scale_r_min = curriculum_state['scale_r_min']
+                trace_r_min = curriculum_state['trace_r_min']
+
+                # Check promotion criteria
+                scale_ok = scale_r_promo >= scale_r_min
+                trace_ok = trace_r_promo >= trace_r_min
+                jacc_ok = jacc_promo >= jacc_min
+
+                # Check if Jacc is not decreasing (need history)
+                prev_jacc = None
+                if len(curriculum_state['eval_history']) >= 1:
+                    prev_jacc = curriculum_state['eval_history'][-1].get('jacc', 0)
+                jacc_not_decreasing = (prev_jacc is None) or (jacc_promo >= prev_jacc - 0.01)
+
+                all_pass = scale_ok and trace_ok and jacc_ok and jacc_not_decreasing
+
+                # Store in history
+                curriculum_state['eval_history'].append({
+                    'epoch': epoch,
+                    'sigma_cap': sigma_cap_curr,
+                    'scale_r': scale_r_promo,
+                    'trace_r': trace_r_promo,
+                    'jacc': jacc_promo,
+                    'passed': all_pass
+                })
+
+                # Phase 2: Generator warm-start check
+                if not curriculum_state['generator_stable']:
+                    gen_scale_ok = 0.85 <= gen_eval_metrics['scale_r'] <= 1.15
+                    gen_trace_ok = gen_eval_metrics['trace_r'] >= 0.70
+                    if gen_scale_ok and gen_trace_ok:
+                        curriculum_state['gen_consecutive_passes'] += 1
+                    else:
+                        curriculum_state['gen_consecutive_passes'] = 0
+
+                    if curriculum_state['gen_consecutive_passes'] >= 3:
+                        curriculum_state['generator_stable'] = True
+                        print(f"\n[GEN-WARMUP] Generator is now STABLE after {epoch+1} epochs!")
+
+                # Promotion logic
+                if all_pass:
+                    curriculum_state['consecutive_passes'] += 1
+                    curriculum_state['stall_count'] = 0
+                else:
+                    curriculum_state['consecutive_passes'] = 0
+                    curriculum_state['stall_count'] += 1
+
+                # Promote if enough consecutive passes
+                promoted = False
+                if curriculum_state['consecutive_passes'] >= curriculum_state['promotion_threshold']:
+                    if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                        curriculum_state['current_stage'] += 1
+                        curriculum_state['consecutive_passes'] = 0
+                        promoted = True
+                        new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+                        print(f"\n[CURRICULUM] 🎉 PROMOTED to stage {curriculum_state['current_stage']} "
+                              f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})")
+
+                # Print curriculum status
+                print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
+                print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1} "
+                      f"(σ_cap = {curr_mult:.1f} × {sigma_data:.4f} = {sigma_cap_curr:.4f})")
+                print(f"  Metrics at σ={closest_sigma:.3f}: scale_r={scale_r_promo:.3f} ({'✓' if scale_ok else '✗'}) "
+                      f"trace_r={trace_r_promo:.3f} ({'✓' if trace_ok else '✗'}) "
+                      f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'}) (min={jacc_min:.2f})")
+                print(f"  Jacc trend: {'✓ stable/improving' if jacc_not_decreasing else '✗ decreasing'}")
+                print(f"  Consecutive passes: {curriculum_state['consecutive_passes']}/{curriculum_state['promotion_threshold']}")
+                print(f"  Generator stable: {curriculum_state['generator_stable']}")
+                if curriculum_state['stall_count'] > 0:
+                    print(f"  ⚠️ Stall count: {curriculum_state['stall_count']}/{curriculum_state['stall_limit']}")
+
+                if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
+                    print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
+                    print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
+
                 print(f"{'='*70}\n")
 
                 # =====================================================================
