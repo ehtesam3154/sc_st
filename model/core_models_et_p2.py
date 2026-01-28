@@ -5423,13 +5423,65 @@ def train_stageC_diffusion_generator(
                 valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                 V_hat_centered = (V_hat_f32 - mean) * m_float  # (B,N,D), centered but NOT clamped
-                
+
                 # --- Step B: Compute V_geom (centered + locally clamped, for STRUCTURE losses) ---
                 # Use kNN-based local scale correction (detached) if we have spatial kNN and this is ST
-                knn_spatial_for_scale = batch.get('knn_spatial', None)
-                
+
+                # ========== OPTION B FIX: Compute within-miniset kNN from V_target ==========
+                # Problem: batch['knn_spatial'] uses slide-level kNN, but only ~44% of neighbors
+                # are in the miniset (rest become -1). This cripples structure losses.
+                # Solution: Compute kNN directly within the miniset from V_target coordinates.
+                # This guarantees 100% valid neighbor indices.
+                knn_k_struct = 15  # k for structure losses
+
+                if (not is_sc):
+                    with torch.no_grad():
+                        B_knn, N_knn, D_knn = V_target.shape
+
+                        # Compute within-miniset kNN for each batch element
+                        knn_spatial_for_scale = torch.full((B_knn, N_knn, knn_k_struct), -1,
+                                                           dtype=torch.long, device=device)
+
+                        for b in range(B_knn):
+                            m_b = mask[b].bool()
+                            n_valid = m_b.sum().item()
+
+                            if n_valid < knn_k_struct + 1:
+                                continue
+
+                            # Get valid points for this batch element
+                            valid_indices = torch.where(m_b)[0]  # (n_valid,)
+                            V_b = V_target[b, valid_indices]     # (n_valid, D)
+
+                            # Compute pairwise distances
+                            D_b = torch.cdist(V_b, V_b)          # (n_valid, n_valid)
+                            D_b.fill_diagonal_(float('inf'))     # Exclude self
+
+                            # Get k nearest neighbors (indices into valid_indices)
+                            _, knn_local = D_b.topk(knn_k_struct, dim=1, largest=False)  # (n_valid, k)
+
+                            # Map back to full indices
+                            knn_global = valid_indices[knn_local]  # (n_valid, k)
+
+                            # Store in output tensor
+                            knn_spatial_for_scale[b, valid_indices] = knn_global
+
+                    # Debug: verify 100% validity (first few steps only)
+                    if global_step < 100 and global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            tot_valid, tot_entries = 0, 0
+                            for b in range(min(8, B_knn)):
+                                m_b = mask[b].bool()
+                                if m_b.sum() < knn_k_struct + 1:
+                                    continue
+                                knn_b = knn_spatial_for_scale[b, m_b]
+                                tot_valid += (knn_b >= 0).sum().item()
+                                tot_entries += knn_b.numel()
+                            new_valid_frac = tot_valid / max(tot_entries, 1)
+                            print(f"\n  [WITHIN-MINISET-KNN] step={global_step} valid_frac={new_valid_frac:.1%} "
+                                  f"(should be ~100%)")
+
                 if (not is_sc) and knn_spatial_for_scale is not None:
-                    knn_spatial_for_scale = knn_spatial_for_scale.to(device)
                     
                     # --- ADAPTIVE CLAMP CAP (ChatGPT Change 3) ---
                     # Don't ramp max_log_correction while pin-rate is terrible (>60%).
@@ -6058,9 +6110,10 @@ def train_stageC_diffusion_generator(
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Get sigma values (works for both EDM and non-EDM)
                         sigma_vec = sigma_t.view(-1).float()  # (B,)
-                        
+
                         # Compute robust edge scale from target kNN edges
-                        knn_indices_batch = batch['knn_spatial'].to(device)
+                        # FIX: Use within-miniset kNN (100% valid) instead of slide-level kNN
+                        knn_indices_batch = knn_spatial_for_scale  # Already on device
                         edge_scales = torch.zeros(batch_size_real, device=device)
                         
                         for b in range(batch_size_real):
@@ -7009,11 +7062,9 @@ def train_stageC_diffusion_generator(
                 # This is the ONLY loss that uses V_hat_centered
                 if WEIGHTS.get('knn_scale', 0) > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
-                        # Use knn_spatial from batch (same edges as edge loss)
-                        knn_spatial_batch = batch.get('knn_spatial', None)
-                        if knn_spatial_batch is not None:
-                            knn_spatial_batch = knn_spatial_batch.to(device)
-                        
+                        # FIX: Use within-miniset kNN (knn_spatial_for_scale) instead of slide-level kNN
+                        # This guarantees 100% valid neighbor indices
+
                         # CHANGE 5: Use V_hat_centered (RAW, NOT clamped V_geom)
                         # This is critical - knn_scale needs to see actual scale error to teach it
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
@@ -7021,7 +7072,7 @@ def train_stageC_diffusion_generator(
                             V_hat_centered_L,  # RAW centered - this is the KEY difference
                             V_target.float(),
                             struct_mask,       # Only core non-landmarks (valid kNN indices)
-                            knn_indices=knn_spatial_batch,
+                            knn_indices=knn_spatial_for_scale,  # Within-miniset kNN (100% valid)
                             k=15,
                             return_per_sample=True
                         )
@@ -7203,10 +7254,10 @@ def train_stageC_diffusion_generator(
 
 
                 # Low-noise gating - use actual drop_mask for consistency with CFG
-                if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
+                if WEIGHTS['edge'] > 0 and knn_spatial_for_scale is not None:
                     with torch.autocast(device_type='cuda', enabled=False):
-                        # Use SPATIAL kNN for geometry, not expression kNN
-                        knn_indices_batch = batch['knn_spatial'].to(device)
+                        # FIX: Use within-miniset kNN instead of slide-level kNN
+                        knn_indices_batch = knn_spatial_for_scale  # Already on device, 100% valid
                         
                         # PATCH 3B (CORRECTED): Re-enable edge gating with stricter threshold
                         # Target: ~10-30% hit rate for edge (local features)
@@ -7641,8 +7692,8 @@ def train_stageC_diffusion_generator(
                                             print(f"    Ratio: {(G_pred_b.diag().sum() / G_tgt_b.diag().sum().clamp_min(1e-8)).item():.6f}")
                                 
                                 # Edge loss
-                                if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
-                                    knn_idx = batch['knn_spatial'].to(device)
+                                if WEIGHTS['edge'] > 0 and knn_spatial_for_scale is not None:
+                                    knn_idx = knn_spatial_for_scale  # Within-miniset kNN
                                     # --- DEBUG 5: Check edge loss across sigma bins ---
                                     sigma_for_edge = sigma_flat if use_edm else sigma_t.view(-1)
                                     debug_samples = get_one_sample_per_sigma_bin(sigma_for_edge)
@@ -7940,21 +7991,18 @@ def train_stageC_diffusion_generator(
                         # ==================== CHANGE 6: GENERATOR SCALE CLAMP (Option 1 Change B) ====================
 
                         # PATCH 8: Scale-aware generator alignment losses
-                        # Use knn_spatial for generator scale clamp (same as diffusion)
-                        knn_spatial_for_gen = batch.get('knn_spatial', None)
-                        if knn_spatial_for_gen is not None:
-                            knn_spatial_for_gen = knn_spatial_for_gen.to(device)
-                            
+                        # FIX: Use within-miniset kNN instead of slide-level kNN
+                        if knn_spatial_for_scale is not None:
                             # Compute scale correction for GENERATOR (separate from diffusion)
                             s_corr_gen, _, valid_scale_gen, _, _, _ = uet.compute_local_scale_correction(
                                 V_pred=V_gen_centered,  # Generator output, NOT V_hat_centered
                                 V_tgt=V_target.float(),
                                 mask=mask,
-                                knn_indices=knn_spatial_for_gen,
+                                knn_indices=knn_spatial_for_scale,  # Within-miniset kNN
                                 k=15,
                                 max_log_correction=max_log_corr_for_knn if max_log_corr_for_knn is not None else 0.25,
                             )
-                            
+
                             # Apply scale correction to generator
                             V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_corr_gen.detach(), mask)
                         else:
@@ -8328,8 +8376,8 @@ def train_stageC_diffusion_generator(
                         print(f"  Batch t_norms: {[f'{t.item():.3f}' for t in t_norm_vals]}")
                     
                     # 1) Edge distances from EdgeLengthLoss
-                    if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
-                        knn_indices = batch['knn_spatial'].to(device)
+                    if WEIGHTS['edge'] > 0 and knn_spatial_for_scale is not None:
+                        knn_indices = knn_spatial_for_scale  # Within-miniset kNN
                         
                         # Pick first valid sample
                         for b in range(batch_size_real):
