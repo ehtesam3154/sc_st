@@ -8862,6 +8862,10 @@ def train_stageC_diffusion_generator(
                                 F_x_2 = F_x_2 * mask_2.unsqueeze(-1).float()
 
                                 # Compute residual overlap loss ONLY for high-σ samples
+                                # Also track F_x discrepancy for diagnostics
+                                Fx_discrepancy_sum = 0.0
+                                Fx_discrepancy_count = 0
+
                                 for b in range(F_x_1.shape[0]):
                                     if not hi_mask[b]:  # Skip low-σ samples
                                         continue
@@ -8882,12 +8886,21 @@ def train_stageC_diffusion_generator(
                                     F1_I_c = F1_I - F1_I.mean(dim=0, keepdim=True)
                                     F2_I_c = F2_I - F2_I.mean(dim=0, keepdim=True)
 
+                                    # Track ||F_x1 - F_x2|| for diagnostics (same-noise sanity check)
+                                    with torch.no_grad():
+                                        Fx_diff = (F2_I_c - F1_I_c).norm(dim=-1).mean().item()
+                                        Fx_discrepancy_sum += Fx_diff
+                                        Fx_discrepancy_count += 1
+
                                     # MSE on centered residuals
                                     L_ov_residual = L_ov_residual + F.mse_loss(F2_I_c, F1_I_c)
                                     residual_count += 1
 
                                 if residual_count > 0:
                                     L_ov_residual = L_ov_residual / residual_count
+                                    mean_Fx_discrepancy = Fx_discrepancy_sum / Fx_discrepancy_count
+                                else:
+                                    mean_Fx_discrepancy = 0.0
 
                             # ============================================================
                             # LOW-σ SAMPLES: Standard x0 overlap (with TRY2 gating)
@@ -8933,6 +8946,10 @@ def train_stageC_diffusion_generator(
                                     hi_sigmas = sigma_pair_ov[hi_mask]
                                     print(f"[OV-PERSAMPLE] HIGH-σ: min={hi_sigmas.min().item():.3f} "
                                           f"max={hi_sigmas.max().item():.3f} L_residual={L_ov_residual.item():.6f}")
+                                    # [SANITY CHECK] Log F_x discrepancy - should decrease over training
+                                    # with same-noise coupling (measures residual agreement, not noise agreement)
+                                    print(f"[Fx-DISCREP] mean ||F_x1-F_x2||={mean_Fx_discrepancy:.4f} "
+                                          f"(should ↓ over training with same-noise)")
                                 if n_lo > 0:
                                     lo_sigmas = sigma_pair_ov[lo_mask]
                                     print(f"[OV-PERSAMPLE] LOW-σ: min={lo_sigmas.min().item():.3f} "
