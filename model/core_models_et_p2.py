@@ -3598,8 +3598,19 @@ def train_stageC_diffusion_generator(
         if 'score_net_ema' in ckpt:
             score_net_ema.load_state_dict(ckpt['score_net_ema'])
 
+        if 'encoder' in ckpt and encoder is not None:
+            encoder_to_load = encoder.module if hasattr(encoder, 'module') else encoder
+            encoder_to_load.load_state_dict(ckpt['encoder'])
+            print("[RESUME] Loaded encoder state.")
+        elif encoder is not None:
+            print("[RESUME] WARNING: encoder not found in checkpoint; keeping current weights.")
+
         if 'optimizer' in ckpt and not resume_reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
+
+        if 'scheduler' in ckpt and not resume_reset_optimizer:
+            scheduler.load_state_dict(ckpt['scheduler'])
+            print("[RESUME] Loaded scheduler state.")
 
         if 'epoch' in ckpt:
             start_epoch = int(ckpt['epoch']) + 1
@@ -3618,6 +3629,11 @@ def train_stageC_diffusion_generator(
             sigma_min = ckpt['sigma_min']
         if 'sigma_max' in ckpt:
             sigma_max = ckpt['sigma_max']
+
+        if 'curriculum_state' in ckpt:
+            curriculum_state = ckpt['curriculum_state']
+            print(f"[RESUME] Loaded curriculum_state: stage={curriculum_state['current_stage']}, "
+                  f"steps_in_stage={curriculum_state.get('steps_in_stage', 0)}")
 
         print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
 
@@ -10913,26 +10929,32 @@ def train_stageC_diffusion_generator(
 
 
         # --- save checkpoints only on rank-0 ---
-        # --- save checkpoints only on rank-0 ---
-        if (epoch + 1) % 100 == 0:
-            if fabric is None or fabric.is_global_zero:
-                ckpt = {
-                    'epoch': epoch,
-                    'context_encoder': context_encoder.state_dict(),
-                    'score_net': score_net.state_dict(),
-                    'generator': generator.state_dict(),
-                    'context_encoder_ema': context_encoder_ema.state_dict(),
-                    'score_net_ema': score_net_ema.state_dict(),
-                    'ema_decay': ema_decay,
-                    'optimizer': optimizer.state_dict(),
-                    'history': history,
-                    'sigma_data': sigma_data,
-                    'sigma_min': sigma_min,
-                    'sigma_max': sigma_max,
-                }
-                if encoder is not None:
-                    encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
-                    ckpt['encoder'] = encoder_to_save.state_dict()
+        if fabric is None or fabric.is_global_zero:
+            ckpt = {
+                'epoch': epoch,
+                'context_encoder': context_encoder.state_dict(),
+                'score_net': score_net.state_dict(),
+                'generator': generator.state_dict(),
+                'context_encoder_ema': context_encoder_ema.state_dict(),
+                'score_net_ema': score_net_ema.state_dict(),
+                'ema_decay': ema_decay,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'history': history,
+                'sigma_data': sigma_data,
+                'sigma_min': sigma_min,
+                'sigma_max': sigma_max,
+                'curriculum_state': curriculum_state,
+            }
+            if encoder is not None:
+                encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
+                ckpt['encoder'] = encoder_to_save.state_dict()
+
+            # Rolling latest checkpoint — overwritten every epoch
+            torch.save(ckpt, os.path.join(outf, 'ckpt_latest.pt'))
+
+            # Periodic milestone checkpoint every 50 epochs
+            if (epoch + 1) % 50 == 0:
                 torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
     
     # Save final checkpoint after training loop
@@ -10946,10 +10968,12 @@ def train_stageC_diffusion_generator(
             'score_net_ema': score_net_ema.state_dict(),
             'ema_decay': ema_decay,
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'history': history,
             'sigma_data': sigma_data,
             'sigma_min': sigma_min,
             'sigma_max': sigma_max,
+            'curriculum_state': curriculum_state,
         }
         if encoder is not None:
             encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
