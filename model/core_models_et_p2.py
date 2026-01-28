@@ -10423,38 +10423,110 @@ def train_stageC_diffusion_generator(
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
-            if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
-                # Use total weighted loss as validation metric
-                # This includes all geometry regularizers (dim, triangle, radial)
-                val_metric = avg_total
+            # ============================================================
+            # CURRICULUM-AWARE EARLY STOPPING
+            # When curriculum is enabled, loss-based early stop is disabled
+            # until the final stage. Instead, we use curriculum stall/completion.
+            # ============================================================
+            curriculum_enabled = (curriculum_state is not None and
+                                  len(curriculum_state.get('sigma_cap_mults', [])) > 0)
 
-                
-                # Check for improvement
-                if val_metric < early_stop_best:
-                    rel_improv = (early_stop_best - val_metric) / max(early_stop_best, 1e-8)
-                    
-                    if rel_improv > early_stop_threshold:
-                        # Significant improvement
-                        early_stop_best = val_metric
-                        early_stop_no_improve = 0
-                    else:
-                        # Minor improvement, doesn't count
-                        early_stop_no_improve += 1
-                else:
-                    # No improvement
-                    early_stop_no_improve += 1
-                
-                # Check if we should stop
-                if early_stop_no_improve >= early_stop_patience:
+            if curriculum_enabled:
+                final_stage_idx = len(curriculum_state['sigma_cap_mults']) - 1
+                curr_stage = curriculum_state['current_stage']
+                at_final_stage = (curr_stage >= final_stage_idx)
+
+                # Curriculum-based stopping conditions
+                stall_count = curriculum_state.get('stall_count', 0)
+                stall_limit = curriculum_state.get('stall_limit', 6)
+                consecutive_passes = curriculum_state.get('consecutive_passes', 0)
+                promotion_threshold = curriculum_state.get('promotion_threshold', 5)
+
+                # Condition 1: Curriculum stall (failure at current stage)
+                if stall_count >= stall_limit:
+                    if fabric is None or fabric.is_global_zero:
+                        print(f"\n[CURRICULUM-STOP] Stall limit reached at stage {curr_stage}")
+                        print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
+                        print(f"  Stopping training (curriculum stall)")
                     should_stop = True
                     early_stopped = True
                     early_stop_epoch = epoch + 1
 
-            elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
-                # Just track best, don't stop yet
-                val_metric = avg_total
-                if val_metric < early_stop_best:
-                    early_stop_best = val_metric
+                # Condition 2: Final stage completion (success)
+                elif at_final_stage and consecutive_passes >= promotion_threshold:
+                    if fabric is None or fabric.is_global_zero:
+                        print(f"\n[CURRICULUM-STOP] Final stage {curr_stage} completed!")
+                        print(f"  consecutive_passes={consecutive_passes} >= threshold={promotion_threshold}")
+                        print(f"  Stopping training (curriculum success)")
+                    should_stop = True
+                    early_stopped = True
+                    early_stop_epoch = epoch + 1
+
+                # Condition 3: At final stage, use metric-based early stop (optional)
+                elif at_final_stage and enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
+                    val_metric = avg_total
+                    if val_metric < early_stop_best:
+                        rel_improv = (early_stop_best - val_metric) / max(early_stop_best, 1e-8)
+                        if rel_improv > early_stop_threshold:
+                            early_stop_best = val_metric
+                            early_stop_no_improve = 0
+                        else:
+                            early_stop_no_improve += 1
+                    else:
+                        early_stop_no_improve += 1
+
+                    if early_stop_no_improve >= early_stop_patience:
+                        if fabric is None or fabric.is_global_zero:
+                            print(f"\n[CURRICULUM-STOP] Metric plateau at final stage {curr_stage}")
+                            print(f"  No improvement for {early_stop_patience} epochs")
+                        should_stop = True
+                        early_stopped = True
+                        early_stop_epoch = epoch + 1
+
+                # Not at final stage: just track best metric, no early stop
+                else:
+                    val_metric = avg_total
+                    if val_metric < early_stop_best:
+                        early_stop_best = val_metric
+                    # Log curriculum status (no early stop)
+                    if (fabric is None or fabric.is_global_zero) and (epoch + 1) % 5 == 0:
+                        print(f"[CURRICULUM-ES] Stage {curr_stage}/{final_stage_idx} - "
+                              f"early stop disabled until final stage")
+
+            else:
+                # No curriculum: use legacy loss-based early stop
+                if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
+                    # Use total weighted loss as validation metric
+                    # This includes all geometry regularizers (dim, triangle, radial)
+                    val_metric = avg_total
+
+
+                    # Check for improvement
+                    if val_metric < early_stop_best:
+                        rel_improv = (early_stop_best - val_metric) / max(early_stop_best, 1e-8)
+
+                        if rel_improv > early_stop_threshold:
+                            # Significant improvement
+                            early_stop_best = val_metric
+                            early_stop_no_improve = 0
+                        else:
+                            # Minor improvement, doesn't count
+                            early_stop_no_improve += 1
+                    else:
+                        # No improvement
+                        early_stop_no_improve += 1
+
+                    # Check if we should stop
+                    if early_stop_no_improve >= early_stop_patience:
+                        should_stop = True
+                        early_stopped = True
+                        early_stop_epoch = epoch + 1
+
+                elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
+                    # Just track best, don't stop yet
+                    val_metric = avg_total
+                    if val_metric < early_stop_best:
+                        early_stop_best = val_metric
         
 
         # Broadcast stop decision to ALL ranks
