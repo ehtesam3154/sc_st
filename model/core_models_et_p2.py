@@ -3989,6 +3989,23 @@ def train_stageC_diffusion_generator(
             if anchor_mask is not None:
                 anchor_mask = anchor_mask.to(device).bool() & mask
 
+            # Landmark mask (landmarks are FPS-selected reference points, not real data)
+            is_landmark = batch.get('is_landmark', None)
+            if is_landmark is not None:
+                is_landmark = is_landmark.to(device).bool() & mask
+            else:
+                is_landmark = torch.zeros_like(mask)  # No landmarks by default
+
+            # ========== STRUCT_MASK: Points where kNN-based structure losses are valid ==========
+            # Problem: knn_spatial indices become -1 when neighbors aren't in the miniset
+            # This is especially bad for:
+            # - Landmarks: appended AFTER knn_spatial is computed, so all -1
+            # - Extras (non-core competitors): spatially distant, many neighbors missing
+            # Solution: Restrict structure losses to core non-landmarks only
+            if anchor_mask is not None:
+                struct_mask = mask & anchor_mask & (~is_landmark)
+            else:
+                struct_mask = mask & (~is_landmark)
 
             n_list = batch['n']
             batch_size_real = Z_set.shape[0]
@@ -5636,27 +5653,64 @@ def train_stageC_diffusion_generator(
                             knn_max = knn_spatial_for_scale.max().item()
                             n_max_batch = mask.shape[1]
 
-                            # Check ALL batch elements, not just b=0
-                            total_valid = 0
-                            total_entries = 0
-                            for b_chk in range(min(8, mask.shape[0])):
-                                m_chk = mask[b_chk].bool()
-                                if m_chk.sum() < 5:
-                                    continue
-                                knn_chk = knn_spatial_for_scale[b_chk, m_chk, :]
-                                total_valid += (knn_chk >= 0).sum().item()
-                                total_entries += knn_chk.numel()
+                            # Helper to compute valid_neighbor_frac for a given point mask
+                            def compute_valid_frac(point_mask, knn_spatial, max_b=8):
+                                tot_valid, tot_entries = 0, 0
+                                for b in range(min(max_b, point_mask.shape[0])):
+                                    pm = point_mask[b].bool()
+                                    if pm.sum() < 2:
+                                        continue
+                                    knn_b = knn_spatial[b, pm, :]
+                                    tot_valid += (knn_b >= 0).sum().item()
+                                    tot_entries += knn_b.numel()
+                                return tot_valid / max(tot_entries, 1), tot_entries
 
-                            valid_frac = total_valid / max(total_entries, 1)
+                            # Compute validity breakdown by token type
+                            frac_all, _ = compute_valid_frac(mask, knn_spatial_for_scale)
 
-                            print(f"\n  [KNN-INDEX-CHECK] step={global_step} knn_max={knn_max}, N={n_max_batch}, "
-                                  f"valid_neighbor_frac={valid_frac:.2%}")
+                            # Core only (anchor_mask = True)
+                            if anchor_mask is not None:
+                                core_mask = mask & anchor_mask
+                                frac_core, n_core_entries = compute_valid_frac(core_mask, knn_spatial_for_scale)
+                            else:
+                                frac_core, n_core_entries = frac_all, 0
 
-                            # CRITICAL WARNING if validity is too low
-                            if valid_frac < 0.50:
-                                print(f"  ⚠️ WARNING: valid_neighbor_frac={valid_frac:.1%} is VERY LOW!")
-                                print(f"     knn_nca/edge losses are INEFFECTIVE with invalid indices.")
-                                print(f"     This cripples local structure learning.")
+                            # Landmarks only
+                            landmark_mask = mask & is_landmark
+                            frac_landmark, n_lmk_entries = compute_valid_frac(landmark_mask, knn_spatial_for_scale)
+
+                            # Extras only (not core, not landmark)
+                            if anchor_mask is not None:
+                                extras_mask = mask & (~anchor_mask) & (~is_landmark)
+                                frac_extras, n_extras_entries = compute_valid_frac(extras_mask, knn_spatial_for_scale)
+                            else:
+                                frac_extras, n_extras_entries = 0.0, 0
+
+                            # struct_mask (what we'll use for structure losses)
+                            frac_struct, n_struct_entries = compute_valid_frac(struct_mask, knn_spatial_for_scale)
+
+                            # Count tokens per type
+                            n_all = mask.sum().item()
+                            n_core = core_mask.sum().item() if anchor_mask is not None else n_all
+                            n_lmk = landmark_mask.sum().item()
+                            n_extras = extras_mask.sum().item() if anchor_mask is not None else 0
+                            n_struct = struct_mask.sum().item()
+
+                            print(f"\n  [KNN-INDEX-CHECK] step={global_step} knn_max={knn_max}, N={n_max_batch}")
+                            print(f"    {'Token type':<15} | {'Count':>6} | {'valid_frac':>10}")
+                            print(f"    {'-'*15} | {'-'*6} | {'-'*10}")
+                            print(f"    {'all masked':<15} | {n_all:>6.0f} | {frac_all:>10.1%}")
+                            print(f"    {'core only':<15} | {n_core:>6.0f} | {frac_core:>10.1%}")
+                            print(f"    {'landmarks':<15} | {n_lmk:>6.0f} | {frac_landmark:>10.1%}")
+                            print(f"    {'extras':<15} | {n_extras:>6.0f} | {frac_extras:>10.1%}")
+                            print(f"    {'struct_mask':<15} | {n_struct:>6.0f} | {frac_struct:>10.1%}  <- used for kNN/edge losses")
+
+                            # CRITICAL WARNING if struct_mask validity is too low
+                            if frac_struct < 0.70:
+                                print(f"  ⚠️ WARNING: struct_mask valid_frac={frac_struct:.1%} is LOW!")
+                                print(f"     Consider: (A) more core points, (B) within-miniset kNN")
+                            elif frac_struct >= 0.85:
+                                print(f"  ✓ struct_mask valid_frac={frac_struct:.1%} is GOOD")
 
                 else:
                     # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
@@ -6769,11 +6823,12 @@ def train_stageC_diffusion_generator(
                             point_weight = None  # All valid points contribute
                         
                         # Compute NCA loss with point weighting
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
                         L_knn_per = uet.knn_nca_loss(
                             V_geom_L,              # Clamped structure tensor
                             V_target.float(),    # Raw target
-                            mask, 
-                            k=15, 
+                            struct_mask,           # Only core non-landmarks (valid kNN indices)
+                            k=15,
                             temperature=tau_reference,
                             return_per_sample=True,
                             scale_compensate=True,
@@ -6961,10 +7016,11 @@ def train_stageC_diffusion_generator(
                         
                         # CHANGE 5: Use V_hat_centered (RAW, NOT clamped V_geom)
                         # This is critical - knn_scale needs to see actual scale error to teach it
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
                         L_knn_scale_per = uet.knn_scale_loss(
                             V_hat_centered_L,  # RAW centered - this is the KEY difference
                             V_target.float(),
-                            mask,
+                            struct_mask,       # Only core non-landmarks (valid kNN indices)
                             knn_indices=knn_spatial_batch,
                             k=15,
                             return_per_sample=True
@@ -7191,11 +7247,12 @@ def train_stageC_diffusion_generator(
                         # Edge is a STRUCTURE loss - it measures local neighborhood shape
                         # Using clamped V_geom removes systematic scale bias from gradients
                         # Scale learning happens via knn_scale on V_hat_centered
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
                         L_edge_per = uet.edge_log_ratio_loss(
                             V_pred=V_geom_L,  # Clamped structure tensor, NOT raw x0_pred
                             V_tgt=V_target.float(),
                             knn_idx=knn_indices_batch,
-                            mask=mask
+                            mask=struct_mask   # Only core non-landmarks (valid kNN indices)
                         )
 
                         
@@ -7921,12 +7978,12 @@ def train_stageC_diffusion_generator(
                         
                         # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
                         # This ensures generator learns correct local neighborhood distances
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
                         if knn_spatial_for_gen is not None:
                             L_gen_scale_local = uet.knn_scale_loss(
                                 V_gen_centered_L,  # Anchor-clamped generator output
-
                                 V_target_batch,
-                                mask,
+                                struct_mask,       # Only core non-landmarks (valid kNN indices)
                                 knn_indices=knn_spatial_for_gen,
                                 k=15,
                                 return_per_sample=False  # Scalar loss
