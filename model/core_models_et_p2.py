@@ -2790,6 +2790,14 @@ def train_stageC_diffusion_generator(
         },
         'scale_r_min': 0.80,
         'trace_r_min': 0.60,
+        # Cap-band emphasis: fraction of samples drawn from [0.7*σ_cap, σ_cap]
+        # Remaining (1 - frac) drawn from full [σ_min, σ_cap] via log-normal
+        'cap_band_frac_by_stage': {
+            0: 0.4, 1: 0.4,   # Early stages: 40% cap-band
+            2: 0.6, 3: 0.6,   # Mid stages: 60% cap-band
+        },
+        'cap_band_frac_default': 0.7,  # Stage 4+: 70% cap-band
+        'cap_band_lo_mult': 0.7,       # Cap-band lower bound = 0.7 * σ_cap
         # History for tracking
         'eval_history': [],           # List of (epoch, metrics_dict)
 
@@ -4196,14 +4204,40 @@ def train_stageC_diffusion_generator(
                     sigma_cap = curr_mult * sigma_data  # Dynamic cap based on curriculum
                     sigma_cap = min(sigma_cap, sigma_refine_max)  # Never exceed original limit
 
-                    # sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
-                    sigma = uet.sample_sigma_lognormal_stratified(
-                        batch_size_real, P_mean, P_std,
-                        high_sigma_fraction=0.4,  # 40% of batch guaranteed high-σ
-                        high_sigma_threshold=min(0.5, sigma_cap * 0.5),  # Adjust threshold for curriculum
-                        device=device
-                    )
-                    sigma = sigma.clamp(sigma_min, sigma_cap)  # [CURRICULUM] Use sigma_cap instead of sigma_refine_max
+                    # [CURRICULUM] Cap-band emphasis sampling
+                    # Mixture: cap_band_frac from [0.7*σ_cap, σ_cap], rest from full [σ_min, σ_cap]
+                    cap_band_frac = curriculum_state['cap_band_frac_by_stage'].get(
+                        curr_stage, curriculum_state['cap_band_frac_default'])
+                    cap_band_lo = curriculum_state['cap_band_lo_mult'] * sigma_cap  # 0.7 * σ_cap
+                    cap_band_lo = max(cap_band_lo, sigma_min)  # Safety floor
+
+                    n_cap_band = int(batch_size_real * cap_band_frac)
+                    n_full_range = batch_size_real - n_cap_band
+
+                    sigma_parts = []
+
+                    # (A) Cap-band samples: uniform in log-space over [0.7*σ_cap, σ_cap]
+                    if n_cap_band > 0:
+                        import math
+                        log_lo = math.log(cap_band_lo)
+                        log_hi = math.log(sigma_cap)
+                        if log_hi > log_lo + 1e-8:
+                            log_sigma_cb = torch.rand(n_cap_band, device=device) * (log_hi - log_lo) + log_lo
+                            sigma_parts.append(log_sigma_cb.exp())
+                        else:
+                            # σ_cap ≈ cap_band_lo (very early stage): just use σ_cap
+                            sigma_parts.append(torch.full((n_cap_band,), sigma_cap, device=device))
+
+                    # (B) Full-range samples: log-normal clamped to [σ_min, σ_cap]
+                    if n_full_range > 0:
+                        rnd_normal = torch.randn(n_full_range, device=device)
+                        sigma_full = (rnd_normal * P_std + P_mean).exp()
+                        sigma_full = sigma_full.clamp(sigma_min, sigma_cap)
+                        sigma_parts.append(sigma_full)
+
+                    sigma = torch.cat(sigma_parts, dim=0)
+                    # Shuffle so cap-band and full-range samples are interleaved
+                    sigma = sigma[torch.randperm(sigma.shape[0], device=device)]
                     sigma_t = sigma.view(-1, 1, 1)
 
                     # ========== PHASE 2: SIGMA SAMPLING SANITY ==========
@@ -4211,6 +4245,11 @@ def train_stageC_diffusion_generator(
                         print(f"\n[PHASE 2] Sigma Sampling (step {global_step}):")
                         print(f"  [CURRICULUM] stage={curr_stage} mult={curr_mult:.1f}x sigma_cap={sigma_cap:.4f} "
                               f"(sigma_data={sigma_data:.4f})")
+                        print(f"  [CAP-BAND] frac={cap_band_frac:.0%} band=[{cap_band_lo:.6f}, {sigma_cap:.6f}] "
+                              f"n_cb={n_cap_band} n_full={n_full_range}")
+                        # Actual fraction in cap-band (including full-range samples that landed there)
+                        actual_in_band = ((sigma >= cap_band_lo) & (sigma <= sigma_cap)).float().mean().item()
+                        print(f"  [CAP-BAND] actual_in_band={actual_in_band*100:.1f}%")
                         print(f"  sigma: min={sigma.min():.6f} median={sigma.median():.6f} max={sigma.max():.6f}")
 
                         import math
@@ -4224,7 +4263,7 @@ def train_stageC_diffusion_generator(
                         print(f"  Quantiles: p05={sigma.quantile(0.05):.6f} p25={sigma.quantile(0.25):.6f} "
                               f"p75={sigma.quantile(0.75):.6f} p95={sigma.quantile(0.95):.6f}")
 
-                        # Clamp hit rates
+                        # Clamp hit rates (only relevant for full-range samples now)
                         clamp_low = (sigma <= sigma_min + 1e-6).float().mean().item()
                         clamp_high = (sigma >= sigma_cap - 1e-6).float().mean().item()
                         print(f"  Clamp hit rate: at sigma_min={clamp_low*100:.1f}% at sigma_cap={clamp_high*100:.1f}%")
