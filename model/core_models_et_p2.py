@@ -10498,7 +10498,7 @@ def train_stageC_diffusion_generator(
                     # PRE-TARGET: promote based on STRUCTURE only + collapse floor
                     # This stops the "scale lags behind structure" infinite stall
                     should_promote = (structure_passes_in_window >= required_passes and
-                                      len(struct_window) >= required_passes and
+                                      len(structure_window) >= required_passes and
                                       not scale_collapsed)
                     promo_reason = "structure"
 
@@ -10522,7 +10522,7 @@ def train_stageC_diffusion_generator(
                         promo_label = "STRUCTURE-PROMOTED" if promo_reason == "structure" else "PROMOTED"
                         print(f"\n[CURRICULUM] {promo_label} to stage {curriculum_state['current_stage']} "
                               f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})")
-                        print(f"  Basis: {promo_reason} ({structure_passes_in_window}/{len(struct_window)} struct, "
+                        print(f"  Basis: {promo_reason} ({structure_passes_in_window}/{len(structure_window)} struct, "
                               f"{passes_in_window}/{len(window)} full)")
                         print(f"  [RAMP] Enabled: {old_mult:.1f} → {new_mult:.1f} over {ramp_steps} steps")
 
