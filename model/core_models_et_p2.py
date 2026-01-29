@@ -2792,28 +2792,35 @@ def train_stageC_diffusion_generator(
             14.0: 0.07,
             17.0: 0.07,
         },
-        # Tiered scale_r thresholds: relaxed at early stages, tighter at later stages
+        # Tiered scale_r thresholds for PROMOTION:
+        # - Stricter at low σ (easier to predict scale accurately)
+        # - Relaxed at high σ (harder to predict scale with more noise)
+        # Note: trace_r ≈ scale_r², so trace thresholds derived from scale
         'scale_r_min_by_mult': {
-            0.3: 0.75,   # Relaxed at early stages
-            0.9: 0.78,
-            2.3: 0.78,
-            4.0: 0.80,
-            7.0: 0.82,
-            14.0: 0.82,
-            17.0: 0.82,
+            0.3: 0.88,   # Low σ: stricter (easy to predict)
+            0.9: 0.84,
+            2.3: 0.75,   # Your stall was here with ~0.77
+            4.0: 0.73,
+            7.0: 0.72,
+            14.0: 0.68,
+            17.0: 0.65,  # High σ: relaxed for promotion
         },
-        'scale_r_min_default': 0.82,
-        # Tiered trace_r thresholds: relaxed at early stages, tighter at later stages
+        'scale_r_min_default': 0.65,
+        # trace_r_min ≈ 0.95 * scale_r_min² (they're correlated)
         'trace_r_min_by_mult': {
-            0.3: 0.55,   # Relaxed at early stages
-            0.9: 0.58,
-            2.3: 0.58,
-            4.0: 0.60,
-            7.0: 0.62,
-            14.0: 0.62,
-            17.0: 0.62,
+            0.3: 0.74,   # ≈ 0.95 * 0.88²
+            0.9: 0.67,   # ≈ 0.95 * 0.84²
+            2.3: 0.53,   # ≈ 0.95 * 0.75²
+            4.0: 0.51,   # ≈ 0.95 * 0.73²
+            7.0: 0.49,   # ≈ 0.95 * 0.72²
+            14.0: 0.44,  # ≈ 0.95 * 0.68²
+            17.0: 0.40,  # ≈ 0.95 * 0.65²
         },
-        'trace_r_min_default': 0.62,
+        'trace_r_min_default': 0.40,
+        # FINAL thresholds (at target stage only, for "training succeeded")
+        # These are stricter to ensure generation quality
+        'scale_r_min_final': 0.80,
+        'trace_r_min_final': 0.60,
         # Cap-band emphasis: fraction of samples drawn from [0.7*σ_cap, σ_cap]
         # Remaining (1 - frac) drawn from full [σ_min, σ_cap] via log-normal
         'cap_band_frac_by_stage': {
@@ -10184,10 +10191,18 @@ def train_stageC_diffusion_generator(
 
                 # Get tiered thresholds based on current stage multiplier
                 jacc_min = curriculum_state['jacc_min_by_mult'].get(curr_mult, 0.07)
-                scale_r_min = curriculum_state['scale_r_min_by_mult'].get(
-                    curr_mult, curriculum_state['scale_r_min_default'])
-                trace_r_min = curriculum_state['trace_r_min_by_mult'].get(
-                    curr_mult, curriculum_state['trace_r_min_default'])
+                target_stage = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
+
+                # At target stage: use FINAL (stricter) thresholds for "training succeeded"
+                # Before target stage: use relaxed PROMOTION thresholds
+                if curr_stage >= target_stage:
+                    scale_r_min = curriculum_state.get('scale_r_min_final', 0.80)
+                    trace_r_min = curriculum_state.get('trace_r_min_final', 0.60)
+                else:
+                    scale_r_min = curriculum_state['scale_r_min_by_mult'].get(
+                        curr_mult, curriculum_state['scale_r_min_default'])
+                    trace_r_min = curriculum_state['trace_r_min_by_mult'].get(
+                        curr_mult, curriculum_state['trace_r_min_default'])
 
                 # Check promotion criteria
                 scale_ok = scale_r_promo >= scale_r_min
@@ -10290,7 +10305,8 @@ def train_stageC_diffusion_generator(
                 print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
                 print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1} "
                       f"(σ_cap = {curr_mult:.1f} × {sigma_data:.4f} = {sigma_cap_curr:.4f})")
-                print(f"  Thresholds: scale_r≥{scale_r_min:.2f}, trace_r≥{trace_r_min:.2f}, Jacc≥{jacc_min:.2f}")
+                thresh_type = "FINAL" if curr_stage >= target_stage else "promo"
+                print(f"  Thresholds ({thresh_type}): scale_r≥{scale_r_min:.2f}, trace_r≥{trace_r_min:.2f}, Jacc≥{jacc_min:.2f}")
                 print(f"  Metrics at σ={closest_sigma:.3f}: scale_r={scale_r_promo:.3f} ({'✓' if scale_ok else '✗'}) "
                       f"trace_r={trace_r_promo:.3f} ({'✓' if trace_ok else '✗'}) "
                       f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'})")
