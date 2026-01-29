@@ -3671,74 +3671,77 @@ def train_stageC_diffusion_generator(
         if 'sigma_max' in ckpt:
             sigma_max = ckpt['sigma_max']
 
+        # Save canonical config BEFORE loading checkpoint (source of truth)
+        canonical_curriculum = curriculum_state.copy()
+
         if 'curriculum_state' in ckpt:
-            curriculum_state = ckpt['curriculum_state']
-            print(f"[RESUME] Loaded curriculum_state: stage={curriculum_state['current_stage']}, "
-                  f"steps_in_stage={curriculum_state.get('steps_in_stage', 0)}")
+            loaded_state = ckpt['curriculum_state']
+            print(f"[RESUME] Loaded curriculum_state: stage={loaded_state['current_stage']}, "
+                  f"steps_in_stage={loaded_state.get('steps_in_stage', 0)}")
 
             # ============================================================
-            # MIGRATION: Add/update keys when resuming from checkpoint
-            # NOTE: ALWAYS overwrite tiered thresholds to ensure correct values
-            # (previous versions may have saved wrong values)
+            # MIGRATION: Merge loaded state with canonical config
+            # - Keep runtime state from checkpoint (current_stage, stall_count, etc.)
+            # - Override threshold configs with canonical values (single source of truth)
             # ============================================================
-            # Tiered scale_r thresholds - ALWAYS update to ensure correct values
-            old_scale_thresholds = curriculum_state.get('scale_r_min_by_mult', {})
-            curriculum_state['scale_r_min_by_mult'] = {
-                0.3: 0.88, 0.9: 0.84, 2.3: 0.75, 4.0: 0.73,
-                7.0: 0.72, 14.0: 0.68, 17.0: 0.65,
-            }
-            curriculum_state['scale_r_min_default'] = 0.65
-            if old_scale_thresholds != curriculum_state['scale_r_min_by_mult']:
-                print("[RESUME-MIGRATE] Updated scale_r_min_by_mult (tiered thresholds)")
-                print(f"  Stage 2 (mult=2.3): scale_r threshold = 0.75")
 
-            # Tiered trace_r thresholds - ALWAYS update to ensure correct values
-            old_trace_thresholds = curriculum_state.get('trace_r_min_by_mult', {})
-            curriculum_state['trace_r_min_by_mult'] = {
-                0.3: 0.74, 0.9: 0.67, 2.3: 0.53, 4.0: 0.51,
-                7.0: 0.49, 14.0: 0.44, 17.0: 0.40,
-            }
-            curriculum_state['trace_r_min_default'] = 0.40
-            if old_trace_thresholds != curriculum_state['trace_r_min_by_mult']:
-                print("[RESUME-MIGRATE] Updated trace_r_min_by_mult (tiered thresholds)")
+            # Keys that should ALWAYS use canonical values (config, not runtime state)
+            config_keys = [
+                'sigma_cap_mults',
+                'scale_r_min_by_mult', 'scale_r_min_default',
+                'trace_r_min_by_mult', 'trace_r_min_default',
+                'jacc_min_by_mult',
+                'scale_r_min_final', 'trace_r_min_final',
+                'cap_band_frac_by_stage', 'cap_band_frac_default', 'cap_band_lo_mult',
+                'promotion_threshold', 'stall_limit',
+                'metrics_history_K', 'min_steps_per_stage', 'min_steps_at_target',
+                'loss_plateau_patience', 'loss_plateau_threshold',
+            ]
 
-            # Reset stall_count if thresholds were updated (old stalls based on wrong thresholds)
-            if old_scale_thresholds != curriculum_state['scale_r_min_by_mult']:
-                old_stall = curriculum_state.get('stall_count', 0)
+            # Start with loaded state, then override config keys with canonical values
+            curriculum_state = loaded_state.copy()
+
+            updated_keys = []
+            for key in config_keys:
+                if key in canonical_curriculum:
+                    old_val = curriculum_state.get(key)
+                    new_val = canonical_curriculum[key]
+                    if old_val != new_val:
+                        updated_keys.append(key)
+                    curriculum_state[key] = new_val
+
+            if updated_keys:
+                print(f"[RESUME-MIGRATE] Updated config keys from code: {updated_keys}")
+                # Show current stage threshold for clarity
+                curr_stage = curriculum_state['current_stage']
+                curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
+                scale_thresh = curriculum_state['scale_r_min_by_mult'].get(curr_mult,
+                               curriculum_state['scale_r_min_default'])
+                print(f"  Current stage {curr_stage} (mult={curr_mult}): scale_r threshold = {scale_thresh}")
+
+            # Reset stall_count if thresholds changed (old stalls based on wrong thresholds)
+            if 'scale_r_min_by_mult' in updated_keys or 'trace_r_min_by_mult' in updated_keys:
+                old_stall = loaded_state.get('stall_count', 0)
                 if old_stall > 0:
                     curriculum_state['stall_count'] = 0
                     curriculum_state['consecutive_passes'] = 0
                     print(f"[RESUME-MIGRATE] Reset stall_count ({old_stall}→0) due to threshold update")
 
-            # Final thresholds (new)
-            if 'scale_r_min_final' not in curriculum_state:
-                curriculum_state['scale_r_min_final'] = 0.80
-                curriculum_state['trace_r_min_final'] = 0.60
-                print("[RESUME-MIGRATE] Added scale_r_min_final/trace_r_min_final (0.80/0.60)")
+            # Add any NEW keys that didn't exist in old checkpoint
+            new_keys = []
+            for key, val in canonical_curriculum.items():
+                if key not in curriculum_state:
+                    curriculum_state[key] = val
+                    new_keys.append(key)
+            if new_keys:
+                print(f"[RESUME-MIGRATE] Added new keys: {new_keys}")
 
-            # Structure pass window (new)
-            if 'structure_pass_window' not in curriculum_state:
-                curriculum_state['structure_pass_window'] = []
-                curriculum_state['structure_passes_in_window'] = 0
-                print("[RESUME-MIGRATE] Added structure_pass_window tracking")
-
-            # Min steps at target (new)
-            if 'min_steps_at_target' not in curriculum_state:
-                curriculum_state['min_steps_at_target'] = 2000
-                print("[RESUME-MIGRATE] Added min_steps_at_target=2000")
-
-            # Scale collapsed flag (new)
-            if 'scale_collapsed' not in curriculum_state:
-                curriculum_state['scale_collapsed'] = False
-                print("[RESUME-MIGRATE] Added scale_collapsed flag")
-
-            # Remove old flat thresholds if present (migration from old format)
-            if 'scale_r_min' in curriculum_state and 'scale_r_min_by_mult' in curriculum_state:
-                del curriculum_state['scale_r_min']
-                print("[RESUME-MIGRATE] Removed old flat scale_r_min (now using tiered)")
-            if 'trace_r_min' in curriculum_state and 'trace_r_min_by_mult' in curriculum_state:
-                del curriculum_state['trace_r_min']
-                print("[RESUME-MIGRATE] Removed old flat trace_r_min (now using tiered)")
+            # Remove deprecated keys
+            deprecated_keys = ['scale_r_min', 'trace_r_min']  # Old flat thresholds
+            for key in deprecated_keys:
+                if key in curriculum_state:
+                    del curriculum_state[key]
+                    print(f"[RESUME-MIGRATE] Removed deprecated key: {key}")
 
         print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
 
