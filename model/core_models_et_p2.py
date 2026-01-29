@@ -3623,7 +3623,7 @@ def train_stageC_diffusion_generator(
     start_epoch = 0
     if resume_ckpt_path:
         print(f"[RESUME] Loading Stage C checkpoint: {resume_ckpt_path}")
-        ckpt = torch.load(resume_ckpt_path, map_location=device)
+        ckpt = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
 
         if 'context_encoder' in ckpt:
             context_encoder.load_state_dict(ckpt['context_encoder'])

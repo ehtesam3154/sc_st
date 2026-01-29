@@ -459,7 +459,7 @@ def main(args=None):
 
         if resume_ckpt_path and fabric.is_global_zero:
             print(f"[RESUME] Loading full checkpoint: {resume_ckpt_path}")
-            ckpt = torch.load(resume_ckpt_path, map_location=fabric.device)
+            ckpt = torch.load(resume_ckpt_path, map_location=fabric.device, weights_only=False)
             if 'encoder' in ckpt:
                 model.encoder.load_state_dict(ckpt['encoder'])
             if 'context_encoder' in ckpt:
@@ -519,7 +519,7 @@ def main(args=None):
     if not fabric.is_global_zero:
         # Load A/B weights
         path = os.path.join(outdir, "ab_init.pt")
-        ck = torch.load(path, map_location=fabric.device)
+        ck = torch.load(path, map_location=fabric.device, weights_only=False)
         model.encoder.load_state_dict(ck["encoder"])
         model.context_encoder.load_state_dict(ck["context_encoder"])
         model.generator.load_state_dict(ck["generator"])
@@ -998,10 +998,10 @@ def main(args=None):
         checkpoint_path_p1 = os.path.join(outdir, "phase1_st_checkpoint.pt")
         
         if os.path.exists(checkpoint_path_p2):
-            checkpoint = torch.load(checkpoint_path_p2, map_location=fabric.device)
+            checkpoint = torch.load(checkpoint_path_p2, map_location=fabric.device, weights_only=False)
             print(f"✓ Loaded checkpoint: phase2_sc_finetuned_checkpoint.pt")
         elif os.path.exists(checkpoint_path_p1):
-            checkpoint = torch.load(checkpoint_path_p1, map_location=fabric.device)
+            checkpoint = torch.load(checkpoint_path_p1, map_location=fabric.device, weights_only=False)
             print(f"✓ Loaded checkpoint: phase1_st_checkpoint.pt")
         else:
             checkpoint = {}
