@@ -10263,8 +10263,13 @@ def train_stageC_diffusion_generator(
                     print(f"  ⚠️ Stall count: {curriculum_state['stall_count']}/{curriculum_state['stall_limit']}")
 
                 if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
-                    print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
-                    print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
+                    target_stg = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
+                    if curr_stage < target_stg:
+                        print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
+                        print(f"  → Will FORCE PROMOTE to stage {curr_stage + 1} at end of epoch (model must see all stages)")
+                    else:
+                        print(f"\n[CURRICULUM] ⚠️ STALLED at TARGET stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
+                        print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
 
                 # ============================================================
                 # [THREE-GATE] Track Gate B (metrics) and Gate C (cap-band loss)
@@ -10668,17 +10673,44 @@ def train_stageC_diffusion_generator(
                 stall_count = curriculum_state.get('stall_count', 0)
                 stall_limit = curriculum_state.get('stall_limit', 6)
 
-                # === STOP CONDITION 1: Curriculum stall (failure) ===
-                # Only after BOTH min_epochs AND min_steps to avoid premature stall
-                if stall_count >= stall_limit and min_epochs_met and min_steps_met:
-                    if fabric is None or fabric.is_global_zero:
-                        print(f"\n[THREE-GATE-STOP] Stall limit reached at stage {curr_stage}")
-                        print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
-                        print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
-                        print(f"  Stopping training (curriculum stall)")
-                    should_stop = True
-                    early_stopped = True
-                    early_stop_epoch = epoch + 1
+                # === STOP CONDITION 1: Curriculum stall ===
+                # If stalled but NOT at target stage → FORCE PROMOTE instead of stopping
+                # Only stop if stalled AND already at target stage (nowhere to promote to)
+                if stall_count >= stall_limit and min_steps_met:
+                    if curr_stage < target_stage:
+                        # NOT at target stage yet → Force promote to next stage
+                        if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                            curriculum_state['current_stage'] += 1
+                            curriculum_state['stall_count'] = 0  # Reset stall count
+                            curriculum_state['promo_pass_window'] = []  # Reset window
+                            new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                            # Reset stage-local tracking
+                            curriculum_state['steps_in_stage'] = 0
+                            curriculum_state['cap_band_loss_sum'] = 0.0
+                            curriculum_state['cap_band_loss_count'] = 0
+                            curriculum_state['cap_band_loss_history'] = []
+                            curriculum_state['best_cap_band_loss'] = float('inf')
+                            curriculum_state['loss_no_improve_count'] = 0
+                            curriculum_state['metrics_pass_history'] = []
+
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[CURRICULUM] ⚠️ STALL DETECTED at stage {curr_stage-1} → FORCE PROMOTING to stage {curriculum_state['current_stage']}")
+                                print(f"  stall_count was {stall_count} >= stall_limit={stall_limit}")
+                                print(f"  New σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f}")
+                                print(f"  Model MUST see all sigma stages - continuing training!")
+
+                    elif min_epochs_met:
+                        # AT target stage AND min_epochs met → can stop due to stall
+                        if fabric is None or fabric.is_global_zero:
+                            print(f"\n[THREE-GATE-STOP] Stall limit reached at TARGET stage {curr_stage}")
+                            print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
+                            print(f"  Gate A satisfied: stage {curr_stage} >= target {target_stage}")
+                            print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
+                            print(f"  Stopping training (stall at target stage)")
+                        should_stop = True
+                        early_stopped = True
+                        early_stop_epoch = epoch + 1
 
                 # === STOP CONDITION 2: Three-gate success ===
                 # All gates pass + prerequisites met
@@ -10720,10 +10752,13 @@ def train_stageC_diffusion_generator(
                         elif not min_steps_met:
                             print(f"  → Training continues: min steps per stage not met")
 
-                        # Also log if stall detected but min_epochs protects us
-                        if stall_count >= stall_limit and not min_epochs_met:
-                            print(f"  ⚠️ Stall detected ({stall_count}>={stall_limit}) but min_epochs={min_epochs_curriculum} protects training")
-                            print(f"  → Training continues until epoch {min_epochs_curriculum}")
+                        # Log stall status
+                        if stall_count >= stall_limit:
+                            if curr_stage < target_stage:
+                                print(f"  ⚠️ Stall count {stall_count}>={stall_limit} - will FORCE PROMOTE when min_steps met")
+                            elif not min_epochs_met:
+                                print(f"  ⚠️ Stall at target stage ({stall_count}>={stall_limit}) but min_epochs={min_epochs_curriculum} not met")
+                                print(f"  → Training continues until epoch {min_epochs_curriculum}")
 
             elif not curriculum_enabled:
                 # No curriculum: use legacy loss-based early stop
