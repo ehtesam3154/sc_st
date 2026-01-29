@@ -3677,25 +3677,38 @@ def train_stageC_diffusion_generator(
                   f"steps_in_stage={curriculum_state.get('steps_in_stage', 0)}")
 
             # ============================================================
-            # MIGRATION: Add new keys if resuming from old checkpoint
+            # MIGRATION: Add/update keys when resuming from checkpoint
+            # NOTE: ALWAYS overwrite tiered thresholds to ensure correct values
+            # (previous versions may have saved wrong values)
             # ============================================================
-            # Tiered scale_r thresholds (new)
-            if 'scale_r_min_by_mult' not in curriculum_state:
-                curriculum_state['scale_r_min_by_mult'] = {
-                    0.3: 0.88, 0.9: 0.84, 2.3: 0.75, 4.0: 0.73,
-                    7.0: 0.72, 14.0: 0.68, 17.0: 0.65,
-                }
-                curriculum_state['scale_r_min_default'] = 0.65
-                print("[RESUME-MIGRATE] Added scale_r_min_by_mult (tiered thresholds)")
+            # Tiered scale_r thresholds - ALWAYS update to ensure correct values
+            old_scale_thresholds = curriculum_state.get('scale_r_min_by_mult', {})
+            curriculum_state['scale_r_min_by_mult'] = {
+                0.3: 0.88, 0.9: 0.84, 2.3: 0.75, 4.0: 0.73,
+                7.0: 0.72, 14.0: 0.68, 17.0: 0.65,
+            }
+            curriculum_state['scale_r_min_default'] = 0.65
+            if old_scale_thresholds != curriculum_state['scale_r_min_by_mult']:
+                print("[RESUME-MIGRATE] Updated scale_r_min_by_mult (tiered thresholds)")
+                print(f"  Stage 2 (mult=2.3): scale_r threshold = 0.75")
 
-            # Tiered trace_r thresholds (new)
-            if 'trace_r_min_by_mult' not in curriculum_state:
-                curriculum_state['trace_r_min_by_mult'] = {
-                    0.3: 0.74, 0.9: 0.67, 2.3: 0.53, 4.0: 0.51,
-                    7.0: 0.49, 14.0: 0.44, 17.0: 0.40,
-                }
-                curriculum_state['trace_r_min_default'] = 0.40
-                print("[RESUME-MIGRATE] Added trace_r_min_by_mult (tiered thresholds)")
+            # Tiered trace_r thresholds - ALWAYS update to ensure correct values
+            old_trace_thresholds = curriculum_state.get('trace_r_min_by_mult', {})
+            curriculum_state['trace_r_min_by_mult'] = {
+                0.3: 0.74, 0.9: 0.67, 2.3: 0.53, 4.0: 0.51,
+                7.0: 0.49, 14.0: 0.44, 17.0: 0.40,
+            }
+            curriculum_state['trace_r_min_default'] = 0.40
+            if old_trace_thresholds != curriculum_state['trace_r_min_by_mult']:
+                print("[RESUME-MIGRATE] Updated trace_r_min_by_mult (tiered thresholds)")
+
+            # Reset stall_count if thresholds were updated (old stalls based on wrong thresholds)
+            if old_scale_thresholds != curriculum_state['scale_r_min_by_mult']:
+                old_stall = curriculum_state.get('stall_count', 0)
+                if old_stall > 0:
+                    curriculum_state['stall_count'] = 0
+                    curriculum_state['consecutive_passes'] = 0
+                    print(f"[RESUME-MIGRATE] Reset stall_count ({old_stall}→0) due to threshold update")
 
             # Final thresholds (new)
             if 'scale_r_min_final' not in curriculum_state:
