@@ -5729,8 +5729,19 @@ def train_stageC_diffusion_generator(
                 # This replaces V_geom (which used V_target distances) for structure supervision
                 rms_per_sample = (V_hat_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
                 rms_per_sample = rms_per_sample.sqrt().clamp(min=1e-8)  # (B,)
-                V_struct = V_hat_centered / rms_per_sample.view(-1, 1, 1)  # (B,N,D) - scale-normalized
+                # CRITICAL: Detach RMS to prevent backprop through scale normalization
+                # This stops the model from "gaming" the normalization and avoids amplification at high σ
+                V_struct = V_hat_centered / rms_per_sample.detach().view(-1, 1, 1)  # (B,N,D) - scale-normalized
                 V_struct = V_struct * m_float  # Re-apply mask
+
+                # --- Step A3: Compute V_target_struct (normalized target for structure loss comparisons) ---
+                # Must normalize target the SAME way as V_struct for consistent comparisons
+                V_target_centered, _ = uet.center_only(V_target.float(), mask)
+                V_target_centered = V_target_centered * m_float
+                tgt_rms = (V_target_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                tgt_rms = tgt_rms.sqrt().clamp(min=1e-8)
+                V_target_struct = V_target_centered / tgt_rms.view(-1, 1, 1)  # No detach needed - it's GT
+                V_target_struct = V_target_struct * m_float
 
                 # --- Step B: Compute V_geom (DIAGNOSTIC ONLY - NOT for training losses) ---
                 # V_geom uses V_target distances, so NOT inference-feasible
@@ -5842,16 +5853,7 @@ def train_stageC_diffusion_generator(
                         use_anchor_geom = (n_unknown.median() >= anchor_geom_min_unknown) and anchor_cond_mask.any()
                         
                         if use_anchor_geom:
-                            # Center the target in the same frame as V_struct for proper clamping
-                            V_target_centered, _ = uet.center_only(V_target.float(), mask)
-                            V_target_centered = V_target_centered * m_float
-
-                            # Normalize target to same scale as V_struct for anchor clamping
-                            tgt_rms = (V_target_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
-                            tgt_rms = tgt_rms.sqrt().clamp(min=1e-8)
-                            V_target_struct = V_target_centered / tgt_rms.view(-1, 1, 1)
-                            V_target_struct = V_target_struct * m_float
-
+                            # V_target_struct and V_target_centered already computed globally (Step A3)
                             # Create anchor-clamped versions of structure tensors
                             # V_struct_L: for Gram, Edge, NCA (structure losses) - inference-feasible
                             V_struct_L = uet.clamp_anchors_for_loss(V_struct, V_target_struct, anchor_cond_mask, mask)
@@ -6660,7 +6662,13 @@ def train_stageC_diffusion_generator(
                     # This ensures the target Gram is feasible in D_latent dimensions
                     # (G_target from batch is full-rank from 2D coords, creating impossible pressure)
                     Vt_c_for_gram, _ = uet.center_only(V_target_batch.float(), mask)
-                    Gt = Vt_c_for_gram @ Vt_c_for_gram.transpose(1, 2)  # (B, N, N), rank ≤ D_latent
+                    # ChatGPT FIX: Normalize target the SAME way as V_struct (RMS-normalize)
+                    # This ensures consistent scale-free comparison: Gp vs Gt both normalized
+                    tgt_gram_rms = (Vt_c_for_gram.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                    tgt_gram_rms = tgt_gram_rms.sqrt().clamp(min=1e-8)
+                    Vt_c_for_gram = Vt_c_for_gram / tgt_gram_rms.view(-1, 1, 1)
+                    Vt_c_for_gram = Vt_c_for_gram * m_float  # Re-apply mask
+                    Gt = Vt_c_for_gram @ Vt_c_for_gram.transpose(1, 2)  # (B, N, N), rank ≤ D_latent, scale-normalized
                     # NOTE: MM and P_off masks are applied downstream, no need to multiply here
                     B, N, _ = V_geom.shape
                     
@@ -7200,9 +7208,10 @@ def train_stageC_diffusion_generator(
                         # Compute NCA loss with point weighting
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
                         # ChatGPT FIX: Use V_struct_L (self-normalized RAW) for inference-feasible structure
+                        # ChatGPT FIX 2: Use V_target_struct (normalized target) for consistent comparison
                         L_knn_per = uet.knn_nca_loss(
                             V_struct_L,            # Self-normalized structure tensor, inference-feasible
-                            V_target.float(),    # Raw target
+                            V_target_struct,       # Normalized target (same scale as V_struct)
                             struct_mask,           # Only core non-landmarks (valid kNN indices)
                             k=15,
                             temperature=tau_reference,
@@ -7622,9 +7631,10 @@ def train_stageC_diffusion_generator(
                         # ChatGPT FIX: V_struct_L is inference-feasible (no GT needed for scale)
                         # Scale learning happens via knn_scale on V_hat_centered
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
+                        # ChatGPT FIX 2: Use V_target_struct (normalized target) for consistent comparison
                         L_edge_per = uet.edge_log_ratio_loss(
                             V_pred=V_struct_L,  # Self-normalized structure tensor, inference-feasible
-                            V_tgt=V_target.float(),
+                            V_tgt=V_target_struct,  # Normalized target (same scale as V_struct)
                             knn_idx=knn_indices_batch,
                             mask=struct_mask   # Only core non-landmarks (valid kNN indices)
                         )
