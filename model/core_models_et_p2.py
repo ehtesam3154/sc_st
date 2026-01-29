@@ -8858,7 +8858,8 @@ def train_stageC_diffusion_generator(
                     sigma_pair_ov = sigma_pair[idx_keep]  # Was: sigma_pair = sigma_pair[idx_keep]
                     sigma_pair_3d_ov = sigma_pair_3d[idx_keep]  # Was: sigma_pair_3d = sigma_pair_3d[idx_keep]
                     eps_ov = eps[idx_keep]  # Was: eps = eps[idx_keep]
- 
+                    V_t_1 = V_t[idx_keep]  # Noisy view1 input for residual overlap
+
                     # DEBUG: gate + sigma stats
                     if global_step % overlap_debug_every == 0:
                         rank = dist.get_rank() if dist.is_initialized() else 0
