@@ -2871,6 +2871,11 @@ def train_stageC_diffusion_generator(
         'loss_plateau_threshold': 0.02,  # 2% relative improvement threshold
         'loss_no_improve_count': 0,   # Counter for plateau detection
         'best_cap_band_loss': float('inf'),  # Best cap-band loss at current stage
+
+        # Conditioning strength knob (ChatGPT fix for scale collapse at moderate σ)
+        # Normalizes H to unit RMS then scales by α
+        # This controls conditioning magnitude without changing model architecture
+        'cond_alpha': 0.1,            # Fixed conditioning strength (start conservative)
     }
 
     slide_d15_medians = []
@@ -3663,6 +3668,7 @@ def train_stageC_diffusion_generator(
     }
 
     start_epoch = 0
+    start_global_step = 0  # Will be restored from checkpoint if available
     if resume_ckpt_path:
         print(f"[RESUME] Loading Stage C checkpoint: {resume_ckpt_path}")
         ckpt = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
@@ -3738,6 +3744,7 @@ def train_stageC_diffusion_generator(
                 'promotion_threshold', 'stall_limit',
                 'metrics_history_K', 'min_steps_per_stage', 'min_steps_at_target',
                 'loss_plateau_patience', 'loss_plateau_threshold',
+                'cond_alpha',  # Conditioning strength knob
             ]
 
             # Start with loaded state, then override config keys with canonical values
@@ -3787,7 +3794,22 @@ def train_stageC_diffusion_generator(
                     del curriculum_state[key]
                     print(f"[RESUME-MIGRATE] Removed deprecated key: {key}")
 
-        print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
+        # ============================================================
+        # RESTORE global_step (NEW: fixes ramp state consistency)
+        # ============================================================
+        if 'global_step' in ckpt:
+            start_global_step = int(ckpt['global_step'])
+            print(f"[RESUME] Restored global_step={start_global_step}")
+        else:
+            # Old checkpoint without global_step - clear any stale ramp state
+            start_global_step = 0
+            if curriculum_state.get('ramp_start_step') is not None:
+                print(f"[RESUME-MIGRATE] Old checkpoint without global_step, clearing stale ramp state")
+                curriculum_state['ramp_start_step'] = None
+                curriculum_state['ramp_prev_cap'] = None
+                curriculum_state['ramp_target_cap'] = None
+
+        print(f"[RESUME] start_epoch={start_epoch}, start_global_step={start_global_step}, reset_optimizer={resume_reset_optimizer}")
 
 
     # ========== EDM DEBUG STATE INITIALIZATION ==========
@@ -4033,8 +4055,8 @@ def train_stageC_diffusion_generator(
     #--amp scaler choice based on precision---
     use_fp16 = (precision == '16-mixed')
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-    
-    global_step = 0
+
+    global_step = start_global_step  # Restore from checkpoint or 0 for fresh start
 
     ema_grads = {
         'score': 1.0,
@@ -4196,6 +4218,49 @@ def train_stageC_diffusion_generator(
 
         # No ramp or ramp complete
         return sigma_cap_target, sigma_cap_target, False, 1.0
+
+    def normalize_and_scale_conditioning(H, mask, alpha, eps=1e-8):
+        """
+        Normalize H to unit RMS (per sample), then scale by alpha.
+
+        ChatGPT fix for scale collapse: conditioning magnitude was suppressing
+        the learned branch. This knob controls conditioning strength without
+        changing model architecture.
+
+        Args:
+            H: (B, N, c_dim) conditioning tensor (after dropout)
+            mask: (B, N) validity mask
+            alpha: scalar conditioning strength
+            eps: numerical stability
+
+        Returns:
+            H_scaled: (B, N, c_dim) normalized and scaled conditioning
+            rms_before: (B,) per-sample RMS before normalization (for logging)
+        """
+        B, N, c_dim = H.shape
+
+        # Mask H for valid positions only
+        mask_f = mask.unsqueeze(-1).float()  # (B, N, 1)
+        H_masked = H * mask_f
+
+        # Compute per-sample RMS with CORRECT denominator (include c_dim)
+        # rms = sqrt(sum(H^2) / (n_valid * c_dim))
+        n_valid = mask.sum(dim=1).float()  # (B,)
+        denominator = (n_valid * c_dim).clamp(min=1.0)  # (B,)
+        sq_sum = (H_masked ** 2).sum(dim=(1, 2))  # (B,)
+        rms_H = (sq_sum / denominator + eps).sqrt()  # (B,)
+
+        # DETACH RMS so context encoder can't game the normalization
+        rms_H = rms_H.detach()
+
+        # Normalize to unit RMS, then scale by alpha
+        H_norm = H / rms_H.view(B, 1, 1).clamp(min=eps)
+        H_scaled = H_norm * alpha
+
+        # Apply mask again (for safety)
+        H_scaled = H_scaled * mask_f
+
+        return H_scaled, rms_H
 
     # Track pin-rate for adaptive clamp (persists across steps within this training run)
     last_pin_rate = 1.0  # Assume worst case initially
@@ -4738,7 +4803,34 @@ def train_stageC_diffusion_generator(
                           f"drop_rate={uncond_rate:.4f} FORCE_COND_ONLY={FORCE_COND_ONLY}")
                 # ======== END A/B TEST 2 DEBUG ========
 
-                
+                # ======== CONDITIONING STRENGTH KNOB (ChatGPT fix for scale collapse) ========
+                # Apply AFTER dropout: normalize H_train to unit RMS, then scale by alpha
+                # This controls conditioning magnitude without architecture changes
+                cond_alpha = curriculum_state.get('cond_alpha', 0.1)
+                H_train, rms_H_before = normalize_and_scale_conditioning(H_train, mask, cond_alpha)
+
+                # Logging: verify the knob is working
+                if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                    # Compute RMS after scaling for verification
+                    mask_f = mask.unsqueeze(-1).float()
+                    n_valid = mask.sum(dim=1).float()
+                    c_dim = H_train.shape[-1]
+                    den = (n_valid * c_dim).clamp(min=1.0)
+                    sq_sum_after = ((H_train * mask_f) ** 2).sum(dim=(1, 2))
+                    rms_H_after = (sq_sum_after / den + 1e-8).sqrt()
+
+                    # Report median and p90 for before/after
+                    rms_before_med = rms_H_before.median().item()
+                    rms_before_p90 = rms_H_before.quantile(0.9).item()
+                    rms_after_med = rms_H_after.median().item()
+                    rms_after_p90 = rms_H_after.quantile(0.9).item()
+
+                    print(f"[COND-SCALE] step={global_step} alpha={cond_alpha:.3f} "
+                          f"rms_before=[med={rms_before_med:.4f}, p90={rms_before_p90:.4f}] "
+                          f"rms_after=[med={rms_after_med:.4f}, p90={rms_after_p90:.4f}] "
+                          f"(expect after≈{cond_alpha:.3f})")
+                # ======== END CONDITIONING STRENGTH KNOB ========
+
                 # For ST: still load G_target (needed for Gram loss later)
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
@@ -11521,6 +11613,7 @@ def train_stageC_diffusion_generator(
         if fabric is None or fabric.is_global_zero:
             ckpt = {
                 'epoch': epoch,
+                'global_step': global_step,  # NEW: save for correct resume
                 'context_encoder': context_encoder.state_dict(),
                 'score_net': score_net.state_dict(),
                 'generator': generator.state_dict(),
@@ -11550,6 +11643,7 @@ def train_stageC_diffusion_generator(
     if fabric is None or fabric.is_global_zero:
         ckpt_final = {
             'epoch': epoch,
+            'global_step': global_step,  # NEW: save for correct resume
             'context_encoder': context_encoder.state_dict(),
             'score_net': score_net.state_dict(),
             'generator': generator.state_dict(),
