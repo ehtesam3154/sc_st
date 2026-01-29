@@ -6101,7 +6101,8 @@ def train_stageC_diffusion_generator(
 
             # --- PATCH 7: Low-rank subspace penalty ---
             if not is_sc and WEIGHTS.get('subspace', 0) > 0:
-                L_subspace = uet.variance_outside_topk(V_geom_L, mask, k=2)
+                # ChatGPT FIX: Use V_struct_L (inference-feasible) instead of V_geom_L (GT-referenced)
+                L_subspace = uet.variance_outside_topk(V_struct_L, mask, k=2)
             else:
                 L_subspace = torch.tensor(0.0, device=device)
 
@@ -8324,36 +8325,29 @@ def train_stageC_diffusion_generator(
                         # ==================== CHANGE 6: GENERATOR SCALE CLAMP (Option 1 Change B) ====================
 
                         # PATCH 8: Scale-aware generator alignment losses
-                        # FIX: Use within-miniset kNN instead of slide-level kNN
-                        if knn_spatial_for_scale is not None:
-                            # Compute scale correction for GENERATOR (separate from diffusion)
-                            s_corr_gen, _, valid_scale_gen, _, _, _ = uet.compute_local_scale_correction(
-                                V_pred=V_gen_centered,  # Generator output, NOT V_hat_centered
-                                V_tgt=V_target.float(),
-                                mask=mask,
-                                knn_indices=knn_spatial_for_scale,  # Within-miniset kNN
-                                k=15,
-                                max_log_correction=max_log_corr_for_knn if max_log_corr_for_knn is not None else 0.25,
-                            )
+                        # ChatGPT FIX: Use self-normalized V_gen_struct (inference-feasible)
+                        # instead of GT-referenced V_gen_geo (which used compute_local_scale_correction with V_target)
 
-                            # Apply scale correction to generator
-                            V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_corr_gen.detach(), mask)
-                        else:
-                            V_gen_geo = V_gen_centered
+                        # Create V_gen_struct: self-normalized generator output (same as V_struct)
+                        gen_rms = (V_gen_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                        gen_rms = gen_rms.sqrt().clamp(min=1e-8)
+                        # Detach RMS to prevent backprop through scale normalization
+                        V_gen_struct = V_gen_centered / gen_rms.detach().view(-1, 1, 1)
+                        V_gen_struct = V_gen_struct * m_float
 
                         # ========== ANCHOR-CLAMP GENERATOR TENSORS ==========
                         if anchor_train and anchor_geom_losses and anchor_cond_mask is not None and use_anchor_geom:
-                            V_target_centered_gen, _ = uet.center_only(V_target.float(), mask)
-                            V_target_centered_gen = V_target_centered_gen * mask.float().unsqueeze(-1)
-                            V_gen_geo_L = uet.clamp_anchors_for_loss(V_gen_geo, V_target_centered_gen, anchor_cond_mask, mask)
-                            V_gen_centered_L = uet.clamp_anchors_for_loss(V_gen_centered, V_target_centered_gen, anchor_cond_mask, mask)
+                            # Use V_target_struct (already computed globally) for consistent normalization
+                            V_gen_struct_L = uet.clamp_anchors_for_loss(V_gen_struct, V_target_struct, anchor_cond_mask, mask)
+                            V_gen_centered_L = uet.clamp_anchors_for_loss(V_gen_centered, V_target_centered, anchor_cond_mask, mask)
                         else:
-                            V_gen_geo_L = V_gen_geo
+                            V_gen_struct_L = V_gen_struct
                             V_gen_centered_L = V_gen_centered
-                        
+
                         # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
-                        # Use anchor-clamped V_gen_geo_L for alignment
-                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_geo_L, V_target_batch, mask)
+                        # ChatGPT FIX: Use V_gen_struct_L (inference-feasible) for alignment
+                        # Compare against V_target_struct (normalized target) for consistent comparison
+                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_struct_L, V_target_struct, mask)
                         # Use anchor-clamped V_gen_centered_L for scale loss
                         L_gen_scale = uet.rms_log_loss(V_gen_centered_L, V_target_batch, mask)
                         
