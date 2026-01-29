@@ -10481,9 +10481,28 @@ def train_stageC_diffusion_generator(
                 scale_collapsed = scale_r_promo < 0.60
                 curriculum_state['scale_collapsed'] = scale_collapsed  # Store for use in stall handling
 
-                # Promote if enough passes in window AND scale not collapsed
+                # ========== ChatGPT Must-fix #1: Structure-based promotion for pre-target ==========
+                # Problem: scale/trace can lag behind structure learning, causing infinite stalls.
+                # Fix: For stages < target, promote based on STRUCTURE (Jacc) only + collapse floor.
+                #      At target stage, use full scale+trace+Jacc requirements.
                 promoted = False
-                if passes_in_window >= required_passes and len(window) >= required_passes and not scale_collapsed:
+                at_target = (curr_stage >= target_stage)
+
+                if at_target:
+                    # AT TARGET STAGE: require full passes (scale + trace + Jacc)
+                    should_promote = (passes_in_window >= required_passes and
+                                      len(window) >= required_passes and
+                                      not scale_collapsed)
+                    promo_reason = "full"
+                else:
+                    # PRE-TARGET: promote based on STRUCTURE only + collapse floor
+                    # This stops the "scale lags behind structure" infinite stall
+                    should_promote = (structure_passes_in_window >= required_passes and
+                                      len(struct_window) >= required_passes and
+                                      not scale_collapsed)
+                    promo_reason = "structure"
+
+                if should_promote:
                     if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
                         old_stage = curr_stage
                         old_mult = curriculum_state['sigma_cap_mults'][old_stage]
@@ -10500,9 +10519,11 @@ def train_stageC_diffusion_generator(
                         curriculum_state['ramp_prev_mult'] = old_mult
                         curriculum_state['ramp_target_mult'] = new_mult
 
-                        print(f"\n[CURRICULUM] PROMOTED to stage {curriculum_state['current_stage']} "
-                              f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})"
-                              f" [{passes_in_window}/{len(window)} full passes, {structure_passes_in_window}/{len(struct_window)} structure passes]")
+                        promo_label = "STRUCTURE-PROMOTED" if promo_reason == "structure" else "PROMOTED"
+                        print(f"\n[CURRICULUM] {promo_label} to stage {curriculum_state['current_stage']} "
+                              f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})")
+                        print(f"  Basis: {promo_reason} ({structure_passes_in_window}/{len(struct_window)} struct, "
+                              f"{passes_in_window}/{len(window)} full)")
                         print(f"  [RAMP] Enabled: {old_mult:.1f} → {new_mult:.1f} over {ramp_steps} steps")
 
                         # [THREE-GATE] Reset stage-local tracking on promotion
@@ -10519,6 +10540,12 @@ def train_stageC_diffusion_generator(
                 print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
                 print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1} "
                       f"(σ_cap = {curr_mult:.1f} × {sigma_data:.4f} = {sigma_cap_curr:.4f})")
+                # Show which promotion mode is active
+                if curr_stage >= target_stage:
+                    promo_mode = "AT TARGET: need full passes (scale+trace+Jacc)"
+                else:
+                    promo_mode = "PRE-TARGET: need structure passes only (Jacc) + collapse floor"
+                print(f"  Promo mode: {promo_mode}")
                 thresh_type = "FINAL" if curr_stage >= target_stage else "promo"
                 print(f"  Thresholds ({thresh_type}): scale_r≥{scale_r_min:.2f}, trace_r≥{trace_r_min:.2f}, Jacc≥{jacc_min:.2f}")
                 print(f"  Metrics at σ={closest_sigma:.3f}: scale_r={scale_r_promo:.3f} ({'✓' if scale_ok else '✗'}) "
