@@ -10669,11 +10669,12 @@ def train_stageC_diffusion_generator(
                 stall_limit = curriculum_state.get('stall_limit', 6)
 
                 # === STOP CONDITION 1: Curriculum stall (failure) ===
-                # Only after min_steps to avoid premature stall
-                if stall_count >= stall_limit and min_steps_met:
+                # Only after BOTH min_epochs AND min_steps to avoid premature stall
+                if stall_count >= stall_limit and min_epochs_met and min_steps_met:
                     if fabric is None or fabric.is_global_zero:
                         print(f"\n[THREE-GATE-STOP] Stall limit reached at stage {curr_stage}")
                         print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
+                        print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
                         print(f"  Stopping training (curriculum stall)")
                     should_stop = True
                     early_stopped = True
@@ -10718,6 +10719,11 @@ def train_stageC_diffusion_generator(
                             print(f"  → Training continues: min epochs not met")
                         elif not min_steps_met:
                             print(f"  → Training continues: min steps per stage not met")
+
+                        # Also log if stall detected but min_epochs protects us
+                        if stall_count >= stall_limit and not min_epochs_met:
+                            print(f"  ⚠️ Stall detected ({stall_count}>={stall_limit}) but min_epochs={min_epochs_curriculum} protects training")
+                            print(f"  → Training continues until epoch {min_epochs_curriculum}")
 
             elif not curriculum_enabled:
                 # No curriculum: use legacy loss-based early stop
