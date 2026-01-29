@@ -5723,8 +5723,18 @@ def train_stageC_diffusion_generator(
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                 V_hat_centered = (V_hat_f32 - mean) * m_float  # (B,N,D), centered but NOT clamped
 
-                # --- Step B: Compute V_geom (centered + locally clamped, for STRUCTURE losses) ---
-                # Use kNN-based local scale correction (detached) if we have spatial kNN and this is ST
+                # --- Step A2: Compute V_struct (self-normalized RAW for STRUCTURE losses) ---
+                # ChatGPT fix: Structure losses should be scale-INVARIANT without using V_target
+                # V_struct = V_hat_centered / RMS(V_hat_centered) - inference-feasible, no GT needed
+                # This replaces V_geom (which used V_target distances) for structure supervision
+                rms_per_sample = (V_hat_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                rms_per_sample = rms_per_sample.sqrt().clamp(min=1e-8)  # (B,)
+                V_struct = V_hat_centered / rms_per_sample.view(-1, 1, 1)  # (B,N,D) - scale-normalized
+                V_struct = V_struct * m_float  # Re-apply mask
+
+                # --- Step B: Compute V_geom (DIAGNOSTIC ONLY - NOT for training losses) ---
+                # V_geom uses V_target distances, so NOT inference-feasible
+                # Kept only for diagnostic logging (shows "if scale were perfect")
 
                 # ========== OPTION B FIX: Compute within-miniset kNN from V_target ==========
                 # Problem: batch['knn_spatial'] uses slide-level kNN, but only ~44% of neighbors
@@ -5832,14 +5842,23 @@ def train_stageC_diffusion_generator(
                         use_anchor_geom = (n_unknown.median() >= anchor_geom_min_unknown) and anchor_cond_mask.any()
                         
                         if use_anchor_geom:
-                            # Center the target in the same frame as V_geom for proper clamping
+                            # Center the target in the same frame as V_struct for proper clamping
                             V_target_centered, _ = uet.center_only(V_target.float(), mask)
                             V_target_centered = V_target_centered * m_float
-                            
+
+                            # Normalize target to same scale as V_struct for anchor clamping
+                            tgt_rms = (V_target_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                            tgt_rms = tgt_rms.sqrt().clamp(min=1e-8)
+                            V_target_struct = V_target_centered / tgt_rms.view(-1, 1, 1)
+                            V_target_struct = V_target_struct * m_float
+
                             # Create anchor-clamped versions of structure tensors
-                            # V_geom_L: for Gram, Edge, NCA (structure losses)
+                            # V_struct_L: for Gram, Edge, NCA (structure losses) - inference-feasible
+                            V_struct_L = uet.clamp_anchors_for_loss(V_struct, V_target_struct, anchor_cond_mask, mask)
+
+                            # V_geom_L: DIAGNOSTIC ONLY (not for training)
                             V_geom_L = uet.clamp_anchors_for_loss(V_geom, V_target_centered, anchor_cond_mask, mask)
-                            
+
                             # V_hat_centered_L: for knn_scale (raw scale loss needs clamping too)
                             V_hat_centered_L = uet.clamp_anchors_for_loss(V_hat_centered, V_target_centered, anchor_cond_mask, mask)
                             
@@ -5860,12 +5879,14 @@ def train_stageC_diffusion_generator(
                                     print(f"  V_hat_centered_L max_anchor_err={max_anchor_err_scale:.6f} (should be ~0)")
                         else:
                             # Not enough unknown points, use original tensors
-                            V_geom_L = V_geom
+                            V_struct_L = V_struct  # For structure losses
+                            V_geom_L = V_geom      # Diagnostic only
                             V_hat_centered_L = V_hat_centered
                             use_anchor_geom = False
                     else:
                         # No anchor training, use original tensors
-                        V_geom_L = V_geom
+                        V_struct_L = V_struct  # For structure losses
+                        V_geom_L = V_geom      # Diagnostic only
                         V_hat_centered_L = V_hat_centered
                         use_anchor_geom = False
 
@@ -6066,6 +6087,7 @@ def train_stageC_diffusion_generator(
                 else:
                     # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
                     V_geom = V_hat_centered
+                    V_struct_L = V_struct  # For structure losses (SC has no anchor clamping)
                     # No clamp computed - set variables to None for knn_scale block
                     log_s_unclamped_for_knn = None
                     valid_scale_for_knn = None
@@ -6652,7 +6674,8 @@ def train_stageC_diffusion_generator(
                                   f"ratio={tr_Gt_new.item()/tr_Gt_old.item():.4f}")
                     
                     # Build predicted Gram *with* true scale
-                    Gp_raw = V_geom_L @ V_geom_L.transpose(1, 2)          # (B,N,N)
+                    # ChatGPT FIX: Use V_struct_L (self-normalized RAW) for inference-feasible structure
+                    Gp_raw = V_struct_L @ V_struct_L.transpose(1, 2)          # (B,N,N)
                     
                     # --- PATCH 6: Diagonal distribution loss (per-point norm matching) ---
                     diag_p = torch.diagonal(Gp_raw, dim1=-2, dim2=-1)  # (B,N)
@@ -7176,8 +7199,9 @@ def train_stageC_diffusion_generator(
                         
                         # Compute NCA loss with point weighting
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
+                        # ChatGPT FIX: Use V_struct_L (self-normalized RAW) for inference-feasible structure
                         L_knn_per = uet.knn_nca_loss(
-                            V_geom_L,              # Clamped structure tensor
+                            V_struct_L,            # Self-normalized structure tensor, inference-feasible
                             V_target.float(),    # Raw target
                             struct_mask,           # Only core non-landmarks (valid kNN indices)
                             k=15,
@@ -7593,13 +7617,13 @@ def train_stageC_diffusion_generator(
                         #     knn_idx=knn_indices_batch,
                         #     mask=mask
                         # )
-                        # CHANGE 3: Use V_geom (clamped) for edge loss
+                        # CHANGE 3: Use V_struct_L (self-normalized RAW) for edge loss
                         # Edge is a STRUCTURE loss - it measures local neighborhood shape
-                        # Using clamped V_geom removes systematic scale bias from gradients
+                        # ChatGPT FIX: V_struct_L is inference-feasible (no GT needed for scale)
                         # Scale learning happens via knn_scale on V_hat_centered
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=V_geom_L,  # Clamped structure tensor, NOT raw x0_pred
+                            V_pred=V_struct_L,  # Self-normalized structure tensor, inference-feasible
                             V_tgt=V_target.float(),
                             knn_idx=knn_indices_batch,
                             mask=struct_mask   # Only core non-landmarks (valid kNN indices)
@@ -10461,11 +10485,12 @@ def train_stageC_diffusion_generator(
                 curriculum_state['cap_band_loss_sum'] = 0.0
                 curriculum_state['cap_band_loss_count'] = 0
 
-                # Gate B status
-                recent_passes = curriculum_state['metrics_pass_history']
-                gate_b_ok = len(recent_passes) >= K and all(recent_passes[-K:])
-                print(f"  [THREE-GATE] Gate B: {sum(recent_passes)}/{len(recent_passes)} recent passes "
-                      f"(need {K}/{K} for gate) {'✓' if gate_b_ok else '✗'}")
+                # Gate B status - use WINDOWED 5/6, matching actual implementation
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                passes_in_window = sum(promo_window) if promo_window else 0
+                gate_b_ok = (len(promo_window) >= 6 and passes_in_window >= 5)
+                print(f"  [THREE-GATE] Gate B: {passes_in_window}/{len(promo_window)} in window "
+                      f"(need 5/6 for gate) {'✓' if gate_b_ok else '✗'}")
 
                 # Steps in stage
                 print(f"  [THREE-GATE] Steps in stage: {curriculum_state['steps_in_stage']} "
