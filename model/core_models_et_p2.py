@@ -2853,10 +2853,9 @@ def train_stageC_diffusion_generator(
         'target_dwell_frac': 0.20,    # Reserve 20% of total steps for target stage
         # Promotion ramp: smooth σ_cap transitions to avoid "stage shock"
         'ramp_steps': 300,            # Interpolate σ_cap over this many steps after promotion
-        'ramp_active': False,         # True during ramp period
-        'ramp_start_step': None,      # Global step when ramp started
-        'ramp_prev_mult': None,       # Previous σ_cap multiplier
-        'ramp_target_mult': None,     # Target σ_cap multiplier
+        'ramp_start_step': None,      # Global step when ramp started (None = no ramp active)
+        'ramp_prev_cap': None,        # Previous σ_cap value (actual cap, not multiplier)
+        'ramp_target_cap': None,      # Target σ_cap value (actual cap, not multiplier)
         'min_epochs': curriculum_min_epochs,  # Absolute minimum epochs before any stopping (CLI arg, default 100)
 
         # Gate B: Metrics stability tracking (K consecutive passes)
@@ -4158,9 +4157,43 @@ def train_stageC_diffusion_generator(
         return result
     
 
+    # =========================================================================
+    # HELPER: Get effective sigma_cap (accounts for ramp)
+    # Pure function - does NOT mutate state
+    # =========================================================================
+    def get_sigma_cap_eff(curriculum_state, global_step, sigma_data):
+        """
+        Single source of truth for effective sigma_cap during ramp.
+
+        Returns: (sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress)
+        - sigma_cap_eff: the actual cap to use for training/eval
+        - sigma_cap_target: the target cap for current stage
+        - ramp_active: True if ramp is in progress
+        - ramp_progress: 0.0-1.0 progress through ramp (0 if not active)
+        """
+        curr_stage = curriculum_state['current_stage']
+        sigma_cap_target = curriculum_state['sigma_cap_mults'][curr_stage] * sigma_data
+
+        ramp_start = curriculum_state.get('ramp_start_step')
+        ramp_steps = curriculum_state.get('ramp_steps', 300)
+
+        # Ramp is active if ramp_start_step is set and not yet complete
+        if ramp_start is not None:
+            steps_since_ramp = global_step - ramp_start
+            if steps_since_ramp < ramp_steps:
+                # Ramp in progress
+                t = steps_since_ramp / ramp_steps
+                prev_cap = curriculum_state.get('ramp_prev_cap', sigma_cap_target)
+                target_cap = curriculum_state.get('ramp_target_cap', sigma_cap_target)
+                sigma_cap_eff = prev_cap + t * (target_cap - prev_cap)
+                return sigma_cap_eff, sigma_cap_target, True, t
+
+        # No ramp or ramp complete
+        return sigma_cap_target, sigma_cap_target, False, 1.0
+
     # Track pin-rate for adaptive clamp (persists across steps within this training run)
     last_pin_rate = 1.0  # Assume worst case initially
-    
+
     for epoch in range(start_epoch, n_epochs):
         epoch_cv_sum = 0.0
         epoch_qent_sum = 0.0
@@ -4352,34 +4385,27 @@ def train_stageC_diffusion_generator(
 
                 # === EDM: sample sigma from log-normal ===
                 if use_edm:
-                    # [CURRICULUM] Phase 3: Compute current sigma_cap from curriculum state
+                    # [CURRICULUM] Phase 3: Compute current sigma_cap using helper
                     curr_stage = curriculum_state['current_stage']
-                    curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
+                    sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
+                        curriculum_state, global_step, sigma_data)
 
-                    # ChatGPT FIX: Apply ramp if active (smooth σ_cap transition after promotion)
-                    if curriculum_state.get('ramp_active', False):
-                        ramp_start = curriculum_state.get('ramp_start_step', global_step)
-                        ramp_steps = curriculum_state.get('ramp_steps', 300)
-                        steps_since_ramp = global_step - ramp_start
+                    # Clear ramp state when ramp completes (state mutation happens HERE, not in helper)
+                    if not ramp_active and curriculum_state.get('ramp_start_step') is not None:
+                        curriculum_state['ramp_start_step'] = None
+                        curriculum_state['ramp_prev_cap'] = None
+                        curriculum_state['ramp_target_cap'] = None
+                        if fabric is None or fabric.is_global_zero:
+                            print(f"  [RAMP] Completed at step={global_step}, σ_cap_eff={sigma_cap_eff:.4f}")
 
-                        if steps_since_ramp < ramp_steps:
-                            # Interpolate between prev_mult and target_mult
-                            t = steps_since_ramp / ramp_steps
-                            prev_mult = curriculum_state.get('ramp_prev_mult', curr_mult)
-                            target_mult = curriculum_state.get('ramp_target_mult', curr_mult)
-                            curr_mult = prev_mult + t * (target_mult - prev_mult)
+                    # Log ramp progress periodically
+                    if ramp_active and global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        prev_cap = curriculum_state.get('ramp_prev_cap', sigma_cap_eff)
+                        target_cap = curriculum_state.get('ramp_target_cap', sigma_cap_target)
+                        print(f"  [RAMP] step={global_step} progress={ramp_progress:.0%} "
+                              f"σ_cap_eff={sigma_cap_eff:.4f} ({prev_cap:.4f}→{target_cap:.4f})")
 
-                            if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
-                                print(f"  [RAMP] step={global_step} t={t:.2f} σ_mult={curr_mult:.2f} "
-                                      f"({prev_mult:.1f}→{target_mult:.1f})")
-                        else:
-                            # Ramp done
-                            curriculum_state['ramp_active'] = False
-                            if fabric is None or fabric.is_global_zero:
-                                print(f"  [RAMP] Completed at step={global_step}")
-
-                    sigma_cap = curr_mult * sigma_data  # Dynamic cap based on curriculum
-                    sigma_cap = min(sigma_cap, sigma_refine_max)  # Never exceed original limit
+                    sigma_cap = min(sigma_cap_eff, sigma_refine_max)  # Never exceed original limit
 
                     # [CURRICULUM] Cap-band emphasis sampling
                     # Mixture: cap_band_frac from [0.7*σ_cap, σ_cap], rest from full [σ_min, σ_cap]
@@ -10321,12 +10347,24 @@ def train_stageC_diffusion_generator(
                 # [CURRICULUM] Phase 3: Promotion logic based on fixed-batch eval
                 # =====================================================================
                 curr_stage = curriculum_state['current_stage']
-                curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
-                sigma_cap_curr = curr_mult * sigma_data
 
-                # Find the closest sigma in fixed_eval_sigmas to current sigma_cap
-                # Evaluate at sigma_cap (or closest available)
-                closest_sigma = min(fixed_eval_sigmas, key=lambda x: abs(x - sigma_cap_curr))
+                # Use EFFECTIVE sigma_cap (accounts for ramp) for eval
+                sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
+                    curriculum_state, global_step, sigma_data)
+
+                # Select closest_sigma: max({s in fixed_eval_sigmas | s <= sigma_cap_eff})
+                # This ensures we don't eval at sigma we're not training on yet
+                candidates = [s for s in fixed_eval_sigmas if s <= sigma_cap_eff]
+                if candidates:
+                    closest_sigma = max(candidates)  # Largest sigma <= sigma_cap_eff
+                else:
+                    closest_sigma = min(fixed_eval_sigmas)  # Fallback to smallest
+
+                # Log what we're evaluating at
+                if fabric is None or fabric.is_global_zero:
+                    print(f"  [EVAL] σ_cap_eff={sigma_cap_eff:.4f} σ_cap_target={sigma_cap_target:.4f} "
+                          f"→ eval at σ={closest_sigma:.3f}"
+                          f"{' (ramp ' + f'{ramp_progress:.0%})' if ramp_active else ''}")
 
                 # Cache eps_promo ONCE per run (deterministic, no RNG contamination)
                 if 'eps_promo_cached' not in edm_debug_state:
@@ -10387,20 +10425,25 @@ def train_stageC_diffusion_generator(
                                 jacc_cnt_promo += 1
                     jacc_promo = jacc_sum_promo / max(jacc_cnt_promo, 1)
 
-                # Get tiered thresholds based on current stage multiplier
-                jacc_min = curriculum_state['jacc_min_by_mult'].get(curr_mult, 0.07)
+                # Get tiered thresholds based on effective sigma (not target)
+                # Find which stage's thresholds to use based on closest_sigma
+                curr_mult_eff = sigma_cap_eff / sigma_data  # Effective multiplier
+                # Find closest mult in threshold dict
+                available_mults = list(curriculum_state['jacc_min_by_mult'].keys())
+                closest_mult = min(available_mults, key=lambda m: abs(m - curr_mult_eff))
+                jacc_min = curriculum_state['jacc_min_by_mult'].get(closest_mult, 0.07)
                 target_stage = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
 
                 # At target stage: use FINAL (stricter) thresholds for "training succeeded"
-                # Before target stage: use relaxed PROMOTION thresholds
+                # Before target stage: use relaxed PROMOTION thresholds based on effective mult
                 if curr_stage >= target_stage:
                     scale_r_min = curriculum_state.get('scale_r_min_final', 0.80)
                     trace_r_min = curriculum_state.get('trace_r_min_final', 0.60)
                 else:
                     scale_r_min = curriculum_state['scale_r_min_by_mult'].get(
-                        curr_mult, curriculum_state['scale_r_min_default'])
+                        closest_mult, curriculum_state['scale_r_min_default'])
                     trace_r_min = curriculum_state['trace_r_min_by_mult'].get(
-                        curr_mult, curriculum_state['trace_r_min_default'])
+                        closest_mult, curriculum_state['trace_r_min_default'])
 
                 # Check promotion criteria
                 scale_ok = scale_r_promo >= scale_r_min
@@ -10467,12 +10510,18 @@ def train_stageC_diffusion_generator(
                 required_passes = curriculum_state['promotion_threshold']  # 5
 
                 # Update stall_count based on WINDOW, not single-epoch events
-                # This avoids inconsistency between "5/6 pass" promotion and stall detection
-                if len(window) >= window_size:
+                # Only count stalls when:
+                # 1. Window is full (len >= window_size)
+                # 2. Minimum warmup steps met (avoid noisy early epochs)
+                # 3. Ramp is NOT active (during ramp, sigma is shifting so stall counter is meaningless)
+                steps_in_stage = curriculum_state.get('steps_in_stage', 0)
+                warmup_steps = 200  # Don't count stalls during first ~4 epochs of a stage
+                if len(window) >= window_size and steps_in_stage >= warmup_steps and not ramp_active:
                     if passes_in_window >= 2:
                         curriculum_state['stall_count'] = 0  # Window shows progress
                     else:
                         curriculum_state['stall_count'] += 1  # Window shows stall (<2/6)
+                # During ramp or warmup, don't touch stall_count - wait for stable evaluation
 
                 # Store structure passes count for stall decision
                 curriculum_state['structure_passes_in_window'] = structure_passes_in_window
@@ -10509,22 +10558,25 @@ def train_stageC_diffusion_generator(
                         curriculum_state['current_stage'] += 1
                         curriculum_state['promo_pass_window'] = []  # Reset window
                         curriculum_state['structure_pass_window'] = []  # Reset structure window
+                        curriculum_state['stall_count'] = 0  # Reset stall count on promotion
                         promoted = True
                         new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
 
                         # Enable promotion ramp for smooth σ_cap transition
+                        # Store actual caps (not mults) for cleaner interpolation
                         ramp_steps = curriculum_state.get('ramp_steps', 300)
-                        curriculum_state['ramp_active'] = True
+                        old_cap = old_mult * sigma_data
+                        new_cap = new_mult * sigma_data
                         curriculum_state['ramp_start_step'] = global_step
-                        curriculum_state['ramp_prev_mult'] = old_mult
-                        curriculum_state['ramp_target_mult'] = new_mult
+                        curriculum_state['ramp_prev_cap'] = old_cap
+                        curriculum_state['ramp_target_cap'] = new_cap
 
                         promo_label = "STRUCTURE-PROMOTED" if promo_reason == "structure" else "PROMOTED"
                         print(f"\n[CURRICULUM] {promo_label} to stage {curriculum_state['current_stage']} "
-                              f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})")
+                              f"(σ_cap_target = {new_cap:.4f})")
                         print(f"  Basis: {promo_reason} ({structure_passes_in_window}/{len(structure_window)} struct, "
                               f"{passes_in_window}/{len(window)} full)")
-                        print(f"  [RAMP] Enabled: {old_mult:.1f} → {new_mult:.1f} over {ramp_steps} steps")
+                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
 
                         # [THREE-GATE] Reset stage-local tracking on promotion
                         curriculum_state['steps_in_stage'] = 0
@@ -10538,8 +10590,9 @@ def train_stageC_diffusion_generator(
 
                 # Print curriculum status
                 print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
-                print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1} "
-                      f"(σ_cap = {curr_mult:.1f} × {sigma_data:.4f} = {sigma_cap_curr:.4f})")
+                print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1}")
+                print(f"  σ_cap: eff={sigma_cap_eff:.4f} target={sigma_cap_target:.4f}"
+                      f"{' (ramp ' + f'{ramp_progress:.0%})' if ramp_active else ''}")
                 # Show which promotion mode is active
                 if curr_stage >= target_stage:
                     promo_mode = "AT TARGET: need full passes (scale+trace+Jacc)"
@@ -10572,8 +10625,10 @@ def train_stageC_diffusion_generator(
                             print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage}!")
                             print(f"  Structure competent ({struct_passes}/6 passes) → Will FORCE PROMOTE to stage {curr_stage + 1}")
                         elif struct_passes < 2:
-                            print(f"\n[CURRICULUM] ⚠️ GENUINE FAILURE at stage {curr_stage}!")
-                            print(f"  Structure failing ({struct_passes}/6 passes) → Will STOP after min_epochs met")
+                            max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                            print(f"\n[CURRICULUM] Structure struggling at stage {curr_stage} (informational)")
+                            print(f"  Structure passes: {struct_passes}/6 (<2 = struggling)")
+                            print(f"  → Will force-promote at max_steps ({steps_in_stage}/{max_steps}) if not recovered")
                         else:
                             print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} (borderline structure {struct_passes}/6)")
                             print(f"  → Training continues until structure is competent or failing")
@@ -11028,10 +11083,11 @@ def train_stageC_diffusion_generator(
 
                                 # Enable promotion ramp for smooth σ_cap transition
                                 ramp_steps = curriculum_state.get('ramp_steps', 300)
-                                curriculum_state['ramp_active'] = True
+                                old_cap = old_mult * sigma_data
+                                new_cap = new_mult * sigma_data
                                 curriculum_state['ramp_start_step'] = global_step
-                                curriculum_state['ramp_prev_mult'] = old_mult
-                                curriculum_state['ramp_target_mult'] = new_mult
+                                curriculum_state['ramp_prev_cap'] = old_cap
+                                curriculum_state['ramp_target_cap'] = new_cap
 
                                 # Reset stage-local tracking
                                 curriculum_state['steps_in_stage'] = 0
@@ -11047,8 +11103,8 @@ def train_stageC_diffusion_generator(
                                     print(f"  stall_count was {stall_count} >= stall_limit={stall_limit}")
                                     print(f"  Structure competent: {structure_passes}/6 passes (≥4 required) ✓")
                                     print(f"  Scale not collapsed: scale_r >= 0.60 ✓")
-                                    print(f"  New σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f}")
-                                    print(f"  [RAMP] Enabled: {old_mult:.1f} → {new_mult:.1f} over {ramp_steps} steps")
+                                    print(f"  New σ_cap_target = {new_cap:.4f}")
+                                    print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
                                     print(f"  Model learned structure but scale lagging - promoting to learn at higher σ")
 
                         elif structure_competent and scale_collapsed:
@@ -11067,6 +11123,7 @@ def train_stageC_diffusion_generator(
                                 # Hard escape: force promote even if structure failing
                                 if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
                                     old_stage = curr_stage
+                                    old_mult = curriculum_state['sigma_cap_mults'][old_stage]
                                     curriculum_state['current_stage'] += 1
                                     curriculum_state['stall_count'] = 0
                                     curriculum_state['promo_pass_window'] = []
@@ -11074,11 +11131,12 @@ def train_stageC_diffusion_generator(
                                     new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
 
                                     # Enable ramp for smooth transition
-                                    old_mult = curriculum_state['sigma_cap_mults'][old_stage]
-                                    curriculum_state['ramp_active'] = True
+                                    ramp_steps = curriculum_state.get('ramp_steps', 300)
+                                    old_cap = old_mult * sigma_data
+                                    new_cap = new_mult * sigma_data
                                     curriculum_state['ramp_start_step'] = global_step
-                                    curriculum_state['ramp_prev_mult'] = old_mult
-                                    curriculum_state['ramp_target_mult'] = new_mult
+                                    curriculum_state['ramp_prev_cap'] = old_cap
+                                    curriculum_state['ramp_target_cap'] = new_cap
 
                                     # Reset stage-local tracking
                                     curriculum_state['steps_in_stage'] = 0
@@ -11093,8 +11151,8 @@ def train_stageC_diffusion_generator(
                                         print(f"\n[CURRICULUM] ⚠️ MAX_STEPS ESCAPE at stage {old_stage}")
                                         print(f"  steps_in_stage={steps_in_stage} >= max_steps={max_steps}")
                                         print(f"  Structure failing ({structure_passes}/6) but FORCE PROMOTING anyway")
-                                        print(f"  → PROMOTED to stage {curriculum_state['current_stage']} (σ_cap = {new_mult:.1f} × σ_data)")
-                                        print(f"  Ramp enabled: {old_mult:.1f} → {new_mult:.1f} over {curriculum_state.get('ramp_steps', 300)} steps")
+                                        print(f"  → PROMOTED to stage {curriculum_state['current_stage']} (σ_cap_target = {new_cap:.4f})")
+                                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
                             else:
                                 # Not yet at max_steps, just warn and continue
                                 if fabric is None or fabric.is_global_zero:
@@ -11152,14 +11210,14 @@ def train_stageC_diffusion_generator(
                         print(f"  [BUDGET] stage {curr_stage}: {steps_in_stage}/{max_steps} steps "
                               f"({steps_until_escape} until force-promote)")
 
-                        if curriculum_state.get('ramp_active', False):
+                        if ramp_active:
                             ramp_start = curriculum_state.get('ramp_start_step', 0)
-                            ramp_steps = curriculum_state.get('ramp_steps', 300)
+                            ramp_steps_val = curriculum_state.get('ramp_steps', 300)
                             steps_into_ramp = global_step - ramp_start
-                            prev_m = curriculum_state.get('ramp_prev_mult', 0)
-                            targ_m = curriculum_state.get('ramp_target_mult', 0)
-                            print(f"  [RAMP] Active: {steps_into_ramp}/{ramp_steps} "
-                                  f"({prev_m:.1f}→{targ_m:.1f})")
+                            prev_cap = curriculum_state.get('ramp_prev_cap', 0)
+                            targ_cap = curriculum_state.get('ramp_target_cap', 0)
+                            print(f"  [RAMP] Active: {steps_into_ramp}/{ramp_steps_val} "
+                                  f"({prev_cap:.4f}→{targ_cap:.4f})")
 
                         if not gate_a:
                             print(f"  → Training continues: need to reach target stage {target_stage}")
@@ -11179,8 +11237,9 @@ def train_stageC_diffusion_generator(
                                     print(f"  ⚠️ SCALE-STALL ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
                                     print(f"  → Will FORCE PROMOTE to stage {curr_stage+1} when min_steps met")
                                 elif structure_failing:
-                                    print(f"  ⚠️ GENUINE FAILURE ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
-                                    print(f"  → Will STOP when min_epochs={min_epochs_curriculum} met")
+                                    max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                                    print(f"  Structure struggling ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Will force-promote at max_steps ({steps_in_stage}/{max_steps})")
                                 else:
                                     print(f"  ⚠️ BORDERLINE ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
                                     print(f"  → Training continues until structure is competent (≥4) or failing (<2)")
