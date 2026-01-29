@@ -10824,10 +10824,10 @@ def train_stageC_diffusion_generator(
 
                 # === STOP CONDITION 2: Curriculum stall handling ===
                 # Only checked if success condition not met
-                # Get scale_collapsed from curriculum state (computed during promotion check)
-                scale_collapsed = curriculum_state.get('scale_collapsed', False)
-
                 elif stall_count >= stall_limit and min_steps_met:
+                    # Get scale_collapsed from curriculum state (computed during promotion check)
+                    scale_collapsed = curriculum_state.get('scale_collapsed', False)
+
                     if curr_stage < target_stage:
                         # NOT at target stage yet
                         if structure_competent and not scale_collapsed:
