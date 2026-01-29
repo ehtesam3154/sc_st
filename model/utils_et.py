@@ -1030,42 +1030,19 @@ def factor_from_gram(G: torch.Tensor, D_latent: int) -> torch.Tensor:
     eigvals_top = eigvals[:D]
     eigvecs_top = eigvecs[:, :D]
 
-    # ========== CANONICALIZATION (ChatGPT fix for ε-training gauge ambiguity) ==========
-    # Without this, V_target can flip/rotate between batches, making ε labels inconsistent.
+    # ========== SIGN CANONICALIZATION (fixes ε-training gauge ambiguity) ==========
+    # Eigenvectors from eigh are only defined up to sign (±). This causes V_target to
+    # randomly flip between batches, making ε labels inconsistent.
+    #
+    # FIX: For each column, force the element with maximum absolute value to be positive.
+    # This is a minimal, geometry-preserving fix that removes sign ambiguity.
+    #
+    # NOTE: We do NOT use Procrustes alignment to polynomial anchors because that
+    # destroys the geometric meaning of V_target (eigenvectors have nothing to do
+    # with polynomials - they represent principal directions of atomic positions).
 
     if D > 0 and n > 0:
-        # --- FIX 2: BASIS CANONICALIZATION (handles rotations in near-degenerate eigenspaces) ---
-        # If eigenvalues are close, the eigensolver can return any orthonormal basis spanning
-        # that subspace. We align to fixed anchor vectors derived only from indices.
-        # This makes the basis deterministic even under rotations within a degenerate block.
-
-        # Fixed anchor matrix R (n x D) from deterministic index functions
-        t = torch.linspace(-1.0, 1.0, steps=n, device=device, dtype=torch.float32).view(n, 1)
-        R_cols = [t]
-        for p in range(2, D + 1):
-            R_cols.append(t ** p)
-        R = torch.cat(R_cols, dim=1)  # (n, D) in float32
-
-        # Center/normalize R columns (avoid trivial scaling issues)
-        R = R - R.mean(dim=0, keepdim=True)
-        R = R / (R.norm(dim=0, keepdim=True).clamp(min=1e-8))
-
-        # Align eigvec basis to anchors via orthogonal Procrustes in the eigenspace
-        U = eigvecs_top.to(torch.float32)  # (n, D)
-        A = U.T @ R  # (D, D)
-
-        # Q = argmin_Q ||UQ - R||, Q orthogonal: Q = UV^T from SVD(A)
-        try:
-            Ua, _, Vha = torch.linalg.svd(A, full_matrices=False)
-            Q = Ua @ Vha  # (D, D)
-            eigvecs_top = (U @ Q).to(dtype)
-        except RuntimeError:
-            # SVD can fail in rare edge cases; fall back to sign-only fix
-            eigvecs_top = eigvecs_top  # Keep as-is, sign fix below will still help
-
-        # --- FIX 1: SIGN CANONICALIZATION (minimal, deterministic) ---
-        # For each latent dim, pick the index with largest magnitude and force it positive.
-        # This removes the ± sign flip instability across calls.
+        # Sign canonicalization: force max-magnitude element positive in each column
         abs_max_idx = eigvecs_top.abs().argmax(dim=0)  # (D,)
         col_indices = torch.arange(D, device=device)
         col_vals = eigvecs_top[abs_max_idx, col_indices]  # (D,)
