@@ -2792,8 +2792,28 @@ def train_stageC_diffusion_generator(
             14.0: 0.07,
             17.0: 0.07,
         },
-        'scale_r_min': 0.80,
-        'trace_r_min': 0.60,
+        # Tiered scale_r thresholds: relaxed at early stages, tighter at later stages
+        'scale_r_min_by_mult': {
+            0.3: 0.75,   # Relaxed at early stages
+            0.9: 0.78,
+            2.3: 0.78,
+            4.0: 0.80,
+            7.0: 0.82,
+            14.0: 0.82,
+            17.0: 0.82,
+        },
+        'scale_r_min_default': 0.82,
+        # Tiered trace_r thresholds: relaxed at early stages, tighter at later stages
+        'trace_r_min_by_mult': {
+            0.3: 0.55,   # Relaxed at early stages
+            0.9: 0.58,
+            2.3: 0.58,
+            4.0: 0.60,
+            7.0: 0.62,
+            14.0: 0.62,
+            17.0: 0.62,
+        },
+        'trace_r_min_default': 0.62,
         # Cap-band emphasis: fraction of samples drawn from [0.7*σ_cap, σ_cap]
         # Remaining (1 - frac) drawn from full [σ_min, σ_cap] via log-normal
         'cap_band_frac_by_stage': {
@@ -10162,10 +10182,12 @@ def train_stageC_diffusion_generator(
                                 jacc_cnt_promo += 1
                     jacc_promo = jacc_sum_promo / max(jacc_cnt_promo, 1)
 
-                # Get tiered Jacc threshold
+                # Get tiered thresholds based on current stage multiplier
                 jacc_min = curriculum_state['jacc_min_by_mult'].get(curr_mult, 0.07)
-                scale_r_min = curriculum_state['scale_r_min']
-                trace_r_min = curriculum_state['trace_r_min']
+                scale_r_min = curriculum_state['scale_r_min_by_mult'].get(
+                    curr_mult, curriculum_state['scale_r_min_default'])
+                trace_r_min = curriculum_state['trace_r_min_by_mult'].get(
+                    curr_mult, curriculum_state['trace_r_min_default'])
 
                 # Check promotion criteria
                 scale_ok = scale_r_promo >= scale_r_min
@@ -10178,7 +10200,10 @@ def train_stageC_diffusion_generator(
                     prev_jacc = curriculum_state['eval_history'][-1].get('jacc', 0)
                 jacc_not_decreasing = (prev_jacc is None) or (jacc_promo >= prev_jacc - 0.01)
 
-                all_pass = scale_ok and trace_ok and jacc_ok and jacc_not_decreasing
+                # Structure pass = Jacc competence (model learned structure at this stage)
+                structure_pass = jacc_ok and jacc_not_decreasing
+                # Full pass = structure + scale/trace (ready for promotion)
+                all_pass = structure_pass and scale_ok and trace_ok
 
                 # Store in history
                 curriculum_state['eval_history'].append({
@@ -10187,7 +10212,8 @@ def train_stageC_diffusion_generator(
                     'scale_r': scale_r_promo,
                     'trace_r': trace_r_promo,
                     'jacc': jacc_promo,
-                    'passed': all_pass
+                    'passed': all_pass,
+                    'structure_pass': structure_pass,  # Track structure competence separately
                 })
 
                 # Phase 2: Generator warm-start check
@@ -10205,24 +10231,37 @@ def train_stageC_diffusion_generator(
 
                 # Promotion logic: windowed "5 of last 6" instead of strict consecutive
                 # This avoids one borderline epoch resetting all progress
+                window_size = 6
+
+                # Track full passes (for promotion)
                 if 'promo_pass_window' not in curriculum_state:
                     curriculum_state['promo_pass_window'] = []
-
                 curriculum_state['promo_pass_window'].append(all_pass)
-                # Keep only last 6
-                window_size = 6
                 if len(curriculum_state['promo_pass_window']) > window_size:
                     curriculum_state['promo_pass_window'] = curriculum_state['promo_pass_window'][-window_size:]
 
+                # Track structure passes (for stall behavior decision)
+                if 'structure_pass_window' not in curriculum_state:
+                    curriculum_state['structure_pass_window'] = []
+                curriculum_state['structure_pass_window'].append(structure_pass)
+                if len(curriculum_state['structure_pass_window']) > window_size:
+                    curriculum_state['structure_pass_window'] = curriculum_state['structure_pass_window'][-window_size:]
+
                 window = curriculum_state['promo_pass_window']
+                structure_window = curriculum_state['structure_pass_window']
                 passes_in_window = sum(window)
+                structure_passes_in_window = sum(structure_window)
                 required_passes = curriculum_state['promotion_threshold']  # 5
 
-                # Update stall_count: stall if <2 passes in last 6
+                # Update stall_count: stall if <2 full passes in last 6
+                # But also track structure competence to decide stall behavior later
                 if len(window) >= window_size and passes_in_window < 2:
                     curriculum_state['stall_count'] += 1
                 elif all_pass:
                     curriculum_state['stall_count'] = 0
+
+                # Store structure passes count for stall decision
+                curriculum_state['structure_passes_in_window'] = structure_passes_in_window
 
                 # Promote if enough passes in window
                 promoted = False
@@ -10230,11 +10269,12 @@ def train_stageC_diffusion_generator(
                     if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
                         curriculum_state['current_stage'] += 1
                         curriculum_state['promo_pass_window'] = []  # Reset window
+                        curriculum_state['structure_pass_window'] = []  # Reset structure window
                         promoted = True
                         new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
                         print(f"\n[CURRICULUM] PROMOTED to stage {curriculum_state['current_stage']} "
                               f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})"
-                              f" [{passes_in_window}/{len(window)} passes in window]")
+                              f" [{passes_in_window}/{len(window)} full passes, {structure_passes_in_window}/{len(struct_window)} structure passes]")
 
                         # [THREE-GATE] Reset stage-local tracking on promotion
                         curriculum_state['steps_in_stage'] = 0
@@ -10250,23 +10290,36 @@ def train_stageC_diffusion_generator(
                 print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
                 print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1} "
                       f"(σ_cap = {curr_mult:.1f} × {sigma_data:.4f} = {sigma_cap_curr:.4f})")
+                print(f"  Thresholds: scale_r≥{scale_r_min:.2f}, trace_r≥{trace_r_min:.2f}, Jacc≥{jacc_min:.2f}")
                 print(f"  Metrics at σ={closest_sigma:.3f}: scale_r={scale_r_promo:.3f} ({'✓' if scale_ok else '✗'}) "
                       f"trace_r={trace_r_promo:.3f} ({'✓' if trace_ok else '✗'}) "
-                      f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'}) (min={jacc_min:.2f})")
+                      f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'})")
                 print(f"  Jacc trend: {'✓ stable/improving' if jacc_not_decreasing else '✗ decreasing'}")
                 promo_window = curriculum_state.get('promo_pass_window', [])
-                print(f"  Promotion window: {sum(promo_window)}/{len(promo_window)} passes "
-                      f"(need {curriculum_state['promotion_threshold']}/{window_size})"
+                struct_window = curriculum_state.get('structure_pass_window', [])
+                print(f"  Full passes: {sum(promo_window)}/{len(promo_window)} "
+                      f"(need {curriculum_state['promotion_threshold']}/6)"
                       f" [{' '.join('✓' if p else '✗' for p in promo_window)}]")
+                print(f"  Structure passes: {sum(struct_window)}/{len(struct_window)} "
+                      f"(≥4=competent, <2=failing)"
+                      f" [{' '.join('✓' if p else '✗' for p in struct_window)}]")
                 print(f"  Generator stable: {curriculum_state['generator_stable']}")
                 if curriculum_state['stall_count'] > 0:
                     print(f"  ⚠️ Stall count: {curriculum_state['stall_count']}/{curriculum_state['stall_limit']}")
 
                 if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
                     target_stg = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
+                    struct_passes = sum(struct_window)
                     if curr_stage < target_stg:
-                        print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
-                        print(f"  → Will FORCE PROMOTE to stage {curr_stage + 1} at end of epoch (model must see all stages)")
+                        if struct_passes >= 4:
+                            print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage}!")
+                            print(f"  Structure competent ({struct_passes}/6 passes) → Will FORCE PROMOTE to stage {curr_stage + 1}")
+                        elif struct_passes < 2:
+                            print(f"\n[CURRICULUM] ⚠️ GENUINE FAILURE at stage {curr_stage}!")
+                            print(f"  Structure failing ({struct_passes}/6 passes) → Will STOP after min_epochs met")
+                        else:
+                            print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} (borderline structure {struct_passes}/6)")
+                            print(f"  → Training continues until structure is competent or failing")
                     else:
                         print(f"\n[CURRICULUM] ⚠️ STALLED at TARGET stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
                         print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
@@ -10674,31 +10727,54 @@ def train_stageC_diffusion_generator(
                 stall_limit = curriculum_state.get('stall_limit', 6)
 
                 # === STOP CONDITION 1: Curriculum stall ===
-                # If stalled but NOT at target stage → FORCE PROMOTE instead of stopping
-                # Only stop if stalled AND already at target stage (nowhere to promote to)
+                # Stall behavior depends on structure competence (Jacc passes)
+                # - structure_passes >= 4/6 → FORCE PROMOTE (scale-stall, model learned structure)
+                # - structure_passes < 2/6 → STOP (genuine failure, model can't learn)
+                # - Otherwise → continue training
+                structure_passes = curriculum_state.get('structure_passes_in_window', 0)
+                structure_competent = structure_passes >= 4  # Model learned structure at this stage
+                structure_failing = structure_passes < 2     # Model genuinely failing
+
                 if stall_count >= stall_limit and min_steps_met:
                     if curr_stage < target_stage:
-                        # NOT at target stage yet → Force promote to next stage
-                        if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
-                            curriculum_state['current_stage'] += 1
-                            curriculum_state['stall_count'] = 0  # Reset stall count
-                            curriculum_state['promo_pass_window'] = []  # Reset window
-                            new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+                        # NOT at target stage yet
+                        if structure_competent:
+                            # Structure OK but scale/trace failing → FORCE PROMOTE (scale-stall)
+                            if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                                curriculum_state['current_stage'] += 1
+                                curriculum_state['stall_count'] = 0  # Reset stall count
+                                curriculum_state['promo_pass_window'] = []  # Reset window
+                                curriculum_state['structure_pass_window'] = []  # Reset structure window
+                                new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
 
-                            # Reset stage-local tracking
-                            curriculum_state['steps_in_stage'] = 0
-                            curriculum_state['cap_band_loss_sum'] = 0.0
-                            curriculum_state['cap_band_loss_count'] = 0
-                            curriculum_state['cap_band_loss_history'] = []
-                            curriculum_state['best_cap_band_loss'] = float('inf')
-                            curriculum_state['loss_no_improve_count'] = 0
-                            curriculum_state['metrics_pass_history'] = []
+                                # Reset stage-local tracking
+                                curriculum_state['steps_in_stage'] = 0
+                                curriculum_state['cap_band_loss_sum'] = 0.0
+                                curriculum_state['cap_band_loss_count'] = 0
+                                curriculum_state['cap_band_loss_history'] = []
+                                curriculum_state['best_cap_band_loss'] = float('inf')
+                                curriculum_state['loss_no_improve_count'] = 0
+                                curriculum_state['metrics_pass_history'] = []
 
+                                if fabric is None or fabric.is_global_zero:
+                                    print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage-1} → FORCE PROMOTING to stage {curriculum_state['current_stage']}")
+                                    print(f"  stall_count was {stall_count} >= stall_limit={stall_limit}")
+                                    print(f"  Structure competent: {structure_passes}/6 passes (≥4 required) ✓")
+                                    print(f"  New σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f}")
+                                    print(f"  Model learned structure but scale lagging - promoting to learn at higher σ")
+
+                        elif structure_failing and min_epochs_met:
+                            # Structure also failing → genuine failure, stop
                             if fabric is None or fabric.is_global_zero:
-                                print(f"\n[CURRICULUM] ⚠️ STALL DETECTED at stage {curr_stage-1} → FORCE PROMOTING to stage {curriculum_state['current_stage']}")
-                                print(f"  stall_count was {stall_count} >= stall_limit={stall_limit}")
-                                print(f"  New σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f}")
-                                print(f"  Model MUST see all sigma stages - continuing training!")
+                                print(f"\n[THREE-GATE-STOP] Genuine failure at stage {curr_stage}")
+                                print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
+                                print(f"  Structure failing: {structure_passes}/6 passes (<2 required)")
+                                print(f"  Model cannot learn structure at this stage - stopping")
+                            should_stop = True
+                            early_stopped = True
+                            early_stop_epoch = epoch + 1
+
+                        # else: structure borderline (2-3 passes), continue training
 
                     elif min_epochs_met:
                         # AT target stage AND min_epochs met → can stop due to stall
@@ -10752,10 +10828,18 @@ def train_stageC_diffusion_generator(
                         elif not min_steps_met:
                             print(f"  → Training continues: min steps per stage not met")
 
-                        # Log stall status
+                        # Log stall status with structure competence info
                         if stall_count >= stall_limit:
                             if curr_stage < target_stage:
-                                print(f"  ⚠️ Stall count {stall_count}>={stall_limit} - will FORCE PROMOTE when min_steps met")
+                                if structure_competent:
+                                    print(f"  ⚠️ SCALE-STALL ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Will FORCE PROMOTE to stage {curr_stage+1} when min_steps met")
+                                elif structure_failing:
+                                    print(f"  ⚠️ GENUINE FAILURE ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Will STOP when min_epochs={min_epochs_curriculum} met")
+                                else:
+                                    print(f"  ⚠️ BORDERLINE ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Training continues until structure is competent (≥4) or failing (<2)")
                             elif not min_epochs_met:
                                 print(f"  ⚠️ Stall at target stage ({stall_count}>={stall_limit}) but min_epochs={min_epochs_curriculum} not met")
                                 print(f"  → Training continues until epoch {min_epochs_curriculum}")
