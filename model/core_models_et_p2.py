@@ -2844,6 +2844,8 @@ def train_stageC_diffusion_generator(
         'min_steps_per_stage': 1000,  # Minimum steps before promotion/stopping allowed
                                       # For 6000 samples / batch_size=32 ≈ 188 steps/epoch
                                       # 1000 steps ≈ 5.3 epochs minimum per stage
+        'min_steps_at_target': 2000,  # Minimum steps at TARGET stage before "stall at target" can stop
+                                      # ~10.6 epochs at target stage to give it a fair chance
         'min_epochs': curriculum_min_epochs,  # Absolute minimum epochs before any stopping (CLI arg, default 100)
 
         # Gate B: Metrics stability tracking (K consecutive passes)
@@ -10281,6 +10283,7 @@ def train_stageC_diffusion_generator(
 
                 # Safety floor: never promote if scale_r < 0.60 (real collapse)
                 scale_collapsed = scale_r_promo < 0.60
+                curriculum_state['scale_collapsed'] = scale_collapsed  # Store for use in stall handling
 
                 # Promote if enough passes in window AND scale not collapsed
                 promoted = False
@@ -10770,11 +10773,15 @@ def train_stageC_diffusion_generator(
 
                 # === STOP CONDITION 2: Curriculum stall handling ===
                 # Only checked if success condition not met
+                # Get scale_collapsed from curriculum state (computed during promotion check)
+                scale_collapsed = curriculum_state.get('scale_collapsed', False)
+
                 elif stall_count >= stall_limit and min_steps_met:
                     if curr_stage < target_stage:
                         # NOT at target stage yet
-                        if structure_competent:
-                            # Structure OK but scale/trace failing → FORCE PROMOTE (scale-stall)
+                        if structure_competent and not scale_collapsed:
+                            # Structure OK AND scale not collapsed → FORCE PROMOTE (scale-stall)
+                            # Note: we check scale_collapsed to avoid promoting truly collapsed models
                             if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
                                 curriculum_state['current_stage'] += 1
                                 curriculum_state['stall_count'] = 0  # Reset stall count
@@ -10795,8 +10802,17 @@ def train_stageC_diffusion_generator(
                                     print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage-1} → FORCE PROMOTING to stage {curriculum_state['current_stage']}")
                                     print(f"  stall_count was {stall_count} >= stall_limit={stall_limit}")
                                     print(f"  Structure competent: {structure_passes}/6 passes (≥4 required) ✓")
+                                    print(f"  Scale not collapsed: scale_r >= 0.60 ✓")
                                     print(f"  New σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f}")
                                     print(f"  Model learned structure but scale lagging - promoting to learn at higher σ")
+
+                        elif structure_competent and scale_collapsed:
+                            # Structure OK but scale collapsed → don't force promote, continue training
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[CURRICULUM] ⚠️ STALL with collapsed scale at stage {curr_stage}")
+                                print(f"  Structure competent: {structure_passes}/6 passes ✓")
+                                print(f"  But scale_r < 0.60 (collapsed) - cannot force promote")
+                                print(f"  → Training continues to try recovering scale")
 
                         elif structure_failing and min_epochs_met:
                             # Structure also failing → genuine failure, stop
@@ -10811,19 +10827,31 @@ def train_stageC_diffusion_generator(
 
                         # else: structure borderline (2-3 passes), continue training
 
-                    elif min_epochs_met:
-                        # AT target stage AND min_epochs met → can stop due to stall
-                        # (only reached if success condition above wasn't met)
-                        if fabric is None or fabric.is_global_zero:
-                            print(f"\n[THREE-GATE-STOP] Stall limit reached at TARGET stage {curr_stage}")
-                            print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
-                            print(f"  Gate A satisfied: stage {curr_stage} >= target {target_stage}")
-                            print(f"  Gate B (5/6 window): {passes_in_window}/6 (need 5) ✗")
-                            print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
-                            print(f"  Stopping training (stall at target stage)")
-                        should_stop = True
-                        early_stopped = True
-                        early_stop_epoch = epoch + 1
+                    else:
+                        # AT target stage - check minimum dwell before allowing stall stop
+                        min_steps_at_target = curriculum_state.get('min_steps_at_target', 2000)
+                        target_dwell_met = steps_in_stage >= min_steps_at_target
+
+                        if min_epochs_met and target_dwell_met:
+                            # AT target stage AND min_epochs met AND minimum dwell at target met
+                            # → can stop due to stall (only reached if success condition above wasn't met)
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[THREE-GATE-STOP] Stall limit reached at TARGET stage {curr_stage}")
+                                print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
+                                print(f"  Gate A satisfied: stage {curr_stage} >= target {target_stage}")
+                                print(f"  Gate B (5/6 window): {passes_in_window}/6 (need 5) ✗")
+                                print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
+                                print(f"  Min steps at target: {steps_in_stage} >= {min_steps_at_target} ✓")
+                                print(f"  Stopping training (stall at target stage)")
+                            should_stop = True
+                            early_stopped = True
+                            early_stop_epoch = epoch + 1
+                        elif not target_dwell_met:
+                            # Stalled at target but haven't dwelled long enough
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[CURRICULUM] ⚠️ STALL at target stage {curr_stage} but minimum dwell not met")
+                                print(f"  Steps at target: {steps_in_stage}/{min_steps_at_target}")
+                                print(f"  → Training continues to give target stage a fair chance")
 
                 # === NO STOP: Log gate status ===
                 else:
