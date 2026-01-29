@@ -2875,7 +2875,7 @@ def train_stageC_diffusion_generator(
         # Conditioning strength knob (ChatGPT fix for scale collapse at moderate σ)
         # Normalizes H to unit RMS then scales by α
         # This controls conditioning magnitude without changing model architecture
-        'cond_alpha': 0.1,            # Fixed conditioning strength (start conservative)
+        'cond_alpha': 0.5,            # ChatGPT: α=0.1 too small, H increases Fx at high σ
     }
 
     slide_d15_medians = []
@@ -3546,13 +3546,15 @@ def train_stageC_diffusion_generator(
     #     'shape_spec': 0.0,
     # }
 
+    # ChatGPT R2: Scale-first phase - disable conflicting losses to let scale recover
+    # Keep ONLY: score + L_fx_hi + L_out_scale + generator losses
     WEIGHTS = {
-        'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
-        'gram': 2.0,           # was 1.0
-        'gram_scale': 2.0,     # was 1.0
-        'out_scale': 2.0,
-        'gram_learn': 2.0,
-        'knn_scale': 0.2,     # NEW: kNN distance scale calibration
+        'score': 16.0,         # KEEP: main denoising loss
+        'gram': 0.0,           # OFF: ChatGPT R2 - potential conflict
+        'gram_scale': 0.0,     # OFF: ChatGPT R2 - potential conflict
+        'out_scale': 2.0,      # KEEP: learned branch scale calibration
+        'gram_learn': 0.0,     # OFF: ChatGPT R2 - potential conflict
+        'knn_scale': 0.0,      # OFF: ChatGPT R2 - potential conflict
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -3560,19 +3562,19 @@ def train_stageC_diffusion_generator(
         'ordinal_sc': 0.0,
         'st_dist': 0.0,
         'edm_tail': 0.0,
-        'gen_align': 10.0,     # was 0.5 - will use new gen losses in Patch 8
-        'gen_scale': 10.0,     # NEW: add this key for Patch 8
+        'gen_align': 10.0,     # KEEP: generator alignment
+        'gen_scale': 10.0,     # KEEP: generator scale
         'dim': 0.0,
         'triangle': 0.0,
         'radial': 0.0,
-        'knn_nca': 2.0,
+        'knn_nca': 0.0,        # OFF: ChatGPT R2 - potential conflict
         'repel': 0.0,
         'shape': 0.0,
-        'edge': 4.0,           # was 2.0
+        'edge': 0.0,           # OFF: ChatGPT R2 - potential conflict
         'topo': 0.0,
         'shape_spec': 0.0,
-        'subspace': 0.5,       # NEW: add this key for Patch 7
-        'ctx_edge': 0.05,
+        'subspace': 0.0,       # OFF: ChatGPT R2 - potential conflict
+        'ctx_edge': 0.0,       # OFF: ChatGPT R2 - potential conflict
         # ========== OVERLAP CONSISTENCY LOSSES (Candidate 1) ==========
         'ov_shape': 0.0,       # Weight set dynamically via overlap_loss_weight_shape
         'ov_scale': 0.0,       # Weight set dynamically via overlap_loss_weight_scale
@@ -4128,7 +4130,7 @@ def train_stageC_diffusion_generator(
     USE_AUTOBALANCE = False
 
     #self conditioning probability
-    p_sc = 0.5 #prob of using self-conditioning in training
+    p_sc = 0.0  # ChatGPT R4: disable self-cond to break potential shrink feedback loop
 
     # Early stopping state
     early_stop_best = float('inf')
