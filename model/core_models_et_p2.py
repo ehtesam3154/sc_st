@@ -4178,13 +4178,19 @@ def train_stageC_diffusion_generator(
         ramp_steps = curriculum_state.get('ramp_steps', 300)
 
         # Ramp is active if ramp_start_step is set and not yet complete
+        # Also need valid ramp_prev_cap and ramp_target_cap
         if ramp_start is not None:
+            prev_cap = curriculum_state.get('ramp_prev_cap')
+            target_cap = curriculum_state.get('ramp_target_cap')
+
+            # If caps are None (e.g., old checkpoint), treat as no ramp
+            if prev_cap is None or target_cap is None:
+                return sigma_cap_target, sigma_cap_target, False, 1.0
+
             steps_since_ramp = global_step - ramp_start
             if steps_since_ramp < ramp_steps:
                 # Ramp in progress
                 t = steps_since_ramp / ramp_steps
-                prev_cap = curriculum_state.get('ramp_prev_cap', sigma_cap_target)
-                target_cap = curriculum_state.get('ramp_target_cap', sigma_cap_target)
                 sigma_cap_eff = prev_cap + t * (target_cap - prev_cap)
                 return sigma_cap_eff, sigma_cap_target, True, t
 
