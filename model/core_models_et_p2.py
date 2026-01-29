@@ -10268,19 +10268,23 @@ def train_stageC_diffusion_generator(
                 structure_passes_in_window = sum(structure_window)
                 required_passes = curriculum_state['promotion_threshold']  # 5
 
-                # Update stall_count: stall if <2 full passes in last 6
-                # But also track structure competence to decide stall behavior later
-                if len(window) >= window_size and passes_in_window < 2:
-                    curriculum_state['stall_count'] += 1
-                elif all_pass:
-                    curriculum_state['stall_count'] = 0
+                # Update stall_count based on WINDOW, not single-epoch events
+                # This avoids inconsistency between "5/6 pass" promotion and stall detection
+                if len(window) >= window_size:
+                    if passes_in_window >= 2:
+                        curriculum_state['stall_count'] = 0  # Window shows progress
+                    else:
+                        curriculum_state['stall_count'] += 1  # Window shows stall (<2/6)
 
                 # Store structure passes count for stall decision
                 curriculum_state['structure_passes_in_window'] = structure_passes_in_window
 
-                # Promote if enough passes in window
+                # Safety floor: never promote if scale_r < 0.60 (real collapse)
+                scale_collapsed = scale_r_promo < 0.60
+
+                # Promote if enough passes in window AND scale not collapsed
                 promoted = False
-                if passes_in_window >= required_passes and len(window) >= required_passes:
+                if passes_in_window >= required_passes and len(window) >= required_passes and not scale_collapsed:
                     if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
                         curriculum_state['current_stage'] += 1
                         curriculum_state['promo_pass_window'] = []  # Reset window
@@ -10724,10 +10728,11 @@ def train_stageC_diffusion_generator(
                 # Gate A: Stage target reached
                 gate_a = (curr_stage >= target_stage)
 
-                # Gate B: Metrics stable for K consecutive evals
-                K = curriculum_state.get('metrics_history_K', 5)
-                recent_passes = curriculum_state.get('metrics_pass_history', [])
-                gate_b = len(recent_passes) >= K and all(recent_passes[-K:])
+                # Gate B: Metrics stable - use WINDOWED 5/6, not 5 consecutive
+                # This is more forgiving of high-σ fluctuations at target stage
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                passes_in_window = sum(promo_window) if promo_window else 0
+                gate_b = (len(promo_window) >= 6 and passes_in_window >= 5)  # 5/6 windowed
 
                 # Gate C: Cap-band loss plateau
                 loss_plateau_patience = curriculum_state.get('loss_plateau_patience', 6)
@@ -10742,16 +10747,30 @@ def train_stageC_diffusion_generator(
                 stall_count = curriculum_state.get('stall_count', 0)
                 stall_limit = curriculum_state.get('stall_limit', 6)
 
-                # === STOP CONDITION 1: Curriculum stall ===
-                # Stall behavior depends on structure competence (Jacc passes)
-                # - structure_passes >= 4/6 → FORCE PROMOTE (scale-stall, model learned structure)
-                # - structure_passes < 2/6 → STOP (genuine failure, model can't learn)
-                # - Otherwise → continue training
+                # Structure competence info for stall handling
                 structure_passes = curriculum_state.get('structure_passes_in_window', 0)
                 structure_competent = structure_passes >= 4  # Model learned structure at this stage
                 structure_failing = structure_passes < 2     # Model genuinely failing
 
-                if stall_count >= stall_limit and min_steps_met:
+                # === STOP CONDITION 1: Three-gate SUCCESS (check FIRST!) ===
+                # At target stage, success stop takes priority over stall stop
+                # This prevents stopping for "stall" when actually converged
+                if gate_a and gate_b and gate_c and min_epochs_met and min_steps_met:
+                    if fabric is None or fabric.is_global_zero:
+                        print(f"\n[THREE-GATE-STOP] All gates passed! 🎉")
+                        print(f"  Gate A (stage >= target): {curr_stage} >= {target_stage} ✓")
+                        print(f"  Gate B (metrics 5/6 window): {passes_in_window}/6 passes ✓")
+                        print(f"  Gate C (loss plateau): no_improve={loss_no_improve} >= {loss_plateau_patience} ✓")
+                        print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
+                        print(f"  Min steps: {steps_in_stage} >= {min_steps_per_stage} ✓")
+                        print(f"  Stopping training (convergence success)")
+                    should_stop = True
+                    early_stopped = True
+                    early_stop_epoch = epoch + 1
+
+                # === STOP CONDITION 2: Curriculum stall handling ===
+                # Only checked if success condition not met
+                elif stall_count >= stall_limit and min_steps_met:
                     if curr_stage < target_stage:
                         # NOT at target stage yet
                         if structure_competent:
@@ -10794,30 +10813,17 @@ def train_stageC_diffusion_generator(
 
                     elif min_epochs_met:
                         # AT target stage AND min_epochs met → can stop due to stall
+                        # (only reached if success condition above wasn't met)
                         if fabric is None or fabric.is_global_zero:
                             print(f"\n[THREE-GATE-STOP] Stall limit reached at TARGET stage {curr_stage}")
                             print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
                             print(f"  Gate A satisfied: stage {curr_stage} >= target {target_stage}")
+                            print(f"  Gate B (5/6 window): {passes_in_window}/6 (need 5) ✗")
                             print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
                             print(f"  Stopping training (stall at target stage)")
                         should_stop = True
                         early_stopped = True
                         early_stop_epoch = epoch + 1
-
-                # === STOP CONDITION 2: Three-gate success ===
-                # All gates pass + prerequisites met
-                elif gate_a and gate_b and gate_c and min_epochs_met and min_steps_met:
-                    if fabric is None or fabric.is_global_zero:
-                        print(f"\n[THREE-GATE-STOP] All gates passed! 🎉")
-                        print(f"  Gate A (stage >= target): {curr_stage} >= {target_stage} ✓")
-                        print(f"  Gate B (metrics stable): {sum(recent_passes[-K:])}/{K} passes ✓")
-                        print(f"  Gate C (loss plateau): no_improve={loss_no_improve} >= {loss_plateau_patience} ✓")
-                        print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
-                        print(f"  Min steps: {steps_in_stage} >= {min_steps_per_stage} ✓")
-                        print(f"  Stopping training (convergence success)")
-                    should_stop = True
-                    early_stopped = True
-                    early_stop_epoch = epoch + 1
 
                 # === NO STOP: Log gate status ===
                 else:
@@ -10829,14 +10835,14 @@ def train_stageC_diffusion_generator(
                     if (fabric is None or fabric.is_global_zero) and (epoch + 1) % 5 == 0:
                         print(f"\n[THREE-GATE] Epoch {epoch+1} Gate Status:")
                         print(f"  Gate A (stage >= {target_stage}): {curr_stage} {'✓' if gate_a else '✗'}")
-                        print(f"  Gate B (metrics K={K}): {sum(recent_passes[-K:]) if recent_passes else 0}/{K} {'✓' if gate_b else '✗'}")
+                        print(f"  Gate B (5/6 window): {passes_in_window}/6 {'✓' if gate_b else '✗'}")
                         print(f"  Gate C (loss plateau): {loss_no_improve}/{loss_plateau_patience} {'✓' if gate_c else '✗'}")
                         print(f"  Min epochs: {epoch+1}/{min_epochs_curriculum} {'✓' if min_epochs_met else '✗'}")
                         print(f"  Min steps: {steps_in_stage}/{min_steps_per_stage} {'✓' if min_steps_met else '✗'}")
                         if not gate_a:
                             print(f"  → Training continues: need to reach target stage {target_stage}")
                         elif not gate_b:
-                            print(f"  → Training continues: need {K} consecutive metric passes")
+                            print(f"  → Training continues: need 5/6 passes in window")
                         elif not gate_c:
                             print(f"  → Training continues: loss still improving")
                         elif not min_epochs_met:
