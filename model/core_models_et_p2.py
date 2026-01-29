@@ -10470,7 +10470,8 @@ def train_stageC_diffusion_generator(
                 # Store in history
                 curriculum_state['eval_history'].append({
                     'epoch': epoch,
-                    'sigma_cap': sigma_cap_curr,
+                    'sigma_cap': sigma_cap_eff,  # Store effective cap (what we actually trained on)
+                    'sigma_cap_target': sigma_cap_target,  # Also store target for reference
                     'scale_r': scale_r_promo,
                     'trace_r': trace_r_promo,
                     'jacc': jacc_promo,
