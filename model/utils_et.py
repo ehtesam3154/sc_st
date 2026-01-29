@@ -1003,36 +1003,86 @@ def gram_from_coords(y_hat: torch.Tensor) -> torch.Tensor:
 def factor_from_gram(G: torch.Tensor, D_latent: int) -> torch.Tensor:
     """
     Factor Gram matrix to get V such that G ≈ V V^T.
-    
+
     Args:
         G: (n, n) Gram matrix (PSD)
         D_latent: target latent dimension
-        
+
     Returns:
-        V: (n, D_latent) factor matrix
+        V: (n, D_latent) factor matrix with CANONICALIZED gauge
+
+    Note: Eigenvectors are only defined up to sign (and rotations within
+    degenerate eigenspaces). This function applies deterministic canonicalization
+    to ensure V_target is stable across calls, which is critical for ε-prediction
+    training where inconsistent V_target causes inconsistent ε labels.
     """
+    n = G.shape[0]
+    device = G.device
+    dtype = G.dtype
+
     # Eigendecomposition
-    # eigvals, eigvecs = torch.linalg.eigh(G)  # Ascending order
     eigvals, eigvecs = safe_eigh(G, return_vecs=True)
     eigvals = eigvals.flip(0).clamp(min=0)  # Descending, non-negative
     eigvecs = eigvecs.flip(1)
-    
+
     # Take top D_latent eigenpairs
     D = min(D_latent, eigvals.shape[0])
     eigvals_top = eigvals[:D]
     eigvecs_top = eigvecs[:, :D]
-    
+
+    # ========== CANONICALIZATION (ChatGPT fix for ε-training gauge ambiguity) ==========
+    # Without this, V_target can flip/rotate between batches, making ε labels inconsistent.
+
+    if D > 0 and n > 0:
+        # --- FIX 2: BASIS CANONICALIZATION (handles rotations in near-degenerate eigenspaces) ---
+        # If eigenvalues are close, the eigensolver can return any orthonormal basis spanning
+        # that subspace. We align to fixed anchor vectors derived only from indices.
+        # This makes the basis deterministic even under rotations within a degenerate block.
+
+        # Fixed anchor matrix R (n x D) from deterministic index functions
+        t = torch.linspace(-1.0, 1.0, steps=n, device=device, dtype=torch.float32).view(n, 1)
+        R_cols = [t]
+        for p in range(2, D + 1):
+            R_cols.append(t ** p)
+        R = torch.cat(R_cols, dim=1)  # (n, D) in float32
+
+        # Center/normalize R columns (avoid trivial scaling issues)
+        R = R - R.mean(dim=0, keepdim=True)
+        R = R / (R.norm(dim=0, keepdim=True).clamp(min=1e-8))
+
+        # Align eigvec basis to anchors via orthogonal Procrustes in the eigenspace
+        U = eigvecs_top.to(torch.float32)  # (n, D)
+        A = U.T @ R  # (D, D)
+
+        # Q = argmin_Q ||UQ - R||, Q orthogonal: Q = UV^T from SVD(A)
+        try:
+            Ua, _, Vha = torch.linalg.svd(A, full_matrices=False)
+            Q = Ua @ Vha  # (D, D)
+            eigvecs_top = (U @ Q).to(dtype)
+        except RuntimeError:
+            # SVD can fail in rare edge cases; fall back to sign-only fix
+            eigvecs_top = eigvecs_top  # Keep as-is, sign fix below will still help
+
+        # --- FIX 1: SIGN CANONICALIZATION (minimal, deterministic) ---
+        # For each latent dim, pick the index with largest magnitude and force it positive.
+        # This removes the ± sign flip instability across calls.
+        abs_max_idx = eigvecs_top.abs().argmax(dim=0)  # (D,)
+        col_indices = torch.arange(D, device=device)
+        col_vals = eigvecs_top[abs_max_idx, col_indices]  # (D,)
+        sign = torch.sign(col_vals)
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)  # Handle exact zeros
+        eigvecs_top = eigvecs_top * sign.view(1, D)
+
+    # ==================================================================================
+
     # V = U @ sqrt(Λ)
     V = eigvecs_top @ torch.diag(torch.sqrt(eigvals_top))
-    
+
     # Pad with zeros if rank < D_latent
     if D < D_latent:
-        padding = torch.zeros(V.shape[0], D_latent - D, device=V.device)
+        padding = torch.zeros(V.shape[0], D_latent - D, device=V.device, dtype=V.dtype)
         V = torch.cat([V, padding], dim=1)
-    
-    # Center rows (translation neutrality)
-    # V = V - V.mean(dim=0, keepdim=True)
-    
+
     return V
 
 
