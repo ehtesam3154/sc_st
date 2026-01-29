@@ -4417,6 +4417,38 @@ def train_stageC_diffusion_generator(
                         V_target[i, :n_valid] = V_i
                     # --------------------------------------------------------
 
+                    # ========== [GRAM-CANON] DEBUG: Verify gauge canonicalization ==========
+                    # ChatGPT requested: check that anchor signs are stable (should all be +1)
+                    if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            # Check first valid sample in batch
+                            for i in range(batch_size_real):
+                                n_valid = int(mask[i].sum().item())
+                                if n_valid > 1:
+                                    V_check = V_target[i, :n_valid]  # (n_valid, D_latent)
+                                    D_check = min(D_latent, n_valid)
+
+                                    # Compute anchor signs (same logic as factor_from_gram)
+                                    abs_max_idx = V_check[:, :D_check].abs().argmax(dim=0)  # (D,)
+                                    col_indices = torch.arange(D_check, device=V_check.device)
+                                    anchor_vals = V_check[abs_max_idx, col_indices]  # (D,)
+
+                                    num_pos = (anchor_vals > 0).sum().item()
+                                    num_neg = (anchor_vals < 0).sum().item()
+                                    num_zero = (anchor_vals == 0).sum().item()
+
+                                    # Reproducibility check: factor same G twice
+                                    G_i = G_target[i, :n_valid, :n_valid].float()
+                                    V_rep1 = uet.factor_from_gram(G_i, D_latent)
+                                    V_rep2 = uet.factor_from_gram(G_i, D_latent)
+                                    repeat_mse = (V_rep1 - V_rep2).pow(2).mean().item()
+
+                                    print(f"  [GRAM-CANON] Anchor signs: +{num_pos} -{num_neg} 0:{num_zero} "
+                                          f"(expect all + after canonicalization)")
+                                    print(f"  [GRAM-CANON] V_target repeat MSE: {repeat_mse:.2e} "
+                                          f"(should be ~0 for reproducibility)")
+                                    break  # Only check first valid sample
+
                     # ========== PROBE BATCH CAPTURE (once, rank-0 only) ==========
                     # Must be AFTER V_target canonicalization so we capture the same
                     # targets the model is trained on
