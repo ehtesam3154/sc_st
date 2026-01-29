@@ -3676,6 +3676,57 @@ def train_stageC_diffusion_generator(
             print(f"[RESUME] Loaded curriculum_state: stage={curriculum_state['current_stage']}, "
                   f"steps_in_stage={curriculum_state.get('steps_in_stage', 0)}")
 
+            # ============================================================
+            # MIGRATION: Add new keys if resuming from old checkpoint
+            # ============================================================
+            # Tiered scale_r thresholds (new)
+            if 'scale_r_min_by_mult' not in curriculum_state:
+                curriculum_state['scale_r_min_by_mult'] = {
+                    0.3: 0.88, 0.9: 0.84, 2.3: 0.75, 4.0: 0.73,
+                    7.0: 0.72, 14.0: 0.68, 17.0: 0.65,
+                }
+                curriculum_state['scale_r_min_default'] = 0.65
+                print("[RESUME-MIGRATE] Added scale_r_min_by_mult (tiered thresholds)")
+
+            # Tiered trace_r thresholds (new)
+            if 'trace_r_min_by_mult' not in curriculum_state:
+                curriculum_state['trace_r_min_by_mult'] = {
+                    0.3: 0.74, 0.9: 0.67, 2.3: 0.53, 4.0: 0.51,
+                    7.0: 0.49, 14.0: 0.44, 17.0: 0.40,
+                }
+                curriculum_state['trace_r_min_default'] = 0.40
+                print("[RESUME-MIGRATE] Added trace_r_min_by_mult (tiered thresholds)")
+
+            # Final thresholds (new)
+            if 'scale_r_min_final' not in curriculum_state:
+                curriculum_state['scale_r_min_final'] = 0.80
+                curriculum_state['trace_r_min_final'] = 0.60
+                print("[RESUME-MIGRATE] Added scale_r_min_final/trace_r_min_final (0.80/0.60)")
+
+            # Structure pass window (new)
+            if 'structure_pass_window' not in curriculum_state:
+                curriculum_state['structure_pass_window'] = []
+                curriculum_state['structure_passes_in_window'] = 0
+                print("[RESUME-MIGRATE] Added structure_pass_window tracking")
+
+            # Min steps at target (new)
+            if 'min_steps_at_target' not in curriculum_state:
+                curriculum_state['min_steps_at_target'] = 2000
+                print("[RESUME-MIGRATE] Added min_steps_at_target=2000")
+
+            # Scale collapsed flag (new)
+            if 'scale_collapsed' not in curriculum_state:
+                curriculum_state['scale_collapsed'] = False
+                print("[RESUME-MIGRATE] Added scale_collapsed flag")
+
+            # Remove old flat thresholds if present (migration from old format)
+            if 'scale_r_min' in curriculum_state and 'scale_r_min_by_mult' in curriculum_state:
+                del curriculum_state['scale_r_min']
+                print("[RESUME-MIGRATE] Removed old flat scale_r_min (now using tiered)")
+            if 'trace_r_min' in curriculum_state and 'trace_r_min_by_mult' in curriculum_state:
+                del curriculum_state['trace_r_min']
+                print("[RESUME-MIGRATE] Removed old flat trace_r_min (now using tiered)")
+
         print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
 
 
