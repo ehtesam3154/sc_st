@@ -706,7 +706,7 @@ class GEMSModel:
                                and rebuild context_encoder if needed
         """
         import copy
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # ========== AUTO-DETECT ANCHOR MODE ==========
         if auto_detect_anchor:
@@ -735,14 +735,26 @@ class GEMSModel:
                 
                 print(f"[ANCHOR-LOAD] Rebuilt context_encoder: input_dim={self.context_encoder.input_dim}")
         
-        # Now load state dicts
+        # Now load state dicts (with safety checks for missing keys)
         if 'encoder' in checkpoint:
             self.encoder.load_state_dict(checkpoint['encoder'])
         else:
-            print("[LOAD] WARNING: encoder not found in checkpoint; load it separately.")
-        self.context_encoder.load_state_dict(checkpoint['context_encoder'])
-        self.generator.load_state_dict(checkpoint['generator'])
-        self.score_net.load_state_dict(checkpoint['score_net'])
+            print("[LOAD] WARNING: encoder not found in checkpoint; keeping current weights.")
+
+        if 'context_encoder' in checkpoint:
+            self.context_encoder.load_state_dict(checkpoint['context_encoder'])
+        else:
+            print("[LOAD] WARNING: context_encoder not found in checkpoint; keeping current weights.")
+
+        if 'generator' in checkpoint:
+            self.generator.load_state_dict(checkpoint['generator'])
+        else:
+            print("[LOAD] WARNING: generator not found in checkpoint; keeping current weights.")
+
+        if 'score_net' in checkpoint:
+            self.score_net.load_state_dict(checkpoint['score_net'])
+        else:
+            print("[LOAD] WARNING: score_net not found in checkpoint; keeping current weights.")
         
         if 'sigma_data' in checkpoint:
             self.sigma_data = checkpoint['sigma_data']

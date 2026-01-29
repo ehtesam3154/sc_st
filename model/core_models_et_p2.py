@@ -3713,11 +3713,13 @@ def train_stageC_diffusion_generator(
             if updated_keys:
                 print(f"[RESUME-MIGRATE] Updated config keys from code: {updated_keys}")
                 # Show current stage threshold for clarity
-                curr_stage = curriculum_state['current_stage']
-                curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
-                scale_thresh = curriculum_state['scale_r_min_by_mult'].get(curr_mult,
-                               curriculum_state['scale_r_min_default'])
-                print(f"  Current stage {curr_stage} (mult={curr_mult}): scale_r threshold = {scale_thresh}")
+                curr_stage = curriculum_state.get('current_stage', 0)
+                sigma_mults = curriculum_state.get('sigma_cap_mults', [0.3])
+                if curr_stage < len(sigma_mults):
+                    curr_mult = sigma_mults[curr_stage]
+                    scale_thresh = curriculum_state['scale_r_min_by_mult'].get(curr_mult,
+                                   curriculum_state['scale_r_min_default'])
+                    print(f"  Current stage {curr_stage} (mult={curr_mult}): scale_r threshold = {scale_thresh}")
 
             # Reset stall_count if thresholds changed (old stalls based on wrong thresholds)
             if 'scale_r_min_by_mult' in updated_keys or 'trace_r_min_by_mult' in updated_keys:
