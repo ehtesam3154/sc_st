@@ -4504,6 +4504,7 @@ def train_stageC_diffusion_generator(
                 if use_edm:
                     # [CURRICULUM] Phase 3: Compute current sigma_cap using helper
                     curr_stage = curriculum_state['current_stage']
+                    curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
                     sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
                         curriculum_state, global_step, sigma_data)
 
