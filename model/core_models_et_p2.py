@@ -4999,21 +4999,30 @@ def train_stageC_diffusion_generator(
                         # --- DEBUG 5: Check noise across sigma bins ---
                         sigma_for_debug = sigma_t.view(-1) if use_edm else torch.exp(4.0 * t_norm)
                         debug_samples = get_one_sample_per_sigma_bin(sigma_for_debug)
-                        
+
                         for bin_name, b_idx in debug_samples[:2]:  # Check 2 bins max
                             m_b = mask_orig[b_idx].bool()
                             if m_b.sum() > 5:
-                                noise_actual = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
+                                # FIX: Use correct baseline for residual diffusion
+                                # In residual mode, V_t = R_target + σε, so noise = V_t - R_target
+                                # In standard mode, V_t = V_target + σε, so noise = V_t - V_target
+                                if use_resid and R_target is not None:
+                                    clean_baseline = R_target[b_idx]
+                                else:
+                                    clean_baseline = V_target_orig[b_idx]
+
+                                noise_actual = (V_t[b_idx] - clean_baseline)[m_b]
                                 sigma_val = sigma_for_debug[b_idx].item()
                                 noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
                                 diff = (noise_actual - noise_expected).abs().max().item()
-                                
-                                noise_b = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
+
+                                noise_b = (V_t[b_idx] - clean_baseline)[m_b]
                                 noise_std = noise_b.std(dim=0).mean().item()
                                 noise_mean_norm = noise_b.mean(dim=0).norm().item()
                                 sig_b = float(sigma_t_orig[b_idx].view(-1)[0])
 
-                                print(f"[NOISE CHECK] bin={bin_name}, σ={sigma_val:.3f}, sample={b_idx}")
+                                mode_str = "RESID" if (use_resid and R_target is not None) else "STD"
+                                print(f"[NOISE CHECK] bin={bin_name}, σ={sigma_val:.3f}, sample={b_idx}, mode={mode_str}")
 
                                 print(f"\n[NOISE] step={global_step}")
                                 print(f"  equation_diff: {diff:.6f}")
