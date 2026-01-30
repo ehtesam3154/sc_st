@@ -88,6 +88,8 @@ def parse_args():
                         help='Minimum epochs before three-gate stopping is allowed')
     parser.add_argument('--curriculum_early_stop', action=argparse.BooleanOptionalAction, default=True,
                         help='Enable three-gate curriculum-aware early stopping (default: enabled)')
+    parser.add_argument('--use_legacy_curriculum', action=argparse.BooleanOptionalAction, default=False,
+                        help='Use legacy 7-stage curriculum [0.3,0.9,...,17.0] instead of new 3-stage [1,2,3]')
 
     parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
                         help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
@@ -645,6 +647,7 @@ def main(args=None):
         curriculum_target_stage=args.curriculum_target_stage,
         curriculum_min_epochs=args.curriculum_min_epochs,
         curriculum_early_stop=args.curriculum_early_stop,
+        use_legacy_curriculum=args.use_legacy_curriculum,
         # ========== NEW: Context augmentation ==========
         z_noise_std=0.0,       # No noise for Phase 1 (focus on clean geometry)
         z_dropout_rate=0.0,    # No dropout for Phase 1

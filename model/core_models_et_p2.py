@@ -2698,6 +2698,7 @@ def train_stageC_diffusion_generator(
     curriculum_target_stage: int = 6,
     curriculum_min_epochs: int = 100,
     curriculum_early_stop: bool = True,
+    use_legacy_curriculum: bool = False,  # True = 7-stage [0.3,...,17.0], False = 3-stage [1,2,3]
     # NEW: EDM parameters
     P_mean: float = -1.2,          # Log-normal mean for sigma sampling
     P_std: float = 1.2,            # Log-normal std for sigma sampling
@@ -2774,61 +2775,52 @@ def train_stageC_diffusion_generator(
     # For σ_data=0.175: [0.05, 0.16, 0.40, 0.70, 1.23, 2.45, 2.98]
     # =========================================================================
     curriculum_state = {
-        'sigma_cap_mults': [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0],  # Multiples of σ_data
-        'current_stage': 0,           # Start at stage 0 (0.3 * σ_data)
+        'sigma_cap_mults': [1.0, 2.0, 3.0],  # 3-stage curriculum: multiples of σ_0
+        'current_stage': 2,           # Start at S2 (highest), demote on failure
+        'sigma_cap_safe': 0.30,       # Hard clamp: σ_cap ≤ sigma_cap_safe always
         'consecutive_passes': 0,      # Need 5 consecutive passes for promotion
         'promotion_threshold': 5,     # User requested 5 instead of 2-3
         'stall_count': 0,             # Count of failed promotion attempts
         'stall_limit': 6,             # Stop if stalled for this many evals
         'generator_stable': False,    # Phase 2: warm-start flag
         'gen_consecutive_passes': 0,  # Phase 2: generator stability counter
-        # Stricter thresholds at lower σ (tiered)
+        # Residual mode: switch σ_0 from σ_data to σ_residual when generator is good
+        # σ_residual is the std of (V_target - V_base) where V_base is generator output
+        'residual_mode': False,       # Activates when generator_stable becomes True
+        'sigma_residual': None,       # Computed from residuals when mode activates
+        # Thresholds for 3-stage curriculum (Jacc ≥ 0.10 for all)
         'jacc_min_by_mult': {
-            0.3: 0.15,   # Stricter at low σ
-            0.9: 0.12,   # Still relatively strict
-            2.3: 0.10,
-            4.0: 0.09,
-            7.0: 0.08,
-            14.0: 0.07,
-            17.0: 0.07,
+            1.0: 0.10,   # S0: Jacc threshold
+            2.0: 0.10,   # S1: Jacc threshold
+            3.0: 0.10,   # S2: Jacc threshold
         },
-        # Tiered scale_r thresholds for PROMOTION:
-        # - Stricter at low σ (easier to predict scale accurately)
-        # - Relaxed at high σ (harder to predict scale with more noise)
-        # Note: trace_r ≈ scale_r², so trace thresholds derived from scale
+        # Scale_r thresholds for PROMOTION (3-stage):
+        # S0→S1: scale_r ≥ 0.85, S1→S2: scale_r ≥ 0.80
         'scale_r_min_by_mult': {
-            0.3: 0.88,   # Low σ: stricter (easy to predict)
-            0.9: 0.84,
-            2.3: 0.75,   # Your stall was here with ~0.77
-            4.0: 0.73,
-            7.0: 0.72,
-            14.0: 0.68,
-            17.0: 0.65,  # High σ: relaxed for promotion
+            1.0: 0.85,   # S0→S1 promotion threshold
+            2.0: 0.80,   # S1→S2 promotion threshold
+            3.0: 0.75,   # S2: relaxed (final stage)
         },
-        'scale_r_min_default': 0.65,
-        # trace_r_min ≈ 0.95 * scale_r_min² (they're correlated)
+        'scale_r_min_default': 0.75,
+        # trace_r_min ≈ 0.95 * scale_r_min² (derived from scale)
         'trace_r_min_by_mult': {
-            0.3: 0.74,   # ≈ 0.95 * 0.88²
-            0.9: 0.67,   # ≈ 0.95 * 0.84²
-            2.3: 0.53,   # ≈ 0.95 * 0.75²
-            4.0: 0.51,   # ≈ 0.95 * 0.73²
-            7.0: 0.49,   # ≈ 0.95 * 0.72²
-            14.0: 0.44,  # ≈ 0.95 * 0.68²
-            17.0: 0.40,  # ≈ 0.95 * 0.65²
+            1.0: 0.69,   # ≈ 0.95 * 0.85²
+            2.0: 0.61,   # ≈ 0.95 * 0.80²
+            3.0: 0.53,   # ≈ 0.95 * 0.75²
         },
-        'trace_r_min_default': 0.40,
+        'trace_r_min_default': 0.53,
         # FINAL thresholds (at target stage only, for "training succeeded")
         # These are stricter to ensure generation quality
         'scale_r_min_final': 0.80,
         'trace_r_min_final': 0.60,
-        # Cap-band emphasis: fraction of samples drawn from [0.7*σ_cap, σ_cap]
+        # Cap-band emphasis: fraction of samples drawn from [lo_mult*σ_cap, σ_cap]
         # Remaining (1 - frac) drawn from full [σ_min, σ_cap] via log-normal
+        # Reduced from 70% to 50% to prevent overfitting to cap-band
         'cap_band_frac_by_stage': {
-            0: 0.4, 1: 0.4,   # Early stages: 40% cap-band
-            2: 0.6, 3: 0.6,   # Mid stages: 60% cap-band
+            0: 0.5, 1: 0.5, 2: 0.5,  # 50% cap-band for all stages
         },
-        'cap_band_frac_default': 0.7,  # Stage 4+: 70% cap-band
-        'cap_band_lo_mult': 0.7,       # Cap-band lower bound = 0.7 * σ_cap
+        'cap_band_frac_default': 0.5,  # 50% cap-band (reduced from 70%)
+        'cap_band_lo_mult': 0.6,       # Cap-band lower bound = 0.6 * σ_cap (was 0.7)
         # History for tracking
         'eval_history': [],           # List of (epoch, metrics_dict)
 
@@ -2877,6 +2869,30 @@ def train_stageC_diffusion_generator(
         # This controls conditioning magnitude without changing model architecture
         'cond_alpha': 0.1,            # Fixed conditioning strength (start conservative)
     }
+
+    # Legacy curriculum override: use 7-stage [0.3,...,17.0] instead of 3-stage [1,2,3]
+    if use_legacy_curriculum:
+        curriculum_state['sigma_cap_mults'] = [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0]
+        curriculum_state['current_stage'] = 0  # Start at stage 0 (promotion-based)
+        curriculum_state['sigma_cap_safe'] = 3.0  # Higher safe cap for legacy
+        curriculum_state['jacc_min_by_mult'] = {
+            0.3: 0.15, 0.9: 0.12, 2.3: 0.10, 4.0: 0.09, 7.0: 0.08, 14.0: 0.07, 17.0: 0.07,
+        }
+        curriculum_state['scale_r_min_by_mult'] = {
+            0.3: 0.88, 0.9: 0.84, 2.3: 0.75, 4.0: 0.73, 7.0: 0.72, 14.0: 0.68, 17.0: 0.65,
+        }
+        curriculum_state['scale_r_min_default'] = 0.65
+        curriculum_state['trace_r_min_by_mult'] = {
+            0.3: 0.74, 0.9: 0.67, 2.3: 0.53, 4.0: 0.51, 7.0: 0.49, 14.0: 0.44, 17.0: 0.40,
+        }
+        curriculum_state['trace_r_min_default'] = 0.40
+        curriculum_state['cap_band_frac_by_stage'] = {0: 0.4, 1: 0.4, 2: 0.6, 3: 0.6}
+        curriculum_state['cap_band_frac_default'] = 0.7
+        curriculum_state['cap_band_lo_mult'] = 0.7
+        print(f"[CURRICULUM] Using LEGACY 7-stage curriculum: {curriculum_state['sigma_cap_mults']}")
+    else:
+        print(f"[CURRICULUM] Using NEW 3-stage curriculum: {curriculum_state['sigma_cap_mults']}")
+        print(f"  Starting at S{curriculum_state['current_stage']}, σ_cap_safe={curriculum_state['sigma_cap_safe']}")
 
     slide_d15_medians = []
     for slide_id in st_dataset.targets_dict:
@@ -4194,7 +4210,17 @@ def train_stageC_diffusion_generator(
         - ramp_progress: 0.0-1.0 progress through ramp (0 if not active)
         """
         curr_stage = curriculum_state['current_stage']
-        sigma_cap_target = curriculum_state['sigma_cap_mults'][curr_stage] * sigma_data
+
+        # Residual mode: use sigma_residual instead of sigma_data for σ_0
+        if curriculum_state.get('residual_mode', False):
+            sigma_0 = curriculum_state.get('sigma_residual', sigma_data)
+        else:
+            sigma_0 = sigma_data
+
+        sigma_cap_target = curriculum_state['sigma_cap_mults'][curr_stage] * sigma_0
+
+        # Hard safety clamp: sigma_cap never exceeds sigma_cap_safe
+        sigma_cap_safe = curriculum_state.get('sigma_cap_safe', 0.30)
 
         ramp_start = curriculum_state.get('ramp_start_step')
         ramp_steps = curriculum_state.get('ramp_steps', 300)
@@ -4207,17 +4233,20 @@ def train_stageC_diffusion_generator(
 
             # If caps are None (e.g., old checkpoint), treat as no ramp
             if prev_cap is None or target_cap is None:
-                return sigma_cap_target, sigma_cap_target, False, 1.0
+                sigma_cap_eff = min(sigma_cap_target, sigma_cap_safe)
+                return sigma_cap_eff, sigma_cap_target, False, 1.0
 
             steps_since_ramp = global_step - ramp_start
             if steps_since_ramp < ramp_steps:
                 # Ramp in progress
                 t = steps_since_ramp / ramp_steps
                 sigma_cap_eff = prev_cap + t * (target_cap - prev_cap)
+                sigma_cap_eff = min(sigma_cap_eff, sigma_cap_safe)  # Safety clamp
                 return sigma_cap_eff, sigma_cap_target, True, t
 
-        # No ramp or ramp complete
-        return sigma_cap_target, sigma_cap_target, False, 1.0
+        # No ramp or ramp complete - apply safety clamp
+        sigma_cap_eff = min(sigma_cap_target, sigma_cap_safe)
+        return sigma_cap_eff, sigma_cap_target, False, 1.0
 
     def normalize_and_scale_conditioning(H, mask, alpha, eps=1e-8):
         """
@@ -10584,6 +10613,17 @@ def train_stageC_diffusion_generator(
                         curriculum_state['generator_stable'] = True
                         print(f"\n[GEN-WARMUP] Generator is now STABLE after {epoch+1} epochs!")
 
+                        # Activate residual mode: switch σ_0 from σ_data to σ_residual
+                        # When residual_mode=True, the denoiser trains on residuals (V_target - V_base)
+                        # and σ_residual (computed from residual std) is used instead of σ_data
+                        if not curriculum_state.get('residual_mode', False):
+                            curriculum_state['residual_mode'] = True
+                            # TODO: Compute sigma_residual from actual residuals
+                            # For now, use a conservative estimate: sigma_residual ≈ 0.5 * sigma_data
+                            # This assumes residuals are about half the magnitude of raw coordinates
+                            curriculum_state['sigma_residual'] = 0.5 * sigma_data
+                            print(f"  [RESIDUAL] Activated residual mode: σ_residual = {curriculum_state['sigma_residual']:.4f}")
+
                 # Promotion logic: windowed "5 of last 6" instead of strict consecutive
                 # This avoids one borderline epoch resetting all progress
                 window_size = 6
@@ -10717,23 +10757,49 @@ def train_stageC_diffusion_generator(
                     print(f"  ⚠️ Stall count: {curriculum_state['stall_count']}/{curriculum_state['stall_limit']}")
 
                 if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
-                    target_stg = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
                     struct_passes = sum(struct_window)
-                    if curr_stage < target_stg:
-                        if struct_passes >= 4:
-                            print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage}!")
-                            print(f"  Structure competent ({struct_passes}/6 passes) → Will FORCE PROMOTE to stage {curr_stage + 1}")
-                        elif struct_passes < 2:
-                            max_steps = curriculum_state.get('max_steps_per_stage', 1500)
-                            print(f"\n[CURRICULUM] Structure struggling at stage {curr_stage} (informational)")
-                            print(f"  Structure passes: {struct_passes}/6 (<2 = struggling)")
-                            print(f"  → Will force-promote at max_steps ({steps_in_stage}/{max_steps}) if not recovered")
-                        else:
-                            print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} (borderline structure {struct_passes}/6)")
-                            print(f"  → Training continues until structure is competent or failing")
+                    # DEMOTION LOGIC: If struggling at current stage, demote to lower stage
+                    # This is the new 3-stage curriculum where we start at S2 and demote on failure
+                    if curr_stage > 0 and struct_passes < 4:
+                        # Demote to lower stage
+                        old_stage = curr_stage
+                        old_mult = curriculum_state['sigma_cap_mults'][old_stage]
+                        curriculum_state['current_stage'] -= 1
+                        curriculum_state['promo_pass_window'] = []
+                        curriculum_state['structure_pass_window'] = []
+                        curriculum_state['stall_count'] = 0
+                        new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                        # Enable demotion ramp for smooth σ_cap transition (downward)
+                        ramp_steps = curriculum_state.get('ramp_steps', 300)
+                        old_cap = old_mult * sigma_data
+                        new_cap = new_mult * sigma_data
+                        curriculum_state['ramp_start_step'] = global_step
+                        curriculum_state['ramp_prev_cap'] = old_cap
+                        curriculum_state['ramp_target_cap'] = new_cap
+
+                        print(f"\n[CURRICULUM] ⚠️ DEMOTED from stage {old_stage} → {curriculum_state['current_stage']}")
+                        print(f"  Reason: stall_count >= {curriculum_state['stall_limit']}, struct_passes={struct_passes}<4")
+                        print(f"  σ_cap_target: {old_cap:.4f} → {new_cap:.4f}")
+                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
+
+                        # Reset stage-local tracking
+                        curriculum_state['steps_in_stage'] = 0
+                        curriculum_state['cap_band_loss_sum'] = 0.0
+                        curriculum_state['cap_band_loss_count'] = 0
+                        curriculum_state['cap_band_loss_history'] = []
+                        curriculum_state['best_cap_band_loss'] = float('inf')
+                        curriculum_state['loss_no_improve_count'] = 0
+                        curriculum_state['metrics_pass_history'] = []
+                    elif curr_stage == 0:
+                        print(f"\n[CURRICULUM] ⚠️ STALLED at LOWEST stage S0!")
+                        print(f"  Cannot demote further. struct_passes={struct_passes}/6")
+                        print(f"  Consider: checking conditioning, data quality, or model capacity")
                     else:
-                        print(f"\n[CURRICULUM] ⚠️ STALLED at TARGET stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
-                        print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
+                        # struct_passes >= 4 but scale stalled - just informational
+                        print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage}")
+                        print(f"  Structure competent ({struct_passes}/6) but scale metrics not passing")
+                        print(f"  → Continuing training (structure OK, scale may catch up)")
 
                 # ============================================================
                 # [THREE-GATE] Track Gate B (metrics) and Gate C (cap-band loss)

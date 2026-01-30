@@ -391,6 +391,7 @@ class GEMSModel:
         curriculum_target_stage: int = 6,
         curriculum_min_epochs: int = 100,
         curriculum_early_stop: bool = True,
+        use_legacy_curriculum: bool = False,  # True = 7-stage [0.3,...,17.0], False = 3-stage [1,2,3]
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
         # NEW: Stochastic kNN sampling parameters (for STSetDataset)
         # NOTE: For small slides (<1000 spots), use 1.5-2.0 to maintain spatial locality
@@ -590,6 +591,7 @@ class GEMSModel:
             curriculum_target_stage=curriculum_target_stage,
             curriculum_min_epochs=curriculum_min_epochs,
             curriculum_early_stop=curriculum_early_stop,
+            use_legacy_curriculum=use_legacy_curriculum,
             # NEW: Context augmentation
             z_noise_std=z_noise_std,
             z_dropout_rate=z_dropout_rate,
