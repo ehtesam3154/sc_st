@@ -15120,57 +15120,106 @@ def _sample_sc_edm_patchwise_v2(
 
     # =========================================================================
     # CRITICAL DIAGNOSTIC: Per-patch distance correlation with GT
+    # Compare both V_base (generator) and V_final (after diffusion) to GT
     # =========================================================================
     if DEBUG_FLAG and gt_coords is not None:
-        print(f"\n[V2-PATCH-DIAG] Checking per-patch V quality against GT coords...")
-        patch_knn_accs = []
-        patch_dist_corrs = []
+        print(f"\n[V2-PATCH-DIAG] Checking per-patch quality against GT coords...")
+        print(f"[V2-PATCH-DIAG] Comparing: V_base (generator) vs V_final (after diffusion)")
+
+        base_knn_accs = []
+        base_dist_corrs = []
+        final_knn_accs = []
+        final_dist_corrs = []
 
         for k in range(min(K, 5)):  # Check first 5 patches
             S_k = patch_indices[k]
-            V_k = patch_V[k]
+            V_base_k = patch_V_base[k]
+            V_final_k = patch_V[k]
             gt_k = gt_coords[S_k]  # (m, 2)
+            m = V_base_k.shape[0]
 
             # Compute distance matrices
-            D_pred = torch.cdist(V_k, V_k)  # From predicted V
-            D_gt = torch.cdist(gt_k, gt_k)  # From GT coords
+            D_base = torch.cdist(V_base_k.unsqueeze(0), V_base_k.unsqueeze(0)).squeeze(0)
+            D_final = torch.cdist(V_final_k.unsqueeze(0), V_final_k.unsqueeze(0)).squeeze(0)
+            D_gt = torch.cdist(gt_k.unsqueeze(0).to(device), gt_k.unsqueeze(0).to(device)).squeeze(0)
 
             # Distance correlation (upper triangle only)
-            m = V_k.shape[0]
             triu_idx = torch.triu_indices(m, m, offset=1)
-            d_pred_flat = D_pred[triu_idx[0], triu_idx[1]].cpu().numpy()
+            d_base_flat = D_base[triu_idx[0], triu_idx[1]].cpu().numpy()
+            d_final_flat = D_final[triu_idx[0], triu_idx[1]].cpu().numpy()
             d_gt_flat = D_gt[triu_idx[0], triu_idx[1]].cpu().numpy()
 
-            if len(d_pred_flat) > 10:
-                corr = np.corrcoef(d_pred_flat, d_gt_flat)[0, 1]
-                patch_dist_corrs.append(corr)
+            if len(d_gt_flat) > 10:
+                corr_base = np.corrcoef(d_base_flat, d_gt_flat)[0, 1]
+                corr_final = np.corrcoef(d_final_flat, d_gt_flat)[0, 1]
+                base_dist_corrs.append(corr_base)
+                final_dist_corrs.append(corr_final)
 
             # kNN accuracy within patch
             k_nn = min(10, m - 1)
-            _, idx_pred = D_pred.topk(k_nn + 1, dim=1, largest=False)
-            idx_pred = idx_pred[:, 1:].cpu()
+
+            # V_base kNN
+            _, idx_base = D_base.topk(k_nn + 1, dim=1, largest=False)
+            idx_base = idx_base[:, 1:].cpu()
+            # V_final kNN
+            _, idx_final = D_final.topk(k_nn + 1, dim=1, largest=False)
+            idx_final = idx_final[:, 1:].cpu()
+            # GT kNN
             _, idx_gt = D_gt.topk(k_nn + 1, dim=1, largest=False)
             idx_gt = idx_gt[:, 1:].cpu()
 
-            overlaps = []
+            overlaps_base = []
+            overlaps_final = []
             for i in range(m):
-                overlap = len(set(idx_pred[i].tolist()) & set(idx_gt[i].tolist())) / k_nn
-                overlaps.append(overlap)
-            patch_knn_accs.append(np.mean(overlaps))
+                overlap_base = len(set(idx_base[i].tolist()) & set(idx_gt[i].tolist())) / k_nn
+                overlap_final = len(set(idx_final[i].tolist()) & set(idx_gt[i].tolist())) / k_nn
+                overlaps_base.append(overlap_base)
+                overlaps_final.append(overlap_final)
+            base_knn_accs.append(np.mean(overlaps_base))
+            final_knn_accs.append(np.mean(overlaps_final))
 
-        print(f"[V2-PATCH-DIAG] Per-patch k=10 kNN accuracy (should be high if V is meaningful):")
-        for k, acc in enumerate(patch_knn_accs):
-            corr = patch_dist_corrs[k] if k < len(patch_dist_corrs) else 0
-            print(f"[V2-PATCH-DIAG]   Patch {k}: kNN_acc={acc:.3f}, dist_corr={corr:.3f}")
+        print(f"[V2-PATCH-DIAG] Per-patch k=10 kNN accuracy:")
+        print(f"[V2-PATCH-DIAG]   {'Patch':<8} {'V_base kNN':<12} {'V_final kNN':<12} {'Base corr':<12} {'Final corr':<12}")
+        for k in range(len(final_knn_accs)):
+            b_acc = base_knn_accs[k]
+            f_acc = final_knn_accs[k]
+            b_corr = base_dist_corrs[k] if k < len(base_dist_corrs) else 0
+            f_corr = final_dist_corrs[k] if k < len(final_dist_corrs) else 0
+            print(f"[V2-PATCH-DIAG]   {k:<8} {b_acc:<12.3f} {f_acc:<12.3f} {b_corr:<12.3f} {f_corr:<12.3f}")
 
-        if patch_knn_accs:
-            avg_acc = np.mean(patch_knn_accs)
-            avg_corr = np.mean(patch_dist_corrs) if patch_dist_corrs else 0
-            print(f"[V2-PATCH-DIAG] Average: kNN_acc={avg_acc:.3f}, dist_corr={avg_corr:.3f}")
-            if avg_acc < 0.3:
-                print(f"[V2-WARNING] CRITICAL: Per-patch kNN accuracy is very low!")
-                print(f"[V2-WARNING] This means the diffusion is NOT producing meaningful spatial distances.")
-                print(f"[V2-WARNING] Check: (1) Is generator trained? (2) Is score_net trained? (3) Is sigma_data_resid correct?")
+        if final_knn_accs:
+            avg_base_acc = np.mean(base_knn_accs)
+            avg_final_acc = np.mean(final_knn_accs)
+            avg_base_corr = np.mean(base_dist_corrs) if base_dist_corrs else 0
+            avg_final_corr = np.mean(final_dist_corrs) if final_dist_corrs else 0
+            print(f"[V2-PATCH-DIAG] Average: V_base kNN={avg_base_acc:.3f}, V_final kNN={avg_final_acc:.3f}")
+            print(f"[V2-PATCH-DIAG] Average: V_base corr={avg_base_corr:.3f}, V_final corr={avg_final_corr:.3f}")
+
+            # Interpretation
+            if avg_base_acc < 0.3:
+                print(f"[V2-WARNING] Generator (V_base) is producing poor spatial structure!")
+                print(f"[V2-WARNING] This suggests the generator itself is not well-trained.")
+            elif avg_final_acc < avg_base_acc - 0.1:
+                print(f"[V2-WARNING] Diffusion is DEGRADING quality (final < base)!")
+                print(f"[V2-WARNING] This suggests the score_net or diffusion process has issues.")
+            elif avg_final_acc < 0.3:
+                print(f"[V2-WARNING] Final V has low kNN accuracy despite reasonable generator.")
+                print(f"[V2-WARNING] Check diffusion parameters: sigma_data_resid, sigma_start, n_steps.")
+            else:
+                print(f"[V2-OK] Per-patch V quality looks reasonable (kNN > 0.3).")
+                if avg_final_acc > avg_base_acc + 0.05:
+                    print(f"[V2-OK] Diffusion is IMPROVING quality over generator baseline!")
+
+        # Also check scale: are V distances in similar scale to GT distances?
+        print(f"\n[V2-PATCH-DIAG] Scale check (V-space distance vs GT-space distance):")
+        for k in range(min(K, 3)):
+            S_k = patch_indices[k]
+            V_final_k = patch_V[k]
+            gt_k = gt_coords[S_k]
+            D_final = torch.cdist(V_final_k.unsqueeze(0), V_final_k.unsqueeze(0)).squeeze(0)
+            D_gt = torch.cdist(gt_k.unsqueeze(0).to(device), gt_k.unsqueeze(0).to(device)).squeeze(0)
+            scale_ratio = D_final.mean().item() / (D_gt.mean().item() + 1e-8)
+            print(f"[V2-PATCH-DIAG]   Patch {k}: V_final mean_dist={D_final.mean().item():.4f}, GT mean_dist={D_gt.mean().item():.4f}, ratio={scale_ratio:.2f}")
 
     # =========================================================================
     # STEP 4: Extract distance measurements from patches
