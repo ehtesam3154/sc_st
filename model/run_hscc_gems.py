@@ -193,6 +193,8 @@ def parse_args():
     # ========== RESIDUAL DIFFUSION ==========
     parser.add_argument('--use_residual_diffusion', action=argparse.BooleanOptionalAction, default=False,
                         help='Enable residual diffusion: diffuse R = V_target - V_base instead of V_target')
+    parser.add_argument('--sigma_resid_recompute_step', type=int, default=3000,
+                        help='Step at which to recompute sigma_data_resid (after generator warmup)')
 
     # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
     parser.add_argument('--train_pair_overlap', action=argparse.BooleanOptionalAction, default=False,
@@ -703,6 +705,7 @@ def main(args=None):
         self_cond_mode=args.self_cond_mode,
         # ========== RESIDUAL DIFFUSION ==========
         use_residual_diffusion=args.use_residual_diffusion,
+        sigma_resid_recompute_step=args.sigma_resid_recompute_step,
         # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
         train_pair_overlap=args.train_pair_overlap,
         pair_overlap_alpha=args.pair_overlap_alpha,

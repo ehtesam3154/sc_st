@@ -448,6 +448,7 @@ class GEMSModel:
         self_cond_mode: str = 'standard',
         # ========== RESIDUAL DIFFUSION ==========
         use_residual_diffusion: bool = False,
+        sigma_resid_recompute_step: int = 3000,
         # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
         train_pair_overlap: bool = False,
         pair_overlap_alpha: float = 0.5,
@@ -642,6 +643,7 @@ class GEMSModel:
             self_cond_mode=self_cond_mode,
             # ========== RESIDUAL DIFFUSION ==========
             use_residual_diffusion=use_residual_diffusion,
+            sigma_resid_recompute_step=sigma_resid_recompute_step,
             # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
             train_pair_overlap=train_pair_overlap,
             pair_overlap_alpha=pair_overlap_alpha,

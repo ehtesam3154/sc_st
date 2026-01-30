@@ -2749,6 +2749,7 @@ def train_stageC_diffusion_generator(
     self_cond_mode: str = 'standard',
     # ========== RESIDUAL DIFFUSION ==========
     use_residual_diffusion: bool = False,
+    sigma_resid_recompute_step: int = 3000,  # Step to recompute sigma_data_resid (after generator warmup)
     # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
     train_pair_overlap: bool = False,
     pair_overlap_alpha: float = 0.5,
@@ -2874,7 +2875,7 @@ def train_stageC_diffusion_generator(
         # ============================================================
         'sigma_resid_valid': False,           # True once sigma_data_resid is properly computed
         'sigma_data_resid_locked': None,      # Locked value for curriculum (after validation)
-        'sigma_resid_recompute_step': 3000,   # Step at which to recompute sigma_data_resid
+        'sigma_resid_recompute_step': sigma_resid_recompute_step,  # Step at which to recompute (CLI arg)
         'sigma_resid_recomputed': False,      # True once recomputation has been done
 
         # ============================================================
@@ -10567,8 +10568,9 @@ def train_stageC_diffusion_generator(
 
             # =====================================================================
             # [SIGMA-RANGE] Debug: Show sigma configuration every 200 steps
+            # Also print at step 1 (first completed step) to show initial config
             # =====================================================================
-            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+            if (global_step == 1 or global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
                 # Get current sigma cap info
                 _cap_eff, _cap_target, _ramp_active, _ramp_prog, _dbg = get_sigma_cap_eff(
                     curriculum_state, global_step, sigma_data, do_log=False)
