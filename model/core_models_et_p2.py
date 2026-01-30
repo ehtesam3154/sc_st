@@ -14107,6 +14107,56 @@ def sample_patches_random_walk_v2(
 
     is_connected = len(components) == 1
 
+    # =========================================================================
+    # FM1 FIX: Ensure 100% coverage - add uncovered cells to nearest patches
+    # =========================================================================
+    uncovered_cells = (coverage_counts == 0).nonzero(as_tuple=True)[0].cpu().tolist()
+    if len(uncovered_cells) > 0:
+        if DEBUG_FLAG:
+            print(f"[PATCH-SAMPLE] FM1 FIX: {len(uncovered_cells)} uncovered cells, adding to nearest patches...")
+
+        # For each uncovered cell, find the patch that shares the most neighbors
+        for cell_idx in uncovered_cells:
+            cell_neighbors = set(adj_list[cell_idx])
+
+            if len(cell_neighbors) > 0:
+                # Find patch with most overlap with cell's neighbors
+                best_patch_idx = 0
+                best_overlap = 0
+                for k, patch_set in enumerate(patch_sets):
+                    overlap = len(cell_neighbors & patch_set)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_patch_idx = k
+
+                # Add cell to the best patch
+                patch_sets[best_patch_idx].add(cell_idx)
+                patch_indices_list[best_patch_idx] = torch.tensor(
+                    list(patch_sets[best_patch_idx]), dtype=torch.long, device=device
+                )
+                coverage_counts[cell_idx] = 1
+            else:
+                # Isolated cell (no neighbors) - add to largest patch
+                largest_patch_idx = max(range(K), key=lambda k: len(patch_sets[k]))
+                patch_sets[largest_patch_idx].add(cell_idx)
+                patch_indices_list[largest_patch_idx] = torch.tensor(
+                    list(patch_sets[largest_patch_idx]), dtype=torch.long, device=device
+                )
+                coverage_counts[cell_idx] = 1
+
+        if DEBUG_FLAG:
+            print(f"[PATCH-SAMPLE] FM1 FIX: All cells now covered!")
+
+        # Recompute overlaps after adding cells
+        patch_overlaps = {}
+        overlap_sizes = []
+        for k1 in range(K):
+            for k2 in range(k1 + 1, K):
+                overlap = patch_sets[k1] & patch_sets[k2]
+                if len(overlap) >= min_overlap:
+                    patch_overlaps[(k1, k2)] = overlap
+                    overlap_sizes.append(len(overlap))
+
     if DEBUG_FLAG:
         print(f"[PATCH-SAMPLE] Generated {K} patches")
         print(f"[PATCH-SAMPLE] Coverage: min={coverage_counts.min().item()}, median={coverage_counts.float().median().item():.1f}, max={coverage_counts.max().item()}")
@@ -14522,6 +14572,60 @@ def aggregate_distance_measurements_v2(
             print(f"[AGGREGATE] Consensus distances: min={min(consensus_distances):.4f}, median={np.median(consensus_distances):.4f}, max={max(consensus_distances):.4f}")
             print(f"[AGGREGATE] Spreads: min={min(edge_spreads):.3f}, median={np.median(edge_spreads):.3f}, max={max(edge_spreads):.3f}")
             print(f"[AGGREGATE] Counts: min={min(edge_counts)}, median={np.median(edge_counts):.1f}, max={max(edge_counts)}")
+
+    # =========================================================================
+    # FM6 FIX: Connect isolated nodes using single measurements
+    # =========================================================================
+    # Find nodes with no edges
+    connected_nodes = set()
+    for (i, j) in global_edges:
+        connected_nodes.add(i)
+        connected_nodes.add(j)
+
+    isolated_nodes = [i for i in range(N) if i not in connected_nodes]
+
+    if len(isolated_nodes) > 0:
+        if DEBUG_FLAG:
+            print(f"[AGGREGATE] FM6 FIX: {len(isolated_nodes)} isolated nodes, adding rescue edges...")
+
+        # For isolated nodes, use single-measurement edges (M_min=1) with relaxed spread
+        rescue_edges_added = 0
+        for node in isolated_nodes:
+            # Find all edges involving this node from unfiltered measurements
+            node_edges = []
+            for (i, j), measurements in edge_measurements.items():
+                if i == node or j == node:
+                    # Take median distance even from single measurement
+                    distances_ij = [m[0] for m in measurements]
+                    d_median = np.median(distances_ij)
+                    # Use count as weight (penalize single measurements)
+                    w = len(measurements) * 0.5  # Reduced weight for rescue edges
+                    node_edges.append(((i, j), d_median, w))
+
+            # Sort by weight (prefer edges with more measurements)
+            node_edges.sort(key=lambda x: -x[2])
+
+            # Add top-k edges for this node (at least connect it)
+            k_rescue = min(5, len(node_edges))
+            for idx in range(k_rescue):
+                edge, d, w = node_edges[idx]
+                if edge not in global_edges:
+                    global_edges.append(edge)
+                    consensus_distances.append(d)
+                    consensus_weights.append(w)
+                    edge_spreads.append(0.5)  # Mark as uncertain
+                    edge_counts.append(1)
+                    rescue_edges_added += 1
+
+        if DEBUG_FLAG:
+            print(f"[AGGREGATE] FM6 FIX: Added {rescue_edges_added} rescue edges")
+            # Recount isolated nodes
+            connected_nodes = set()
+            for (i, j) in global_edges:
+                connected_nodes.add(i)
+                connected_nodes.add(j)
+            still_isolated = [i for i in range(N) if i not in connected_nodes]
+            print(f"[AGGREGATE] FM6 FIX: {len(still_isolated)} nodes still isolated after fix")
 
     diagnostics = {
         'n_global_edges': len(global_edges),
@@ -15370,6 +15474,77 @@ def _sample_sc_edm_patchwise_v2(
     # DEBUG: kNN accuracy if GT available
     # =========================================================================
     if debug_knn and gt_coords is not None:
+        # Also check kNN using raw aggregated distances (before distance geometry)
+        if DEBUG_FLAG and len(global_edges) > 0:
+            print(f"\n[V2-DIAG] Comparing aggregated distances vs GT (before distance geometry)...")
+
+            # Build sparse distance matrix from aggregated edges
+            D_agg = torch.full((N, N), float('inf'), device=device)
+            for (i, j), d in zip(global_edges, global_distances):
+                D_agg[i, j] = d
+                D_agg[j, i] = d
+            D_agg.fill_diagonal_(float('inf'))
+
+            # GT distances
+            D_gt = torch.cdist(gt_coords.to(device), gt_coords.to(device))
+            D_gt.fill_diagonal_(float('inf'))
+
+            # Check kNN using aggregated distances (only where we have edges)
+            k_test = 10
+            _, knn_agg = D_agg.topk(k_test, largest=False, dim=1)
+            _, knn_gt = D_gt.topk(k_test, largest=False, dim=1)
+
+            # Separate connected vs isolated nodes
+            node_degrees = torch.zeros(N, device=device)
+            for (i, j) in global_edges:
+                node_degrees[i] += 1
+                node_degrees[j] += 1
+
+            connected_mask = node_degrees > 0
+            isolated_mask = node_degrees == 0
+            n_connected = connected_mask.sum().item()
+            n_isolated = isolated_mask.sum().item()
+
+            # kNN accuracy for connected nodes (using aggregated distances)
+            overlaps_connected = []
+            for i in range(N):
+                if connected_mask[i]:
+                    pred_set = set(knn_agg[i].cpu().tolist())
+                    gt_set = set(knn_gt[i].cpu().tolist())
+                    # Filter out 'inf' neighbors
+                    pred_set = {x for x in pred_set if D_agg[i, x] < float('inf')}
+                    if len(pred_set) > 0:
+                        overlap = len(pred_set & gt_set) / max(len(pred_set), 1)
+                        overlaps_connected.append(overlap)
+
+            if overlaps_connected:
+                print(f"[V2-DIAG] Aggregated distances kNN (k={k_test}):")
+                print(f"[V2-DIAG]   Connected nodes ({n_connected}): mean_overlap={np.mean(overlaps_connected):.3f}")
+                print(f"[V2-DIAG]   Isolated nodes ({n_isolated}): NO distance constraints")
+
+            # Now check final 2D coordinates kNN for connected vs isolated
+            D_2d = torch.cdist(X_canon, X_canon)
+            D_2d.fill_diagonal_(float('inf'))
+            _, knn_2d = D_2d.topk(k_test, largest=False, dim=1)
+
+            overlaps_2d_connected = []
+            overlaps_2d_isolated = []
+            for i in range(N):
+                pred_set = set(knn_2d[i].cpu().tolist())
+                gt_set = set(knn_gt[i].cpu().tolist())
+                overlap = len(pred_set & gt_set) / k_test
+                if connected_mask[i]:
+                    overlaps_2d_connected.append(overlap)
+                else:
+                    overlaps_2d_isolated.append(overlap)
+
+            print(f"[V2-DIAG] Final 2D coordinates kNN (k={k_test}):")
+            if overlaps_2d_connected:
+                print(f"[V2-DIAG]   Connected nodes ({n_connected}): mean_overlap={np.mean(overlaps_2d_connected):.3f}")
+            if overlaps_2d_isolated:
+                print(f"[V2-DIAG]   Isolated nodes ({n_isolated}): mean_overlap={np.mean(overlaps_2d_isolated):.3f}")
+            print(f"[V2-DIAG]   Overall: mean_overlap={(np.mean(overlaps_2d_connected + overlaps_2d_isolated)):.3f}")
+
         _compute_knn_accuracy_v2(X_canon, gt_coords, debug_k_list, DEBUG_FLAG)
 
     # =========================================================================
