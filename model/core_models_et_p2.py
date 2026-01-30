@@ -4750,10 +4750,17 @@ def train_stageC_diffusion_generator(
                     # For residual diffusion: always compute V_base from generator (detached)
                     with torch.no_grad():
                         V_base = generator(H, mask).detach()  # Detach to prevent gradient flow
-                    # Compute residual: R_target = V_target - V_base
-                    R_target = V_target - V_base
-                    # Store for later composition
-                    # V_base will be used after denoising: V_hat = V_base + R_hat
+
+                    # CRITICAL FIX: Align V_target to V_base's frame before computing residual
+                    # V_target comes from factor_from_gram() which has arbitrary rotation/reflection.
+                    # V_base is in the generator's learned frame. Without alignment, the residual
+                    # would be dominated by frame mismatch (~√2 × |V_target|), defeating residual diffusion.
+                    with torch.no_grad():
+                        V_target_aligned = uet.rigid_align_apply_no_scale(V_target, V_base, mask)
+
+                    # Compute residual in V_base's frame (now small corrections!)
+                    R_target = V_target_aligned - V_base
+                    # Store for later composition: V_hat = V_base + R_hat (in base frame)
 
                     # [RESID-DIFF] Diagnostics: log residual statistics periodically
                     if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
@@ -4765,12 +4772,18 @@ def train_stageC_diffusion_generator(
                             rms_base = (V_base.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
                             rms_resid = (R_target.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
 
-                            # Residual-to-target ratio (should be < 1 if generator is good)
+                            # Also compute unaligned residual to show the fix is working
+                            R_unaligned = V_target - V_base
+                            rms_resid_unaligned = (R_unaligned.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+
+                            # Residual-to-target ratio (should be << 1 after alignment)
                             resid_ratio = rms_resid / (rms_tgt + 1e-8)
+                            resid_ratio_unaligned = rms_resid_unaligned / (rms_tgt + 1e-8)
 
                             print(f"[RESID-DIFF] step={global_step} "
-                                  f"rms_tgt={rms_tgt:.4f} rms_base={rms_base:.4f} rms_resid={rms_resid:.4f} "
-                                  f"resid/tgt={resid_ratio:.3f}")
+                                  f"rms_tgt={rms_tgt:.4f} rms_base={rms_base:.4f} "
+                                  f"rms_resid_aligned={rms_resid:.4f} rms_resid_unaligned={rms_resid_unaligned:.4f}")
+                            print(f"[RESID-DIFF] resid/tgt_aligned={resid_ratio:.3f} resid/tgt_unaligned={resid_ratio_unaligned:.3f}")
                 else:
                     V_base = None
                     R_target = None
@@ -9307,11 +9320,13 @@ def train_stageC_diffusion_generator(
                         H_2 = context_encoder(Z_set_2, mask_2)
 
                     # ========== RESIDUAL DIFFUSION: View 2 ==========
-                    # Must match view 1's residual treatment
+                    # Must match view 1's residual treatment (including frame alignment!)
                     if use_resid:
                         with torch.no_grad():
                             V_base_2 = generator(H_2, mask_2).detach()
-                        R_target_2 = V_target_2 - V_base_2
+                            # CRITICAL: Align V_target_2 to V_base_2's frame (same as view 1)
+                            V_target_2_aligned = uet.rigid_align_apply_no_scale(V_target_2, V_base_2, mask_2)
+                        R_target_2 = V_target_2_aligned - V_base_2
                         # Noise the residual, not the absolute target
                         V_t_2 = R_target_2 + sigma_pair_3d_ov * eps_2
                     else:
