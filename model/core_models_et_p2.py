@@ -4763,7 +4763,7 @@ def train_stageC_diffusion_generator(
                     # Store for later composition: V_hat = V_base + R_hat (in base frame)
 
                     # [RESID-DIFF] Diagnostics: log residual statistics periodically
-                    if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             mask_f = mask.unsqueeze(-1).float()
                             valid_count = mask_f.sum() * V_target.shape[-1]
@@ -4784,6 +4784,18 @@ def train_stageC_diffusion_generator(
                                   f"rms_tgt={rms_tgt:.4f} rms_base={rms_base:.4f} "
                                   f"rms_resid_aligned={rms_resid:.4f} rms_resid_unaligned={rms_resid_unaligned:.4f}")
                             print(f"[RESID-DIFF] resid/tgt_aligned={resid_ratio:.3f} resid/tgt_unaligned={resid_ratio_unaligned:.3f}")
+
+                            # [RESID-DIFF-GRAM] Check if Gram matrices match (geometry vs just rotation)
+                            G_tgt = (V_target @ V_target.transpose(1,2))[0]  # First sample
+                            G_base = (V_base @ V_base.transpose(1,2))[0]
+                            m = mask[0].bool()
+                            G_tgt_valid = G_tgt[m][:, m]
+                            G_base_valid = G_base[m][:, m]
+                            gram_corr = torch.corrcoef(torch.stack([G_tgt_valid.flatten(), G_base_valid.flatten()]))[0,1].item()
+                            print(f"[RESID-DIFF-GRAM] Gram_corr={gram_corr:.4f} (>0.95=alignment bug, <0.8=generator geometry wrong)")
+
+                            # [RESID-DIFF-WEIGHTS] Print gen_align weight to verify it's active
+                            print(f"[RESID-DIFF-WEIGHTS] gen_align={WEIGHTS.get('gen_align', 0.0)}")
                 else:
                     V_base = None
                     R_target = None
