@@ -14260,6 +14260,17 @@ def sample_patch_residual_diffusion_v2(
         # EDM sigma schedule (Karras et al.)
         sigmas = uet.edm_sigma_schedule(n_steps, sigma_min, sigma_start, rho=7.0, device=device)
 
+        # Debug: Show diffusion setup
+        if DEBUG_FLAG:
+            rms_V_base_init = V_base.pow(2).mean().sqrt().item()
+            rms_R_init = R_t.pow(2).mean().sqrt().item()
+            print(f"\n[DIFFUSION] Residual diffusion sampling:")
+            print(f"[DIFFUSION]   n_steps={n_steps}, sigma_start={sigma_start:.4f}, sigma_min={sigma_min:.4f}")
+            print(f"[DIFFUSION]   sigma_data (for score_net)={sigma_data:.4f}")
+            print(f"[DIFFUSION]   V_base RMS={rms_V_base_init:.4f}")
+            print(f"[DIFFUSION]   Initial noise R_t RMS={rms_R_init:.4f} (should be ~sigma_start)")
+            print(f"[DIFFUSION]   Sigma schedule: [{sigmas[0].item():.4f}, ..., {sigmas[len(sigmas)//2].item():.4f}, ..., {sigmas[-1].item():.4f}]")
+
         # Denoising loop in residual space
         for i in range(len(sigmas) - 1):
             sigma = sigmas[i]
@@ -14302,6 +14313,14 @@ def sample_patch_residual_diffusion_v2(
         V_final = V_final * mask_f
         V_base = V_base * mask_f
         R_final = R_final * mask_f
+
+        # Debug: Show final state
+        if DEBUG_FLAG:
+            rms_R_final = R_final.pow(2).mean().sqrt().item()
+            rms_V_final = V_final.pow(2).mean().sqrt().item()
+            print(f"[DIFFUSION]   Final R_t RMS={rms_R_final:.4f} (denoised residual)")
+            print(f"[DIFFUSION]   Final V RMS={rms_V_final:.4f} (V_base + R)")
+            print(f"[DIFFUSION]   Residual/Base ratio={rms_R_final/(rms_V_base_init+1e-8):.3f}")
 
     # Diagnostics
     rms_V_base = V_base.pow(2).sum() / (mask_f.sum() * V_base.shape[-1] + 1e-8)
