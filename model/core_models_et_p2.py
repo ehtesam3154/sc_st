@@ -10565,6 +10565,26 @@ def train_stageC_diffusion_generator(
             if fabric is None or fabric.is_global_zero:
                 pass  # print / tqdm here if you want
 
+            # =====================================================================
+            # [SIGMA-RANGE] Debug: Show sigma configuration every 200 steps
+            # =====================================================================
+            if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
+                # Get current sigma cap info
+                _cap_eff, _cap_target, _ramp_active, _ramp_prog, _dbg = get_sigma_cap_eff(
+                    curriculum_state, global_step, sigma_data, do_log=False)
+
+                _stage = curriculum_state['current_stage']
+                _resid_valid = curriculum_state.get('sigma_resid_valid', False)
+                _sigma0 = _dbg.get('sigma0', sigma_data)
+                _resid_val = curriculum_state.get('sigma_data_resid', sigma_data)
+                _resid_locked = curriculum_state.get('sigma_data_resid_locked')
+
+                print(f"\n[SIGMA-RANGE] step={global_step} stage=S{_stage}")
+                print(f"[SIGMA-RANGE]   sigma_data={sigma_data:.4f}, sigma_data_resid={_resid_val:.4f} (valid={_resid_valid}, locked={_resid_locked})")
+                print(f"[SIGMA-RANGE]   sigma0_for_curriculum={_sigma0:.4f} ({'resid' if _resid_valid else 'data'})")
+                print(f"[SIGMA-RANGE]   sigma_min={sigma_min:.4f}, sigma_cap_eff={_cap_eff:.4f} (target={_cap_target:.4f})")
+                print(f"[SIGMA-RANGE]   training_range=[{sigma_min:.4f}, {_cap_eff:.4f}], ramp_active={_ramp_active}")
+
             # DEBUG: Per-batch logging
             if DEBUG and (global_step % LOG_EVERY == 0):
                 Vn = float(V_hat.norm().item()) / (mask.sum().item()**0.5 * D_latent**0.5 + 1e-8)
