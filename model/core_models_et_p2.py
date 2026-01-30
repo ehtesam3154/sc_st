@@ -14695,52 +14695,53 @@ def global_distance_geometry_solve_v2(
     w = torch.tensor(weights, dtype=torch.float32, device=device)
     w = w / (w.sum() + 1e-8)  # Normalize
 
-    # Initialize
-    X = X_init.clone().detach().requires_grad_(True)
+    # Initialize - need to enable grad even if called inside no_grad context
     X_anchor = X_init.clone().detach()
-
-    optimizer = torch.optim.Adam([X], lr=lr)
-
     stress_history = []
-    current_anchor_lambda = anchor_lambda
 
-    for it in range(n_iters):
-        optimizer.zero_grad()
+    # Use enable_grad to allow optimization even when called from no_grad context
+    with torch.enable_grad():
+        X = X_init.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([X], lr=lr)
+        current_anchor_lambda = anchor_lambda
 
-        # Compute pairwise distances for edges
-        diff = X[edge_i] - X[edge_j]  # (E, 2)
-        d_pred = diff.norm(dim=1)  # (E,)
+        for it in range(n_iters):
+            optimizer.zero_grad()
 
-        # Huber loss
-        residuals = d_pred - d_target
-        abs_res = residuals.abs()
-        huber = torch.where(
-            abs_res <= huber_delta,
-            0.5 * residuals ** 2,
-            huber_delta * (abs_res - 0.5 * huber_delta)
-        )
+            # Compute pairwise distances for edges
+            diff = X[edge_i] - X[edge_j]  # (E, 2)
+            d_pred = diff.norm(dim=1)  # (E,)
 
-        # Weighted stress
-        stress = (w * huber).sum()
+            # Huber loss
+            residuals = d_pred - d_target
+            abs_res = residuals.abs()
+            huber = torch.where(
+                abs_res <= huber_delta,
+                0.5 * residuals ** 2,
+                huber_delta * (abs_res - 0.5 * huber_delta)
+            )
 
-        # Anchor regularization (decays over time)
-        anchor_loss = current_anchor_lambda * ((X - X_anchor) ** 2).mean()
+            # Weighted stress
+            stress = (w * huber).sum()
 
-        loss = stress + anchor_loss
-        loss.backward()
-        optimizer.step()
+            # Anchor regularization (decays over time)
+            anchor_loss = current_anchor_lambda * ((X - X_anchor) ** 2).mean()
 
-        # Decay anchor weight
-        current_anchor_lambda *= anchor_decay
+            loss = stress + anchor_loss
+            loss.backward()
+            optimizer.step()
 
-        stress_val = stress.item()
-        stress_history.append(stress_val)
+            # Decay anchor weight
+            current_anchor_lambda *= anchor_decay
 
-        if DEBUG_FLAG and (it % log_every == 0 or it == n_iters - 1):
-            mean_residual = residuals.abs().mean().item()
-            max_residual = residuals.abs().max().item()
-            print(f"[GLOBAL-SOLVE] iter={it:4d} stress={stress_val:.6f} anchor={anchor_loss.item():.6f} "
-                  f"mean_res={mean_residual:.4f} max_res={max_residual:.4f}")
+            stress_val = stress.item()
+            stress_history.append(stress_val)
+
+            if DEBUG_FLAG and (it % log_every == 0 or it == n_iters - 1):
+                mean_residual = residuals.abs().mean().item()
+                max_residual = residuals.abs().max().item()
+                print(f"[GLOBAL-SOLVE] iter={it:4d} stress={stress_val:.6f} anchor={anchor_loss.item():.6f} "
+                      f"mean_res={mean_residual:.4f} max_res={max_residual:.4f}")
 
     X_final = X.detach()
 
