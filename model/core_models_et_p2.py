@@ -14498,6 +14498,7 @@ def aggregate_distance_measurements_v2(
     M_min: int = 2,
     tau_spread: float = 0.30,
     spread_alpha: float = 10.0,
+    patch_consistency: Optional[Dict[int, float]] = None,  # FM3 mitigation: per-patch consistency scores
     device: str = 'cuda',
     DEBUG_FLAG: bool = True,
 ) -> Dict[str, Any]:
@@ -14509,6 +14510,10 @@ def aggregate_distance_measurements_v2(
     - Spread (disagreement measure)
     - Filter by count and spread
 
+    Args:
+        patch_consistency: Optional dict mapping patch_id -> consistency score (0 to 1).
+                          Measurements from higher-consistency patches are weighted more.
+
     Returns:
         dict with global edges, consensus distances, weights, and diagnostics
     """
@@ -14517,12 +14522,17 @@ def aggregate_distance_measurements_v2(
 
     if DEBUG_FLAG:
         print(f"\n[AGGREGATE] Aggregating measurements from {len(patch_measurements)} patches")
+        if patch_consistency:
+            print(f"[AGGREGATE] Using patch consistency weighting (FM3 mitigation)")
 
     # Collect measurements per global edge
     edge_measurements = defaultdict(list)  # (i,j) -> [(distance, weight), ...]
 
     for k, (patch_meas, patch_idx) in enumerate(zip(patch_measurements, patch_indices)):
         patch_idx_list = patch_idx.cpu().tolist()
+
+        # Get patch consistency weight (default 1.0 if not provided)
+        patch_weight = patch_consistency.get(k, 1.0) if patch_consistency else 1.0
 
         for (u, v), d, w in zip(patch_meas['edges'], patch_meas['distances'], patch_meas['weights']):
             # Map local indices to global
@@ -14531,7 +14541,9 @@ def aggregate_distance_measurements_v2(
 
             # Canonical ordering
             edge = (min(i_global, j_global), max(i_global, j_global))
-            edge_measurements[edge].append((d, w, k))  # (distance, weight, patch_id)
+            # Apply patch consistency weight to the edge weight
+            w_adjusted = w * patch_weight
+            edge_measurements[edge].append((d, w_adjusted, k))  # (distance, weight, patch_id)
 
     if DEBUG_FLAG:
         print(f"[AGGREGATE] Total unique edges: {len(edge_measurements)}")
@@ -14999,8 +15011,43 @@ def compute_overlap_consistency_v2(
         'disagreement_max': max(disagreement_values) if disagreement_values else 0,
     }
 
+    # =========================================================================
+    # Compute per-patch consistency scores (FM3 mitigation)
+    # Patches that agree with neighbors get higher scores
+    # =========================================================================
+    K = len(patch_V)
+    patch_disagreements = {k: [] for k in range(K)}
+
+    for (k1, k2), disagreement in pair_disagreements.items():
+        patch_disagreements[k1].append(disagreement)
+        patch_disagreements[k2].append(disagreement)
+
+    # Compute mean disagreement per patch
+    patch_mean_disagreement = {}
+    for k in range(K):
+        if patch_disagreements[k]:
+            patch_mean_disagreement[k] = np.mean(patch_disagreements[k])
+        else:
+            # Patch has no overlaps - assign median disagreement
+            patch_mean_disagreement[k] = diagnostics['disagreement_median']
+
+    # Convert to consistency score: lower disagreement = higher consistency
+    # consistency = exp(-disagreement / scale)
+    # where scale = median disagreement (so median patch gets consistency ~0.37)
+    scale = diagnostics['disagreement_median'] + 1e-8
+    patch_consistency = {}
+    for k in range(K):
+        patch_consistency[k] = np.exp(-patch_mean_disagreement[k] / scale)
+
+    if DEBUG_FLAG:
+        consistency_values = list(patch_consistency.values())
+        print(f"[OVERLAP-CONSIST] Per-patch consistency scores:")
+        print(f"[OVERLAP-CONSIST]   min={min(consistency_values):.3f}, "
+              f"median={np.median(consistency_values):.3f}, max={max(consistency_values):.3f}")
+
     return {
         'pair_disagreements': pair_disagreements,
+        'patch_consistency': patch_consistency,  # NEW: per-patch consistency scores
         'diagnostics': diagnostics,
     }
 
@@ -15383,8 +15430,11 @@ def _sample_sc_edm_patchwise_v2(
         print(f"[V2-WARNING] FM2/FM3: High overlap disagreement suggests teleport patches or context variance")
 
     # =========================================================================
-    # STEP 6: Aggregate distance measurements
+    # STEP 6: Aggregate distance measurements (with FM3 mitigation)
     # =========================================================================
+    # Get patch consistency scores from overlap analysis
+    patch_consistency = overlap_result.get('patch_consistency', None)
+
     agg_result = aggregate_distance_measurements_v2(
         patch_measurements=patch_measurements,
         patch_indices=patch_indices,
@@ -15392,6 +15442,7 @@ def _sample_sc_edm_patchwise_v2(
         M_min=M_min,
         tau_spread=tau_spread,
         spread_alpha=spread_alpha,
+        patch_consistency=patch_consistency,  # FM3 mitigation
         device=device,
         DEBUG_FLAG=DEBUG_FLAG,
     )
