@@ -14299,12 +14299,15 @@ def extract_patch_distances_v2(
     mask_patch: torch.Tensor,  # (m,)
     k_edge: int = 20,
     centrality_weight: bool = True,
+    random_edge_frac: float = 0.1,  # FM6 mitigation: add random longer-range edges
     device: str = 'cuda',
 ) -> Dict[str, Any]:
     """
     Step 3: Convert patch output to sparse distance measurements.
 
-    Instead of full m×m matrix, extract kNN edges for efficiency.
+    Extracts:
+    1. kNN edges for local structure
+    2. Random non-kNN edges for global connectivity (FM6 mitigation)
 
     Returns:
         dict with edges (List of (u,v)), distances, weights, and diagnostics
@@ -14328,6 +14331,9 @@ def extract_patch_distances_v2(
     _, knn_indices = D_mat.topk(k_actual + 1, dim=1, largest=False)  # +1 for self
     knn_indices = knn_indices[:, 1:]  # Remove self
 
+    # Track which edges are kNN (for avoiding duplicates with random edges)
+    knn_edge_set = set()
+
     # Convert to edge list with distances
     edges = []
     distances = []
@@ -14342,6 +14348,7 @@ def extract_patch_distances_v2(
     else:
         centrality = torch.ones(n_valid, device=device)
 
+    # Add kNN edges
     for i in range(n_valid):
         for j_idx in range(k_actual):
             j = knn_indices[i, j_idx].item()
@@ -14354,6 +14361,35 @@ def extract_patch_distances_v2(
                 edges.append((u, v))
                 distances.append(d)
                 weights.append(w)
+                knn_edge_set.add((min(i, j), max(i, j)))
+
+    # FM6 MITIGATION: Add random longer-range edges for better connectivity
+    n_knn_edges = len(edges)
+    n_random_target = max(1, int(n_knn_edges * random_edge_frac))
+
+    # Generate random pairs that aren't already kNN edges
+    random_edges_added = 0
+    max_attempts = n_random_target * 10
+    attempts = 0
+
+    while random_edges_added < n_random_target and attempts < max_attempts:
+        i = random.randint(0, n_valid - 1)
+        j = random.randint(0, n_valid - 1)
+        if i != j:
+            edge_key = (min(i, j), max(i, j))
+            if edge_key not in knn_edge_set:
+                u = valid_indices[i].item()
+                v = valid_indices[j].item()
+                d = D_mat[i, j].item()
+                # Lower weight for random edges (less trusted)
+                w = 0.5 * (centrality[i] * centrality[j]).sqrt().item()
+
+                edges.append((u, v))
+                distances.append(d)
+                weights.append(w)
+                knn_edge_set.add(edge_key)
+                random_edges_added += 1
+        attempts += 1
 
     # Compute planarity diagnostic (rank-2 energy)
     # B = -0.5 * J @ D^2 @ J where J is centering matrix
