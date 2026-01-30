@@ -63,15 +63,31 @@ def parse_args():
     parser.add_argument('--sc_feat_mode', type=str, default='concat', choices=['concat', 'mlp'])
     parser.add_argument('--landmarks_L', type=int, default=16)
 
+    # Miniset sampling parameters
+    parser.add_argument('--pool_mult', type=float, default=2.0,
+                        help='Pool multiplier for stochastic miniset sampling. '
+                             'Lower values (1.5-2.0) give tighter spatial locality. '
+                             'For small slides (<1000 spots), use 1.5-2.0 to avoid pool covering entire slide.')
+    parser.add_argument('--stochastic_tau', type=float, default=1.0,
+                        help='Temperature for stochastic sampling within pool (lower = more deterministic)')
+
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
-                        help='Enable early stopping')
+                        help='Enable early stopping (legacy, only used when curriculum is disabled)')
     parser.add_argument('--early_stop_min_epochs', type=int, default=12,
                         help='Minimum epochs before early stopping kicks in')
     parser.add_argument('--early_stop_patience', type=int, default=6,
                         help='Epochs to wait without improvement before stopping')
     parser.add_argument('--early_stop_threshold', type=float, default=0.01,
-                        help='Relative improvement threshold (e.g., 0.01 = 1%)')
+                        help='Relative improvement threshold (e.g., 0.01 = 1%%)')
+
+    # ========== CURRICULUM EARLY STOPPING ==========
+    parser.add_argument('--curriculum_target_stage', type=int, default=6,
+                        help='Target curriculum stage for Gate A (0-indexed, default 6 = full curriculum)')
+    parser.add_argument('--curriculum_min_epochs', type=int, default=100,
+                        help='Minimum epochs before three-gate stopping is allowed')
+    parser.add_argument('--curriculum_early_stop', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable three-gate curriculum-aware early stopping (default: enabled)')
 
     parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
                         help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
@@ -443,7 +459,7 @@ def main(args=None):
 
         if resume_ckpt_path and fabric.is_global_zero:
             print(f"[RESUME] Loading full checkpoint: {resume_ckpt_path}")
-            ckpt = torch.load(resume_ckpt_path, map_location=fabric.device)
+            ckpt = torch.load(resume_ckpt_path, map_location=fabric.device, weights_only=False)
             if 'encoder' in ckpt:
                 model.encoder.load_state_dict(ckpt['encoder'])
             if 'context_encoder' in ckpt:
@@ -503,7 +519,7 @@ def main(args=None):
     if not fabric.is_global_zero:
         # Load A/B weights
         path = os.path.join(outdir, "ab_init.pt")
-        ck = torch.load(path, map_location=fabric.device)
+        ck = torch.load(path, map_location=fabric.device, weights_only=False)
         model.encoder.load_state_dict(ck["encoder"])
         model.context_encoder.load_state_dict(ck["context_encoder"])
         model.generator.load_state_dict(ck["generator"])
@@ -626,6 +642,9 @@ def main(args=None):
         early_stop_min_epochs=args.early_stop_min_epochs,
         early_stop_patience=args.early_stop_patience,
         early_stop_threshold=args.early_stop_threshold,
+        curriculum_target_stage=args.curriculum_target_stage,
+        curriculum_min_epochs=args.curriculum_min_epochs,
+        curriculum_early_stop=args.curriculum_early_stop,
         # ========== NEW: Context augmentation ==========
         z_noise_std=0.0,       # No noise for Phase 1 (focus on clean geometry)
         z_dropout_rate=0.0,    # No dropout for Phase 1
@@ -675,6 +694,9 @@ def main(args=None):
         overlap_sigma_thresh=args.overlap_sigma_thresh,
         disable_ctx_loss_when_overlap=args.disable_ctx_loss_when_overlap,
         overlap_debug_every=args.overlap_debug_every,
+        # ========== MINISET SAMPLING ==========
+        pool_mult=args.pool_mult,
+        stochastic_tau=args.stochastic_tau,
     )
 
     
@@ -976,10 +998,10 @@ def main(args=None):
         checkpoint_path_p1 = os.path.join(outdir, "phase1_st_checkpoint.pt")
         
         if os.path.exists(checkpoint_path_p2):
-            checkpoint = torch.load(checkpoint_path_p2, map_location=fabric.device)
+            checkpoint = torch.load(checkpoint_path_p2, map_location=fabric.device, weights_only=False)
             print(f"✓ Loaded checkpoint: phase2_sc_finetuned_checkpoint.pt")
         elif os.path.exists(checkpoint_path_p1):
-            checkpoint = torch.load(checkpoint_path_p1, map_location=fabric.device)
+            checkpoint = torch.load(checkpoint_path_p1, map_location=fabric.device, weights_only=False)
             print(f"✓ Loaded checkpoint: phase1_st_checkpoint.pt")
         else:
             checkpoint = {}

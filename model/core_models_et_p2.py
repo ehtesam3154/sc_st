@@ -85,16 +85,25 @@ def compute_overlap_losses(
     V_target_1: torch.Tensor = None,   # (B, N1, D) ground truth for view1
     V_target_2: torch.Tensor = None,   # (B, N2, D) ground truth for view2
     sigma_0_hi: float = 0.5,           # threshold for high-σ scale anchor
+    # NEW: for per-sample SNR gating (Try 2)
+    sigma_data: float = 0.5,           # EDM sigma_data for c_skip computation
+    kl_gate_power: float = 2.0,        # power for c_skip^p gating
 ) -> Dict[str, torch.Tensor]:
     """
     Compute overlap consistency losses for paired minisets.
 
+    [TRY 2] Per-sample SNR gating for KL loss:
+    - Computes c_skip_i = sigma_data^2 / (sigma_i^2 + sigma_data^2) per sample
+    - Gates KL: L_ov_kl_gated = (1/B) * sum(c_skip_i^p * kl_i)
+    - This REDUCES KL pressure at high σ (not just reweights)
+
     Returns dict with:
-    - L_ov_shape: Scale-free Gram consistency loss
-    - L_ov_scale: Log-trace scale consistency loss (between views)
-    - L_ov_kl: Symmetric KL divergence of neighbor distributions
-    - L_hi_scale: Direct high-σ log-RMS anchor loss (pred vs target) [NEW]
-    - debug_dict: Diagnostic information
+    - L_ov_shape: Scale-free Gram consistency loss (ungated)
+    - L_ov_scale: Log-trace scale consistency loss (ungated)
+    - L_ov_kl: Symmetric KL divergence (ungated, for logging)
+    - L_ov_kl_gated: Per-sample SNR-gated KL (for training loss)
+    - L_hi_scale: Direct high-σ log-RMS anchor loss (pred vs target)
+    - debug_dict: Diagnostic information including gating stats
     """
     B = x0_pred_1.shape[0]
     device = x0_pred_1.device
@@ -102,11 +111,16 @@ def compute_overlap_losses(
     # Initialize losses
     L_ov_shape = torch.tensor(0.0, device=device)
     L_ov_scale = torch.tensor(0.0, device=device)
-    L_ov_kl = torch.tensor(0.0, device=device)
-    L_hi_scale = torch.tensor(0.0, device=device)  # NEW: direct high-σ scale anchor
+    L_ov_kl = torch.tensor(0.0, device=device)           # Ungated (for logging)
+    L_ov_kl_gated = torch.tensor(0.0, device=device)     # [TRY 2] Per-sample gated (for training)
+    L_hi_scale = torch.tensor(0.0, device=device)        # Direct high-σ scale anchor
 
     valid_batch_count = 0
-    hi_scale_count = 0  # NEW: track high-σ samples separately
+    hi_scale_count = 0  # Track high-σ samples separately
+
+    # [TRY 2] Per-sample gating accumulators
+    gate_sum = 0.0  # For debug: sum of gates (to see how much gating is applied)
+
     debug_info = {
         'I_sizes': [],
         'trG1': [],
@@ -115,7 +129,10 @@ def compute_overlap_losses(
         'mean_pairwise_dist1': [],
         'mean_pairwise_dist2': [],
         'jaccard_k10': [],
-        'hi_scale_ratio': [],  # NEW: pred_rms / tgt_rms for high-σ
+        'hi_scale_ratio': [],  # pred_rms / tgt_rms for high-σ
+        # [TRY 2] Per-sample gating debug
+        'kl_gates': [],        # Per-sample c_skip^p values
+        'sigmas': [],          # Per-sample sigma values
     }
 
 
@@ -231,7 +248,30 @@ def compute_overlap_losses(
         kl_12 = (P1 * (torch.log(P1) - torch.log(P2))).sum(dim=1).mean()  # Mean over points
         kl_21 = (P2 * (torch.log(P2) - torch.log(P1))).sum(dim=1).mean()
         kl_sym = (kl_12 + kl_21) / 2
-        L_ov_kl = L_ov_kl + kl_sym
+
+        # [TRY 2] Per-sample SNR gating for KL
+        # c_skip = sigma_data^2 / (sigma^2 + sigma_data^2)
+        # gate = c_skip^p (p=2 by default)
+        # This REDUCES KL pressure at high σ (not just reweights)
+        if sigma_t is not None:
+            sigma_b = sigma_t[b].view(-1)[0] if sigma_t.dim() > 1 else sigma_t[b]
+            sigma_sq = sigma_b ** 2
+            c_skip_b = (sigma_data ** 2) / (sigma_sq + sigma_data ** 2)
+            gate_b = c_skip_b ** kl_gate_power
+
+            # Debug: track gating info
+            debug_info['kl_gates'].append(gate_b.item())
+            debug_info['sigmas'].append(sigma_b.item())
+            gate_sum += gate_b.item()
+        else:
+            gate_b = 1.0  # No gating if sigma not provided
+            debug_info['kl_gates'].append(1.0)
+            debug_info['sigmas'].append(0.0)
+            gate_sum += 1.0
+
+        # Accumulate BOTH gated and ungated KL
+        L_ov_kl = L_ov_kl + kl_sym                    # Ungated (for logging)
+        L_ov_kl_gated = L_ov_kl_gated + gate_b * kl_sym  # Gated (for training)
 
         valid_batch_count += 1
 
@@ -268,20 +308,29 @@ def compute_overlap_losses(
             debug_info['jaccard_k10'].append(jaccard_mean)
 
     # Normalize by valid batch count
+    # [TRY 2] IMPORTANT: Divide gated KL by B (valid_batch_count), NOT by sum(gates)
+    # This makes KL *truly weaker* when gates are small (high σ)
     if valid_batch_count > 0:
         L_ov_shape = L_ov_shape / valid_batch_count
         L_ov_scale = L_ov_scale / valid_batch_count
-        L_ov_kl = L_ov_kl / valid_batch_count
+        L_ov_kl = L_ov_kl / valid_batch_count              # Ungated average (for logging)
+        L_ov_kl_gated = L_ov_kl_gated / valid_batch_count  # Gated average (for training)
     if hi_scale_count > 0:
         L_hi_scale = L_hi_scale / hi_scale_count
+
+    # [TRY 2] Compute gating statistics for debug
+    mean_gate = gate_sum / max(valid_batch_count, 1)
+    debug_info['mean_kl_gate'] = mean_gate
+    debug_info['gate_sum'] = gate_sum
 
     return {
         'L_ov_shape': L_ov_shape,
         'L_ov_scale': L_ov_scale,
-        'L_ov_kl': L_ov_kl,
-        'L_hi_scale': L_hi_scale,  # NEW
+        'L_ov_kl': L_ov_kl,                    # Ungated (for logging)
+        'L_ov_kl_gated': L_ov_kl_gated,        # [TRY 2] Gated (for training)
+        'L_hi_scale': L_hi_scale,
         'valid_batch_count': valid_batch_count,
-        'hi_scale_count': hi_scale_count,  # NEW
+        'hi_scale_count': hi_scale_count,
         'debug_info': debug_info,
     }
 
@@ -2640,11 +2689,15 @@ def train_stageC_diffusion_generator(
     precision: str = '16-mixed', # "32-true" | "16-mixed" | "bf16-mixed"
     logger = None,
     log_interval: int = 20,
-    # Early stopping parameters
+    # Early stopping parameters (legacy, non-curriculum)
     enable_early_stop: bool = True,
     early_stop_min_epochs: int = 12,
     early_stop_patience: int = 6,
     early_stop_threshold: float = 0.01,  # 1% relative improvement
+    # Curriculum early stopping (three-gate)
+    curriculum_target_stage: int = 6,
+    curriculum_min_epochs: int = 100,
+    curriculum_early_stop: bool = True,
     # NEW: EDM parameters
     P_mean: float = -1.2,          # Log-normal mean for sigma sampling
     P_std: float = 1.2,            # Log-normal std for sigma sampling
@@ -2713,6 +2766,116 @@ def train_stageC_diffusion_generator(
         'dbg_overlap_pairs': 0,
         'dbg_k_mean': 0.0,
         'overlap_count_this_epoch': 0
+    }
+
+    # =========================================================================
+    # [CURRICULUM] Phase 3: σ curriculum state initialization
+    # Ladder of σ_cap values as multiples of σ_data
+    # For σ_data=0.175: [0.05, 0.16, 0.40, 0.70, 1.23, 2.45, 2.98]
+    # =========================================================================
+    curriculum_state = {
+        'sigma_cap_mults': [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0],  # Multiples of σ_data
+        'current_stage': 0,           # Start at stage 0 (0.3 * σ_data)
+        'consecutive_passes': 0,      # Need 5 consecutive passes for promotion
+        'promotion_threshold': 5,     # User requested 5 instead of 2-3
+        'stall_count': 0,             # Count of failed promotion attempts
+        'stall_limit': 6,             # Stop if stalled for this many evals
+        'generator_stable': False,    # Phase 2: warm-start flag
+        'gen_consecutive_passes': 0,  # Phase 2: generator stability counter
+        # Stricter thresholds at lower σ (tiered)
+        'jacc_min_by_mult': {
+            0.3: 0.15,   # Stricter at low σ
+            0.9: 0.12,   # Still relatively strict
+            2.3: 0.10,
+            4.0: 0.09,
+            7.0: 0.08,
+            14.0: 0.07,
+            17.0: 0.07,
+        },
+        # Tiered scale_r thresholds for PROMOTION:
+        # - Stricter at low σ (easier to predict scale accurately)
+        # - Relaxed at high σ (harder to predict scale with more noise)
+        # Note: trace_r ≈ scale_r², so trace thresholds derived from scale
+        'scale_r_min_by_mult': {
+            0.3: 0.88,   # Low σ: stricter (easy to predict)
+            0.9: 0.84,
+            2.3: 0.75,   # Your stall was here with ~0.77
+            4.0: 0.73,
+            7.0: 0.72,
+            14.0: 0.68,
+            17.0: 0.65,  # High σ: relaxed for promotion
+        },
+        'scale_r_min_default': 0.65,
+        # trace_r_min ≈ 0.95 * scale_r_min² (they're correlated)
+        'trace_r_min_by_mult': {
+            0.3: 0.74,   # ≈ 0.95 * 0.88²
+            0.9: 0.67,   # ≈ 0.95 * 0.84²
+            2.3: 0.53,   # ≈ 0.95 * 0.75²
+            4.0: 0.51,   # ≈ 0.95 * 0.73²
+            7.0: 0.49,   # ≈ 0.95 * 0.72²
+            14.0: 0.44,  # ≈ 0.95 * 0.68²
+            17.0: 0.40,  # ≈ 0.95 * 0.65²
+        },
+        'trace_r_min_default': 0.40,
+        # FINAL thresholds (at target stage only, for "training succeeded")
+        # These are stricter to ensure generation quality
+        'scale_r_min_final': 0.80,
+        'trace_r_min_final': 0.60,
+        # Cap-band emphasis: fraction of samples drawn from [0.7*σ_cap, σ_cap]
+        # Remaining (1 - frac) drawn from full [σ_min, σ_cap] via log-normal
+        'cap_band_frac_by_stage': {
+            0: 0.4, 1: 0.4,   # Early stages: 40% cap-band
+            2: 0.6, 3: 0.6,   # Mid stages: 60% cap-band
+        },
+        'cap_band_frac_default': 0.7,  # Stage 4+: 70% cap-band
+        'cap_band_lo_mult': 0.7,       # Cap-band lower bound = 0.7 * σ_cap
+        # History for tracking
+        'eval_history': [],           # List of (epoch, metrics_dict)
+
+        # ============================================================
+        # THREE-GATE EARLY STOPPING (combined loss + metrics + stage)
+        # Gate A: current_stage >= target_stage
+        # Gate B: metrics stable for K consecutive evals
+        # Gate C: cap-band loss plateau (loss for σ near σ_cap stabilized)
+        # ============================================================
+        'target_stage': curriculum_target_stage,  # Gate A: target stage index (CLI arg, default 6 = full)
+        'curriculum_early_stop': curriculum_early_stop,  # Enable/disable three-gate stopping
+        'steps_in_stage': 0,          # Reset when promoting to new stage
+        'min_steps_per_stage': 1000,  # Minimum steps before promotion/stopping allowed
+                                      # For 6000 samples / batch_size=32 ≈ 188 steps/epoch
+                                      # 1000 steps ≈ 5.3 epochs minimum per stage
+        'min_steps_at_target': 2000,  # Minimum steps at TARGET stage before "stall at target" can stop
+                                      # ~10.6 epochs at target stage to give it a fair chance
+        # ChatGPT FIX: Dynamic max_steps_per_stage (computed after knowing total epochs)
+        # Formula: (total_steps - target_dwell) / num_stages_to_traverse
+        # Ensures model ALWAYS reaches target stage within epoch budget
+        'max_steps_per_stage': None,  # Will be computed dynamically
+        'target_dwell_frac': 0.20,    # Reserve 20% of total steps for target stage
+        # Promotion ramp: smooth σ_cap transitions to avoid "stage shock"
+        'ramp_steps': 300,            # Interpolate σ_cap over this many steps after promotion
+        'ramp_start_step': None,      # Global step when ramp started (None = no ramp active)
+        'ramp_prev_cap': None,        # Previous σ_cap value (actual cap, not multiplier)
+        'ramp_target_cap': None,      # Target σ_cap value (actual cap, not multiplier)
+        'min_epochs': curriculum_min_epochs,  # Absolute minimum epochs before any stopping (CLI arg, default 100)
+
+        # Gate B: Metrics stability tracking (K consecutive passes)
+        'metrics_history_K': 5,       # Need K consecutive good evals for Gate B
+        'metrics_pass_history': [],   # List of bools (recent eval pass/fail)
+
+        # Gate C: Cap-band loss plateau detection
+        # Track loss for samples with σ ∈ [0.8*σ_cap, σ_cap]
+        'cap_band_loss_sum': 0.0,     # Accumulated cap-band score loss
+        'cap_band_loss_count': 0,     # Number of cap-band samples
+        'cap_band_loss_history': [],  # Per-epoch average cap-band loss
+        'loss_plateau_patience': 6,   # P evals without improvement = plateau
+        'loss_plateau_threshold': 0.02,  # 2% relative improvement threshold
+        'loss_no_improve_count': 0,   # Counter for plateau detection
+        'best_cap_band_loss': float('inf'),  # Best cap-band loss at current stage
+
+        # Conditioning strength knob (ChatGPT fix for scale collapse at moderate σ)
+        # Normalizes H to unit RMS then scales by α
+        # This controls conditioning magnitude without changing model architecture
+        'cond_alpha': 0.1,            # Fixed conditioning strength (start conservative)
     }
 
     slide_d15_medians = []
@@ -2838,8 +3001,11 @@ def train_stageC_diffusion_generator(
 
     
     # A/B 3: F_x-space supervision for high-noise (learned branch direct supervision)
-    EXP_SCORE_FX_HI = False
-    FX_HI_WEIGHT = 1.0                 # Multiplier for Fx loss term
+    # ENABLED: This directly supervises the learned branch F_x at high σ, which is
+    # needed because scale improved but structure didn't. The learned branch must
+    # carry correct geometry at high σ (where c_skip ≈ 0).
+    EXP_SCORE_FX_HI = True  # CHANGED from False
+    FX_HI_WEIGHT = 2.0                 # Multiplier for Fx loss term (increased from 1.0)
     FX_USE_COUT2_MATCH = True          # If True, multiply Fx-MSE by c_out^2 (unit-matching)
     
     print(f"[EXP FLAGS] WD0={EXP_SCORE_WD0}, WNORM={EXP_SCORE_WNORM}, HI_BOOST={EXP_SCORE_HI_BOOST}, FX_HI={EXP_SCORE_FX_HI}")
@@ -3080,6 +3246,7 @@ def train_stageC_diffusion_generator(
                 print(f"[PAIR-OVERLAP] Using ONLY paired minisets for ST training")
                 print(f"[PAIR-OVERLAP] alpha={pair_overlap_alpha}, min_I={pair_overlap_min_I}")
                 print(f"[PAIR-OVERLAP] Overlap loss weights: shape={overlap_loss_weight_shape}, scale={overlap_loss_weight_scale}, kl={overlap_loss_weight_kl}")
+                print(f"[PAIR-OVERLAP] [TRY2] Per-sample SNR gating for KL enabled (c_skip^2, divide by B not sum(gate))")
         else:
             # Standard unpaired training
             st_loader = DataLoader(
@@ -3116,6 +3283,38 @@ def train_stageC_diffusion_generator(
         steps_per_epoch = 1  # fallback
 
     LOG_EVERY = steps_per_epoch  # Print once per epoch
+
+    # ========== ChatGPT FIX: Compute dynamic max_steps_per_stage ==========
+    # Formula: (total_steps - target_dwell) / num_stages_to_traverse
+    # This GUARANTEES reaching target stage within the epoch budget
+    total_steps = n_epochs * steps_per_epoch
+    target_stage = curriculum_state['target_stage']
+    num_stages_to_traverse = target_stage  # stages 0 to target_stage-1
+    target_dwell_frac = curriculum_state.get('target_dwell_frac', 0.20)
+    target_dwell_steps = int(total_steps * target_dwell_frac)
+
+    if num_stages_to_traverse > 0:
+        # Reserve target_dwell_steps for target stage, divide rest among stages
+        available_steps = total_steps - target_dwell_steps
+        max_steps_per_stage = max(500, available_steps // num_stages_to_traverse)
+    else:
+        max_steps_per_stage = total_steps  # Already at target
+
+    # Also update min_steps_at_target to be proportional
+    min_steps_at_target = max(500, target_dwell_steps // 2)
+
+    curriculum_state['max_steps_per_stage'] = max_steps_per_stage
+    curriculum_state['min_steps_at_target'] = min_steps_at_target
+
+    if fabric is None or fabric.is_global_zero:
+        print(f"\n[CURRICULUM-BUDGET] Dynamic step allocation:")
+        print(f"  total_epochs={n_epochs}, steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
+        print(f"  target_stage={target_stage}, stages_to_traverse={num_stages_to_traverse}")
+        print(f"  target_dwell_frac={target_dwell_frac:.0%} → target_dwell_steps={target_dwell_steps}")
+        print(f"  max_steps_per_stage={max_steps_per_stage} (hard escape hatch)")
+        print(f"  min_steps_at_target={min_steps_at_target}")
+        print(f"  ramp_steps={curriculum_state.get('ramp_steps', 300)} (smooth promotion transitions)")
+    # =====================================================================
 
     # ========== COMPUTE TRIANGLE EPSILON FOR ST ONLY ==========
     
@@ -3469,9 +3668,10 @@ def train_stageC_diffusion_generator(
     }
 
     start_epoch = 0
+    start_global_step = 0  # Will be restored from checkpoint if available
     if resume_ckpt_path:
         print(f"[RESUME] Loading Stage C checkpoint: {resume_ckpt_path}")
-        ckpt = torch.load(resume_ckpt_path, map_location=device)
+        ckpt = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
 
         if 'context_encoder' in ckpt:
             context_encoder.load_state_dict(ckpt['context_encoder'])
@@ -3487,8 +3687,19 @@ def train_stageC_diffusion_generator(
         if 'score_net_ema' in ckpt:
             score_net_ema.load_state_dict(ckpt['score_net_ema'])
 
+        if 'encoder' in ckpt and encoder is not None:
+            encoder_to_load = encoder.module if hasattr(encoder, 'module') else encoder
+            encoder_to_load.load_state_dict(ckpt['encoder'])
+            print("[RESUME] Loaded encoder state.")
+        elif encoder is not None:
+            print("[RESUME] WARNING: encoder not found in checkpoint; keeping current weights.")
+
         if 'optimizer' in ckpt and not resume_reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
+
+        if 'scheduler' in ckpt and not resume_reset_optimizer:
+            scheduler.load_state_dict(ckpt['scheduler'])
+            print("[RESUME] Loaded scheduler state.")
 
         if 'epoch' in ckpt:
             start_epoch = int(ckpt['epoch']) + 1
@@ -3508,7 +3719,97 @@ def train_stageC_diffusion_generator(
         if 'sigma_max' in ckpt:
             sigma_max = ckpt['sigma_max']
 
-        print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
+        # Save canonical config BEFORE loading checkpoint (source of truth)
+        canonical_curriculum = curriculum_state.copy()
+
+        if 'curriculum_state' in ckpt:
+            loaded_state = ckpt['curriculum_state']
+            print(f"[RESUME] Loaded curriculum_state: stage={loaded_state['current_stage']}, "
+                  f"steps_in_stage={loaded_state.get('steps_in_stage', 0)}")
+
+            # ============================================================
+            # MIGRATION: Merge loaded state with canonical config
+            # - Keep runtime state from checkpoint (current_stage, stall_count, etc.)
+            # - Override threshold configs with canonical values (single source of truth)
+            # ============================================================
+
+            # Keys that should ALWAYS use canonical values (config, not runtime state)
+            config_keys = [
+                'sigma_cap_mults',
+                'scale_r_min_by_mult', 'scale_r_min_default',
+                'trace_r_min_by_mult', 'trace_r_min_default',
+                'jacc_min_by_mult',
+                'scale_r_min_final', 'trace_r_min_final',
+                'cap_band_frac_by_stage', 'cap_band_frac_default', 'cap_band_lo_mult',
+                'promotion_threshold', 'stall_limit',
+                'metrics_history_K', 'min_steps_per_stage', 'min_steps_at_target',
+                'loss_plateau_patience', 'loss_plateau_threshold',
+                'cond_alpha',  # Conditioning strength knob
+            ]
+
+            # Start with loaded state, then override config keys with canonical values
+            curriculum_state = loaded_state.copy()
+
+            updated_keys = []
+            for key in config_keys:
+                if key in canonical_curriculum:
+                    old_val = curriculum_state.get(key)
+                    new_val = canonical_curriculum[key]
+                    if old_val != new_val:
+                        updated_keys.append(key)
+                    curriculum_state[key] = new_val
+
+            if updated_keys:
+                print(f"[RESUME-MIGRATE] Updated config keys from code: {updated_keys}")
+                # Show current stage threshold for clarity
+                curr_stage = curriculum_state.get('current_stage', 0)
+                sigma_mults = curriculum_state.get('sigma_cap_mults', [0.3])
+                if curr_stage < len(sigma_mults):
+                    curr_mult = sigma_mults[curr_stage]
+                    scale_thresh = curriculum_state['scale_r_min_by_mult'].get(curr_mult,
+                                   curriculum_state['scale_r_min_default'])
+                    print(f"  Current stage {curr_stage} (mult={curr_mult}): scale_r threshold = {scale_thresh}")
+
+            # Reset stall_count if thresholds changed (old stalls based on wrong thresholds)
+            if 'scale_r_min_by_mult' in updated_keys or 'trace_r_min_by_mult' in updated_keys:
+                old_stall = loaded_state.get('stall_count', 0)
+                if old_stall > 0:
+                    curriculum_state['stall_count'] = 0
+                    curriculum_state['consecutive_passes'] = 0
+                    print(f"[RESUME-MIGRATE] Reset stall_count ({old_stall}→0) due to threshold update")
+
+            # Add any NEW keys that didn't exist in old checkpoint
+            new_keys = []
+            for key, val in canonical_curriculum.items():
+                if key not in curriculum_state:
+                    curriculum_state[key] = val
+                    new_keys.append(key)
+            if new_keys:
+                print(f"[RESUME-MIGRATE] Added new keys: {new_keys}")
+
+            # Remove deprecated keys
+            deprecated_keys = ['scale_r_min', 'trace_r_min']  # Old flat thresholds
+            for key in deprecated_keys:
+                if key in curriculum_state:
+                    del curriculum_state[key]
+                    print(f"[RESUME-MIGRATE] Removed deprecated key: {key}")
+
+        # ============================================================
+        # RESTORE global_step (NEW: fixes ramp state consistency)
+        # ============================================================
+        if 'global_step' in ckpt:
+            start_global_step = int(ckpt['global_step'])
+            print(f"[RESUME] Restored global_step={start_global_step}")
+        else:
+            # Old checkpoint without global_step - clear any stale ramp state
+            start_global_step = 0
+            if curriculum_state.get('ramp_start_step') is not None:
+                print(f"[RESUME-MIGRATE] Old checkpoint without global_step, clearing stale ramp state")
+                curriculum_state['ramp_start_step'] = None
+                curriculum_state['ramp_prev_cap'] = None
+                curriculum_state['ramp_target_cap'] = None
+
+        print(f"[RESUME] start_epoch={start_epoch}, start_global_step={start_global_step}, reset_optimizer={resume_reset_optimizer}")
 
 
     # ========== EDM DEBUG STATE INITIALIZATION ==========
@@ -3610,6 +3911,15 @@ def train_stageC_diffusion_generator(
 
     # Store sigma_data on score_net for reference in forward pass
     print(f"[StageC] sigma_data = {sigma_data:.4f}")
+
+    if fabric is None or fabric.is_global_zero:
+        print(f"\n[CURRICULUM CONFIG]")
+        print(f"  stages: {curriculum_state['sigma_cap_mults']} (× σ_data={sigma_data:.4f})")
+        print(f"  target_stage: {curriculum_state['target_stage']} / {len(curriculum_state['sigma_cap_mults'])-1}")
+        print(f"  min_epochs: {curriculum_state['min_epochs']}")
+        print(f"  three-gate early stop: {curriculum_state.get('curriculum_early_stop', True)}")
+        print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
+              f"default={curriculum_state['cap_band_frac_default']}")
     
     # Store sigma_data on score_net (handle DDP/Fabric wrapper)
     if hasattr(score_net, 'module'):
@@ -3745,8 +4055,8 @@ def train_stageC_diffusion_generator(
     #--amp scaler choice based on precision---
     use_fp16 = (precision == '16-mixed')
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-    
-    global_step = 0
+
+    global_step = start_global_step  # Restore from checkpoint or 0 for fresh start
 
     ema_grads = {
         'score': 1.0,
@@ -3869,9 +4179,92 @@ def train_stageC_diffusion_generator(
         return result
     
 
+    # =========================================================================
+    # HELPER: Get effective sigma_cap (accounts for ramp)
+    # Pure function - does NOT mutate state
+    # =========================================================================
+    def get_sigma_cap_eff(curriculum_state, global_step, sigma_data):
+        """
+        Single source of truth for effective sigma_cap during ramp.
+
+        Returns: (sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress)
+        - sigma_cap_eff: the actual cap to use for training/eval
+        - sigma_cap_target: the target cap for current stage
+        - ramp_active: True if ramp is in progress
+        - ramp_progress: 0.0-1.0 progress through ramp (0 if not active)
+        """
+        curr_stage = curriculum_state['current_stage']
+        sigma_cap_target = curriculum_state['sigma_cap_mults'][curr_stage] * sigma_data
+
+        ramp_start = curriculum_state.get('ramp_start_step')
+        ramp_steps = curriculum_state.get('ramp_steps', 300)
+
+        # Ramp is active if ramp_start_step is set and not yet complete
+        # Also need valid ramp_prev_cap and ramp_target_cap
+        if ramp_start is not None:
+            prev_cap = curriculum_state.get('ramp_prev_cap')
+            target_cap = curriculum_state.get('ramp_target_cap')
+
+            # If caps are None (e.g., old checkpoint), treat as no ramp
+            if prev_cap is None or target_cap is None:
+                return sigma_cap_target, sigma_cap_target, False, 1.0
+
+            steps_since_ramp = global_step - ramp_start
+            if steps_since_ramp < ramp_steps:
+                # Ramp in progress
+                t = steps_since_ramp / ramp_steps
+                sigma_cap_eff = prev_cap + t * (target_cap - prev_cap)
+                return sigma_cap_eff, sigma_cap_target, True, t
+
+        # No ramp or ramp complete
+        return sigma_cap_target, sigma_cap_target, False, 1.0
+
+    def normalize_and_scale_conditioning(H, mask, alpha, eps=1e-8):
+        """
+        Normalize H to unit RMS (per sample), then scale by alpha.
+
+        ChatGPT fix for scale collapse: conditioning magnitude was suppressing
+        the learned branch. This knob controls conditioning strength without
+        changing model architecture.
+
+        Args:
+            H: (B, N, c_dim) conditioning tensor (after dropout)
+            mask: (B, N) validity mask
+            alpha: scalar conditioning strength
+            eps: numerical stability
+
+        Returns:
+            H_scaled: (B, N, c_dim) normalized and scaled conditioning
+            rms_before: (B,) per-sample RMS before normalization (for logging)
+        """
+        B, N, c_dim = H.shape
+
+        # Mask H for valid positions only
+        mask_f = mask.unsqueeze(-1).float()  # (B, N, 1)
+        H_masked = H * mask_f
+
+        # Compute per-sample RMS with CORRECT denominator (include c_dim)
+        # rms = sqrt(sum(H^2) / (n_valid * c_dim))
+        n_valid = mask.sum(dim=1).float()  # (B,)
+        denominator = (n_valid * c_dim).clamp(min=1.0)  # (B,)
+        sq_sum = (H_masked ** 2).sum(dim=(1, 2))  # (B,)
+        rms_H = (sq_sum / denominator + eps).sqrt()  # (B,)
+
+        # DETACH RMS so context encoder can't game the normalization
+        rms_H = rms_H.detach()
+
+        # Normalize to unit RMS, then scale by alpha
+        H_norm = H / rms_H.view(B, 1, 1).clamp(min=eps)
+        H_scaled = H_norm * alpha
+
+        # Apply mask again (for safety)
+        H_scaled = H_scaled * mask_f
+
+        return H_scaled, rms_H
+
     # Track pin-rate for adaptive clamp (persists across steps within this training run)
     last_pin_rate = 1.0  # Assume worst case initially
-    
+
     for epoch in range(start_epoch, n_epochs):
         epoch_cv_sum = 0.0
         epoch_qent_sum = 0.0
@@ -3893,7 +4286,7 @@ def train_stageC_diffusion_generator(
         ctx_perm_fixed_sum = 0.0
 
         # ========== OVERLAP CONSISTENCY LOSS TRACKING (Candidate 1) ==========
-        ov_loss_sum = {'shape': 0.0, 'scale': 0.0, 'kl': 0.0, 'total': 0.0}
+        ov_loss_sum = {'shape': 0.0, 'scale': 0.0, 'kl': 0.0, 'kl_gated': 0.0, 'total': 0.0}  # [TRY2] added kl_gated
         ov_apply_count = 0
         ov_skipped_sigma = 0
         ov_pair_batches = 0
@@ -3986,6 +4379,23 @@ def train_stageC_diffusion_generator(
             if anchor_mask is not None:
                 anchor_mask = anchor_mask.to(device).bool() & mask
 
+            # Landmark mask (landmarks are FPS-selected reference points, not real data)
+            is_landmark = batch.get('is_landmark', None)
+            if is_landmark is not None:
+                is_landmark = is_landmark.to(device).bool() & mask
+            else:
+                is_landmark = torch.zeros_like(mask)  # No landmarks by default
+
+            # ========== STRUCT_MASK: Points where kNN-based structure losses are valid ==========
+            # Problem: knn_spatial indices become -1 when neighbors aren't in the miniset
+            # This is especially bad for:
+            # - Landmarks: appended AFTER knn_spatial is computed, so all -1
+            # - Extras (non-core competitors): spatially distant, many neighbors missing
+            # Solution: Restrict structure losses to core non-landmarks only
+            if anchor_mask is not None:
+                struct_mask = mask & anchor_mask & (~is_landmark)
+            else:
+                struct_mask = mask & (~is_landmark)
 
             n_list = batch['n']
             batch_size_real = Z_set.shape[0]
@@ -4046,42 +4456,97 @@ def train_stageC_diffusion_generator(
 
                 # === EDM: sample sigma from log-normal ===
                 if use_edm:
-                    # sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
-                    sigma = uet.sample_sigma_lognormal_stratified(
-                        batch_size_real, P_mean, P_std,
-                        high_sigma_fraction=0.4,  # 25% of batch guaranteed high-σ
-                        high_sigma_threshold=0.5,  # σ >= 0.5 is "high"
-                        device=device
-                    )
-                    sigma = sigma.clamp(sigma_min, sigma_refine_max)
+                    # [CURRICULUM] Phase 3: Compute current sigma_cap using helper
+                    curr_stage = curriculum_state['current_stage']
+                    sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
+                        curriculum_state, global_step, sigma_data)
+
+                    # Clear ramp state when ramp completes (state mutation happens HERE, not in helper)
+                    if not ramp_active and curriculum_state.get('ramp_start_step') is not None:
+                        curriculum_state['ramp_start_step'] = None
+                        curriculum_state['ramp_prev_cap'] = None
+                        curriculum_state['ramp_target_cap'] = None
+                        if fabric is None or fabric.is_global_zero:
+                            print(f"  [RAMP] Completed at step={global_step}, σ_cap_eff={sigma_cap_eff:.4f}")
+
+                    # Log ramp progress periodically
+                    if ramp_active and global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        prev_cap = curriculum_state.get('ramp_prev_cap', sigma_cap_eff)
+                        target_cap = curriculum_state.get('ramp_target_cap', sigma_cap_target)
+                        print(f"  [RAMP] step={global_step} progress={ramp_progress:.0%} "
+                              f"σ_cap_eff={sigma_cap_eff:.4f} ({prev_cap:.4f}→{target_cap:.4f})")
+
+                    sigma_cap = min(sigma_cap_eff, sigma_refine_max)  # Never exceed original limit
+
+                    # [CURRICULUM] Cap-band emphasis sampling
+                    # Mixture: cap_band_frac from [0.7*σ_cap, σ_cap], rest from full [σ_min, σ_cap]
+                    cap_band_frac = curriculum_state['cap_band_frac_by_stage'].get(
+                        curr_stage, curriculum_state['cap_band_frac_default'])
+                    cap_band_lo = curriculum_state['cap_band_lo_mult'] * sigma_cap  # 0.7 * σ_cap
+                    cap_band_lo = max(cap_band_lo, sigma_min)  # Safety floor
+
+                    n_cap_band = int(batch_size_real * cap_band_frac)
+                    n_full_range = batch_size_real - n_cap_band
+
+                    sigma_parts = []
+
+                    # (A) Cap-band samples: uniform in log-space over [0.7*σ_cap, σ_cap]
+                    if n_cap_band > 0:
+                        import math
+                        log_lo = math.log(cap_band_lo)
+                        log_hi = math.log(sigma_cap)
+                        if log_hi > log_lo + 1e-8:
+                            log_sigma_cb = torch.rand(n_cap_band, device=device) * (log_hi - log_lo) + log_lo
+                            sigma_parts.append(log_sigma_cb.exp())
+                        else:
+                            # σ_cap ≈ cap_band_lo (very early stage): just use σ_cap
+                            sigma_parts.append(torch.full((n_cap_band,), sigma_cap, device=device))
+
+                    # (B) Full-range samples: log-normal clamped to [σ_min, σ_cap]
+                    if n_full_range > 0:
+                        rnd_normal = torch.randn(n_full_range, device=device)
+                        sigma_full = (rnd_normal * P_std + P_mean).exp()
+                        sigma_full = sigma_full.clamp(sigma_min, sigma_cap)
+                        sigma_parts.append(sigma_full)
+
+                    sigma = torch.cat(sigma_parts, dim=0)
+                    # Shuffle so cap-band and full-range samples are interleaved
+                    sigma = sigma[torch.randperm(sigma.shape[0], device=device)]
                     sigma_t = sigma.view(-1, 1, 1)
 
                     # ========== PHASE 2: SIGMA SAMPLING SANITY ==========
                     if global_step % 20 == 0 and (fabric is None or fabric.is_global_zero):
                         print(f"\n[PHASE 2] Sigma Sampling (step {global_step}):")
+                        print(f"  [CURRICULUM] stage={curr_stage} mult={curr_mult:.1f}x sigma_cap={sigma_cap:.4f} "
+                              f"(sigma_data={sigma_data:.4f})")
+                        print(f"  [CAP-BAND] frac={cap_band_frac:.0%} band=[{cap_band_lo:.6f}, {sigma_cap:.6f}] "
+                              f"n_cb={n_cap_band} n_full={n_full_range}")
+                        # Actual fraction in cap-band (including full-range samples that landed there)
+                        actual_in_band = ((sigma >= cap_band_lo) & (sigma <= sigma_cap)).float().mean().item()
+                        print(f"  [CAP-BAND] actual_in_band={actual_in_band*100:.1f}%")
                         print(f"  sigma: min={sigma.min():.6f} median={sigma.median():.6f} max={sigma.max():.6f}")
 
                         import math
-                        
+
                         log_sigma = sigma.log()
                         log_min = math.log(sigma_min)
-                        log_refine = math.log(sigma_refine_max)
+                        log_cap = math.log(sigma_cap)
                         print(f"  log(sigma): min={log_sigma.min():.4f} median={log_sigma.median():.4f} max={log_sigma.max():.4f}")
-                        
+
                         # Quantiles
                         print(f"  Quantiles: p05={sigma.quantile(0.05):.6f} p25={sigma.quantile(0.25):.6f} "
                               f"p75={sigma.quantile(0.75):.6f} p95={sigma.quantile(0.95):.6f}")
-                        
-                        # Clamp hit rates
+
+                        # Clamp hit rates (only relevant for full-range samples now)
                         clamp_low = (sigma <= sigma_min + 1e-6).float().mean().item()
-                        clamp_high = (sigma >= sigma_refine_max - 1e-6).float().mean().item()
-                        print(f"  Clamp hit rate: at sigma_min={clamp_low*100:.1f}% at sigma_refine_max={clamp_high*100:.1f}%")
-                        
+                        clamp_high = (sigma >= sigma_cap - 1e-6).float().mean().item()
+                        print(f"  Clamp hit rate: at sigma_min={clamp_low*100:.1f}% at sigma_cap={clamp_high*100:.1f}%")
+
                         if clamp_low > 0.3 or clamp_high > 0.3:
                             print(f"  ⚠️ WARNING: >30% samples hit clamp bounds!")
-                        
+
                         # t_norm mapping sanity (for time-aware architectures)
-                        t_norm_check = ((log_sigma - log_min) / (log_refine - log_min + 1e-8)).clamp(0, 1)
+                        t_norm_check = ((log_sigma - log_min) / (log_cap - log_min + 1e-8)).clamp(0, 1)
                         print(f"  t_norm: min={t_norm_check.min():.4f} median={t_norm_check.median():.4f} max={t_norm_check.max():.4f}")
                     
                     # Create t_norm proxy for gating/debug (log-space normalization)
@@ -4114,6 +4579,38 @@ def train_stageC_diffusion_generator(
                         V_i = uet.factor_from_gram(G_i, D_latent).to(V_target_raw.dtype)
                         V_target[i, :n_valid] = V_i
                     # --------------------------------------------------------
+
+                    # ========== [GRAM-CANON] DEBUG: Verify gauge canonicalization ==========
+                    # ChatGPT requested: check that anchor signs are stable (should all be +1)
+                    if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            # Check first valid sample in batch
+                            for i in range(batch_size_real):
+                                n_valid = int(mask[i].sum().item())
+                                if n_valid > 1:
+                                    V_check = V_target[i, :n_valid]  # (n_valid, D_latent)
+                                    D_check = min(D_latent, n_valid)
+
+                                    # Compute anchor signs (same logic as factor_from_gram)
+                                    abs_max_idx = V_check[:, :D_check].abs().argmax(dim=0)  # (D,)
+                                    col_indices = torch.arange(D_check, device=V_check.device)
+                                    anchor_vals = V_check[abs_max_idx, col_indices]  # (D,)
+
+                                    num_pos = (anchor_vals > 0).sum().item()
+                                    num_neg = (anchor_vals < 0).sum().item()
+                                    num_zero = (anchor_vals == 0).sum().item()
+
+                                    # Reproducibility check: factor same G twice
+                                    G_i = G_target[i, :n_valid, :n_valid].float()
+                                    V_rep1 = uet.factor_from_gram(G_i, D_latent)
+                                    V_rep2 = uet.factor_from_gram(G_i, D_latent)
+                                    repeat_mse = (V_rep1 - V_rep2).pow(2).mean().item()
+
+                                    print(f"  [GRAM-CANON] Anchor signs: +{num_pos} -{num_neg} 0:{num_zero} "
+                                          f"(expect all + after canonicalization)")
+                                    print(f"  [GRAM-CANON] V_target repeat MSE: {repeat_mse:.2e} "
+                                          f"(should be ~0 for reproducibility)")
+                                    break  # Only check first valid sample
 
                     # ========== PROBE BATCH CAPTURE (once, rank-0 only) ==========
                     # Must be AFTER V_target canonicalization so we capture the same
@@ -4306,7 +4803,34 @@ def train_stageC_diffusion_generator(
                           f"drop_rate={uncond_rate:.4f} FORCE_COND_ONLY={FORCE_COND_ONLY}")
                 # ======== END A/B TEST 2 DEBUG ========
 
-                
+                # ======== CONDITIONING STRENGTH KNOB (ChatGPT fix for scale collapse) ========
+                # Apply AFTER dropout: normalize H_train to unit RMS, then scale by alpha
+                # This controls conditioning magnitude without architecture changes
+                cond_alpha = curriculum_state.get('cond_alpha', 0.1)
+                H_train, rms_H_before = normalize_and_scale_conditioning(H_train, mask, cond_alpha)
+
+                # Logging: verify the knob is working
+                if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                    # Compute RMS after scaling for verification
+                    mask_f = mask.unsqueeze(-1).float()
+                    n_valid = mask.sum(dim=1).float()
+                    c_dim = H_train.shape[-1]
+                    den = (n_valid * c_dim).clamp(min=1.0)
+                    sq_sum_after = ((H_train * mask_f) ** 2).sum(dim=(1, 2))
+                    rms_H_after = (sq_sum_after / den + 1e-8).sqrt()
+
+                    # Report median and p90 for before/after
+                    rms_before_med = rms_H_before.median().item()
+                    rms_before_p90 = rms_H_before.quantile(0.9).item()
+                    rms_after_med = rms_H_after.median().item()
+                    rms_after_p90 = rms_H_after.quantile(0.9).item()
+
+                    print(f"[COND-SCALE] step={global_step} alpha={cond_alpha:.3f} "
+                          f"rms_before=[med={rms_before_med:.4f}, p90={rms_before_p90:.4f}] "
+                          f"rms_after=[med={rms_after_med:.4f}, p90={rms_after_p90:.4f}] "
+                          f"(expect after≈{cond_alpha:.3f})")
+                # ======== END CONDITIONING STRENGTH KNOB ========
+
                 # For ST: still load G_target (needed for Gram loss later)
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
@@ -4997,7 +5521,24 @@ def train_stageC_diffusion_generator(
                     else:
                         # Classic EDM objective estimate
                         L_score = (w_eff * err2_sample).mean()
-                    
+
+                    # ============================================================
+                    # [THREE-GATE] Track cap-band loss for Gate C
+                    # Cap-band = samples with σ ∈ [0.8*σ_cap, σ_cap]
+                    # This makes loss comparable within a stage (same σ distribution)
+                    # ============================================================
+                    with torch.no_grad():
+                        cap_band_lo = 0.8 * sigma_cap
+                        cap_band_hi = sigma_cap
+                        cap_band_mask = (sigma_flat >= cap_band_lo) & (sigma_flat <= cap_band_hi)
+                        n_cap_band = cap_band_mask.sum().item()
+
+                        if n_cap_band > 0:
+                            # Accumulate cap-band score loss (unweighted for stability)
+                            cap_band_err2 = err2_sample[cap_band_mask].mean().item()
+                            curriculum_state['cap_band_loss_sum'] += cap_band_err2 * n_cap_band
+                            curriculum_state['cap_band_loss_count'] += n_cap_band
+
                     # Debug: Log WNORM effect
                     # Debug: Log WNORM effect
                     if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
@@ -5403,13 +5944,86 @@ def train_stageC_diffusion_generator(
                 valid_counts = mask.sum(dim=1, keepdim=True).clamp(min=1)
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                 V_hat_centered = (V_hat_f32 - mean) * m_float  # (B,N,D), centered but NOT clamped
-                
-                # --- Step B: Compute V_geom (centered + locally clamped, for STRUCTURE losses) ---
-                # Use kNN-based local scale correction (detached) if we have spatial kNN and this is ST
-                knn_spatial_for_scale = batch.get('knn_spatial', None)
-                
+
+                # --- Step A2: Compute V_struct (self-normalized RAW for STRUCTURE losses) ---
+                # ChatGPT fix: Structure losses should be scale-INVARIANT without using V_target
+                # V_struct = V_hat_centered / RMS(V_hat_centered) - inference-feasible, no GT needed
+                # This replaces V_geom (which used V_target distances) for structure supervision
+                rms_per_sample = (V_hat_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                rms_per_sample = rms_per_sample.sqrt().clamp(min=1e-8)  # (B,)
+                # CRITICAL: Detach RMS to prevent backprop through scale normalization
+                # This stops the model from "gaming" the normalization and avoids amplification at high σ
+                V_struct = V_hat_centered / rms_per_sample.detach().view(-1, 1, 1)  # (B,N,D) - scale-normalized
+                V_struct = V_struct * m_float  # Re-apply mask
+
+                # --- Step A3: Compute V_target_struct (normalized target for structure loss comparisons) ---
+                # Must normalize target the SAME way as V_struct for consistent comparisons
+                V_target_centered, _ = uet.center_only(V_target.float(), mask)
+                V_target_centered = V_target_centered * m_float
+                tgt_rms = (V_target_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                tgt_rms = tgt_rms.sqrt().clamp(min=1e-8)
+                V_target_struct = V_target_centered / tgt_rms.view(-1, 1, 1)  # No detach needed - it's GT
+                V_target_struct = V_target_struct * m_float
+
+                # --- Step B: Compute V_geom (DIAGNOSTIC ONLY - NOT for training losses) ---
+                # V_geom uses V_target distances, so NOT inference-feasible
+                # Kept only for diagnostic logging (shows "if scale were perfect")
+
+                # ========== OPTION B FIX: Compute within-miniset kNN from V_target ==========
+                # Problem: batch['knn_spatial'] uses slide-level kNN, but only ~44% of neighbors
+                # are in the miniset (rest become -1). This cripples structure losses.
+                # Solution: Compute kNN directly within the miniset from V_target coordinates.
+                # This guarantees 100% valid neighbor indices.
+                knn_k_struct = 15  # k for structure losses
+
+                if (not is_sc):
+                    with torch.no_grad():
+                        B_knn, N_knn, D_knn = V_target.shape
+
+                        # Compute within-miniset kNN for each batch element
+                        knn_spatial_for_scale = torch.full((B_knn, N_knn, knn_k_struct), -1,
+                                                           dtype=torch.long, device=device)
+
+                        for b in range(B_knn):
+                            m_b = mask[b].bool()
+                            n_valid = m_b.sum().item()
+
+                            if n_valid < knn_k_struct + 1:
+                                continue
+
+                            # Get valid points for this batch element
+                            valid_indices = torch.where(m_b)[0]  # (n_valid,)
+                            V_b = V_target[b, valid_indices]     # (n_valid, D)
+
+                            # Compute pairwise distances
+                            D_b = torch.cdist(V_b, V_b)          # (n_valid, n_valid)
+                            D_b.fill_diagonal_(float('inf'))     # Exclude self
+
+                            # Get k nearest neighbors (indices into valid_indices)
+                            _, knn_local = D_b.topk(knn_k_struct, dim=1, largest=False)  # (n_valid, k)
+
+                            # Map back to full indices
+                            knn_global = valid_indices[knn_local]  # (n_valid, k)
+
+                            # Store in output tensor
+                            knn_spatial_for_scale[b, valid_indices] = knn_global
+
+                    # Debug: verify 100% validity (first few steps only)
+                    if global_step < 100 and global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            tot_valid, tot_entries = 0, 0
+                            for b in range(min(8, B_knn)):
+                                m_b = mask[b].bool()
+                                if m_b.sum() < knn_k_struct + 1:
+                                    continue
+                                knn_b = knn_spatial_for_scale[b, m_b]
+                                tot_valid += (knn_b >= 0).sum().item()
+                                tot_entries += knn_b.numel()
+                            new_valid_frac = tot_valid / max(tot_entries, 1)
+                            print(f"\n  [WITHIN-MINISET-KNN] step={global_step} valid_frac={new_valid_frac:.1%} "
+                                  f"(should be ~100%)")
+
                 if (not is_sc) and knn_spatial_for_scale is not None:
-                    knn_spatial_for_scale = knn_spatial_for_scale.to(device)
                     
                     # --- ADAPTIVE CLAMP CAP (ChatGPT Change 3) ---
                     # Don't ramp max_log_correction while pin-rate is terrible (>60%).
@@ -5461,14 +6075,14 @@ def train_stageC_diffusion_generator(
                         use_anchor_geom = (n_unknown.median() >= anchor_geom_min_unknown) and anchor_cond_mask.any()
                         
                         if use_anchor_geom:
-                            # Center the target in the same frame as V_geom for proper clamping
-                            V_target_centered, _ = uet.center_only(V_target.float(), mask)
-                            V_target_centered = V_target_centered * m_float
-                            
+                            # V_target_struct and V_target_centered already computed globally (Step A3)
                             # Create anchor-clamped versions of structure tensors
-                            # V_geom_L: for Gram, Edge, NCA (structure losses)
+                            # V_struct_L: for Gram, Edge, NCA (structure losses) - inference-feasible
+                            V_struct_L = uet.clamp_anchors_for_loss(V_struct, V_target_struct, anchor_cond_mask, mask)
+
+                            # V_geom_L: DIAGNOSTIC ONLY (not for training)
                             V_geom_L = uet.clamp_anchors_for_loss(V_geom, V_target_centered, anchor_cond_mask, mask)
-                            
+
                             # V_hat_centered_L: for knn_scale (raw scale loss needs clamping too)
                             V_hat_centered_L = uet.clamp_anchors_for_loss(V_hat_centered, V_target_centered, anchor_cond_mask, mask)
                             
@@ -5489,12 +6103,14 @@ def train_stageC_diffusion_generator(
                                     print(f"  V_hat_centered_L max_anchor_err={max_anchor_err_scale:.6f} (should be ~0)")
                         else:
                             # Not enough unknown points, use original tensors
-                            V_geom_L = V_geom
+                            V_struct_L = V_struct  # For structure losses
+                            V_geom_L = V_geom      # Diagnostic only
                             V_hat_centered_L = V_hat_centered
                             use_anchor_geom = False
                     else:
                         # No anchor training, use original tensors
-                        V_geom_L = V_geom
+                        V_struct_L = V_struct  # For structure losses
+                        V_geom_L = V_geom      # Diagnostic only
                         V_hat_centered_L = V_hat_centered
                         use_anchor_geom = False
 
@@ -5585,23 +6201,13 @@ def train_stageC_diffusion_generator(
                                     
                                     print(f"  [CLAMP-COVERAGE] pin_rate low(<0.40)={pin_rate_low:.1%} (n={n_low}), "
                                           f"high(>=0.60)={pin_rate_high:.1%} (n={n_high})")
-                            
-                            # --- kNN INDEXING VERIFICATION ---
-                            if global_step % 100 == 0:
-                                knn_max = knn_spatial_for_scale.max().item()
-                                n_max_batch = mask.shape[1]
-                                b_test = 0
-                                m_test = mask[b_test].bool()
-                                knn_test = knn_spatial_for_scale[b_test, m_test, :]
-                                valid_frac = (knn_test >= 0).float().mean().item()
-                                print(f"  [KNN-INDEX-CHECK] knn_max={knn_max}, N={n_max_batch}, "
-                                      f"valid_neighbor_frac={valid_frac:.2%}")
 
-                                # ============ [CLAMP-HIDDEN-ERROR] Per-σ bin error hiding ============
-                                # Shows how much scale error is hidden by clamping at each σ level
+                            # ============ [CLAMP-HIDDEN-ERROR] Per-σ bin error hiding ============
+                            # Only run if valid_scale has any True values (need ratio_raw etc.)
+                            if valid_scale.any() and global_step % 100 == 0:
                                 sigma_flat_che = sigma_t.view(-1)
                                 che_bins = [(0.0, 0.3, "low"), (0.3, 0.7, "mid"), (0.7, 1.5, "high"), (1.5, 5.0, "v.high")]
-                                
+
                                 print(f"\n[CLAMP-HIDDEN-ERROR] step={global_step}")
                                 print(f"  {'σ-range':>10} | {'n':>4} | {'raw_ratio':>10} | {'geom_ratio':>11} | {'hidden_err':>10}")
                                 print(f"  {'-'*10} | {'-'*4} | {'-'*10} | {'-'*11} | {'-'*10}")
@@ -5634,9 +6240,78 @@ def train_stageC_diffusion_generator(
                                 print(f"  BEFORE FIX: high-σ 'hidden_err' >> 0 (error being masked)")
                                 print(f"  AFTER FIX:  L_out_scale/L_gram_learn now see raw error")
 
+                    # --- kNN INDEXING VERIFICATION (INDEPENDENT INTERVAL) ---
+                    # This block runs on its OWN schedule, NOT inside the global_step % 100 block
+                    # Check more frequently early in training (every 25 steps for first 500)
+                    knn_check_interval = 25 if global_step < 500 else 100
+                    if global_step % knn_check_interval == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            knn_max = knn_spatial_for_scale.max().item()
+                            n_max_batch = mask.shape[1]
+
+                            # Helper to compute valid_neighbor_frac for a given point mask
+                            def compute_valid_frac(point_mask, knn_spatial, max_b=8):
+                                tot_valid, tot_entries = 0, 0
+                                for b in range(min(max_b, point_mask.shape[0])):
+                                    pm = point_mask[b].bool()
+                                    if pm.sum() < 2:
+                                        continue
+                                    knn_b = knn_spatial[b, pm, :]
+                                    tot_valid += (knn_b >= 0).sum().item()
+                                    tot_entries += knn_b.numel()
+                                return tot_valid / max(tot_entries, 1), tot_entries
+
+                            # Compute validity breakdown by token type
+                            frac_all, _ = compute_valid_frac(mask, knn_spatial_for_scale)
+
+                            # Core only (anchor_mask = True)
+                            if anchor_mask is not None:
+                                core_mask = mask & anchor_mask
+                                frac_core, n_core_entries = compute_valid_frac(core_mask, knn_spatial_for_scale)
+                            else:
+                                frac_core, n_core_entries = frac_all, 0
+
+                            # Landmarks only
+                            landmark_mask = mask & is_landmark
+                            frac_landmark, n_lmk_entries = compute_valid_frac(landmark_mask, knn_spatial_for_scale)
+
+                            # Extras only (not core, not landmark)
+                            if anchor_mask is not None:
+                                extras_mask = mask & (~anchor_mask) & (~is_landmark)
+                                frac_extras, n_extras_entries = compute_valid_frac(extras_mask, knn_spatial_for_scale)
+                            else:
+                                frac_extras, n_extras_entries = 0.0, 0
+
+                            # struct_mask (what we'll use for structure losses)
+                            frac_struct, n_struct_entries = compute_valid_frac(struct_mask, knn_spatial_for_scale)
+
+                            # Count tokens per type
+                            n_all = mask.sum().item()
+                            n_core = core_mask.sum().item() if anchor_mask is not None else n_all
+                            n_lmk = landmark_mask.sum().item()
+                            n_extras = extras_mask.sum().item() if anchor_mask is not None else 0
+                            n_struct = struct_mask.sum().item()
+
+                            print(f"\n  [KNN-INDEX-CHECK] step={global_step} knn_max={knn_max}, N={n_max_batch}")
+                            print(f"    {'Token type':<15} | {'Count':>6} | {'valid_frac':>10}")
+                            print(f"    {'-'*15} | {'-'*6} | {'-'*10}")
+                            print(f"    {'all masked':<15} | {n_all:>6.0f} | {frac_all:>10.1%}")
+                            print(f"    {'core only':<15} | {n_core:>6.0f} | {frac_core:>10.1%}")
+                            print(f"    {'landmarks':<15} | {n_lmk:>6.0f} | {frac_landmark:>10.1%}")
+                            print(f"    {'extras':<15} | {n_extras:>6.0f} | {frac_extras:>10.1%}")
+                            print(f"    {'struct_mask':<15} | {n_struct:>6.0f} | {frac_struct:>10.1%}  <- used for kNN/edge losses")
+
+                            # CRITICAL WARNING if struct_mask validity is too low
+                            if frac_struct < 0.70:
+                                print(f"  ⚠️ WARNING: struct_mask valid_frac={frac_struct:.1%} is LOW!")
+                                print(f"     Consider: (A) more core points, (B) within-miniset kNN")
+                            elif frac_struct >= 0.85:
+                                print(f"  ✓ struct_mask valid_frac={frac_struct:.1%} is GOOD")
+
                 else:
                     # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
                     V_geom = V_hat_centered
+                    V_struct_L = V_struct  # For structure losses (SC has no anchor clamping)
                     # No clamp computed - set variables to None for knn_scale block
                     log_s_unclamped_for_knn = None
                     valid_scale_for_knn = None
@@ -5648,7 +6323,8 @@ def train_stageC_diffusion_generator(
 
             # --- PATCH 7: Low-rank subspace penalty ---
             if not is_sc and WEIGHTS.get('subspace', 0) > 0:
-                L_subspace = uet.variance_outside_topk(V_geom_L, mask, k=2)
+                # ChatGPT FIX: Use V_struct_L (inference-feasible) instead of V_geom_L (GT-referenced)
+                L_subspace = uet.variance_outside_topk(V_struct_L, mask, k=2)
             else:
                 L_subspace = torch.tensor(0.0, device=device)
 
@@ -5980,9 +6656,10 @@ def train_stageC_diffusion_generator(
                     with torch.autocast(device_type='cuda', enabled=False):
                         # Get sigma values (works for both EDM and non-EDM)
                         sigma_vec = sigma_t.view(-1).float()  # (B,)
-                        
+
                         # Compute robust edge scale from target kNN edges
-                        knn_indices_batch = batch['knn_spatial'].to(device)
+                        # FIX: Use within-miniset kNN (100% valid) instead of slide-level kNN
+                        knn_indices_batch = knn_spatial_for_scale  # Already on device
                         edge_scales = torch.zeros(batch_size_real, device=device)
                         
                         for b in range(batch_size_real):
@@ -6208,7 +6885,13 @@ def train_stageC_diffusion_generator(
                     # This ensures the target Gram is feasible in D_latent dimensions
                     # (G_target from batch is full-rank from 2D coords, creating impossible pressure)
                     Vt_c_for_gram, _ = uet.center_only(V_target_batch.float(), mask)
-                    Gt = Vt_c_for_gram @ Vt_c_for_gram.transpose(1, 2)  # (B, N, N), rank ≤ D_latent
+                    # ChatGPT FIX: Normalize target the SAME way as V_struct (RMS-normalize)
+                    # This ensures consistent scale-free comparison: Gp vs Gt both normalized
+                    tgt_gram_rms = (Vt_c_for_gram.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                    tgt_gram_rms = tgt_gram_rms.sqrt().clamp(min=1e-8)
+                    Vt_c_for_gram = Vt_c_for_gram / tgt_gram_rms.view(-1, 1, 1)
+                    Vt_c_for_gram = Vt_c_for_gram * m_float  # Re-apply mask
+                    Gt = Vt_c_for_gram @ Vt_c_for_gram.transpose(1, 2)  # (B, N, N), rank ≤ D_latent, scale-normalized
                     # NOTE: MM and P_off masks are applied downstream, no need to multiply here
                     B, N, _ = V_geom.shape
                     
@@ -6222,7 +6905,8 @@ def train_stageC_diffusion_generator(
                                   f"ratio={tr_Gt_new.item()/tr_Gt_old.item():.4f}")
                     
                     # Build predicted Gram *with* true scale
-                    Gp_raw = V_geom_L @ V_geom_L.transpose(1, 2)          # (B,N,N)
+                    # ChatGPT FIX: Use V_struct_L (self-normalized RAW) for inference-feasible structure
+                    Gp_raw = V_struct_L @ V_struct_L.transpose(1, 2)          # (B,N,N)
                     
                     # --- PATCH 6: Diagonal distribution loss (per-point norm matching) ---
                     diag_p = torch.diagonal(Gp_raw, dim1=-2, dim2=-1)  # (B,N)
@@ -6745,11 +7429,14 @@ def train_stageC_diffusion_generator(
                             point_weight = None  # All valid points contribute
                         
                         # Compute NCA loss with point weighting
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
+                        # ChatGPT FIX: Use V_struct_L (self-normalized RAW) for inference-feasible structure
+                        # ChatGPT FIX 2: Use V_target_struct (normalized target) for consistent comparison
                         L_knn_per = uet.knn_nca_loss(
-                            V_geom_L,              # Clamped structure tensor
-                            V_target.float(),    # Raw target
-                            mask, 
-                            k=15, 
+                            V_struct_L,            # Self-normalized structure tensor, inference-feasible
+                            V_target_struct,       # Normalized target (same scale as V_struct)
+                            struct_mask,           # Only core non-landmarks (valid kNN indices)
+                            k=15,
                             temperature=tau_reference,
                             return_per_sample=True,
                             scale_compensate=True,
@@ -6930,18 +7617,17 @@ def train_stageC_diffusion_generator(
                 # This is the ONLY loss that uses V_hat_centered
                 if WEIGHTS.get('knn_scale', 0) > 0 and (not is_sc):
                     with torch.autocast(device_type='cuda', enabled=False):
-                        # Use knn_spatial from batch (same edges as edge loss)
-                        knn_spatial_batch = batch.get('knn_spatial', None)
-                        if knn_spatial_batch is not None:
-                            knn_spatial_batch = knn_spatial_batch.to(device)
-                        
+                        # FIX: Use within-miniset kNN (knn_spatial_for_scale) instead of slide-level kNN
+                        # This guarantees 100% valid neighbor indices
+
                         # CHANGE 5: Use V_hat_centered (RAW, NOT clamped V_geom)
                         # This is critical - knn_scale needs to see actual scale error to teach it
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
                         L_knn_scale_per = uet.knn_scale_loss(
                             V_hat_centered_L,  # RAW centered - this is the KEY difference
                             V_target.float(),
-                            mask,
-                            knn_indices=knn_spatial_batch,
+                            struct_mask,       # Only core non-landmarks (valid kNN indices)
+                            knn_indices=knn_spatial_for_scale,  # Within-miniset kNN (100% valid)
                             k=15,
                             return_per_sample=True
                         )
@@ -7123,10 +7809,10 @@ def train_stageC_diffusion_generator(
 
 
                 # Low-noise gating - use actual drop_mask for consistency with CFG
-                if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
+                if WEIGHTS['edge'] > 0 and knn_spatial_for_scale is not None:
                     with torch.autocast(device_type='cuda', enabled=False):
-                        # Use SPATIAL kNN for geometry, not expression kNN
-                        knn_indices_batch = batch['knn_spatial'].to(device)
+                        # FIX: Use within-miniset kNN instead of slide-level kNN
+                        knn_indices_batch = knn_spatial_for_scale  # Already on device, 100% valid
                         
                         # PATCH 3B (CORRECTED): Re-enable edge gating with stricter threshold
                         # Target: ~10-30% hit rate for edge (local features)
@@ -7163,15 +7849,17 @@ def train_stageC_diffusion_generator(
                         #     knn_idx=knn_indices_batch,
                         #     mask=mask
                         # )
-                        # CHANGE 3: Use V_geom (clamped) for edge loss
+                        # CHANGE 3: Use V_struct_L (self-normalized RAW) for edge loss
                         # Edge is a STRUCTURE loss - it measures local neighborhood shape
-                        # Using clamped V_geom removes systematic scale bias from gradients
+                        # ChatGPT FIX: V_struct_L is inference-feasible (no GT needed for scale)
                         # Scale learning happens via knn_scale on V_hat_centered
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
+                        # ChatGPT FIX 2: Use V_target_struct (normalized target) for consistent comparison
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=V_geom_L,  # Clamped structure tensor, NOT raw x0_pred
-                            V_tgt=V_target.float(),
+                            V_pred=V_struct_L,  # Self-normalized structure tensor, inference-feasible
+                            V_tgt=V_target_struct,  # Normalized target (same scale as V_struct)
                             knn_idx=knn_indices_batch,
-                            mask=mask
+                            mask=struct_mask   # Only core non-landmarks (valid kNN indices)
                         )
 
                         
@@ -7560,8 +8248,8 @@ def train_stageC_diffusion_generator(
                                             print(f"    Ratio: {(G_pred_b.diag().sum() / G_tgt_b.diag().sum().clamp_min(1e-8)).item():.6f}")
                                 
                                 # Edge loss
-                                if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
-                                    knn_idx = batch['knn_spatial'].to(device)
+                                if WEIGHTS['edge'] > 0 and knn_spatial_for_scale is not None:
+                                    knn_idx = knn_spatial_for_scale  # Within-miniset kNN
                                     # --- DEBUG 5: Check edge loss across sigma bins ---
                                     sigma_for_edge = sigma_flat if use_edm else sigma_t.view(-1)
                                     debug_samples = get_one_sample_per_sigma_bin(sigma_for_edge)
@@ -7859,51 +8547,41 @@ def train_stageC_diffusion_generator(
                         # ==================== CHANGE 6: GENERATOR SCALE CLAMP (Option 1 Change B) ====================
 
                         # PATCH 8: Scale-aware generator alignment losses
-                        # Use knn_spatial for generator scale clamp (same as diffusion)
-                        knn_spatial_for_gen = batch.get('knn_spatial', None)
-                        if knn_spatial_for_gen is not None:
-                            knn_spatial_for_gen = knn_spatial_for_gen.to(device)
-                            
-                            # Compute scale correction for GENERATOR (separate from diffusion)
-                            s_corr_gen, _, valid_scale_gen, _, _, _ = uet.compute_local_scale_correction(
-                                V_pred=V_gen_centered,  # Generator output, NOT V_hat_centered
-                                V_tgt=V_target.float(),
-                                mask=mask,
-                                knn_indices=knn_spatial_for_gen,
-                                k=15,
-                                max_log_correction=max_log_corr_for_knn if max_log_corr_for_knn is not None else 0.25,
-                            )
-                            
-                            # Apply scale correction to generator
-                            V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_corr_gen.detach(), mask)
-                        else:
-                            V_gen_geo = V_gen_centered
+                        # ChatGPT FIX: Use self-normalized V_gen_struct (inference-feasible)
+                        # instead of GT-referenced V_gen_geo (which used compute_local_scale_correction with V_target)
+
+                        # Create V_gen_struct: self-normalized generator output (same as V_struct)
+                        gen_rms = (V_gen_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                        gen_rms = gen_rms.sqrt().clamp(min=1e-8)
+                        # Detach RMS to prevent backprop through scale normalization
+                        V_gen_struct = V_gen_centered / gen_rms.detach().view(-1, 1, 1)
+                        V_gen_struct = V_gen_struct * m_float
 
                         # ========== ANCHOR-CLAMP GENERATOR TENSORS ==========
                         if anchor_train and anchor_geom_losses and anchor_cond_mask is not None and use_anchor_geom:
-                            V_target_centered_gen, _ = uet.center_only(V_target.float(), mask)
-                            V_target_centered_gen = V_target_centered_gen * mask.float().unsqueeze(-1)
-                            V_gen_geo_L = uet.clamp_anchors_for_loss(V_gen_geo, V_target_centered_gen, anchor_cond_mask, mask)
-                            V_gen_centered_L = uet.clamp_anchors_for_loss(V_gen_centered, V_target_centered_gen, anchor_cond_mask, mask)
+                            # Use V_target_struct (already computed globally) for consistent normalization
+                            V_gen_struct_L = uet.clamp_anchors_for_loss(V_gen_struct, V_target_struct, anchor_cond_mask, mask)
+                            V_gen_centered_L = uet.clamp_anchors_for_loss(V_gen_centered, V_target_centered, anchor_cond_mask, mask)
                         else:
-                            V_gen_geo_L = V_gen_geo
+                            V_gen_struct_L = V_gen_struct
                             V_gen_centered_L = V_gen_centered
-                        
+
                         # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
-                        # Use anchor-clamped V_gen_geo_L for alignment
-                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_geo_L, V_target_batch, mask)
+                        # ChatGPT FIX: Use V_gen_struct_L (inference-feasible) for alignment
+                        # Compare against V_target_struct (normalized target) for consistent comparison
+                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_struct_L, V_target_struct, mask)
                         # Use anchor-clamped V_gen_centered_L for scale loss
                         L_gen_scale = uet.rms_log_loss(V_gen_centered_L, V_target_batch, mask)
                         
                         # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
                         # This ensures generator learns correct local neighborhood distances
-                        if knn_spatial_for_gen is not None:
+                        # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
+                        if knn_spatial_for_scale is not None:
                             L_gen_scale_local = uet.knn_scale_loss(
                                 V_gen_centered_L,  # Anchor-clamped generator output
-
                                 V_target_batch,
-                                mask,
-                                knn_indices=knn_spatial_for_gen,
+                                struct_mask,       # Only core non-landmarks (valid kNN indices)
+                                knn_indices=knn_spatial_for_scale,  # Within-miniset kNN
                                 k=15,
                                 return_per_sample=False  # Scalar loss
                             )
@@ -8247,8 +8925,8 @@ def train_stageC_diffusion_generator(
                         print(f"  Batch t_norms: {[f'{t.item():.3f}' for t in t_norm_vals]}")
                     
                     # 1) Edge distances from EdgeLengthLoss
-                    if WEIGHTS['edge'] > 0 and 'knn_spatial' in batch:
-                        knn_indices = batch['knn_spatial'].to(device)
+                    if WEIGHTS['edge'] > 0 and knn_spatial_for_scale is not None:
+                        knn_indices = knn_spatial_for_scale  # Within-miniset kNN
                         
                         # Pick first valid sample
                         for b in range(batch_size_real):
@@ -8448,7 +9126,8 @@ def train_stageC_diffusion_generator(
                     sigma_pair_ov = sigma_pair[idx_keep]  # Was: sigma_pair = sigma_pair[idx_keep]
                     sigma_pair_3d_ov = sigma_pair_3d[idx_keep]  # Was: sigma_pair_3d = sigma_pair_3d[idx_keep]
                     eps_ov = eps[idx_keep]  # Was: eps = eps[idx_keep]
- 
+                    V_t_1 = V_t[idx_keep]  # Noisy view1 input for residual overlap
+
                     # DEBUG: gate + sigma stats
                     if global_step % overlap_debug_every == 0:
                         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -8483,14 +9162,52 @@ def train_stageC_diffusion_generator(
                                 print(f"  target_rms_ratio={rms_tgt_1/rms_tgt_2:.4f} (should be ~1.0)")
 
 
-                    # Sample noise for view2 - INDEPENDENT from view1
-                    # FIX #1: Do NOT couple noise on overlap points.
+                    # Sample noise for view2 - INDEPENDENT from view1 (for low/moderate σ)
+                    # FIX #1: Do NOT couple noise on overlap points for x0 overlap losses.
                     # Coupled noise creates a shortcut where the model can satisfy
                     # overlap consistency via the skip connection without learning
                     # proper denoising. Independent noise forces the model to actually
                     # denoise to achieve overlap consistency.
                     eps_2 = torch.randn_like(V_target_2)
- 
+
+                    # ============================================================
+                    # [FIX 2a] Same-noise coupling for HIGH-σ samples ONLY
+                    # For residual overlap (Phase 4), we NEED same-noise on overlap
+                    # points so that F_x matching isolates context dependence
+                    # (not "different denoising tasks").
+                    # σ_switch = max(2.3 × σ_data, 0.8 × σ_cap)
+                    #
+                    # TOGGLE: Set ENABLE_FIX2A_SAME_NOISE = True to enable
+                    # Default OFF to preserve Fix #1 (independent noise) behavior
+                    # Turn ON if you see noisy/non-monotone residual loss at high σ
+                    # ============================================================
+                    ENABLE_FIX2A_SAME_NOISE = False  # Toggle: True to enable same-noise at high σ
+
+                    if ENABLE_FIX2A_SAME_NOISE:
+                        curr_stage_noise = curriculum_state['current_stage']
+                        curr_mult_noise = curriculum_state['sigma_cap_mults'][curr_stage_noise]
+                        sigma_cap_noise = curr_mult_noise * sigma_data
+                        sigma_switch_noise = max(2.3 * sigma_data, 0.8 * sigma_cap_noise)
+
+                        # Per-sample high-σ mask (shape: B_keep)
+                        hi_sigma_mask = (sigma_pair_ov > sigma_switch_noise)  # (B_keep,)
+
+                        # Apply same-noise coupling ONLY for high-σ samples on overlap points
+                        if hi_sigma_mask.any():
+                            for b in range(hi_sigma_mask.shape[0]):
+                                if hi_sigma_mask[b]:
+                                    # Get valid overlap indices for this sample
+                                    I_valid_b = I_mask[b]  # (max_I,)
+                                    if I_valid_b.sum() > 0:
+                                        idx1_b = idx1_I[b, I_valid_b]  # Positions in view1
+                                        idx2_b = idx2_I[b, I_valid_b]  # Positions in view2
+                                        # Copy noise from view1 overlap points to view2
+                                        eps_2[b, idx2_b] = eps_ov[b, idx1_b]
+
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                print(f"[FIX2A] Same-noise coupling: {hi_sigma_mask.sum().item()}/{hi_sigma_mask.shape[0]} "
+                                      f"high-σ samples (σ > {sigma_switch_noise:.3f})")
+
                     # Add noise to view2 target
                     V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
                     V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
@@ -8516,23 +9233,22 @@ def train_stageC_diffusion_generator(
                         # Now: same per-sample MSE + EDM weight pipeline as view1
                         # This ensures view2 gets proper σ-dependent ground-truth supervision.
                         # ============================================================
- 
+
                         # Compute per-node MSE (same as view1: mean over dims)
                         err2_node_2 = (x0_pred_2 - V_target_2).pow(2).mean(dim=-1)  # (B_keep, N2)
- 
+
                         # Per-sample normalization (same as view1)
                         mask_2_f = mask_2.float()  # (B_keep, N2)
                         den_2 = mask_2_f.sum(dim=1).clamp_min(1.0)  # (B_keep,)
                         err2_sample_2 = (err2_node_2 * mask_2_f).sum(dim=1) / den_2  # (B_keep,)
- 
+
                         # Slice w_eff to match the paired subset (same σ → same weights)
                         w_eff_2 = w_eff[idx_keep]  # (B_keep,)
- 
+
                         # Apply WNORM (same as view1 when EXP_SCORE_WNORM=True)
                         L_score_2 = (w_eff_2 * err2_sample_2).sum() / w_eff_2.sum().clamp(min=1e-8)
- 
+
                         # Add view2 score loss with same weight as main score loss
-                        # This anchors view2's scale to its target
                         L_total = L_total + WEIGHTS.get('score', 1.0) * L_score_2
                         L_score_2_batch = L_score_2  # Store for epoch tracking
 
@@ -8545,11 +9261,14 @@ def train_stageC_diffusion_generator(
                             idx1_I, idx2_I, I_mask,
                             mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
-                            # NEW: for high-σ scale anchor
+                            # For high-σ scale anchor
                             sigma_t=sigma_pair_3d_ov,
                             V_target_1=V_target_1_ov,
                             V_target_2=V_target_2,
                             sigma_0_hi=0.5,  # threshold for high-σ anchor
+                            # [TRY 2] Per-sample SNR gating for KL
+                            sigma_data=sigma_data,
+                            kl_gate_power=2.0,  # c_skip^2 gating
                         )
 
 
@@ -8557,31 +9276,193 @@ def train_stageC_diffusion_generator(
                         if ov_loss_dict['valid_batch_count'] > 0:
                             L_ov_shape_batch = ov_loss_dict['L_ov_shape']
                             L_ov_scale_batch = ov_loss_dict['L_ov_scale']
-                            L_ov_kl_batch = ov_loss_dict['L_ov_kl']
-                            L_hi_scale_batch = ov_loss_dict['L_hi_scale']  # NEW
+                            L_ov_kl_batch = ov_loss_dict['L_ov_kl']          # Ungated (for logging)
+                            L_ov_kl_gated = ov_loss_dict['L_ov_kl_gated']    # [TRY 2] Per-sample gated
+                            L_hi_scale_batch = ov_loss_dict['L_hi_scale']
 
-                            # Weight for new high-σ scale anchor (tune this!)
-                            HI_SCALE_WEIGHT = 1.0  # Start at 1.0, can increase if needed
+                            # Weight for high-σ scale anchor
+                            HI_SCALE_WEIGHT = 1.0
 
-                            # Add to total loss
-                            L_total = (
-                                L_total
-                                + overlap_loss_weight_shape * L_ov_shape_batch
-                                + overlap_loss_weight_scale * L_ov_scale_batch
-                                + overlap_loss_weight_kl * L_ov_kl_batch
-                                + HI_SCALE_WEIGHT * L_hi_scale_batch  # NEW: high-σ scale anchor
-                            )
+                            # ============================================================
+                            # [PHASE 4] High-σ Residual Overlap
+                            # For σ > σ_switch: disable x0 overlap, use residual (F_x) matching
+                            # σ_switch = max(2.3 * σ_data, 0.8 * σ_cap)
+                            # ============================================================
+                            curr_stage_ov = curriculum_state['current_stage']
+                            curr_mult_ov = curriculum_state['sigma_cap_mults'][curr_stage_ov]
+                            sigma_cap_ov = curr_mult_ov * sigma_data
+
+                            sigma_switch = max(2.3 * sigma_data, 0.8 * sigma_cap_ov)
+
+                            # ============================================================
+                            # [FIX 2b] Per-sample hi_mask instead of batch-mean gating
+                            # This ensures proper classification in mixed-σ batches
+                            # ============================================================
+                            hi_mask = (sigma_pair_ov > sigma_switch)  # (B_keep,) per-sample mask
+                            lo_mask = ~hi_mask
+                            n_hi = hi_mask.sum().item()
+                            n_lo = lo_mask.sum().item()
+
+                            # Initialize losses
+                            L_ov_residual = torch.tensor(0.0, device=device)
+                            residual_count = 0
+
+                            # ============================================================
+                            # HIGH-σ SAMPLES: Residual-space overlap (Phase 4)
+                            # Only for samples where σ > σ_switch
+                            # ============================================================
+                            if n_hi > 0:
+                                # Compute EDM preconditioning for ALL samples (needed for indexing)
+                                c_skip_ov, c_out_ov, c_in_ov, _ = uet.edm_precond(sigma_pair_ov, sigma_data)
+                                # c_skip_ov: (B,) -> expand to (B, 1, 1)
+                                c_skip_ov_3d = c_skip_ov.view(-1, 1, 1)
+                                c_out_ov_3d = c_out_ov.view(-1, 1, 1)
+
+                                # Get centered noisy inputs (same as forward_edm does)
+                                V_t_1_c, _ = uet.center_only(V_t_1, mask_ov)
+                                V_t_2_c, _ = uet.center_only(V_t_2, mask_2)
+
+                                # Compute learned residual F_x = (x0_pred - c_skip * x_centered) / c_out
+                                # x0_pred is already centered in the forward pass
+                                x0_pred_1_c, _ = uet.center_only(x0_pred_1, mask_ov)
+                                x0_pred_2_c, _ = uet.center_only(x0_pred_2, mask_2)
+
+                                F_x_1 = (x0_pred_1_c - c_skip_ov_3d * V_t_1_c) / c_out_ov_3d.clamp(min=1e-6)
+                                F_x_2 = (x0_pred_2_c - c_skip_ov_3d * V_t_2_c) / c_out_ov_3d.clamp(min=1e-6)
+
+                                # Mask
+                                F_x_1 = F_x_1 * mask_ov.unsqueeze(-1).float()
+                                F_x_2 = F_x_2 * mask_2.unsqueeze(-1).float()
+
+                                # Compute residual overlap loss ONLY for high-σ samples
+                                # Also track F_x discrepancy for diagnostics
+                                Fx_discrepancy_sum = 0.0
+                                Fx_discrepancy_count = 0
+
+                                for b in range(F_x_1.shape[0]):
+                                    if not hi_mask[b]:  # Skip low-σ samples
+                                        continue
+
+                                    I_valid = I_mask[b]
+                                    n_I = I_valid.sum().item()
+                                    if n_I < 4:
+                                        continue
+
+                                    idx1_b = idx1_I[b, I_valid]
+                                    idx2_b = idx2_I[b, I_valid]
+
+                                    # Extract F_x on overlap points
+                                    F1_I = F_x_1[b, idx1_b].detach()  # Teacher (stop-grad)
+                                    F2_I = F_x_2[b, idx2_b]           # Student (gradients flow)
+
+                                    # Center residuals (translation gauge)
+                                    F1_I_c = F1_I - F1_I.mean(dim=0, keepdim=True)
+                                    F2_I_c = F2_I - F2_I.mean(dim=0, keepdim=True)
+
+                                    # Track ||F_x1 - F_x2|| for diagnostics (same-noise sanity check)
+                                    with torch.no_grad():
+                                        Fx_diff = (F2_I_c - F1_I_c).norm(dim=-1).mean().item()
+                                        Fx_discrepancy_sum += Fx_diff
+                                        Fx_discrepancy_count += 1
+
+                                    # MSE on centered residuals
+                                    L_ov_residual = L_ov_residual + F.mse_loss(F2_I_c, F1_I_c)
+                                    residual_count += 1
+
+                                if residual_count > 0:
+                                    L_ov_residual = L_ov_residual / residual_count
+                                    mean_Fx_discrepancy = Fx_discrepancy_sum / Fx_discrepancy_count
+                                else:
+                                    mean_Fx_discrepancy = 0.0
+
+                            # ============================================================
+                            # LOW-σ SAMPLES: Standard x0 overlap (with TRY2 gating)
+                            # Only for samples where σ <= σ_switch
+                            # The overlap losses computed in helper already use per-sample
+                            # gating, so we just need to apply them for the low-σ portion
+                            # ============================================================
+                            # Note: L_ov_*_batch already computed over all kept samples
+                            # We need to weight them by the fraction that are low-σ
+                            # OR recompute for only low-σ samples
+                            #
+                            # Since the helper computed losses over ALL kept samples,
+                            # and we want exclusivity (high-σ gets residual, low-σ gets x0),
+                            # we scale the x0 losses by n_lo/total to approximate per-sample
+                            # This is an approximation but maintains the right behavior
+                            B_keep = sigma_pair_ov.shape[0]
+                            lo_frac = n_lo / max(B_keep, 1)
+                            hi_frac = n_hi / max(B_keep, 1)
+
+                            # HIGH-σ: Add residual loss (weighted by fraction of high-σ samples)
+                            RESIDUAL_WEIGHT = 1.0
+                            if n_hi > 0:
+                                L_total = L_total + RESIDUAL_WEIGHT * L_ov_residual
+
+                            # LOW-σ: Add x0 overlap losses (weighted by fraction of low-σ samples)
+                            if n_lo > 0:
+                                L_total = (
+                                    L_total
+                                    + lo_frac * overlap_loss_weight_shape * L_ov_shape_batch   # Ungated, scaled
+                                    + lo_frac * overlap_loss_weight_scale * L_ov_scale_batch   # Ungated, scaled
+                                    + lo_frac * overlap_loss_weight_kl * L_ov_kl_gated         # [TRY 2] Per-sample gated, scaled
+                                )
+
+                            # High-σ scale anchor always applied (stabilizes scale at high σ)
+                            L_total = L_total + HI_SCALE_WEIGHT * L_hi_scale_batch
+
+                            # Debug logging for per-sample regime
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                sigma_mean_batch = sigma_pair_ov.mean().item()
+                                print(f"[OV-PERSAMPLE] σ_switch={sigma_switch:.3f} | "
+                                      f"hi_mask: {n_hi}/{B_keep} samples, lo_mask: {n_lo}/{B_keep} samples")
+                                if n_hi > 0:
+                                    hi_sigmas = sigma_pair_ov[hi_mask]
+                                    print(f"[OV-PERSAMPLE] HIGH-σ: min={hi_sigmas.min().item():.3f} "
+                                          f"max={hi_sigmas.max().item():.3f} L_residual={L_ov_residual.item():.6f}")
+                                    # [SANITY CHECK] Log F_x discrepancy - should decrease over training
+                                    # with same-noise coupling (measures residual agreement, not noise agreement)
+                                    print(f"[Fx-DISCREP] mean ||F_x1-F_x2||={mean_Fx_discrepancy:.4f} "
+                                          f"(should ↓ over training with same-noise)")
+                                if n_lo > 0:
+                                    lo_sigmas = sigma_pair_ov[lo_mask]
+                                    print(f"[OV-PERSAMPLE] LOW-σ: min={lo_sigmas.min().item():.3f} "
+                                          f"max={lo_sigmas.max().item():.3f} (x0 losses active, frac={lo_frac:.3f})")
+
+                            # [TRY 2] Debug: log per-sample gating effect
+                            if global_step % overlap_debug_every == 0 and (fabric is None or fabric.is_global_zero):
+                                mean_gate = ov_loss_dict['debug_info'].get('mean_kl_gate', 1.0)
+                                kl_gates = ov_loss_dict['debug_info'].get('kl_gates', [])
+                                sigmas_dbg = ov_loss_dict['debug_info'].get('sigmas', [])
+
+                                # Compute stats for debug
+                                if kl_gates:
+                                    min_gate = min(kl_gates)
+                                    max_gate = max(kl_gates)
+                                    min_sigma = min(sigmas_dbg) if sigmas_dbg else 0
+                                    max_sigma = max(sigmas_dbg) if sigmas_dbg else 0
+                                else:
+                                    min_gate = max_gate = mean_gate
+                                    min_sigma = max_sigma = 0
+
+                                # Key ratio: gated_kl / ungated_kl shows how much KL is reduced
+                                kl_reduction = L_ov_kl_gated.item() / (L_ov_kl_batch.item() + 1e-8)
+
+                                print(f"[TRY2-KL-GATE] B={len(kl_gates)} σ=[{min_sigma:.3f},{max_sigma:.3f}] "
+                                      f"gate=[{min_gate:.4f},{max_gate:.4f}] mean_gate={mean_gate:.4f}")
+                                print(f"[TRY2-KL-GATE] kl_ungated={L_ov_kl_batch.item():.6f} "
+                                      f"kl_gated={L_ov_kl_gated.item():.6f} reduction={kl_reduction:.4f}")
 
 
                             # Track epoch stats
                             ov_apply_count += 1
                             ov_loss_sum['shape'] += float(L_ov_shape_batch.item())
                             ov_loss_sum['scale'] += float(L_ov_scale_batch.item())
-                            ov_loss_sum['kl'] += float(L_ov_kl_batch.item())
+                            ov_loss_sum['kl'] += float(L_ov_kl_batch.item())           # Ungated
+                            ov_loss_sum['kl_gated'] = ov_loss_sum.get('kl_gated', 0.0) + float(L_ov_kl_gated.item())  # [TRY2]
                             ov_loss_sum['total'] += float(
                                 L_ov_shape_batch.item()
                                 + L_ov_scale_batch.item()
-                                + L_ov_kl_batch.item()
+                                + L_ov_kl_gated.item()  # Use gated KL in total
                             )
 
                             # Debug stats
@@ -9124,7 +10005,21 @@ def train_stageC_diffusion_generator(
                           f"step_ratio={ctx_grad/ctx_param:.4e}")
                     print(f"  generator: ||grad||={gen_grad:.4e} ||param||={gen_param:.4e} "
                           f"step_ratio={gen_grad/gen_param:.4e}")
-                    
+
+                    # [GEN-GRAD] Phase 1.2: Log generator loss contribution vs total
+                    gen_align_contrib = WEIGHTS['gen_align'] * L_gen_align.item() if not is_sc else 0.0
+                    gen_scale_contrib = WEIGHTS.get('gen_scale', 0) * L_gen_scale.item() if not is_sc else 0.0
+                    score_contrib = WEIGHTS.get('score', 1.0) * L_score.item()
+                    gen_total_contrib = gen_align_contrib + gen_scale_contrib
+                    total_loss_approx = L_total.item() if L_total is not None else 1.0
+                    gen_pct = 100.0 * gen_total_contrib / max(total_loss_approx, 1e-8)
+
+                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
+                    print(f"  [GEN-GRAD] score_contrib={score_contrib:.4e} gen_total_contrib={gen_total_contrib:.4e} ({gen_pct:.1f}%)")
+
+                    if gen_pct < 1.0 and not is_sc:
+                        print(f"    ⚠️ WARNING: Generator contributes <1% of loss - may not learn!")
+
                     if ctx_grad < score_grad * 0.01:
                         print(f"    ⚠️ WARNING: Context encoder grads are very small!")
                     
@@ -9256,6 +10151,7 @@ def train_stageC_diffusion_generator(
             
             n_batches += 1
             global_step += 1
+            curriculum_state['steps_in_stage'] += 1  # [THREE-GATE] Track steps per stage
             # batch_pbar.update(1)
             # Sync global_step across ranks to prevent divergence
             if dist.is_initialized():
@@ -9283,9 +10179,9 @@ def train_stageC_diffusion_generator(
         # =====================================================================
         # FIXED-BATCH EVALUATION AT FIXED SIGMAS (once per epoch)
         # =====================================================================
-        # Run fixed-batch eval at epochs 1,3,5,10 for early detection, then every 5 epochs
-        early_eval_epochs = {0, 2, 4, 9}  # 0-indexed: epochs 1,3,5,10
-        run_fixed_eval = (epoch % 5 == 0) or (epoch in early_eval_epochs)
+        # Run every epoch so curriculum promotion is responsive
+        # (5 consecutive passes = 5 epochs per stage, not 25)
+        run_fixed_eval = True
         if (fabric is None or fabric.is_global_zero) and use_st and run_fixed_eval:
             fixed_eval_sigmas = [0.05, 0.15, 0.40, 0.70, 1.20, 2.40]
 
@@ -9315,8 +10211,83 @@ def train_stageC_diffusion_generator(
                             score_net.module.D_latent if hasattr(score_net, 'module') else 16
                     
                     H_fixed = context_encoder(Z_fixed, mask_fixed)
-                    
+
                     print(f"  {'σ':>8} | {'scale_r':>8} | {'trace_r':>8} | {'out/tgt':>8} | {'Jacc@10':>8} | {'SC':>6}")
+                    print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*6}")
+
+                    # =====================================================================
+                    # [GEN-EVAL] Generator-only evaluation (Phase 1.1)
+                    # Evaluate generator output without any denoising
+                    # =====================================================================
+                    V_gen_fixed = generator(H_fixed, mask_fixed)
+
+                    # Center generator output
+                    mask_f_gen = mask_fixed.unsqueeze(-1).float()
+                    valid_count_gen = mask_f_gen.sum()
+                    V_gen_c, _ = uet.center_only(V_gen_fixed, mask_fixed)
+                    V_tgt_c_gen, _ = uet.center_only(V_target_fixed, mask_fixed)
+
+                    # scale_r_gen
+                    rms_gen = (V_gen_c.pow(2) * mask_f_gen).sum().div(valid_count_gen).sqrt()
+                    rms_tgt_gen = (V_tgt_c_gen.pow(2) * mask_f_gen).sum().div(valid_count_gen).sqrt()
+                    scale_r_gen = (rms_gen / rms_tgt_gen.clamp(min=1e-8)).item()
+
+                    # trace_r_gen
+                    G_gen = V_gen_c @ V_gen_c.transpose(1, 2)
+                    G_tgt_gen = V_tgt_c_gen @ V_tgt_c_gen.transpose(1, 2)
+                    trace_gen = torch.diagonal(G_gen, dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_tgt_gen = torch.diagonal(G_tgt_gen, dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_r_gen = (trace_gen / trace_tgt_gen.clamp(min=1e-8)).mean().item()
+
+                    # Jacc@10_gen
+                    jaccard_sum_gen = 0.0
+                    jaccard_count_gen = 0
+                    for b in range(min(4, B_fixed)):
+                        m_b = mask_fixed[b].bool()
+                        n_valid = int(m_b.sum().item())
+                        if n_valid < 15:
+                            continue
+
+                        gen_b = V_gen_fixed[b, m_b]
+                        tgt_b = V_target_fixed[b, m_b]
+
+                        D_gen_b = torch.cdist(gen_b, gen_b)
+                        D_tgt_b = torch.cdist(tgt_b, tgt_b)
+
+                        k_j = min(10, n_valid - 1)
+                        _, knn_gen = D_gen_b.topk(k_j + 1, largest=False)
+                        _, knn_tgt = D_tgt_b.topk(k_j + 1, largest=False)
+
+                        knn_gen = knn_gen[:, 1:]  # Exclude self
+                        knn_tgt = knn_tgt[:, 1:]
+
+                        for i in range(n_valid):
+                            set_gen = set(knn_gen[i].tolist())
+                            set_tgt = set(knn_tgt[i].tolist())
+                            inter = len(set_gen & set_tgt)
+                            union = len(set_gen | set_tgt)
+                            if union > 0:
+                                jaccard_sum_gen += inter / union
+                                jaccard_count_gen += 1
+
+                    jaccard_gen = jaccard_sum_gen / max(jaccard_count_gen, 1)
+
+                    # Print generator row (σ=GEN means generator-only, no denoising)
+                    print(f"  {'GEN':>8} | {scale_r_gen:8.3f} | {trace_r_gen:8.3f} | {'N/A':>8} | {jaccard_gen:8.3f} | {'GEN':>6}")
+
+                    # Store for curriculum/warm-start decisions
+                    gen_eval_metrics = {
+                        'scale_r': scale_r_gen,
+                        'trace_r': trace_r_gen,
+                        'jacc10': jaccard_gen
+                    }
+
+                    # [GEN-EVAL] Summary
+                    gen_scale_ok = 0.85 <= scale_r_gen <= 1.15
+                    gen_trace_ok = trace_r_gen >= 0.70
+                    print(f"  [GEN-EVAL] scale_r={scale_r_gen:.3f} ({'OK' if gen_scale_ok else 'FAIL'}) "
+                          f"trace_r={trace_r_gen:.3f} ({'OK' if gen_trace_ok else 'FAIL'}) "
+                          f"Jacc@10={jaccard_gen:.3f}")
                     print(f"  {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*6}")
 
                     
@@ -9469,7 +10440,358 @@ def train_stageC_diffusion_generator(
                     score_net.train()
                 if was_training_ctx:
                     context_encoder.train()
-                
+
+                # =====================================================================
+                # [CURRICULUM] Phase 3: Promotion logic based on fixed-batch eval
+                # =====================================================================
+                curr_stage = curriculum_state['current_stage']
+
+                # Use EFFECTIVE sigma_cap (accounts for ramp) for eval
+                sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
+                    curriculum_state, global_step, sigma_data)
+
+                # Select closest_sigma: max({s in fixed_eval_sigmas | s <= sigma_cap_eff})
+                # This ensures we don't eval at sigma we're not training on yet
+                candidates = [s for s in fixed_eval_sigmas if s <= sigma_cap_eff]
+                if candidates:
+                    closest_sigma = max(candidates)  # Largest sigma <= sigma_cap_eff
+                else:
+                    closest_sigma = min(fixed_eval_sigmas)  # Fallback to smallest
+
+                # Log what we're evaluating at
+                if fabric is None or fabric.is_global_zero:
+                    print(f"  [EVAL] σ_cap_eff={sigma_cap_eff:.4f} σ_cap_target={sigma_cap_target:.4f} "
+                          f"→ eval at σ={closest_sigma:.3f}"
+                          f"{' (ramp ' + f'{ramp_progress:.0%})' if ramp_active else ''}")
+
+                # Cache eps_promo ONCE per run (deterministic, no RNG contamination)
+                if 'eps_promo_cached' not in edm_debug_state:
+                    promo_gen = torch.Generator(device=device)
+                    promo_gen.manual_seed(42)
+                    edm_debug_state['eps_promo_cached'] = torch.randn(
+                        V_target_fixed.shape, generator=promo_gen, device=device, dtype=V_target_fixed.dtype
+                    )
+
+                sigma_promo = torch.full((B_fixed,), closest_sigma, device=device)
+                sigma_promo_3d = sigma_promo.view(-1, 1, 1)
+                eps_promo = edm_debug_state['eps_promo_cached']
+                V_t_promo = V_target_fixed + sigma_promo_3d * eps_promo
+                V_t_promo = V_t_promo * mask_fixed.unsqueeze(-1).float()
+
+                with torch.no_grad():
+                    x0_promo = score_net.forward_edm(V_t_promo, sigma_promo, H_fixed, mask_fixed, sigma_data, self_cond=None)
+                    if isinstance(x0_promo, tuple):
+                        x0_promo = x0_promo[0]
+
+                    # Compute metrics at sigma_cap
+                    V_promo_c, _ = uet.center_only(x0_promo, mask_fixed)
+                    mask_f_promo = mask_fixed.unsqueeze(-1).float()
+                    valid_cnt_promo = mask_f_promo.sum()
+
+                    rms_promo = (V_promo_c.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
+                    rms_tgt_promo = (V_tgt_c_gen.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
+                    scale_r_promo = (rms_promo / rms_tgt_promo.clamp(min=1e-8)).item()
+
+                    G_promo = V_promo_c @ V_promo_c.transpose(1, 2)
+                    trace_promo = torch.diagonal(G_promo, dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_r_promo = (trace_promo / trace_tgt_gen.clamp(min=1e-8)).mean().item()
+
+                    # Jacc@10 at sigma_cap
+                    jacc_sum_promo = 0.0
+                    jacc_cnt_promo = 0
+                    for b in range(min(4, B_fixed)):
+                        m_b = mask_fixed[b].bool()
+                        n_v = int(m_b.sum().item())
+                        if n_v < 15:
+                            continue
+                        pred_b = x0_promo[b, m_b]
+                        tgt_b = V_target_fixed[b, m_b]
+                        D_pred_b = torch.cdist(pred_b, pred_b)
+                        D_tgt_b = torch.cdist(tgt_b, tgt_b)
+                        k_j = min(10, n_v - 1)
+                        _, knn_pred = D_pred_b.topk(k_j + 1, largest=False)
+                        _, knn_tgt = D_tgt_b.topk(k_j + 1, largest=False)
+                        knn_pred = knn_pred[:, 1:]
+                        knn_tgt = knn_tgt[:, 1:]
+                        for i in range(n_v):
+                            s_pred = set(knn_pred[i].tolist())
+                            s_tgt = set(knn_tgt[i].tolist())
+                            inter = len(s_pred & s_tgt)
+                            union = len(s_pred | s_tgt)
+                            if union > 0:
+                                jacc_sum_promo += inter / union
+                                jacc_cnt_promo += 1
+                    jacc_promo = jacc_sum_promo / max(jacc_cnt_promo, 1)
+
+                # Get tiered thresholds based on effective sigma (not target)
+                # Find which stage's thresholds to use based on closest_sigma
+                curr_mult_eff = sigma_cap_eff / sigma_data  # Effective multiplier
+                # Find closest mult in threshold dict
+                available_mults = list(curriculum_state['jacc_min_by_mult'].keys())
+                closest_mult = min(available_mults, key=lambda m: abs(m - curr_mult_eff))
+                jacc_min = curriculum_state['jacc_min_by_mult'].get(closest_mult, 0.07)
+                target_stage = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
+
+                # At target stage: use FINAL (stricter) thresholds for "training succeeded"
+                # Before target stage: use relaxed PROMOTION thresholds based on effective mult
+                if curr_stage >= target_stage:
+                    scale_r_min = curriculum_state.get('scale_r_min_final', 0.80)
+                    trace_r_min = curriculum_state.get('trace_r_min_final', 0.60)
+                else:
+                    scale_r_min = curriculum_state['scale_r_min_by_mult'].get(
+                        closest_mult, curriculum_state['scale_r_min_default'])
+                    trace_r_min = curriculum_state['trace_r_min_by_mult'].get(
+                        closest_mult, curriculum_state['trace_r_min_default'])
+
+                # Check promotion criteria
+                scale_ok = scale_r_promo >= scale_r_min
+                trace_ok = trace_r_promo >= trace_r_min
+                jacc_ok = jacc_promo >= jacc_min
+
+                # Check if Jacc is not decreasing (need history)
+                prev_jacc = None
+                if len(curriculum_state['eval_history']) >= 1:
+                    prev_jacc = curriculum_state['eval_history'][-1].get('jacc', 0)
+                jacc_not_decreasing = (prev_jacc is None) or (jacc_promo >= prev_jacc - 0.01)
+
+                # Structure pass = Jacc competence (model learned structure at this stage)
+                structure_pass = jacc_ok and jacc_not_decreasing
+                # Full pass = structure + scale/trace (ready for promotion)
+                all_pass = structure_pass and scale_ok and trace_ok
+
+                # Store in history
+                curriculum_state['eval_history'].append({
+                    'epoch': epoch,
+                    'sigma_cap': sigma_cap_eff,  # Store effective cap (what we actually trained on)
+                    'sigma_cap_target': sigma_cap_target,  # Also store target for reference
+                    'scale_r': scale_r_promo,
+                    'trace_r': trace_r_promo,
+                    'jacc': jacc_promo,
+                    'passed': all_pass,
+                    'structure_pass': structure_pass,  # Track structure competence separately
+                })
+
+                # Phase 2: Generator warm-start check
+                if not curriculum_state['generator_stable']:
+                    gen_scale_ok = 0.85 <= gen_eval_metrics['scale_r'] <= 1.15
+                    gen_trace_ok = gen_eval_metrics['trace_r'] >= 0.70
+                    if gen_scale_ok and gen_trace_ok:
+                        curriculum_state['gen_consecutive_passes'] += 1
+                    else:
+                        curriculum_state['gen_consecutive_passes'] = 0
+
+                    if curriculum_state['gen_consecutive_passes'] >= 3:
+                        curriculum_state['generator_stable'] = True
+                        print(f"\n[GEN-WARMUP] Generator is now STABLE after {epoch+1} epochs!")
+
+                # Promotion logic: windowed "5 of last 6" instead of strict consecutive
+                # This avoids one borderline epoch resetting all progress
+                window_size = 6
+
+                # Track full passes (for promotion)
+                if 'promo_pass_window' not in curriculum_state:
+                    curriculum_state['promo_pass_window'] = []
+                curriculum_state['promo_pass_window'].append(all_pass)
+                if len(curriculum_state['promo_pass_window']) > window_size:
+                    curriculum_state['promo_pass_window'] = curriculum_state['promo_pass_window'][-window_size:]
+
+                # Track structure passes (for stall behavior decision)
+                if 'structure_pass_window' not in curriculum_state:
+                    curriculum_state['structure_pass_window'] = []
+                curriculum_state['structure_pass_window'].append(structure_pass)
+                if len(curriculum_state['structure_pass_window']) > window_size:
+                    curriculum_state['structure_pass_window'] = curriculum_state['structure_pass_window'][-window_size:]
+
+                window = curriculum_state['promo_pass_window']
+                structure_window = curriculum_state['structure_pass_window']
+                passes_in_window = sum(window)
+                structure_passes_in_window = sum(structure_window)
+                required_passes = curriculum_state['promotion_threshold']  # 5
+
+                # Update stall_count based on WINDOW, not single-epoch events
+                # Only count stalls when:
+                # 1. Window is full (len >= window_size)
+                # 2. Minimum warmup steps met (avoid noisy early epochs)
+                # 3. Ramp is NOT active (during ramp, sigma is shifting so stall counter is meaningless)
+                steps_in_stage = curriculum_state.get('steps_in_stage', 0)
+                warmup_steps = 200  # Don't count stalls during first ~4 epochs of a stage
+                if len(window) >= window_size and steps_in_stage >= warmup_steps and not ramp_active:
+                    if passes_in_window >= 2:
+                        curriculum_state['stall_count'] = 0  # Window shows progress
+                    else:
+                        curriculum_state['stall_count'] += 1  # Window shows stall (<2/6)
+                # During ramp or warmup, don't touch stall_count - wait for stable evaluation
+
+                # Store structure passes count for stall decision
+                curriculum_state['structure_passes_in_window'] = structure_passes_in_window
+
+                # Safety floor: never promote if scale_r < 0.60 (real collapse)
+                scale_collapsed = scale_r_promo < 0.60
+                curriculum_state['scale_collapsed'] = scale_collapsed  # Store for use in stall handling
+
+                # ========== ChatGPT Must-fix #1: Structure-based promotion for pre-target ==========
+                # Problem: scale/trace can lag behind structure learning, causing infinite stalls.
+                # Fix: For stages < target, promote based on STRUCTURE (Jacc) only + collapse floor.
+                #      At target stage, use full scale+trace+Jacc requirements.
+                promoted = False
+                at_target = (curr_stage >= target_stage)
+
+                if at_target:
+                    # AT TARGET STAGE: require full passes (scale + trace + Jacc)
+                    should_promote = (passes_in_window >= required_passes and
+                                      len(window) >= required_passes and
+                                      not scale_collapsed)
+                    promo_reason = "full"
+                else:
+                    # PRE-TARGET: promote based on STRUCTURE only + collapse floor
+                    # This stops the "scale lags behind structure" infinite stall
+                    should_promote = (structure_passes_in_window >= required_passes and
+                                      len(structure_window) >= required_passes and
+                                      not scale_collapsed)
+                    promo_reason = "structure"
+
+                if should_promote:
+                    if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                        old_stage = curr_stage
+                        old_mult = curriculum_state['sigma_cap_mults'][old_stage]
+                        curriculum_state['current_stage'] += 1
+                        curriculum_state['promo_pass_window'] = []  # Reset window
+                        curriculum_state['structure_pass_window'] = []  # Reset structure window
+                        curriculum_state['stall_count'] = 0  # Reset stall count on promotion
+                        promoted = True
+                        new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                        # Enable promotion ramp for smooth σ_cap transition
+                        # Store actual caps (not mults) for cleaner interpolation
+                        ramp_steps = curriculum_state.get('ramp_steps', 300)
+                        old_cap = old_mult * sigma_data
+                        new_cap = new_mult * sigma_data
+                        curriculum_state['ramp_start_step'] = global_step
+                        curriculum_state['ramp_prev_cap'] = old_cap
+                        curriculum_state['ramp_target_cap'] = new_cap
+
+                        promo_label = "STRUCTURE-PROMOTED" if promo_reason == "structure" else "PROMOTED"
+                        print(f"\n[CURRICULUM] {promo_label} to stage {curriculum_state['current_stage']} "
+                              f"(σ_cap_target = {new_cap:.4f})")
+                        print(f"  Basis: {promo_reason} ({structure_passes_in_window}/{len(structure_window)} struct, "
+                              f"{passes_in_window}/{len(window)} full)")
+                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
+
+                        # [THREE-GATE] Reset stage-local tracking on promotion
+                        curriculum_state['steps_in_stage'] = 0
+                        curriculum_state['cap_band_loss_sum'] = 0.0
+                        curriculum_state['cap_band_loss_count'] = 0
+                        curriculum_state['cap_band_loss_history'] = []
+                        curriculum_state['best_cap_band_loss'] = float('inf')
+                        curriculum_state['loss_no_improve_count'] = 0
+                        curriculum_state['metrics_pass_history'] = []
+                        print(f"  [THREE-GATE] Reset stage-local tracking for new stage")
+
+                # Print curriculum status
+                print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
+                print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1}")
+                print(f"  σ_cap: eff={sigma_cap_eff:.4f} target={sigma_cap_target:.4f}"
+                      f"{' (ramp ' + f'{ramp_progress:.0%})' if ramp_active else ''}")
+                # Show which promotion mode is active
+                if curr_stage >= target_stage:
+                    promo_mode = "AT TARGET: need full passes (scale+trace+Jacc)"
+                else:
+                    promo_mode = "PRE-TARGET: need structure passes only (Jacc) + collapse floor"
+                print(f"  Promo mode: {promo_mode}")
+                thresh_type = "FINAL" if curr_stage >= target_stage else "promo"
+                print(f"  Thresholds ({thresh_type}): scale_r≥{scale_r_min:.2f}, trace_r≥{trace_r_min:.2f}, Jacc≥{jacc_min:.2f}")
+                print(f"  Metrics at σ={closest_sigma:.3f}: scale_r={scale_r_promo:.3f} ({'✓' if scale_ok else '✗'}) "
+                      f"trace_r={trace_r_promo:.3f} ({'✓' if trace_ok else '✗'}) "
+                      f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'})")
+                print(f"  Jacc trend: {'✓ stable/improving' if jacc_not_decreasing else '✗ decreasing'}")
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                struct_window = curriculum_state.get('structure_pass_window', [])
+                print(f"  Full passes: {sum(promo_window)}/{len(promo_window)} "
+                      f"(need {curriculum_state['promotion_threshold']}/6)"
+                      f" [{' '.join('✓' if p else '✗' for p in promo_window)}]")
+                print(f"  Structure passes: {sum(struct_window)}/{len(struct_window)} "
+                      f"(≥4=competent, <2=failing)"
+                      f" [{' '.join('✓' if p else '✗' for p in struct_window)}]")
+                print(f"  Generator stable: {curriculum_state['generator_stable']}")
+                if curriculum_state['stall_count'] > 0:
+                    print(f"  ⚠️ Stall count: {curriculum_state['stall_count']}/{curriculum_state['stall_limit']}")
+
+                if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
+                    target_stg = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
+                    struct_passes = sum(struct_window)
+                    if curr_stage < target_stg:
+                        if struct_passes >= 4:
+                            print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage}!")
+                            print(f"  Structure competent ({struct_passes}/6 passes) → Will FORCE PROMOTE to stage {curr_stage + 1}")
+                        elif struct_passes < 2:
+                            max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                            print(f"\n[CURRICULUM] Structure struggling at stage {curr_stage} (informational)")
+                            print(f"  Structure passes: {struct_passes}/6 (<2 = struggling)")
+                            print(f"  → Will force-promote at max_steps ({steps_in_stage}/{max_steps}) if not recovered")
+                        else:
+                            print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} (borderline structure {struct_passes}/6)")
+                            print(f"  → Training continues until structure is competent or failing")
+                    else:
+                        print(f"\n[CURRICULUM] ⚠️ STALLED at TARGET stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
+                        print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
+
+                # ============================================================
+                # [THREE-GATE] Track Gate B (metrics) and Gate C (cap-band loss)
+                # ============================================================
+                # Gate B: Record whether metrics passed this epoch
+                metrics_passed = all_pass  # From promotion check above
+                curriculum_state['metrics_pass_history'].append(metrics_passed)
+                # Keep only last K entries
+                K = curriculum_state['metrics_history_K']
+                if len(curriculum_state['metrics_pass_history']) > K:
+                    curriculum_state['metrics_pass_history'] = curriculum_state['metrics_pass_history'][-K:]
+
+                # Gate C: Compute average cap-band loss for this epoch
+                if curriculum_state['cap_band_loss_count'] > 0:
+                    avg_cap_band_loss = curriculum_state['cap_band_loss_sum'] / curriculum_state['cap_band_loss_count']
+                    curriculum_state['cap_band_loss_history'].append(avg_cap_band_loss)
+
+                    # Check for plateau
+                    loss_threshold = curriculum_state['loss_plateau_threshold']
+                    best_loss = curriculum_state['best_cap_band_loss']
+
+                    if best_loss == float('inf'):
+                        # First measurement: always set as best, reset counter
+                        curriculum_state['best_cap_band_loss'] = avg_cap_band_loss
+                        curriculum_state['loss_no_improve_count'] = 0
+                    elif avg_cap_band_loss < best_loss:
+                        rel_improv = (best_loss - avg_cap_band_loss) / max(best_loss, 1e-8)
+                        if rel_improv > loss_threshold:
+                            curriculum_state['best_cap_band_loss'] = avg_cap_band_loss
+                            curriculum_state['loss_no_improve_count'] = 0
+                        else:
+                            curriculum_state['loss_no_improve_count'] += 1
+                    else:
+                        curriculum_state['loss_no_improve_count'] += 1
+
+                    print(f"  [THREE-GATE] Cap-band loss: {avg_cap_band_loss:.6f} "
+                          f"(best={curriculum_state['best_cap_band_loss']:.6f}, "
+                          f"no_improve={curriculum_state['loss_no_improve_count']}/{curriculum_state['loss_plateau_patience']})")
+                else:
+                    print(f"  [THREE-GATE] Cap-band loss: N/A (no samples in [0.8σ_cap, σ_cap])")
+
+                # Reset cap-band accumulators for next epoch
+                curriculum_state['cap_band_loss_sum'] = 0.0
+                curriculum_state['cap_band_loss_count'] = 0
+
+                # Gate B status - use WINDOWED 5/6, matching actual implementation
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                passes_in_window = sum(promo_window) if promo_window else 0
+                gate_b_ok = (len(promo_window) >= 6 and passes_in_window >= 5)
+                print(f"  [THREE-GATE] Gate B: {passes_in_window}/{len(promo_window)} in window "
+                      f"(need 5/6 for gate) {'✓' if gate_b_ok else '✗'}")
+
+                # Steps in stage
+                print(f"  [THREE-GATE] Steps in stage: {curriculum_state['steps_in_stage']} "
+                      f"(min={curriculum_state['min_steps_per_stage']})")
+
+                # No need to restore RNG state - eps_promo is cached, no global RNG touched
+
                 print(f"{'='*70}\n")
 
                 # =====================================================================
@@ -9698,14 +11020,19 @@ def train_stageC_diffusion_generator(
             if train_pair_overlap and ov_apply_count > 0:
                 avg_ov_shape = ov_loss_sum['shape'] / ov_apply_count
                 avg_ov_scale = ov_loss_sum['scale'] / ov_apply_count
-                avg_ov_kl = ov_loss_sum['kl'] / ov_apply_count
+                avg_ov_kl = ov_loss_sum['kl'] / ov_apply_count                # Ungated
+                avg_ov_kl_gated = ov_loss_sum['kl_gated'] / ov_apply_count    # [TRY2] Gated
                 avg_ov_total = ov_loss_sum['total'] / ov_apply_count
                 ov_apply_rate = ov_apply_count / max(n_batches, 1)
+
+                # [TRY2] Compute KL gating reduction ratio
+                kl_gating_ratio = avg_ov_kl_gated / (avg_ov_kl + 1e-8)
 
                 # Track in history (safe init for partially populated dicts)
                 history['epoch_avg'].setdefault('ov_shape', [])
                 history['epoch_avg'].setdefault('ov_scale', [])
                 history['epoch_avg'].setdefault('ov_kl', [])
+                history['epoch_avg'].setdefault('ov_kl_gated', [])  # [TRY2]
                 history['epoch_avg'].setdefault('ov_total', [])
                 history['epoch_avg'].setdefault('ov_jaccard_k10', [])
                 history['epoch_avg'].setdefault('ov_I_size_mean', [])
@@ -9714,6 +11041,7 @@ def train_stageC_diffusion_generator(
                 history['epoch_avg']['ov_shape'].append(avg_ov_shape)
                 history['epoch_avg']['ov_scale'].append(avg_ov_scale)
                 history['epoch_avg']['ov_kl'].append(avg_ov_kl)
+                history['epoch_avg']['ov_kl_gated'].append(avg_ov_kl_gated)  # [TRY2]
                 history['epoch_avg']['ov_total'].append(avg_ov_total)
 
                 avg_I_size = np.mean(ov_I_sizes) if ov_I_sizes else 0.0
@@ -9722,8 +11050,10 @@ def train_stageC_diffusion_generator(
                 history['epoch_avg']['ov_jaccard_k10'].append(avg_jaccard)
 
                 print(f"\n[OVLP-EPOCH] Epoch {epoch+1} Overlap Loss Summary:")
-                print(f"  L_ov_shape={avg_ov_shape:.6f}, L_ov_scale={avg_ov_scale:.6f}, "
-                      f"L_ov_kl={avg_ov_kl:.6f}, L_ov_total={avg_ov_total:.6f}")
+                print(f"  L_ov_shape={avg_ov_shape:.6f}, L_ov_scale={avg_ov_scale:.6f}")
+                print(f"  [TRY2] L_ov_kl_ungated={avg_ov_kl:.6f}, L_ov_kl_gated={avg_ov_kl_gated:.6f}, "
+                      f"gating_ratio={kl_gating_ratio:.4f}")
+                print(f"  L_ov_total={avg_ov_total:.6f}")
                 print(f"  apply_rate={ov_apply_rate:.2%}, skipped_sigma={ov_skipped_sigma}")
                 print(f"  avg_I_size={avg_I_size:.1f}, Jaccard@10={avg_jaccard:.4f}")
         
@@ -9767,38 +11097,288 @@ def train_stageC_diffusion_generator(
             else:
                 print(f"[Epoch {epoch+1}] Avg Losses: score={avg_score:.4f}, gram={avg_gram:.4f}, total={avg_total:.4f}")
             
-            if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
-                # Use total weighted loss as validation metric
-                # This includes all geometry regularizers (dim, triangle, radial)
-                val_metric = avg_total
+            # ============================================================
+            # THREE-GATE EARLY STOPPING (CURRICULUM-AWARE)
+            # Gate A: current_stage >= target_stage
+            # Gate B: metrics stable for K consecutive evals
+            # Gate C: cap-band loss plateau
+            # All three gates must pass, plus minimum epochs/steps
+            # ============================================================
+            curriculum_enabled = (curriculum_state is not None and
+                                  len(curriculum_state.get('sigma_cap_mults', [])) > 0)
+            curriculum_stop_enabled = (curriculum_enabled and
+                                       curriculum_state.get('curriculum_early_stop', True))
 
-                
-                # Check for improvement
-                if val_metric < early_stop_best:
-                    rel_improv = (early_stop_best - val_metric) / max(early_stop_best, 1e-8)
-                    
-                    if rel_improv > early_stop_threshold:
-                        # Significant improvement
-                        early_stop_best = val_metric
-                        early_stop_no_improve = 0
-                    else:
-                        # Minor improvement, doesn't count
-                        early_stop_no_improve += 1
-                else:
-                    # No improvement
-                    early_stop_no_improve += 1
-                
-                # Check if we should stop
-                if early_stop_no_improve >= early_stop_patience:
+            if curriculum_enabled and curriculum_stop_enabled:
+                final_stage_idx = len(curriculum_state['sigma_cap_mults']) - 1
+                curr_stage = curriculum_state['current_stage']
+                target_stage = curriculum_state.get('target_stage', final_stage_idx)
+                min_epochs_curriculum = curriculum_state.get('min_epochs', 15)
+                min_steps_per_stage = curriculum_state.get('min_steps_per_stage', 500)
+                steps_in_stage = curriculum_state.get('steps_in_stage', 0)
+
+                # Gate A: Stage target reached
+                gate_a = (curr_stage >= target_stage)
+
+                # Gate B: Metrics stable - use WINDOWED 5/6, not 5 consecutive
+                # This is more forgiving of high-σ fluctuations at target stage
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                passes_in_window = sum(promo_window) if promo_window else 0
+                gate_b = (len(promo_window) >= 6 and passes_in_window >= 5)  # 5/6 windowed
+
+                # Gate C: Cap-band loss plateau
+                loss_plateau_patience = curriculum_state.get('loss_plateau_patience', 6)
+                loss_no_improve = curriculum_state.get('loss_no_improve_count', 0)
+                gate_c = (loss_no_improve >= loss_plateau_patience)
+
+                # Prerequisites: minimum epochs and steps
+                min_epochs_met = (epoch + 1) >= min_epochs_curriculum
+                min_steps_met = steps_in_stage >= min_steps_per_stage
+
+                # Curriculum-based stopping conditions
+                stall_count = curriculum_state.get('stall_count', 0)
+                stall_limit = curriculum_state.get('stall_limit', 6)
+
+                # Structure competence info for stall handling
+                structure_passes = curriculum_state.get('structure_passes_in_window', 0)
+                structure_competent = structure_passes >= 4  # Model learned structure at this stage
+                structure_failing = structure_passes < 2     # Model genuinely failing
+
+                # === STOP CONDITION 1: Three-gate SUCCESS (check FIRST!) ===
+                # At target stage, success stop takes priority over stall stop
+                # This prevents stopping for "stall" when actually converged
+                if gate_a and gate_b and gate_c and min_epochs_met and min_steps_met:
+                    if fabric is None or fabric.is_global_zero:
+                        print(f"\n[THREE-GATE-STOP] All gates passed! 🎉")
+                        print(f"  Gate A (stage >= target): {curr_stage} >= {target_stage} ✓")
+                        print(f"  Gate B (metrics 5/6 window): {passes_in_window}/6 passes ✓")
+                        print(f"  Gate C (loss plateau): no_improve={loss_no_improve} >= {loss_plateau_patience} ✓")
+                        print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
+                        print(f"  Min steps: {steps_in_stage} >= {min_steps_per_stage} ✓")
+                        print(f"  Stopping training (convergence success)")
                     should_stop = True
                     early_stopped = True
                     early_stop_epoch = epoch + 1
 
-            elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
-                # Just track best, don't stop yet
-                val_metric = avg_total
-                if val_metric < early_stop_best:
-                    early_stop_best = val_metric
+                # === STOP CONDITION 2: Curriculum stall handling ===
+                # Only checked if success condition not met
+                elif stall_count >= stall_limit and min_steps_met:
+                    # Get scale_collapsed from curriculum state (computed during promotion check)
+                    scale_collapsed = curriculum_state.get('scale_collapsed', False)
+
+                    if curr_stage < target_stage:
+                        # NOT at target stage yet
+                        if structure_competent and not scale_collapsed:
+                            # Structure OK AND scale not collapsed → FORCE PROMOTE (scale-stall)
+                            # Note: we check scale_collapsed to avoid promoting truly collapsed models
+                            if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                                old_stage = curr_stage
+                                old_mult = curriculum_state['sigma_cap_mults'][old_stage]
+                                curriculum_state['current_stage'] += 1
+                                curriculum_state['stall_count'] = 0  # Reset stall count
+                                curriculum_state['promo_pass_window'] = []  # Reset window
+                                curriculum_state['structure_pass_window'] = []  # Reset structure window
+                                new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                                # Enable promotion ramp for smooth σ_cap transition
+                                ramp_steps = curriculum_state.get('ramp_steps', 300)
+                                old_cap = old_mult * sigma_data
+                                new_cap = new_mult * sigma_data
+                                curriculum_state['ramp_start_step'] = global_step
+                                curriculum_state['ramp_prev_cap'] = old_cap
+                                curriculum_state['ramp_target_cap'] = new_cap
+
+                                # Reset stage-local tracking
+                                curriculum_state['steps_in_stage'] = 0
+                                curriculum_state['cap_band_loss_sum'] = 0.0
+                                curriculum_state['cap_band_loss_count'] = 0
+                                curriculum_state['cap_band_loss_history'] = []
+                                curriculum_state['best_cap_band_loss'] = float('inf')
+                                curriculum_state['loss_no_improve_count'] = 0
+                                curriculum_state['metrics_pass_history'] = []
+
+                                if fabric is None or fabric.is_global_zero:
+                                    print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {old_stage} → FORCE PROMOTING to stage {curriculum_state['current_stage']}")
+                                    print(f"  stall_count was {stall_count} >= stall_limit={stall_limit}")
+                                    print(f"  Structure competent: {structure_passes}/6 passes (≥4 required) ✓")
+                                    print(f"  Scale not collapsed: scale_r >= 0.60 ✓")
+                                    print(f"  New σ_cap_target = {new_cap:.4f}")
+                                    print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
+                                    print(f"  Model learned structure but scale lagging - promoting to learn at higher σ")
+
+                        elif structure_competent and scale_collapsed:
+                            # Structure OK but scale collapsed → don't force promote, continue training
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[CURRICULUM] ⚠️ STALL with collapsed scale at stage {curr_stage}")
+                                print(f"  Structure competent: {structure_passes}/6 passes ✓")
+                                print(f"  But scale_r < 0.60 (collapsed) - cannot force promote")
+                                print(f"  → Training continues to try recovering scale")
+
+                        elif structure_failing:
+                            # ChatGPT FIX: Structure failing pre-target → DO NOT STOP
+                            # Instead, check if max_steps_per_stage exceeded → force promote
+                            max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                            if steps_in_stage >= max_steps:
+                                # Hard escape: force promote even if structure failing
+                                if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                                    old_stage = curr_stage
+                                    old_mult = curriculum_state['sigma_cap_mults'][old_stage]
+                                    curriculum_state['current_stage'] += 1
+                                    curriculum_state['stall_count'] = 0
+                                    curriculum_state['promo_pass_window'] = []
+                                    curriculum_state['structure_pass_window'] = []
+                                    new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                                    # Enable ramp for smooth transition
+                                    ramp_steps = curriculum_state.get('ramp_steps', 300)
+                                    old_cap = old_mult * sigma_data
+                                    new_cap = new_mult * sigma_data
+                                    curriculum_state['ramp_start_step'] = global_step
+                                    curriculum_state['ramp_prev_cap'] = old_cap
+                                    curriculum_state['ramp_target_cap'] = new_cap
+
+                                    # Reset stage-local tracking
+                                    curriculum_state['steps_in_stage'] = 0
+                                    curriculum_state['cap_band_loss_sum'] = 0.0
+                                    curriculum_state['cap_band_loss_count'] = 0
+                                    curriculum_state['cap_band_loss_history'] = []
+                                    curriculum_state['best_cap_band_loss'] = float('inf')
+                                    curriculum_state['loss_no_improve_count'] = 0
+                                    curriculum_state['metrics_pass_history'] = []
+
+                                    if fabric is None or fabric.is_global_zero:
+                                        print(f"\n[CURRICULUM] ⚠️ MAX_STEPS ESCAPE at stage {old_stage}")
+                                        print(f"  steps_in_stage={steps_in_stage} >= max_steps={max_steps}")
+                                        print(f"  Structure failing ({structure_passes}/6) but FORCE PROMOTING anyway")
+                                        print(f"  → PROMOTED to stage {curriculum_state['current_stage']} (σ_cap_target = {new_cap:.4f})")
+                                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
+                            else:
+                                # Not yet at max_steps, just warn and continue
+                                if fabric is None or fabric.is_global_zero:
+                                    print(f"\n[CURRICULUM] ⚠️ Structure struggling at stage {curr_stage}")
+                                    print(f"  Structure passes: {structure_passes}/6 (<2 = failing)")
+                                    print(f"  steps_in_stage: {steps_in_stage}/{max_steps}")
+                                    print(f"  → Will FORCE PROMOTE when max_steps reached (no pre-target stop)")
+
+                        # else: structure borderline (2-3 passes), continue training
+
+                    else:
+                        # AT target stage - check minimum dwell before allowing stall stop
+                        min_steps_at_target = curriculum_state.get('min_steps_at_target', 2000)
+                        target_dwell_met = steps_in_stage >= min_steps_at_target
+
+                        if min_epochs_met and target_dwell_met:
+                            # AT target stage AND min_epochs met AND minimum dwell at target met
+                            # → can stop due to stall (only reached if success condition above wasn't met)
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[THREE-GATE-STOP] Stall limit reached at TARGET stage {curr_stage}")
+                                print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
+                                print(f"  Gate A satisfied: stage {curr_stage} >= target {target_stage}")
+                                print(f"  Gate B (5/6 window): {passes_in_window}/6 (need 5) ✗")
+                                print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
+                                print(f"  Min steps at target: {steps_in_stage} >= {min_steps_at_target} ✓")
+                                print(f"  Stopping training (stall at target stage)")
+                            should_stop = True
+                            early_stopped = True
+                            early_stop_epoch = epoch + 1
+                        elif not target_dwell_met:
+                            # Stalled at target but haven't dwelled long enough
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[CURRICULUM] ⚠️ STALL at target stage {curr_stage} but minimum dwell not met")
+                                print(f"  Steps at target: {steps_in_stage}/{min_steps_at_target}")
+                                print(f"  → Training continues to give target stage a fair chance")
+
+                # === NO STOP: Log gate status ===
+                else:
+                    val_metric = avg_total
+                    if val_metric < early_stop_best:
+                        early_stop_best = val_metric
+
+                    # Log gate status periodically
+                    if (fabric is None or fabric.is_global_zero) and (epoch + 1) % 5 == 0:
+                        print(f"\n[THREE-GATE] Epoch {epoch+1} Gate Status:")
+                        print(f"  Gate A (stage >= {target_stage}): {curr_stage} {'✓' if gate_a else '✗'}")
+                        print(f"  Gate B (5/6 window): {passes_in_window}/6 {'✓' if gate_b else '✗'}")
+                        print(f"  Gate C (loss plateau): {loss_no_improve}/{loss_plateau_patience} {'✓' if gate_c else '✗'}")
+                        print(f"  Min epochs: {epoch+1}/{min_epochs_curriculum} {'✓' if min_epochs_met else '✗'}")
+                        print(f"  Min steps: {steps_in_stage}/{min_steps_per_stage} {'✓' if min_steps_met else '✗'}")
+
+                        # Enhanced curriculum budget tracking
+                        max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                        steps_until_escape = max(0, max_steps - steps_in_stage)
+                        print(f"  [BUDGET] stage {curr_stage}: {steps_in_stage}/{max_steps} steps "
+                              f"({steps_until_escape} until force-promote)")
+
+                        if ramp_active:
+                            ramp_start = curriculum_state.get('ramp_start_step', 0)
+                            ramp_steps_val = curriculum_state.get('ramp_steps', 300)
+                            steps_into_ramp = global_step - ramp_start
+                            prev_cap = curriculum_state.get('ramp_prev_cap', 0)
+                            targ_cap = curriculum_state.get('ramp_target_cap', 0)
+                            print(f"  [RAMP] Active: {steps_into_ramp}/{ramp_steps_val} "
+                                  f"({prev_cap:.4f}→{targ_cap:.4f})")
+
+                        if not gate_a:
+                            print(f"  → Training continues: need to reach target stage {target_stage}")
+                        elif not gate_b:
+                            print(f"  → Training continues: need 5/6 passes in window")
+                        elif not gate_c:
+                            print(f"  → Training continues: loss still improving")
+                        elif not min_epochs_met:
+                            print(f"  → Training continues: min epochs not met")
+                        elif not min_steps_met:
+                            print(f"  → Training continues: min steps per stage not met")
+
+                        # Log stall status with structure competence info
+                        if stall_count >= stall_limit:
+                            if curr_stage < target_stage:
+                                if structure_competent:
+                                    print(f"  ⚠️ SCALE-STALL ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Will FORCE PROMOTE to stage {curr_stage+1} when min_steps met")
+                                elif structure_failing:
+                                    max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                                    print(f"  Structure struggling ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Will force-promote at max_steps ({steps_in_stage}/{max_steps})")
+                                else:
+                                    print(f"  ⚠️ BORDERLINE ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Training continues until structure is competent (≥4) or failing (<2)")
+                            elif not min_epochs_met:
+                                print(f"  ⚠️ Stall at target stage ({stall_count}>={stall_limit}) but min_epochs={min_epochs_curriculum} not met")
+                                print(f"  → Training continues until epoch {min_epochs_curriculum}")
+
+            elif not curriculum_enabled:
+                # No curriculum: use legacy loss-based early stop
+                if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
+                    # Use total weighted loss as validation metric
+                    # This includes all geometry regularizers (dim, triangle, radial)
+                    val_metric = avg_total
+
+                    # Check for improvement
+                    if val_metric < early_stop_best:
+                        rel_improv = (early_stop_best - val_metric) / max(early_stop_best, 1e-8)
+
+                        if rel_improv > early_stop_threshold:
+                            # Significant improvement
+                            early_stop_best = val_metric
+                            early_stop_no_improve = 0
+                        else:
+                            # Minor improvement, doesn't count
+                            early_stop_no_improve += 1
+                    else:
+                        # No improvement
+                        early_stop_no_improve += 1
+
+                    # Check if we should stop
+                    if early_stop_no_improve >= early_stop_patience:
+                        should_stop = True
+                        early_stopped = True
+                        early_stop_epoch = epoch + 1
+
+                elif enable_early_stop and (epoch + 1) < early_stop_min_epochs:
+                    # Just track best, don't stop yet
+                    val_metric = avg_total
+                    if val_metric < early_stop_best:
+                        early_stop_best = val_metric
         
 
         # Broadcast stop decision to ALL ranks
@@ -10030,32 +11610,40 @@ def train_stageC_diffusion_generator(
 
 
         # --- save checkpoints only on rank-0 ---
-        # --- save checkpoints only on rank-0 ---
-        if (epoch + 1) % 100 == 0:
-            if fabric is None or fabric.is_global_zero:
-                ckpt = {
-                    'epoch': epoch,
-                    'context_encoder': context_encoder.state_dict(),
-                    'score_net': score_net.state_dict(),
-                    'generator': generator.state_dict(),
-                    'context_encoder_ema': context_encoder_ema.state_dict(),
-                    'score_net_ema': score_net_ema.state_dict(),
-                    'ema_decay': ema_decay,
-                    'optimizer': optimizer.state_dict(),
-                    'history': history,
-                    'sigma_data': sigma_data,
-                    'sigma_min': sigma_min,
-                    'sigma_max': sigma_max,
-                }
-                if encoder is not None:
-                    encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
-                    ckpt['encoder'] = encoder_to_save.state_dict()
+        if fabric is None or fabric.is_global_zero:
+            ckpt = {
+                'epoch': epoch,
+                'global_step': global_step,  # NEW: save for correct resume
+                'context_encoder': context_encoder.state_dict(),
+                'score_net': score_net.state_dict(),
+                'generator': generator.state_dict(),
+                'context_encoder_ema': context_encoder_ema.state_dict(),
+                'score_net_ema': score_net_ema.state_dict(),
+                'ema_decay': ema_decay,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'history': history,
+                'sigma_data': sigma_data,
+                'sigma_min': sigma_min,
+                'sigma_max': sigma_max,
+                'curriculum_state': curriculum_state,
+            }
+            if encoder is not None:
+                encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
+                ckpt['encoder'] = encoder_to_save.state_dict()
+
+            # Rolling latest checkpoint — overwritten every epoch
+            torch.save(ckpt, os.path.join(outf, 'ckpt_latest.pt'))
+
+            # Periodic milestone checkpoint every 50 epochs
+            if (epoch + 1) % 50 == 0:
                 torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
     
     # Save final checkpoint after training loop
     if fabric is None or fabric.is_global_zero:
         ckpt_final = {
             'epoch': epoch,
+            'global_step': global_step,  # NEW: save for correct resume
             'context_encoder': context_encoder.state_dict(),
             'score_net': score_net.state_dict(),
             'generator': generator.state_dict(),
@@ -10063,10 +11651,12 @@ def train_stageC_diffusion_generator(
             'score_net_ema': score_net_ema.state_dict(),
             'ema_decay': ema_decay,
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'history': history,
             'sigma_data': sigma_data,
             'sigma_min': sigma_min,
             'sigma_max': sigma_max,
+            'curriculum_state': curriculum_state,
         }
         if encoder is not None:
             encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder

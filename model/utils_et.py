@@ -1003,36 +1003,63 @@ def gram_from_coords(y_hat: torch.Tensor) -> torch.Tensor:
 def factor_from_gram(G: torch.Tensor, D_latent: int) -> torch.Tensor:
     """
     Factor Gram matrix to get V such that G ≈ V V^T.
-    
+
     Args:
         G: (n, n) Gram matrix (PSD)
         D_latent: target latent dimension
-        
+
     Returns:
-        V: (n, D_latent) factor matrix
+        V: (n, D_latent) factor matrix with CANONICALIZED gauge
+
+    Note: Eigenvectors are only defined up to sign (and rotations within
+    degenerate eigenspaces). This function applies deterministic canonicalization
+    to ensure V_target is stable across calls, which is critical for ε-prediction
+    training where inconsistent V_target causes inconsistent ε labels.
     """
+    n = G.shape[0]
+    device = G.device
+    dtype = G.dtype
+
     # Eigendecomposition
-    # eigvals, eigvecs = torch.linalg.eigh(G)  # Ascending order
     eigvals, eigvecs = safe_eigh(G, return_vecs=True)
     eigvals = eigvals.flip(0).clamp(min=0)  # Descending, non-negative
     eigvecs = eigvecs.flip(1)
-    
+
     # Take top D_latent eigenpairs
     D = min(D_latent, eigvals.shape[0])
     eigvals_top = eigvals[:D]
     eigvecs_top = eigvecs[:, :D]
-    
+
+    # ========== SIGN CANONICALIZATION (fixes ε-training gauge ambiguity) ==========
+    # Eigenvectors from eigh are only defined up to sign (±). This causes V_target to
+    # randomly flip between batches, making ε labels inconsistent.
+    #
+    # FIX: For each column, force the element with maximum absolute value to be positive.
+    # This is a minimal, geometry-preserving fix that removes sign ambiguity.
+    #
+    # NOTE: We do NOT use Procrustes alignment to polynomial anchors because that
+    # destroys the geometric meaning of V_target (eigenvectors have nothing to do
+    # with polynomials - they represent principal directions of atomic positions).
+
+    if D > 0 and n > 0:
+        # Sign canonicalization: force max-magnitude element positive in each column
+        abs_max_idx = eigvecs_top.abs().argmax(dim=0)  # (D,)
+        col_indices = torch.arange(D, device=device)
+        col_vals = eigvecs_top[abs_max_idx, col_indices]  # (D,)
+        sign = torch.sign(col_vals)
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)  # Handle exact zeros
+        eigvecs_top = eigvecs_top * sign.view(1, D)
+
+    # ==================================================================================
+
     # V = U @ sqrt(Λ)
     V = eigvecs_top @ torch.diag(torch.sqrt(eigvals_top))
-    
+
     # Pad with zeros if rank < D_latent
     if D < D_latent:
-        padding = torch.zeros(V.shape[0], D_latent - D, device=V.device)
+        padding = torch.zeros(V.shape[0], D_latent - D, device=V.device, dtype=V.dtype)
         V = torch.cat([V, padding], dim=1)
-    
-    # Center rows (translation neutrality)
-    # V = V - V.mean(dim=0, keepdim=True)
-    
+
     return V
 
 

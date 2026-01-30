@@ -382,14 +382,19 @@ class GEMSModel:
         precision: str = "16-mixed",
         logger = None,
         log_interval: int = 10,
-        # Early stopping
+        # Early stopping (legacy, non-curriculum)
         enable_early_stop: bool = True,
         early_stop_min_epochs: int = 12,
         early_stop_patience: int = 6,
         early_stop_threshold: float = 0.01,
+        # Curriculum early stopping (three-gate)
+        curriculum_target_stage: int = 6,
+        curriculum_min_epochs: int = 100,
+        curriculum_early_stop: bool = True,
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
         # NEW: Stochastic kNN sampling parameters (for STSetDataset)
-        pool_mult: float = 4.0,
+        # NOTE: For small slides (<1000 spots), use 1.5-2.0 to maintain spatial locality
+        pool_mult: float = 2.0,
         stochastic_tau: float = 1.0,
         # NEW: Context augmentation parameters
         z_noise_std: float = 0.02,
@@ -582,6 +587,9 @@ class GEMSModel:
             early_stop_min_epochs=early_stop_min_epochs,
             early_stop_patience=early_stop_patience,
             early_stop_threshold=early_stop_threshold,
+            curriculum_target_stage=curriculum_target_stage,
+            curriculum_min_epochs=curriculum_min_epochs,
+            curriculum_early_stop=curriculum_early_stop,
             # NEW: Context augmentation
             z_noise_std=z_noise_std,
             z_dropout_rate=z_dropout_rate,
@@ -698,7 +706,7 @@ class GEMSModel:
                                and rebuild context_encoder if needed
         """
         import copy
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # ========== AUTO-DETECT ANCHOR MODE ==========
         if auto_detect_anchor:
@@ -727,14 +735,26 @@ class GEMSModel:
                 
                 print(f"[ANCHOR-LOAD] Rebuilt context_encoder: input_dim={self.context_encoder.input_dim}")
         
-        # Now load state dicts
+        # Now load state dicts (with safety checks for missing keys)
         if 'encoder' in checkpoint:
             self.encoder.load_state_dict(checkpoint['encoder'])
         else:
-            print("[LOAD] WARNING: encoder not found in checkpoint; load it separately.")
-        self.context_encoder.load_state_dict(checkpoint['context_encoder'])
-        self.generator.load_state_dict(checkpoint['generator'])
-        self.score_net.load_state_dict(checkpoint['score_net'])
+            print("[LOAD] WARNING: encoder not found in checkpoint; keeping current weights.")
+
+        if 'context_encoder' in checkpoint:
+            self.context_encoder.load_state_dict(checkpoint['context_encoder'])
+        else:
+            print("[LOAD] WARNING: context_encoder not found in checkpoint; keeping current weights.")
+
+        if 'generator' in checkpoint:
+            self.generator.load_state_dict(checkpoint['generator'])
+        else:
+            print("[LOAD] WARNING: generator not found in checkpoint; keeping current weights.")
+
+        if 'score_net' in checkpoint:
+            self.score_net.load_state_dict(checkpoint['score_net'])
+        else:
+            print("[LOAD] WARNING: score_net not found in checkpoint; keeping current weights.")
         
         if 'sigma_data' in checkpoint:
             self.sigma_data = checkpoint['sigma_data']
