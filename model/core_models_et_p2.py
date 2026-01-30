@@ -14898,6 +14898,15 @@ def _sample_sc_edm_patchwise_v2(
 
     N = sc_gene_expr.shape[0]
 
+    # V2 pipeline requires a trained generator for both residual and standard modes
+    if generator is None:
+        raise ValueError(
+            "[V2-PIPELINE] Generator is required for V2 pipeline. "
+            "The V2 pipeline uses the generator for initialization in both "
+            "residual and standard diffusion modes. Please ensure your checkpoint "
+            "contains a trained generator, or use the legacy pipeline instead."
+        )
+
     if DEBUG_FLAG:
         print("\n" + "="*70)
         print("[V2-PIPELINE] Distance-First Stitching Pipeline")

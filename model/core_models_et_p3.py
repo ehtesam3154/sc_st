@@ -778,7 +778,26 @@ class GEMSModel:
             self.sigma_min = checkpoint['sigma_min']
         if 'sigma_max' in checkpoint:
             self.sigma_max = checkpoint['sigma_max']
-        
+
+        # Load curriculum_state and extract sigma parameters for inference
+        if 'curriculum_state' in checkpoint:
+            cs = checkpoint['curriculum_state']
+            # sigma_data_resid: locked value after generator warmup
+            if cs.get('sigma_resid_valid', False) and cs.get('sigma_data_resid_locked') is not None:
+                self.sigma_data_resid = cs['sigma_data_resid_locked']
+                print(f"  Loaded sigma_data_resid={self.sigma_data_resid:.6f} (from curriculum_state)")
+            elif cs.get('sigma_data_resid') is not None:
+                self.sigma_data_resid = cs['sigma_data_resid']
+                print(f"  Loaded sigma_data_resid={self.sigma_data_resid:.6f} (unlocked, may be unstable)")
+
+            # max_sigma_cap_eff_seen: recommended max sigma for inference
+            if cs.get('max_sigma_cap_eff_seen', 0) > 0:
+                self.max_sigma_cap_eff_seen = cs['max_sigma_cap_eff_seen']
+                print(f"  Loaded max_sigma_cap_eff_seen={self.max_sigma_cap_eff_seen:.4f} (recommended sigma_max for inference)")
+
+            # Store curriculum state for reference
+            self.curriculum_state = cs
+
         # Load config if available
         if 'cfg' in checkpoint:
             self.cfg = checkpoint['cfg']
@@ -1089,8 +1108,16 @@ class GEMSModel:
             sigma_min = getattr(self, 'sigma_min', 0.002)
         if sigma_max is None:
             sigma_max = getattr(self, 'sigma_max', 80.0)
-        
+
+        # Check if sigma_max is appropriate based on training curriculum
+        max_sigma_trained = getattr(self, 'max_sigma_cap_eff_seen', None)
+        if max_sigma_trained is not None and sigma_max > max_sigma_trained * 1.1:
+            print(f"[SIGMA-WARNING] sigma_max={sigma_max:.4f} exceeds max trained sigma={max_sigma_trained:.4f}")
+            print(f"[SIGMA-WARNING] Consider using sigma_max={max_sigma_trained:.4f} for better results")
+
         print(f"[Inference] Using sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.2f}, sigma_data={sigma_data:.4f}")
+        if max_sigma_trained is not None:
+            print(f"[Inference] max_sigma_cap_eff_seen={max_sigma_trained:.4f} (recommended upper bound)")
         print(f"[DEBUG_TAG][INFER-SIGMA] sigma_min={sigma_min:.6f} sigma_max={sigma_max:.6f} sigma_data={sigma_data:.6f}")
 
         if sigma_data is None:
