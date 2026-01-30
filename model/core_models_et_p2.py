@@ -2777,13 +2777,14 @@ def train_stageC_diffusion_generator(
 
     # =========================================================================
     # [CURRICULUM] Phase 3: σ curriculum state initialization
-    # NEW 3-stage curriculum: start at S2 (highest), demote on failure
-    # Legacy 7-stage: start at S0 (lowest), promote on success
+    # NEW 3-stage curriculum: start at S0 (lowest), promote on success (easy→hard)
+    # Demotion enabled as safety valve if failing badly at higher stages
+    # Legacy 7-stage: uses absolute sigma values [0.3, 0.9, ..., 17.0]
     # =========================================================================
     curriculum_state = {
         # NEW 3-stage curriculum (default): [1.0, 2.0, 3.0] × σ_data
         'sigma_cap_mults': [1.0, 2.0, 3.0],
-        'current_stage': 2,           # Start at S2 (highest), demote on failure
+        'current_stage': 0,           # Start at S0 (lowest), promote on success (easy→hard)
         # Data-dependent sigma cap (replaces old absolute sigma_cap_safe=0.30)
         'sigma_cap_safe_mult': sigma_cap_safe_mult,   # σ_cap_safe = mult × σ0 (from CLI arg)
         'sigma_cap_abs_max': sigma_cap_abs_max,       # Optional absolute ceiling (from CLI arg)
@@ -2809,9 +2810,9 @@ def train_stageC_diffusion_generator(
         'trace_r_min_default': 0.53,
         'scale_r_min_final': 0.80,
         'trace_r_min_final': 0.60,
-        # Cap-band: 50% for all stages (reduced from 70% to prevent overfitting)
-        'cap_band_frac_by_stage': {0: 0.5, 1: 0.5, 2: 0.5},
-        'cap_band_frac_default': 0.5,
+        # Cap-band: ramp up with stage (low at S0 for clean warmup, higher at S2)
+        'cap_band_frac_by_stage': {0: 0.2, 1: 0.3, 2: 0.5},
+        'cap_band_frac_default': 0.3,
         'cap_band_lo_mult': 0.6,       # Lower bound = 0.6 × σ_cap (was 0.7)
         # History for tracking
         'eval_history': [],           # List of (epoch, metrics_dict)
@@ -2899,7 +2900,7 @@ def train_stageC_diffusion_generator(
     print(f"\n{'='*70}")
     print(f"[CURRICULUM] Configuration")
     print(f"{'='*70}")
-    print(f"  Mode: {'LEGACY 7-stage (promotion)' if use_legacy_curriculum else 'NEW 3-stage (demotion)'}")
+    print(f"  Mode: {'LEGACY 7-stage (absolute σ)' if use_legacy_curriculum else 'NEW 3-stage (easy→hard, promote up)'}")
     print(f"  sigma_cap_mults: {curriculum_state['sigma_cap_mults']}")
     print(f"  Starting stage: S{curriculum_state['current_stage']}")
     print(f"  sigma_cap_safe_mult: {curriculum_state.get('sigma_cap_safe_mult', 'N/A')} (data-dependent cap)")
