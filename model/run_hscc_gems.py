@@ -89,7 +89,7 @@ def parse_args():
     parser.add_argument('--curriculum_early_stop', action=argparse.BooleanOptionalAction, default=True,
                         help='Enable three-gate curriculum-aware early stopping (default: enabled)')
     parser.add_argument('--use_legacy_curriculum', action=argparse.BooleanOptionalAction, default=False,
-                        help='Use legacy 7-stage curriculum [0.3,0.9,...,17.0] instead of new 3-stage [1,2,3]')
+                        help='Use legacy 7-stage curriculum [0.3,...,17.0] instead of new 3-stage [1,2,3]')
 
     parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
                         help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
@@ -182,7 +182,11 @@ def parse_args():
     parser.add_argument('--self_cond_mode', type=str, default='standard',
                         choices=['none', 'standard'],
                         help='Self-conditioning mode: none (disabled) or standard (two-pass)')
-    
+
+    # ========== RESIDUAL DIFFUSION ==========
+    parser.add_argument('--use_residual_diffusion', action=argparse.BooleanOptionalAction, default=False,
+                        help='Enable residual diffusion: diffuse R = V_target - V_base instead of V_target')
+
     # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
     parser.add_argument('--train_pair_overlap', action=argparse.BooleanOptionalAction, default=False,
                         help='Enable paired overlapping minisets for overlap-consistency training')
@@ -686,6 +690,8 @@ def main(args=None):
         ctx_debug_every=args.ctx_debug_every,
         # ========== SELF-CONDITIONING MODE ==========
         self_cond_mode=args.self_cond_mode,
+        # ========== RESIDUAL DIFFUSION ==========
+        use_residual_diffusion=args.use_residual_diffusion,
         # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
         train_pair_overlap=args.train_pair_overlap,
         pair_overlap_alpha=args.pair_overlap_alpha,

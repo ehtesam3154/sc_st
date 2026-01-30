@@ -391,7 +391,7 @@ class GEMSModel:
         curriculum_target_stage: int = 6,
         curriculum_min_epochs: int = 100,
         curriculum_early_stop: bool = True,
-        use_legacy_curriculum: bool = False,  # True = 7-stage [0.3,...,17.0], False = 3-stage [1,2,3]
+        use_legacy_curriculum: bool = False,
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
         # NEW: Stochastic kNN sampling parameters (for STSetDataset)
         # NOTE: For small slides (<1000 spots), use 1.5-2.0 to maintain spatial locality
@@ -442,6 +442,8 @@ class GEMSModel:
         ctx_debug_every: int = 100,
         # ========== SELF-CONDITIONING MODE ==========
         self_cond_mode: str = 'standard',
+        # ========== RESIDUAL DIFFUSION ==========
+        use_residual_diffusion: bool = False,
         # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
         train_pair_overlap: bool = False,
         pair_overlap_alpha: float = 0.5,
@@ -630,6 +632,8 @@ class GEMSModel:
             ctx_debug_every=ctx_debug_every,
             # ========== SELF-CONDITIONING MODE ==========
             self_cond_mode=self_cond_mode,
+            # ========== RESIDUAL DIFFUSION ==========
+            use_residual_diffusion=use_residual_diffusion,
             # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
             train_pair_overlap=train_pair_overlap,
             pair_overlap_alpha=pair_overlap_alpha,

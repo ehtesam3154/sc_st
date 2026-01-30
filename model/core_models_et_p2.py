@@ -2698,7 +2698,7 @@ def train_stageC_diffusion_generator(
     curriculum_target_stage: int = 6,
     curriculum_min_epochs: int = 100,
     curriculum_early_stop: bool = True,
-    use_legacy_curriculum: bool = False,  # True = 7-stage [0.3,...,17.0], False = 3-stage [1,2,3]
+    use_legacy_curriculum: bool = False,
     # NEW: EDM parameters
     P_mean: float = -1.2,          # Log-normal mean for sigma sampling
     P_std: float = 1.2,            # Log-normal std for sigma sampling
@@ -2743,6 +2743,8 @@ def train_stageC_diffusion_generator(
     ctx_debug_every: int = 100,
     # ========== SELF-CONDITIONING MODE ==========
     self_cond_mode: str = 'standard',
+    # ========== RESIDUAL DIFFUSION ==========
+    use_residual_diffusion: bool = False,
     # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
     train_pair_overlap: bool = False,
     pair_overlap_alpha: float = 0.5,
@@ -2771,56 +2773,39 @@ def train_stageC_diffusion_generator(
 
     # =========================================================================
     # [CURRICULUM] Phase 3: σ curriculum state initialization
-    # Ladder of σ_cap values as multiples of σ_data
-    # For σ_data=0.175: [0.05, 0.16, 0.40, 0.70, 1.23, 2.45, 2.98]
+    # NEW 3-stage curriculum: start at S2 (highest), demote on failure
+    # Legacy 7-stage: start at S0 (lowest), promote on success
     # =========================================================================
     curriculum_state = {
-        'sigma_cap_mults': [1.0, 2.0, 3.0],  # 3-stage curriculum: multiples of σ_0
+        # NEW 3-stage curriculum (default): [1.0, 2.0, 3.0] × σ_data
+        'sigma_cap_mults': [1.0, 2.0, 3.0],
         'current_stage': 2,           # Start at S2 (highest), demote on failure
-        'sigma_cap_safe': 0.30,       # Hard clamp: σ_cap ≤ sigma_cap_safe always
-        'consecutive_passes': 0,      # Need 5 consecutive passes for promotion
-        'promotion_threshold': 5,     # User requested 5 instead of 2-3
-        'stall_count': 0,             # Count of failed promotion attempts
-        'stall_limit': 6,             # Stop if stalled for this many evals
-        'generator_stable': False,    # Phase 2: warm-start flag
-        'gen_consecutive_passes': 0,  # Phase 2: generator stability counter
-        # Residual mode: switch σ_0 from σ_data to σ_residual when generator is good
-        # σ_residual is the std of (V_target - V_base) where V_base is generator output
-        'residual_mode': False,       # Activates when generator_stable becomes True
-        'sigma_residual': None,       # Computed from residuals when mode activates
-        # Thresholds for 3-stage curriculum (Jacc ≥ 0.10 for all)
+        'sigma_cap_safe': 0.30,       # Hard clamp: σ_cap never exceeds this
+        'consecutive_passes': 0,
+        'promotion_threshold': 5,
+        'stall_count': 0,
+        'stall_limit': 6,
+        'generator_stable': False,
+        'gen_consecutive_passes': 0,
+        # Thresholds for 3-stage (Jacc ≥ 0.10 for all)
         'jacc_min_by_mult': {
-            1.0: 0.10,   # S0: Jacc threshold
-            2.0: 0.10,   # S1: Jacc threshold
-            3.0: 0.10,   # S2: Jacc threshold
+            1.0: 0.10, 2.0: 0.10, 3.0: 0.10,
         },
-        # Scale_r thresholds for PROMOTION (3-stage):
-        # S0→S1: scale_r ≥ 0.85, S1→S2: scale_r ≥ 0.80
+        # Scale_r thresholds: S0→S1: ≥0.85, S1→S2: ≥0.80
         'scale_r_min_by_mult': {
-            1.0: 0.85,   # S0→S1 promotion threshold
-            2.0: 0.80,   # S1→S2 promotion threshold
-            3.0: 0.75,   # S2: relaxed (final stage)
+            1.0: 0.85, 2.0: 0.80, 3.0: 0.75,
         },
         'scale_r_min_default': 0.75,
-        # trace_r_min ≈ 0.95 * scale_r_min² (derived from scale)
         'trace_r_min_by_mult': {
-            1.0: 0.69,   # ≈ 0.95 * 0.85²
-            2.0: 0.61,   # ≈ 0.95 * 0.80²
-            3.0: 0.53,   # ≈ 0.95 * 0.75²
+            1.0: 0.69, 2.0: 0.61, 3.0: 0.53,
         },
         'trace_r_min_default': 0.53,
-        # FINAL thresholds (at target stage only, for "training succeeded")
-        # These are stricter to ensure generation quality
         'scale_r_min_final': 0.80,
         'trace_r_min_final': 0.60,
-        # Cap-band emphasis: fraction of samples drawn from [lo_mult*σ_cap, σ_cap]
-        # Remaining (1 - frac) drawn from full [σ_min, σ_cap] via log-normal
-        # Reduced from 70% to 50% to prevent overfitting to cap-band
-        'cap_band_frac_by_stage': {
-            0: 0.5, 1: 0.5, 2: 0.5,  # 50% cap-band for all stages
-        },
-        'cap_band_frac_default': 0.5,  # 50% cap-band (reduced from 70%)
-        'cap_band_lo_mult': 0.6,       # Cap-band lower bound = 0.6 * σ_cap (was 0.7)
+        # Cap-band: 50% for all stages (reduced from 70% to prevent overfitting)
+        'cap_band_frac_by_stage': {0: 0.5, 1: 0.5, 2: 0.5},
+        'cap_band_frac_default': 0.5,
+        'cap_band_lo_mult': 0.6,       # Lower bound = 0.6 × σ_cap (was 0.7)
         # History for tracking
         'eval_history': [],           # List of (epoch, metrics_dict)
 
@@ -2867,14 +2852,17 @@ def train_stageC_diffusion_generator(
         # Conditioning strength knob (ChatGPT fix for scale collapse at moderate σ)
         # Normalizes H to unit RMS then scales by α
         # This controls conditioning magnitude without changing model architecture
-        'cond_alpha': 0.1,            # Fixed conditioning strength (start conservative)
+        'cond_alpha': 0.5,            # ChatGPT: α=0.1 too small, H increases Fx at high σ
+
+        # Residual diffusion: diffuse R = V_target - V_base instead of V_target
+        'use_residual_diffusion': use_residual_diffusion,
     }
 
-    # Legacy curriculum override: use 7-stage [0.3,...,17.0] instead of 3-stage [1,2,3]
+    # Legacy curriculum override: 7-stage [0.3,...,17.0] with promotion
     if use_legacy_curriculum:
         curriculum_state['sigma_cap_mults'] = [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0]
-        curriculum_state['current_stage'] = 0  # Start at stage 0 (promotion-based)
-        curriculum_state['sigma_cap_safe'] = 3.0  # Higher safe cap for legacy
+        curriculum_state['current_stage'] = 0
+        curriculum_state['sigma_cap_safe'] = 3.0
         curriculum_state['jacc_min_by_mult'] = {
             0.3: 0.15, 0.9: 0.12, 2.3: 0.10, 4.0: 0.09, 7.0: 0.08, 14.0: 0.07, 17.0: 0.07,
         }
@@ -2890,21 +2878,17 @@ def train_stageC_diffusion_generator(
         curriculum_state['cap_band_frac_default'] = 0.7
         curriculum_state['cap_band_lo_mult'] = 0.7
 
-    # Diagnostic print showing full curriculum configuration
+    # Print curriculum configuration
     n_stages = len(curriculum_state['sigma_cap_mults'])
     print(f"\n{'='*70}")
-    print(f"[CURRICULUM] Configuration Summary")
+    print(f"[CURRICULUM] Configuration")
     print(f"{'='*70}")
-    print(f"  Mode: {'LEGACY (7-stage, promotion-based)' if use_legacy_curriculum else 'NEW (3-stage, demotion-based)'}")
+    print(f"  Mode: {'LEGACY 7-stage (promotion)' if use_legacy_curriculum else 'NEW 3-stage (demotion)'}")
     print(f"  sigma_cap_mults: {curriculum_state['sigma_cap_mults']}")
-    print(f"  Starting stage: S{curriculum_state['current_stage']} (index {curriculum_state['current_stage']})")
-    print(f"  sigma_cap_safe: {curriculum_state['sigma_cap_safe']}")
-    print(f"  cap_band_frac_default: {curriculum_state['cap_band_frac_default']} ({int(curriculum_state['cap_band_frac_default']*100)}%)")
-    print(f"  cap_band_lo_mult: {curriculum_state['cap_band_lo_mult']}")
-    if use_legacy_curriculum:
-        print(f"  Direction: S0 -> S{n_stages-1} (PROMOTION on success)")
-    else:
-        print(f"  Direction: S{n_stages-1} -> S0 (DEMOTION on failure)")
+    print(f"  Starting stage: S{curriculum_state['current_stage']}")
+    print(f"  sigma_cap_safe: {curriculum_state.get('sigma_cap_safe', 'N/A')}")
+    print(f"  cap_band_frac: {curriculum_state['cap_band_frac_default']} ({int(curriculum_state['cap_band_frac_default']*100)}%)")
+    print(f"  use_residual_diffusion: {use_residual_diffusion}")
     print(f"{'='*70}\n")
 
     slide_d15_medians = []
@@ -3575,13 +3559,15 @@ def train_stageC_diffusion_generator(
     #     'shape_spec': 0.0,
     # }
 
+    # Phase 2: Re-enable structure losses at gentler weights (scale is now healthy)
+    # Keep α=0.5, p_sc=0.0 from scale-first phase
     WEIGHTS = {
-        'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
-        'gram': 2.0,           # was 1.0
-        'gram_scale': 2.0,     # was 1.0
-        'out_scale': 2.0,
-        'gram_learn': 2.0,
-        'knn_scale': 0.2,     # NEW: kNN distance scale calibration
+        'score': 16.0,         # KEEP: main denoising loss
+        'gram': 1.0,           # RE-ENABLE at half weight (was 2.0)
+        'gram_scale': 1.0,     # RE-ENABLE at half weight (was 2.0)
+        'out_scale': 2.0,      # KEEP: learned branch scale calibration
+        'gram_learn': 1.0,     # RE-ENABLE at half weight (was 2.0)
+        'knn_scale': 0.1,      # RE-ENABLE at half weight (was 0.2)
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -3589,19 +3575,20 @@ def train_stageC_diffusion_generator(
         'ordinal_sc': 0.0,
         'st_dist': 0.0,
         'edm_tail': 0.0,
-        'gen_align': 10.0,     # was 0.5 - will use new gen losses in Patch 8
-        'gen_scale': 10.0,     # NEW: add this key for Patch 8
+        'gen_align': 10.0,     # KEEP: generator alignment (Procrustes MSE)
+        'gen_gram': 10.0,      # NEW: Gram matrix loss for generator (gauge-invariant geometry)
+        'gen_scale': 10.0,     # KEEP: generator scale
         'dim': 0.0,
         'triangle': 0.0,
         'radial': 0.0,
-        'knn_nca': 2.0,
+        'knn_nca': 1.0,        # RE-ENABLE at half weight (was 2.0)
         'repel': 0.0,
         'shape': 0.0,
-        'edge': 4.0,           # was 2.0
+        'edge': 2.0,           # RE-ENABLE at half weight (was 4.0)
         'topo': 0.0,
         'shape_spec': 0.0,
-        'subspace': 0.5,       # NEW: add this key for Patch 7
-        'ctx_edge': 0.05,
+        'subspace': 0.25,      # RE-ENABLE at half weight (was 0.5)
+        'ctx_edge': 0.0,       # Keep off for now
         # ========== OVERLAP CONSISTENCY LOSSES (Candidate 1) ==========
         'ov_shape': 0.0,       # Weight set dynamically via overlap_loss_weight_shape
         'ov_scale': 0.0,       # Weight set dynamically via overlap_loss_weight_scale
@@ -3683,7 +3670,7 @@ def train_stageC_diffusion_generator(
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 
             'gram_learn': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],
+            'edm_tail': [], 'gen_align': [], 'gen_gram': [], 'gen_scale': [], 'subspace': [],
             'dim': [], 'triangle': [], 'radial': [],
             'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': [],
             'ov_shape': [], 'ov_scale': [], 'ov_kl': [], 'score_2': [],
@@ -3774,6 +3761,7 @@ def train_stageC_diffusion_generator(
                 'metrics_history_K', 'min_steps_per_stage', 'min_steps_at_target',
                 'loss_plateau_patience', 'loss_plateau_threshold',
                 'cond_alpha',  # Conditioning strength knob
+                'use_residual_diffusion',  # Residual diffusion mode
             ]
 
             # Start with loaded state, then override config keys with canonical values
@@ -3941,6 +3929,42 @@ def train_stageC_diffusion_generator(
     # Store sigma_data on score_net for reference in forward pass
     print(f"[StageC] sigma_data = {sigma_data:.4f}")
 
+    # ========== RESIDUAL DIFFUSION: Compute sigma_data_resid ==========
+    sigma_data_resid = sigma_data  # Default to sigma_data
+    if use_residual_diffusion and use_st and (fabric is None or fabric.is_global_zero):
+        # Compute sigma_data for residuals R = V_target - V_base
+        resid_stds = []
+        it = iter(st_loader)
+        for _ in range(min(10, len(st_loader))):
+            sample_batch = next(it, None)
+            if sample_batch is None:
+                break
+
+            if isinstance(sample_batch, dict) and sample_batch.get('is_pair_batch', False):
+                sample_batch = sample_batch['view1']
+
+            V_batch = sample_batch['V_target'].to(device, non_blocking=True)
+            Z_batch = sample_batch['Z_set'].to(device, non_blocking=True)
+            mask_batch = sample_batch['mask'].to(device, non_blocking=True)
+
+            # Compute context and generator output
+            with torch.no_grad():
+                H_batch = context_encoder(Z_batch, mask_batch)
+                V_base_batch = generator(H_batch, mask_batch)
+                R_batch = V_batch - V_base_batch  # Residual
+
+            for i in range(min(4, V_batch.shape[0])):
+                m = mask_batch[i]
+                if m.sum() > 0:
+                    R_temp = R_batch[i, m]
+                    resid_stds.append(R_temp.std().item())
+
+        sigma_data_resid = float(np.median(resid_stds)) if resid_stds else sigma_data
+        print(f"[RESID-DIFF] sigma_data_resid = {sigma_data_resid:.4f} (vs sigma_data={sigma_data:.4f})")
+
+    sigma_data_resid = sync_scalar(sigma_data_resid, device)
+    curriculum_state['sigma_data_resid'] = sigma_data_resid
+
     if fabric is None or fabric.is_global_zero:
         print(f"\n[CURRICULUM CONFIG]")
         print(f"  stages: {curriculum_state['sigma_cap_mults']} (× σ_data={sigma_data:.4f})")
@@ -3949,6 +3973,7 @@ def train_stageC_diffusion_generator(
         print(f"  three-gate early stop: {curriculum_state.get('curriculum_early_stop', True)}")
         print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
               f"default={curriculum_state['cap_band_frac_default']}")
+        print(f"  residual_diffusion: {curriculum_state.get('use_residual_diffusion', False)}")
     
     # Store sigma_data on score_net (handle DDP/Fabric wrapper)
     if hasattr(score_net, 'module'):
@@ -4157,7 +4182,7 @@ def train_stageC_diffusion_generator(
     USE_AUTOBALANCE = False
 
     #self conditioning probability
-    p_sc = 0.5 #prob of using self-conditioning in training
+    p_sc = 0.0  # ChatGPT R4: disable self-cond to break potential shrink feedback loop
 
     # Early stopping state
     early_stop_best = float('inf')
@@ -4223,17 +4248,10 @@ def train_stageC_diffusion_generator(
         - ramp_progress: 0.0-1.0 progress through ramp (0 if not active)
         """
         curr_stage = curriculum_state['current_stage']
+        sigma_cap_target = curriculum_state['sigma_cap_mults'][curr_stage] * sigma_data
 
-        # Residual mode: use sigma_residual instead of sigma_data for σ_0
-        if curriculum_state.get('residual_mode', False):
-            sigma_0 = curriculum_state.get('sigma_residual', sigma_data)
-        else:
-            sigma_0 = sigma_data
-
-        sigma_cap_target = curriculum_state['sigma_cap_mults'][curr_stage] * sigma_0
-
-        # Hard safety clamp: sigma_cap never exceeds sigma_cap_safe
-        sigma_cap_safe = curriculum_state.get('sigma_cap_safe', 0.30)
+        # Hard safety clamp
+        sigma_cap_safe = curriculum_state.get('sigma_cap_safe', 3.0)
 
         ramp_start = curriculum_state.get('ramp_start_step')
         ramp_steps = curriculum_state.get('ramp_steps', 300)
@@ -4254,7 +4272,7 @@ def train_stageC_diffusion_generator(
                 # Ramp in progress
                 t = steps_since_ramp / ramp_steps
                 sigma_cap_eff = prev_cap + t * (target_cap - prev_cap)
-                sigma_cap_eff = min(sigma_cap_eff, sigma_cap_safe)  # Safety clamp
+                sigma_cap_eff = min(sigma_cap_eff, sigma_cap_safe)
                 return sigma_cap_eff, sigma_cap_target, True, t
 
         # No ramp or ramp complete - apply safety clamp
@@ -4500,6 +4518,7 @@ def train_stageC_diffusion_generator(
                 if use_edm:
                     # [CURRICULUM] Phase 3: Compute current sigma_cap using helper
                     curr_stage = curriculum_state['current_stage']
+                    curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
                     sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
                         curriculum_state, global_step, sigma_data)
 
@@ -4741,6 +4760,70 @@ def train_stageC_diffusion_generator(
                     V_gen = generator(H, mask)
                     V_target = V_gen
 
+                # ========== RESIDUAL DIFFUSION: Compute V_base and R_target ==========
+                use_resid = curriculum_state.get('use_residual_diffusion', False)
+                if use_resid:
+                    # For residual diffusion: always compute V_base from generator (detached)
+                    with torch.no_grad():
+                        V_base = generator(H, mask).detach()  # Detach to prevent gradient flow
+
+                    # CRITICAL FIX: Align V_target to V_base's frame before computing residual
+                    # V_target comes from factor_from_gram() which has arbitrary rotation/reflection.
+                    # V_base is in the generator's learned frame. Without alignment, the residual
+                    # would be dominated by frame mismatch (~√2 × |V_target|), defeating residual diffusion.
+                    with torch.no_grad():
+                        V_target_aligned = uet.rigid_align_apply_no_scale(V_target, V_base, mask)
+
+                    # Compute residual in V_base's frame (now small corrections!)
+                    R_target = V_target_aligned - V_base
+                    # Store for later composition: V_hat = V_base + R_hat (in base frame)
+
+                    # [RESID-DIFF] Diagnostics: log residual statistics periodically
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            mask_f = mask.unsqueeze(-1).float()
+                            valid_count = mask_f.sum() * V_target.shape[-1]
+
+                            rms_tgt = (V_target.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                            rms_base = (V_base.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                            rms_resid = (R_target.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+
+                            # Also compute unaligned residual to show the fix is working
+                            R_unaligned = V_target - V_base
+                            rms_resid_unaligned = (R_unaligned.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+
+                            # Residual-to-target ratio (should be << 1 after alignment)
+                            resid_ratio = rms_resid / (rms_tgt + 1e-8)
+                            resid_ratio_unaligned = rms_resid_unaligned / (rms_tgt + 1e-8)
+
+                            print(f"[RESID-DIFF] step={global_step} "
+                                  f"rms_tgt={rms_tgt:.4f} rms_base={rms_base:.4f} "
+                                  f"rms_resid_aligned={rms_resid:.4f} rms_resid_unaligned={rms_resid_unaligned:.4f}")
+                            print(f"[RESID-DIFF] resid/tgt_aligned={resid_ratio:.3f} resid/tgt_unaligned={resid_ratio_unaligned:.3f}")
+
+                            # [RESID-DIFF-GRAM] Check if Gram matrices match (geometry vs just rotation)
+                            G_tgt = (V_target @ V_target.transpose(1,2))[0]  # First sample
+                            G_base = (V_base @ V_base.transpose(1,2))[0]
+                            m = mask[0].bool()
+                            G_tgt_valid = G_tgt[m][:, m]
+                            G_base_valid = G_base[m][:, m]
+                            gram_corr = torch.corrcoef(torch.stack([G_tgt_valid.flatten(), G_base_valid.flatten()]))[0,1].item()
+                            print(f"[RESID-DIFF-GRAM] Gram_corr={gram_corr:.4f} (>0.95=alignment bug, <0.8=generator geometry wrong)")
+
+                            # [RESID-DIFF-CDIST] Translation-invariant distance-matrix correlation
+                            # This is more robust than Gram which can be affected by centering
+                            V_tgt_valid = V_target[0, m]  # (n_valid, D)
+                            V_base_valid = V_base[0, m]
+                            D_tgt = torch.cdist(V_tgt_valid, V_tgt_valid)  # (n_valid, n_valid)
+                            D_base = torch.cdist(V_base_valid, V_base_valid)
+                            cdist_corr = torch.corrcoef(torch.stack([D_tgt.flatten(), D_base.flatten()]))[0,1].item()
+                            print(f"[RESID-DIFF-CDIST] cdist_corr={cdist_corr:.4f} (translation-invariant geometry check)")
+
+                            # [RESID-DIFF-WEIGHTS] Print gen_align weight to verify it's active
+                            print(f"[RESID-DIFF-WEIGHTS] gen_align={WEIGHTS.get('gen_align', 0.0)}")
+                else:
+                    V_base = None
+                    R_target = None
 
                 # =================================================================
                 # [DEBUG] GENERATOR SCALE SANITY CHECK
@@ -4877,21 +4960,28 @@ def train_stageC_diffusion_generator(
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
                 
-                # ===== NOISE AROUND GROUND TRUTH (not generator!) =====
+                # ===== NOISE AROUND GROUND TRUTH (or RESIDUAL in residual mode) =====
                 eps = torch.randn_like(V_target)
                 # eps = eps * mask.unsqueeze(-1).float()
-                V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
+                if use_resid:
+                    # RESIDUAL DIFFUSION: Noise around R_target = V_target - V_base
+                    V_t = R_target + sigma_t * eps  # Noisy residual
+                else:
+                    # STANDARD: Noise around V_target
+                    V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
                 V_t = V_t * mask.unsqueeze(-1).float()
                 
                 # ========== NEW: Anchored training - clamp anchor positions to clean values ==========
                 if anchor_train and anchor_clamp_clean and anchor_cond_mask is not None and not is_sc:
-                    V_t = uet.apply_anchor_clamp(V_t, V_target, anchor_cond_mask, mask)
+                    # In residual mode, clamp to R_target; in standard mode, clamp to V_target
+                    clamp_target = R_target if use_resid else V_target
+                    V_t = uet.apply_anchor_clamp(V_t, clamp_target, anchor_cond_mask, mask)
                     
                     # Debug: verify clamp worked
                     if global_step % anchor_debug_every == 0 and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             if anchor_cond_mask.any():
-                                anchor_diff = (V_t - V_target).abs()
+                                anchor_diff = (V_t - clamp_target).abs()  # Use clamp_target for correctness
                                 anchor_positions = anchor_cond_mask.unsqueeze(-1).expand_as(V_t)
                                 max_anchor_diff = anchor_diff[anchor_positions].max().item()
                                 sigma_median = sigma_t.median().item()
@@ -5324,8 +5414,12 @@ def train_stageC_diffusion_generator(
                                 
                                 print(f"  σ∈[{lo:.1f},{hi:.1f}): n={n_in_bin}, mse(pred→tgt)={mse_pred:.6f}")
 
-                    # for geom losses, V_hat is x0_pred
-                    V_hat = x0_pred
+                    # for geom losses, V_hat is x0_pred (or V_base + x0_pred in residual mode)
+                    if use_resid:
+                        # RESIDUAL DIFFUSION: x0_pred is R_hat, compose V_hat = V_base + R_hat
+                        V_hat = V_base + x0_pred
+                    else:
+                        V_hat = x0_pred
                     dist_aux = None
                 else:
                     # Self-conditioning logic
@@ -5352,9 +5446,14 @@ def train_stageC_diffusion_generator(
                             eps_pred = result
                             dist_aux = None
 
-                    V_hat = V_t - sigma_t * eps_pred
+                    R_hat = V_t - sigma_t * eps_pred  # Denoised prediction (residual if use_resid)
+                    if use_resid:
+                        # RESIDUAL DIFFUSION: R_hat is the residual, compose V_hat = V_base + R_hat
+                        V_hat = V_base + R_hat
+                    else:
+                        V_hat = R_hat
                     V_hat = V_hat * mask.unsqueeze(-1).float()
-       
+
             # ===== SCORE LOSS (in fp32 for numerical stability) =====
             with torch.autocast(device_type='cuda', enabled=False):
                 mask_fp32 = mask.float()
@@ -5393,9 +5492,12 @@ def train_stageC_diffusion_generator(
                     cap = edm_debug_state['w_cap_ema'].clamp_min(1e-6)
                     w = cap * torch.tanh(w_raw / cap)  # (B,)
 
-                    # Choose target: ST uses V_target; SC must not require coords.
-                    # If your SC path truly has V_target, keep it; otherwise revert to V_0.
-                    target_x0 = V_target if (not is_sc) else V_0
+                    # Choose target: ST uses V_target (or R_target in residual mode); SC uses V_0.
+                    # In residual mode, the network predicts R_hat, so target is R_target.
+                    if use_resid:
+                        target_x0 = R_target if (not is_sc) else V_0
+                    else:
+                        target_x0 = V_target if (not is_sc) else V_0
                     target_fp32 = target_x0.float()
 
                     # Masked MSE (B, N) mean over latent dims
@@ -5931,6 +6033,7 @@ def train_stageC_diffusion_generator(
             L_st_dist = torch.tensor(0.0, device=device)
             L_edm_tail = torch.tensor(0.0, device=device)
             L_gen_align = torch.tensor(0.0, device=device)
+            L_gen_gram = torch.tensor(0.0, device=device)  # NEW: Gram matrix loss for generator
             L_dim = torch.zeros((), device=device)
             L_triangle = torch.zeros((), device=device)
             L_radial = torch.zeros((), device=device)
@@ -5956,6 +6059,7 @@ def train_stageC_diffusion_generator(
             L_st_dist = safe_loss(L_st_dist, "L_st_dist", max_val=50.0, global_step=global_step)
             L_edm_tail = safe_loss(L_edm_tail, "L_edm_tail", max_val=50.0, global_step=global_step)
             L_gen_align = safe_loss(L_gen_align, "L_gen_align", max_val=50.0, global_step=global_step)
+            L_gen_gram = safe_loss(L_gen_gram, "L_gen_gram", max_val=50.0, global_step=global_step)
             L_dim = safe_loss(L_dim, "L_dim", max_val=50.0, global_step=global_step)
             L_triangle = safe_loss(L_triangle, "L_triangle", max_val=50.0, global_step=global_step)
             L_radial = safe_loss(L_radial, "L_radial", max_val=50.0, global_step=global_step)
@@ -8614,6 +8718,18 @@ def train_stageC_diffusion_generator(
                         L_gen_align = uet.rigid_align_mse_no_scale(V_gen_struct_L, V_target_struct, mask)
                         # Use anchor-clamped V_gen_centered_L for scale loss
                         L_gen_scale = uet.rms_log_loss(V_gen_centered_L, V_target_batch, mask)
+
+                        # NEW: Gram matrix loss for generator (gauge-invariant geometry)
+                        # Unlike Procrustes MSE, this has direct gradients and doesn't rely on SVD
+                        if WEIGHTS.get('gen_gram', 0.0) > 0:
+                            # Compute Gram matrices (pairwise inner products)
+                            G_gen = V_gen_struct_L @ V_gen_struct_L.transpose(1, 2)  # (B, N, N)
+                            G_tgt = V_target_struct @ V_target_struct.transpose(1, 2)  # (B, N, N)
+
+                            # Masked MSE over valid pairs
+                            mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)  # (B, N, N)
+                            diff_gram = (G_gen - G_tgt).pow(2) * mask_2d
+                            L_gen_gram = diff_gram.sum() / mask_2d.sum().clamp(min=1)
                         
                         # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
                         # This ensures generator learns correct local neighborhood distances
@@ -9098,6 +9214,7 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['st_dist'] * L_st_dist +
                     WEIGHTS['edm_tail'] * L_edm_tail +
                     WEIGHTS['gen_align'] * L_gen_align +
+                    WEIGHTS.get('gen_gram', 0) * L_gen_gram +    # NEW: Gram loss for generator
                     WEIGHTS.get('gen_scale', 0) * L_gen_scale +  # PATCH 8
                     WEIGHTS['dim'] * L_dim +
                     WEIGHTS['triangle'] * L_triangle +
@@ -9250,13 +9367,29 @@ def train_stageC_diffusion_generator(
                                 print(f"[FIX2A] Same-noise coupling: {hi_sigma_mask.sum().item()}/{hi_sigma_mask.shape[0]} "
                                       f"high-σ samples (σ > {sigma_switch_noise:.3f})")
 
-                    # Add noise to view2 target
-                    V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
-                    V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
- 
-                    # Encode view2 context
+                    # Encode view2 context FIRST (needed for residual V_base_2)
                     with torch.autocast(device_type='cuda', dtype=amp_dtype):
                         H_2 = context_encoder(Z_set_2, mask_2)
+
+                    # ========== RESIDUAL DIFFUSION: View 2 ==========
+                    # Must match view 1's residual treatment (including frame alignment!)
+                    if use_resid:
+                        with torch.no_grad():
+                            V_base_2 = generator(H_2, mask_2).detach()
+                            # CRITICAL: Align V_target_2 to V_base_2's frame (same as view 1)
+                            V_target_2_aligned = uet.rigid_align_apply_no_scale(V_target_2, V_base_2, mask_2)
+                        R_target_2 = V_target_2_aligned - V_base_2
+                        # Noise the residual, not the absolute target
+                        V_t_2 = R_target_2 + sigma_pair_3d_ov * eps_2
+                    else:
+                        V_base_2 = None
+                        R_target_2 = None
+                        # Add noise to view2 target (original behavior)
+                        V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2
+
+                    V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
+
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype):
  
                         # Forward pass for view2
                         x0_pred_2_result = score_net.forward_edm(
@@ -9277,7 +9410,9 @@ def train_stageC_diffusion_generator(
                         # ============================================================
 
                         # Compute per-node MSE (same as view1: mean over dims)
-                        err2_node_2 = (x0_pred_2 - V_target_2).pow(2).mean(dim=-1)  # (B_keep, N2)
+                        # In residual mode, use R_target_2; otherwise use V_target_2
+                        target_2_for_score = R_target_2 if use_resid else V_target_2
+                        err2_node_2 = (x0_pred_2 - target_2_for_score).pow(2).mean(dim=-1)  # (B_keep, N2)
 
                         # Per-sample normalization (same as view1)
                         mask_2_f = mask_2.float()  # (B_keep, N2)
@@ -9297,9 +9432,20 @@ def train_stageC_diffusion_generator(
                         # Compute overlap losses
                         # Slice V_target to match the filtered batch
                         V_target_1_ov = V_target[idx_keep]
-                        
+
+                        # ========== RESIDUAL DIFFUSION: Compose absolute coords for overlap ==========
+                        # In residual mode, x0_pred is R_hat (residual). For overlap consistency,
+                        # we need absolute coordinates: V_hat = V_base + R_hat
+                        if use_resid:
+                            V_base_1 = V_base[idx_keep]  # Slice V_base from main batch
+                            V_hat_1_ov = V_base_1 + x0_pred_1  # Compose absolute coords
+                            V_hat_2_ov = V_base_2 + x0_pred_2  # V_base_2 computed earlier
+                        else:
+                            V_hat_1_ov = x0_pred_1  # Already absolute
+                            V_hat_2_ov = x0_pred_2
+
                         ov_loss_dict = compute_overlap_losses(
-                            x0_pred_1, x0_pred_2,
+                            V_hat_1_ov, V_hat_2_ov,  # Use composed coords in residual mode
                             idx1_I, idx2_I, I_mask,
                             mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
@@ -10050,13 +10196,14 @@ def train_stageC_diffusion_generator(
 
                     # [GEN-GRAD] Phase 1.2: Log generator loss contribution vs total
                     gen_align_contrib = WEIGHTS['gen_align'] * L_gen_align.item() if not is_sc else 0.0
+                    gen_gram_contrib = WEIGHTS.get('gen_gram', 0) * L_gen_gram.item() if not is_sc else 0.0
                     gen_scale_contrib = WEIGHTS.get('gen_scale', 0) * L_gen_scale.item() if not is_sc else 0.0
                     score_contrib = WEIGHTS.get('score', 1.0) * L_score.item()
-                    gen_total_contrib = gen_align_contrib + gen_scale_contrib
+                    gen_total_contrib = gen_align_contrib + gen_gram_contrib + gen_scale_contrib
                     total_loss_approx = L_total.item() if L_total is not None else 1.0
                     gen_pct = 100.0 * gen_total_contrib / max(total_loss_approx, 1e-8)
 
-                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
+                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_gram_contrib={gen_gram_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
                     print(f"  [GEN-GRAD] score_contrib={score_contrib:.4e} gen_total_contrib={gen_total_contrib:.4e} ({gen_pct:.1f}%)")
 
                     if gen_pct < 1.0 and not is_sc:
@@ -10169,6 +10316,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['ordinal_sc'] += L_ordinal_sc.item()
             epoch_losses['edm_tail'] += L_edm_tail.item()
             epoch_losses['gen_align'] += L_gen_align.item()
+            epoch_losses['gen_gram'] += L_gen_gram.item()
             epoch_losses['dim'] += L_dim.item()
             epoch_losses['triangle'] += L_triangle.item()
             epoch_losses['radial'] += L_radial.item()
@@ -10626,17 +10774,6 @@ def train_stageC_diffusion_generator(
                         curriculum_state['generator_stable'] = True
                         print(f"\n[GEN-WARMUP] Generator is now STABLE after {epoch+1} epochs!")
 
-                        # Activate residual mode: switch σ_0 from σ_data to σ_residual
-                        # When residual_mode=True, the denoiser trains on residuals (V_target - V_base)
-                        # and σ_residual (computed from residual std) is used instead of σ_data
-                        if not curriculum_state.get('residual_mode', False):
-                            curriculum_state['residual_mode'] = True
-                            # TODO: Compute sigma_residual from actual residuals
-                            # For now, use a conservative estimate: sigma_residual ≈ 0.5 * sigma_data
-                            # This assumes residuals are about half the magnitude of raw coordinates
-                            curriculum_state['sigma_residual'] = 0.5 * sigma_data
-                            print(f"  [RESIDUAL] Activated residual mode: σ_residual = {curriculum_state['sigma_residual']:.4f}")
-
                 # Promotion logic: windowed "5 of last 6" instead of strict consecutive
                 # This avoids one borderline epoch resetting all progress
                 window_size = 6
@@ -10771,10 +10908,9 @@ def train_stageC_diffusion_generator(
 
                 if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
                     struct_passes = sum(struct_window)
-                    # DEMOTION LOGIC: If struggling at current stage, demote to lower stage
-                    # This is the new 3-stage curriculum where we start at S2 and demote on failure
+                    # DEMOTION LOGIC: For new 3-stage curriculum starting at S2
+                    # If struggling (struct_passes < 4) and not at S0, demote to lower stage
                     if curr_stage > 0 and struct_passes < 4:
-                        # Demote to lower stage
                         old_stage = curr_stage
                         old_mult = curriculum_state['sigma_cap_mults'][old_stage]
                         curriculum_state['current_stage'] -= 1
@@ -10783,7 +10919,7 @@ def train_stageC_diffusion_generator(
                         curriculum_state['stall_count'] = 0
                         new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
 
-                        # Enable demotion ramp for smooth σ_cap transition (downward)
+                        # Enable demotion ramp
                         ramp_steps = curriculum_state.get('ramp_steps', 300)
                         old_cap = old_mult * sigma_data
                         new_cap = new_mult * sigma_data
@@ -10791,10 +10927,9 @@ def train_stageC_diffusion_generator(
                         curriculum_state['ramp_prev_cap'] = old_cap
                         curriculum_state['ramp_target_cap'] = new_cap
 
-                        print(f"\n[CURRICULUM] ⚠️ DEMOTED from stage {old_stage} → {curriculum_state['current_stage']}")
+                        print(f"\n[CURRICULUM] ⚠️ DEMOTED from S{old_stage} → S{curriculum_state['current_stage']}")
                         print(f"  Reason: stall_count >= {curriculum_state['stall_limit']}, struct_passes={struct_passes}<4")
-                        print(f"  σ_cap_target: {old_cap:.4f} → {new_cap:.4f}")
-                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
+                        print(f"  σ_cap: {old_cap:.4f} → {new_cap:.4f}")
 
                         # Reset stage-local tracking
                         curriculum_state['steps_in_stage'] = 0
@@ -10807,12 +10942,10 @@ def train_stageC_diffusion_generator(
                     elif curr_stage == 0:
                         print(f"\n[CURRICULUM] ⚠️ STALLED at LOWEST stage S0!")
                         print(f"  Cannot demote further. struct_passes={struct_passes}/6")
-                        print(f"  Consider: checking conditioning, data quality, or model capacity")
                     else:
-                        # struct_passes >= 4 but scale stalled - just informational
+                        # struct_passes >= 4 but scale stalled
                         print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage}")
-                        print(f"  Structure competent ({struct_passes}/6) but scale metrics not passing")
-                        print(f"  → Continuing training (structure OK, scale may catch up)")
+                        print(f"  Structure competent ({struct_passes}/6) but scale not passing")
 
                 # ============================================================
                 # [THREE-GATE] Track Gate B (metrics) and Gate C (cap-band loss)
@@ -11533,7 +11666,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale', 'ctx_edge'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'gen_gram', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale', 'ctx_edge'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
@@ -11551,6 +11684,9 @@ def train_stageC_diffusion_generator(
         # store + history
         epoch_losses = epoch_means
         for k, v in epoch_losses.items():
+            # Backward compat: add missing keys to history
+            if k not in history['epoch_avg']:
+                history['epoch_avg'][k] = []
             history['epoch_avg'][k].append(v)
         history['epoch'].append(epoch + 1)
 
@@ -11568,6 +11704,7 @@ def train_stageC_diffusion_generator(
             WEIGHTS['st_dist']  * epoch_losses['st_dist']  +   
             WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
             WEIGHTS['gen_align']* epoch_losses['gen_align']+
+            WEIGHTS.get('gen_gram', 0) * epoch_losses.get('gen_gram', 0) +
             WEIGHTS['dim']      * epoch_losses['dim']      +
             WEIGHTS['triangle'] * epoch_losses['triangle'] +
             WEIGHTS['radial']   * epoch_losses['radial']   +
