@@ -1033,6 +1033,32 @@ class GEMSModel:
         debug_gen_vs_noise: bool = False,
         ablate_use_generator_init: bool = False,
         ablate_use_pure_noise_init: bool = False,
+        # =========================================================================
+        # V2 DISTANCE-FIRST STITCHING PIPELINE PARAMS
+        # =========================================================================
+        use_v2_pipeline: bool = False,
+        use_residual_diffusion: bool = False,
+        sigma_data_resid: Optional[float] = None,
+        # V2 locality graph params
+        v2_k_Z: int = 40,
+        v2_k_sigma: int = 10,
+        v2_tau_jaccard: float = 0.10,
+        v2_min_shared: int = 5,
+        # V2 patch sampling params
+        v2_overlap_frac: float = 0.5,
+        v2_min_overlap: int = 30,
+        # V2 residual diffusion params
+        v2_n_diffusion_steps: int = 50,
+        # V2 distance aggregation params
+        v2_M_min: int = 2,
+        v2_tau_spread: float = 0.30,
+        v2_spread_alpha: float = 10.0,
+        # V2 global solve params
+        v2_n_landmarks: int = 256,
+        v2_global_iters: int = 1000,
+        v2_global_lr: float = 0.01,
+        v2_huber_delta: float = 0.1,
+        v2_anchor_lambda: float = 0.1,
 
     ) -> Dict[str, torch.Tensor]:
 
@@ -1070,7 +1096,13 @@ class GEMSModel:
         if sigma_data is None:
             raise ValueError("sigma_data not set - load from checkpoint or compute from data")
 
-
+        # Auto-populate sigma_data_resid for V2 pipeline if not provided
+        if use_v2_pipeline and use_residual_diffusion and sigma_data_resid is None:
+            sigma_data_resid = getattr(self, 'sigma_data_resid', None)
+            if sigma_data_resid is not None:
+                print(f"[V2-INFER] Auto-loaded sigma_data_resid={sigma_data_resid:.6f} from model")
+            else:
+                print("[V2-WARNING] use_residual_diffusion=True but sigma_data_resid not found in model")
 
         # Use EMA weights for inference if available
         ctx_enc = self.context_encoder_ema if self.context_encoder_ema is not None else self.context_encoder
@@ -1153,6 +1185,25 @@ class GEMSModel:
             debug_gen_vs_noise=debug_gen_vs_noise,
             ablate_use_generator_init=ablate_use_generator_init,
             ablate_use_pure_noise_init=ablate_use_pure_noise_init,
+            # --- V2 DISTANCE-FIRST STITCHING PIPELINE ---
+            use_v2_pipeline=use_v2_pipeline,
+            use_residual_diffusion=use_residual_diffusion,
+            sigma_data_resid=sigma_data_resid,
+            v2_k_Z=v2_k_Z,
+            v2_k_sigma=v2_k_sigma,
+            v2_tau_jaccard=v2_tau_jaccard,
+            v2_min_shared=v2_min_shared,
+            v2_overlap_frac=v2_overlap_frac,
+            v2_min_overlap=v2_min_overlap,
+            v2_n_diffusion_steps=v2_n_diffusion_steps,
+            v2_M_min=v2_M_min,
+            v2_tau_spread=v2_tau_spread,
+            v2_spread_alpha=v2_spread_alpha,
+            v2_n_landmarks=v2_n_landmarks,
+            v2_global_iters=v2_global_iters,
+            v2_global_lr=v2_global_lr,
+            v2_huber_delta=v2_huber_delta,
+            v2_anchor_lambda=v2_anchor_lambda,
         )
         return res
 
