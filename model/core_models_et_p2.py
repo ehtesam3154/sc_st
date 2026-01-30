@@ -2889,10 +2889,23 @@ def train_stageC_diffusion_generator(
         curriculum_state['cap_band_frac_by_stage'] = {0: 0.4, 1: 0.4, 2: 0.6, 3: 0.6}
         curriculum_state['cap_band_frac_default'] = 0.7
         curriculum_state['cap_band_lo_mult'] = 0.7
-        print(f"[CURRICULUM] Using LEGACY 7-stage curriculum: {curriculum_state['sigma_cap_mults']}")
+
+    # Diagnostic print showing full curriculum configuration
+    n_stages = len(curriculum_state['sigma_cap_mults'])
+    print(f"\n{'='*70}")
+    print(f"[CURRICULUM] Configuration Summary")
+    print(f"{'='*70}")
+    print(f"  Mode: {'LEGACY (7-stage, promotion-based)' if use_legacy_curriculum else 'NEW (3-stage, demotion-based)'}")
+    print(f"  sigma_cap_mults: {curriculum_state['sigma_cap_mults']}")
+    print(f"  Starting stage: S{curriculum_state['current_stage']} (index {curriculum_state['current_stage']})")
+    print(f"  sigma_cap_safe: {curriculum_state['sigma_cap_safe']}")
+    print(f"  cap_band_frac_default: {curriculum_state['cap_band_frac_default']} ({int(curriculum_state['cap_band_frac_default']*100)}%)")
+    print(f"  cap_band_lo_mult: {curriculum_state['cap_band_lo_mult']}")
+    if use_legacy_curriculum:
+        print(f"  Direction: S0 -> S{n_stages-1} (PROMOTION on success)")
     else:
-        print(f"[CURRICULUM] Using NEW 3-stage curriculum: {curriculum_state['sigma_cap_mults']}")
-        print(f"  Starting at S{curriculum_state['current_stage']}, σ_cap_safe={curriculum_state['sigma_cap_safe']}")
+        print(f"  Direction: S{n_stages-1} -> S0 (DEMOTION on failure)")
+    print(f"{'='*70}\n")
 
     slide_d15_medians = []
     for slide_id in st_dataset.targets_dict:
