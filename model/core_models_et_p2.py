@@ -2742,6 +2742,8 @@ def train_stageC_diffusion_generator(
     ctx_debug_every: int = 100,
     # ========== SELF-CONDITIONING MODE ==========
     self_cond_mode: str = 'standard',
+    # ========== RESIDUAL DIFFUSION ==========
+    use_residual_diffusion: bool = False,
     # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
     train_pair_overlap: bool = False,
     pair_overlap_alpha: float = 0.5,
@@ -2876,6 +2878,9 @@ def train_stageC_diffusion_generator(
         # Normalizes H to unit RMS then scales by α
         # This controls conditioning magnitude without changing model architecture
         'cond_alpha': 0.5,            # ChatGPT: α=0.1 too small, H increases Fx at high σ
+
+        # Residual diffusion: diffuse R = V_target - V_base instead of V_target
+        'use_residual_diffusion': use_residual_diffusion,
     }
 
     slide_d15_medians = []
@@ -3747,6 +3752,7 @@ def train_stageC_diffusion_generator(
                 'metrics_history_K', 'min_steps_per_stage', 'min_steps_at_target',
                 'loss_plateau_patience', 'loss_plateau_threshold',
                 'cond_alpha',  # Conditioning strength knob
+                'use_residual_diffusion',  # Residual diffusion mode
             ]
 
             # Start with loaded state, then override config keys with canonical values
@@ -3914,6 +3920,42 @@ def train_stageC_diffusion_generator(
     # Store sigma_data on score_net for reference in forward pass
     print(f"[StageC] sigma_data = {sigma_data:.4f}")
 
+    # ========== RESIDUAL DIFFUSION: Compute sigma_data_resid ==========
+    sigma_data_resid = sigma_data  # Default to sigma_data
+    if use_residual_diffusion and use_st and (fabric is None or fabric.is_global_zero):
+        # Compute sigma_data for residuals R = V_target - V_base
+        resid_stds = []
+        it = iter(st_loader)
+        for _ in range(min(10, len(st_loader))):
+            sample_batch = next(it, None)
+            if sample_batch is None:
+                break
+
+            if isinstance(sample_batch, dict) and sample_batch.get('is_pair_batch', False):
+                sample_batch = sample_batch['view1']
+
+            V_batch = sample_batch['V_target'].to(device, non_blocking=True)
+            Z_batch = sample_batch['Z_set'].to(device, non_blocking=True)
+            mask_batch = sample_batch['mask'].to(device, non_blocking=True)
+
+            # Compute context and generator output
+            with torch.no_grad():
+                H_batch = context_encoder(Z_batch, mask_batch)
+                V_base_batch = generator(H_batch, mask_batch)
+                R_batch = V_batch - V_base_batch  # Residual
+
+            for i in range(min(4, V_batch.shape[0])):
+                m = mask_batch[i]
+                if m.sum() > 0:
+                    R_temp = R_batch[i, m]
+                    resid_stds.append(R_temp.std().item())
+
+        sigma_data_resid = float(np.median(resid_stds)) if resid_stds else sigma_data
+        print(f"[RESID-DIFF] sigma_data_resid = {sigma_data_resid:.4f} (vs sigma_data={sigma_data:.4f})")
+
+    sigma_data_resid = sync_scalar(sigma_data_resid, device)
+    curriculum_state['sigma_data_resid'] = sigma_data_resid
+
     if fabric is None or fabric.is_global_zero:
         print(f"\n[CURRICULUM CONFIG]")
         print(f"  stages: {curriculum_state['sigma_cap_mults']} (× σ_data={sigma_data:.4f})")
@@ -3922,6 +3964,7 @@ def train_stageC_diffusion_generator(
         print(f"  three-gate early stop: {curriculum_state.get('curriculum_early_stop', True)}")
         print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
               f"default={curriculum_state['cap_band_frac_default']}")
+        print(f"  residual_diffusion: {curriculum_state.get('use_residual_diffusion', False)}")
     
     # Store sigma_data on score_net (handle DDP/Fabric wrapper)
     if hasattr(score_net, 'module'):
@@ -4701,6 +4744,36 @@ def train_stageC_diffusion_generator(
                     V_gen = generator(H, mask)
                     V_target = V_gen
 
+                # ========== RESIDUAL DIFFUSION: Compute V_base and R_target ==========
+                use_resid = curriculum_state.get('use_residual_diffusion', False)
+                if use_resid:
+                    # For residual diffusion: always compute V_base from generator (detached)
+                    with torch.no_grad():
+                        V_base = generator(H, mask).detach()  # Detach to prevent gradient flow
+                    # Compute residual: R_target = V_target - V_base
+                    R_target = V_target - V_base
+                    # Store for later composition
+                    # V_base will be used after denoising: V_hat = V_base + R_hat
+
+                    # [RESID-DIFF] Diagnostics: log residual statistics periodically
+                    if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            mask_f = mask.unsqueeze(-1).float()
+                            valid_count = mask_f.sum() * V_target.shape[-1]
+
+                            rms_tgt = (V_target.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                            rms_base = (V_base.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                            rms_resid = (R_target.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+
+                            # Residual-to-target ratio (should be < 1 if generator is good)
+                            resid_ratio = rms_resid / (rms_tgt + 1e-8)
+
+                            print(f"[RESID-DIFF] step={global_step} "
+                                  f"rms_tgt={rms_tgt:.4f} rms_base={rms_base:.4f} rms_resid={rms_resid:.4f} "
+                                  f"resid/tgt={resid_ratio:.3f}")
+                else:
+                    V_base = None
+                    R_target = None
 
                 # =================================================================
                 # [DEBUG] GENERATOR SCALE SANITY CHECK
@@ -4837,21 +4910,28 @@ def train_stageC_diffusion_generator(
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
                 
-                # ===== NOISE AROUND GROUND TRUTH (not generator!) =====
+                # ===== NOISE AROUND GROUND TRUTH (or RESIDUAL in residual mode) =====
                 eps = torch.randn_like(V_target)
                 # eps = eps * mask.unsqueeze(-1).float()
-                V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
+                if use_resid:
+                    # RESIDUAL DIFFUSION: Noise around R_target = V_target - V_base
+                    V_t = R_target + sigma_t * eps  # Noisy residual
+                else:
+                    # STANDARD: Noise around V_target
+                    V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
                 V_t = V_t * mask.unsqueeze(-1).float()
                 
                 # ========== NEW: Anchored training - clamp anchor positions to clean values ==========
                 if anchor_train and anchor_clamp_clean and anchor_cond_mask is not None and not is_sc:
-                    V_t = uet.apply_anchor_clamp(V_t, V_target, anchor_cond_mask, mask)
+                    # In residual mode, clamp to R_target; in standard mode, clamp to V_target
+                    clamp_target = R_target if use_resid else V_target
+                    V_t = uet.apply_anchor_clamp(V_t, clamp_target, anchor_cond_mask, mask)
                     
                     # Debug: verify clamp worked
                     if global_step % anchor_debug_every == 0 and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             if anchor_cond_mask.any():
-                                anchor_diff = (V_t - V_target).abs()
+                                anchor_diff = (V_t - clamp_target).abs()  # Use clamp_target for correctness
                                 anchor_positions = anchor_cond_mask.unsqueeze(-1).expand_as(V_t)
                                 max_anchor_diff = anchor_diff[anchor_positions].max().item()
                                 sigma_median = sigma_t.median().item()
@@ -5284,8 +5364,12 @@ def train_stageC_diffusion_generator(
                                 
                                 print(f"  σ∈[{lo:.1f},{hi:.1f}): n={n_in_bin}, mse(pred→tgt)={mse_pred:.6f}")
 
-                    # for geom losses, V_hat is x0_pred
-                    V_hat = x0_pred
+                    # for geom losses, V_hat is x0_pred (or V_base + x0_pred in residual mode)
+                    if use_resid:
+                        # RESIDUAL DIFFUSION: x0_pred is R_hat, compose V_hat = V_base + R_hat
+                        V_hat = V_base + x0_pred
+                    else:
+                        V_hat = x0_pred
                     dist_aux = None
                 else:
                     # Self-conditioning logic
@@ -5312,9 +5396,14 @@ def train_stageC_diffusion_generator(
                             eps_pred = result
                             dist_aux = None
 
-                    V_hat = V_t - sigma_t * eps_pred
+                    R_hat = V_t - sigma_t * eps_pred  # Denoised prediction (residual if use_resid)
+                    if use_resid:
+                        # RESIDUAL DIFFUSION: R_hat is the residual, compose V_hat = V_base + R_hat
+                        V_hat = V_base + R_hat
+                    else:
+                        V_hat = R_hat
                     V_hat = V_hat * mask.unsqueeze(-1).float()
-       
+
             # ===== SCORE LOSS (in fp32 for numerical stability) =====
             with torch.autocast(device_type='cuda', enabled=False):
                 mask_fp32 = mask.float()
@@ -5353,9 +5442,12 @@ def train_stageC_diffusion_generator(
                     cap = edm_debug_state['w_cap_ema'].clamp_min(1e-6)
                     w = cap * torch.tanh(w_raw / cap)  # (B,)
 
-                    # Choose target: ST uses V_target; SC must not require coords.
-                    # If your SC path truly has V_target, keep it; otherwise revert to V_0.
-                    target_x0 = V_target if (not is_sc) else V_0
+                    # Choose target: ST uses V_target (or R_target in residual mode); SC uses V_0.
+                    # In residual mode, the network predicts R_hat, so target is R_target.
+                    if use_resid:
+                        target_x0 = R_target if (not is_sc) else V_0
+                    else:
+                        target_x0 = V_target if (not is_sc) else V_0
                     target_fp32 = target_x0.float()
 
                     # Masked MSE (B, N) mean over latent dims
