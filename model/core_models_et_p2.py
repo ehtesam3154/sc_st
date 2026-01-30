@@ -2866,6 +2866,18 @@ def train_stageC_diffusion_generator(
         'use_residual_diffusion': use_residual_diffusion,
 
         # ============================================================
+        # SIGMA_DATA_RESID VALIDITY TRACKING (Option A fix)
+        # At fresh start, generator is random, so sigma_data_resid is meaningless.
+        # We start with sigma_resid_valid=False and use sigma_data for curriculum.
+        # Once generator is trained (checkpoint resume or recompute trigger),
+        # we compute proper sigma_data_resid with Procrustes alignment and lock it.
+        # ============================================================
+        'sigma_resid_valid': False,           # True once sigma_data_resid is properly computed
+        'sigma_data_resid_locked': None,      # Locked value for curriculum (after validation)
+        'sigma_resid_recompute_step': 3000,   # Step at which to recompute sigma_data_resid
+        'sigma_resid_recomputed': False,      # True once recomputation has been done
+
+        # ============================================================
         # SIGMA CAP TRACKING (for inference and checkpoint analysis)
         # ============================================================
         'sigma_cap_eff_last': None,           # Effective σ_cap at last save (after ramp/clamp)
@@ -3951,13 +3963,20 @@ def train_stageC_diffusion_generator(
     # Store sigma_data on score_net for reference in forward pass
     print(f"[StageC] sigma_data = {sigma_data:.4f}")
 
-    # ========== RESIDUAL DIFFUSION: Compute sigma_data_resid ==========
-    sigma_data_resid = sigma_data  # Default to sigma_data
-    if use_residual_diffusion and use_st and (fabric is None or fabric.is_global_zero):
-        # Compute sigma_data for residuals R = V_target - V_base
-        resid_stds = []
+    # ========== RESIDUAL DIFFUSION: Compute sigma_data_resid (Option A fix) ==========
+    # At fresh start, generator is random → sigma_data_resid would be meaningless.
+    # Only compute proper sigma_data_resid if:
+    #   1. Resuming from checkpoint (generator is trained), OR
+    #   2. Later during training via recomputation trigger
+    # Always use Procrustes alignment to avoid √2 inflation.
+    sigma_data_resid = sigma_data  # Default to sigma_data (safe fallback)
+    sigma_resid_valid = False      # Will be set True when properly computed
+
+    def compute_sigma_data_resid_aligned(st_loader, context_encoder, generator, device, n_batches=10):
+        """Compute sigma_data_resid using Procrustes-aligned residuals (no scale)."""
+        resid_rms_list = []
         it = iter(st_loader)
-        for _ in range(min(10, len(st_loader))):
+        for _ in range(min(n_batches, len(st_loader))):
             sample_batch = next(it, None)
             if sample_batch is None:
                 break
@@ -3969,23 +3988,59 @@ def train_stageC_diffusion_generator(
             Z_batch = sample_batch['Z_set'].to(device, non_blocking=True)
             mask_batch = sample_batch['mask'].to(device, non_blocking=True)
 
-            # Compute context and generator output
             with torch.no_grad():
                 H_batch = context_encoder(Z_batch, mask_batch)
                 V_base_batch = generator(H_batch, mask_batch)
-                R_batch = V_batch - V_base_batch  # Residual
 
+                # CRITICAL: Align V_target to V_base frame using Procrustes (no scale)
+                # This avoids the √2 inflation from frame mismatch
+                V_target_aligned = uet.rigid_align_apply_no_scale(V_batch, V_base_batch, mask_batch)
+                R_batch = V_target_aligned - V_base_batch  # Residual in base frame
+
+            # Compute per-sample RMS of aligned residuals
             for i in range(min(4, V_batch.shape[0])):
-                m = mask_batch[i]
+                m = mask_batch[i].bool()
                 if m.sum() > 0:
-                    R_temp = R_batch[i, m]
-                    resid_stds.append(R_temp.std().item())
+                    R_valid = R_batch[i, m]  # (n_valid, D)
+                    rms = R_valid.pow(2).mean().sqrt().item()
+                    resid_rms_list.append(rms)
 
-        sigma_data_resid = float(np.median(resid_stds)) if resid_stds else sigma_data
-        print(f"[RESID-DIFF] sigma_data_resid = {sigma_data_resid:.4f} (vs sigma_data={sigma_data:.4f})")
+        return float(np.median(resid_rms_list)) if resid_rms_list else None
+
+    # Only compute at init if resuming from checkpoint (generator is trained)
+    # Check if checkpoint already has valid sigma_resid (don't recompute if so)
+    checkpoint_has_valid_resid = (resume_ckpt_path and
+                                   curriculum_state.get('sigma_resid_valid', False) and
+                                   curriculum_state.get('sigma_data_resid_locked') is not None)
+
+    if checkpoint_has_valid_resid:
+        # Checkpoint already has valid sigma_resid, use it directly
+        sigma_data_resid = curriculum_state['sigma_data_resid_locked']
+        sigma_resid_valid = True
+        if fabric is None or fabric.is_global_zero:
+            print(f"[RESID-DIFF] Using sigma_data_resid={sigma_data_resid:.4f} from checkpoint [VALID]")
+    elif use_residual_diffusion and use_st and resume_ckpt_path and (fabric is None or fabric.is_global_zero):
+        # Resuming from old checkpoint without valid sigma_resid: compute now
+        print(f"[RESID-DIFF] Computing sigma_data_resid from checkpoint (generator is trained)...")
+        computed_resid = compute_sigma_data_resid_aligned(st_loader, context_encoder, generator, device)
+        if computed_resid is not None:
+            sigma_data_resid = computed_resid
+            sigma_resid_valid = True
+            print(f"[RESID-DIFF] sigma_data_resid = {sigma_data_resid:.4f} (vs sigma_data={sigma_data:.4f}) [VALID]")
+        else:
+            print(f"[RESID-DIFF] Failed to compute sigma_data_resid, using sigma_data={sigma_data:.4f} [INVALID]")
+    elif use_residual_diffusion and not resume_ckpt_path:
+        # Fresh start with residual diffusion: warn user
+        if fabric is None or fabric.is_global_zero:
+            print(f"[RESID-DIFF] WARNING: Fresh start with residual_diffusion=True.")
+            print(f"[RESID-DIFF] Using sigma_data={sigma_data:.4f} until generator is trained.")
+            print(f"[RESID-DIFF] Will recompute sigma_data_resid at step {curriculum_state['sigma_resid_recompute_step']}")
 
     sigma_data_resid = sync_scalar(sigma_data_resid, device)
     curriculum_state['sigma_data_resid'] = sigma_data_resid
+    curriculum_state['sigma_resid_valid'] = sigma_resid_valid
+    if sigma_resid_valid:
+        curriculum_state['sigma_data_resid_locked'] = sigma_data_resid
 
     if fabric is None or fabric.is_global_zero:
         print(f"\n[CURRICULUM CONFIG]")
@@ -3996,6 +4051,12 @@ def train_stageC_diffusion_generator(
         print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
               f"default={curriculum_state['cap_band_frac_default']}")
         print(f"  residual_diffusion: {curriculum_state.get('use_residual_diffusion', False)}")
+        if curriculum_state.get('use_residual_diffusion', False):
+            resid_valid = curriculum_state.get('sigma_resid_valid', False)
+            resid_locked = curriculum_state.get('sigma_data_resid_locked')
+            print(f"  sigma_resid_valid: {resid_valid} (locked={resid_locked})")
+            if not resid_valid:
+                print(f"  NOTE: Using sigma_data={sigma_data:.4f} until recompute at step {curriculum_state.get('sigma_resid_recompute_step', 3000)}")
     
     # Store sigma_data on score_net (handle DDP/Fabric wrapper)
     if hasattr(score_net, 'module'):
@@ -4278,12 +4339,17 @@ def train_stageC_diffusion_generator(
         curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
 
         # =====================================================================
-        # Determine sigma0: use sigma_data_resid if residual mode, else sigma_data
+        # Determine sigma0: use sigma_data_resid ONLY if valid, else sigma_data
+        # Option A fix: sigma_resid_valid ensures we don't use random-generator sigma
         # =====================================================================
         use_resid = curriculum_state.get('use_residual_diffusion', False)
-        if use_resid:
-            sigma0 = curriculum_state.get('sigma_data_resid', sigma_data)
+        sigma_resid_valid = curriculum_state.get('sigma_resid_valid', False)
+        if use_resid and sigma_resid_valid:
+            # Use locked value if available (stable reference), else computed value
+            sigma0 = curriculum_state.get('sigma_data_resid_locked',
+                     curriculum_state.get('sigma_data_resid', sigma_data))
         else:
+            # Fresh start or non-residual mode: use sigma_data
             sigma0 = sigma_data
 
         # Stage cap (before safety clamp)
@@ -10459,7 +10525,42 @@ def train_stageC_diffusion_generator(
                 global_step_tensor = torch.tensor([global_step], device=device, dtype=torch.long)
                 dist.broadcast(global_step_tensor, src=0)
                 global_step = int(global_step_tensor.item())
-        
+
+            # =====================================================================
+            # OPTION A: Recompute sigma_data_resid once generator is trained
+            # Triggered at sigma_resid_recompute_step (default 3000)
+            # =====================================================================
+            if (use_residual_diffusion and
+                not curriculum_state.get('sigma_resid_recomputed', False) and
+                global_step == curriculum_state.get('sigma_resid_recompute_step', 3000)):
+
+                if fabric is None or fabric.is_global_zero:
+                    print(f"\n[RESID-DIFF] RECOMPUTING sigma_data_resid at step {global_step}...")
+                    computed_resid = compute_sigma_data_resid_aligned(st_loader, context_encoder, generator, device)
+                    if computed_resid is not None:
+                        old_resid = curriculum_state.get('sigma_data_resid', sigma_data)
+                        curriculum_state['sigma_data_resid'] = computed_resid
+                        curriculum_state['sigma_data_resid_locked'] = computed_resid
+                        curriculum_state['sigma_resid_valid'] = True
+                        curriculum_state['sigma_resid_recomputed'] = True
+                        print(f"[RESID-DIFF] sigma_data_resid: {old_resid:.4f} → {computed_resid:.4f} [NOW VALID]")
+                        print(f"[RESID-DIFF] Curriculum will now use residual-based sigma scaling")
+                    else:
+                        print(f"[RESID-DIFF] Recomputation failed, keeping sigma_data={sigma_data:.4f}")
+                        curriculum_state['sigma_resid_recomputed'] = True  # Don't retry
+
+                # Sync the new values across ranks
+                if dist.is_initialized():
+                    resid_tensor = torch.tensor([curriculum_state.get('sigma_data_resid', sigma_data)], device=device)
+                    valid_tensor = torch.tensor([1.0 if curriculum_state.get('sigma_resid_valid', False) else 0.0], device=device)
+                    dist.broadcast(resid_tensor, src=0)
+                    dist.broadcast(valid_tensor, src=0)
+                    curriculum_state['sigma_data_resid'] = float(resid_tensor.item())
+                    curriculum_state['sigma_resid_valid'] = valid_tensor.item() > 0.5
+                    if curriculum_state['sigma_resid_valid']:
+                        curriculum_state['sigma_data_resid_locked'] = curriculum_state['sigma_data_resid']
+                    curriculum_state['sigma_resid_recomputed'] = True
+
             # (optional) metrics logging
             if fabric is None or fabric.is_global_zero:
                 pass  # print / tqdm here if you want
