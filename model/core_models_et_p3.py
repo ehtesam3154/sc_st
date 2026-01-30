@@ -392,6 +392,10 @@ class GEMSModel:
         curriculum_min_epochs: int = 100,
         curriculum_early_stop: bool = True,
         use_legacy_curriculum: bool = False,
+        # ========== DATA-DEPENDENT SIGMA CAP ==========
+        sigma_cap_safe_mult: float = 3.0,
+        sigma_cap_abs_max: float = None,
+        sigma_cap_abs_min: float = None,
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
         # NEW: Stochastic kNN sampling parameters (for STSetDataset)
         # NOTE: For small slides (<1000 spots), use 1.5-2.0 to maintain spatial locality
@@ -594,6 +598,10 @@ class GEMSModel:
             curriculum_min_epochs=curriculum_min_epochs,
             curriculum_early_stop=curriculum_early_stop,
             use_legacy_curriculum=use_legacy_curriculum,
+            # ========== DATA-DEPENDENT SIGMA CAP ==========
+            sigma_cap_safe_mult=sigma_cap_safe_mult,
+            sigma_cap_abs_max=sigma_cap_abs_max,
+            sigma_cap_abs_min=sigma_cap_abs_min,
             # NEW: Context augmentation
             z_noise_std=z_noise_std,
             z_dropout_rate=z_dropout_rate,
