@@ -82,8 +82,8 @@ def parse_args():
                         help='Relative improvement threshold (e.g., 0.01 = 1%%)')
 
     # ========== CURRICULUM EARLY STOPPING ==========
-    parser.add_argument('--curriculum_target_stage', type=int, default=6,
-                        help='Target curriculum stage for Gate A (0-indexed, default 6 = full curriculum)')
+    parser.add_argument('--curriculum_target_stage', type=int, default=2,
+                        help='Target curriculum stage for Gate A (0-indexed, default 2 = final stage for 3-stage curriculum)')
     parser.add_argument('--curriculum_min_epochs', type=int, default=100,
                         help='Minimum epochs before three-gate stopping is allowed')
     parser.add_argument('--curriculum_early_stop', action=argparse.BooleanOptionalAction, default=True,
