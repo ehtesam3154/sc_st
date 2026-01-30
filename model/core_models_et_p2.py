@@ -15138,6 +15138,42 @@ def _sample_sc_edm_patchwise_v2(
     global_distances = agg_result['distances']
     global_weights = agg_result['weights']
 
+    # =========================================================================
+    # FM6 CHECK: Connectivity analysis of distance graph
+    # =========================================================================
+    if DEBUG_FLAG:
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        # Build adjacency for connectivity check
+        if len(global_edges) > 0:
+            row = [e[0] for e in global_edges] + [e[1] for e in global_edges]
+            col = [e[1] for e in global_edges] + [e[0] for e in global_edges]
+            data = [1] * len(row)
+            adj = csr_matrix((data, (row, col)), shape=(N, N))
+
+            n_components, labels = connected_components(adj, directed=False)
+            component_sizes = np.bincount(labels)
+
+            # Count isolated nodes (nodes with no edges)
+            node_degrees = np.array(adj.sum(axis=1)).flatten()
+            isolated_nodes = (node_degrees == 0).sum()
+
+            print(f"\n[FM6-CHECK] Distance graph connectivity:")
+            print(f"[FM6-CHECK]   Total edges: {len(global_edges)}")
+            print(f"[FM6-CHECK]   Connected components: {n_components}")
+            print(f"[FM6-CHECK]   Largest component: {component_sizes.max()} nodes ({100*component_sizes.max()/N:.1f}%)")
+            print(f"[FM6-CHECK]   Isolated nodes (degree=0): {isolated_nodes}")
+
+            if n_components > 1:
+                print(f"[V2-WARNING] FM6: Graph has {n_components} components! Stitching will fail.")
+                print(f"[V2-WARNING] Component sizes: {sorted(component_sizes, reverse=True)[:10]}")
+
+            if isolated_nodes > 0:
+                print(f"[V2-WARNING] FM6: {isolated_nodes} nodes have no distance constraints!")
+        else:
+            print(f"[V2-WARNING] FM6: No edges in distance graph!")
+
     if len(global_edges) < N:
         print(f"[V2-WARNING] FM6: Only {len(global_edges)} global edges for {N} nodes - may have connectivity issues")
 
