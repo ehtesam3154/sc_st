@@ -3567,7 +3567,8 @@ def train_stageC_diffusion_generator(
         'ordinal_sc': 0.0,
         'st_dist': 0.0,
         'edm_tail': 0.0,
-        'gen_align': 10.0,     # KEEP: generator alignment
+        'gen_align': 10.0,     # KEEP: generator alignment (Procrustes MSE)
+        'gen_gram': 10.0,      # NEW: Gram matrix loss for generator (gauge-invariant geometry)
         'gen_scale': 10.0,     # KEEP: generator scale
         'dim': 0.0,
         'triangle': 0.0,
@@ -3661,7 +3662,7 @@ def train_stageC_diffusion_generator(
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 
             'gram_learn': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],
+            'edm_tail': [], 'gen_align': [], 'gen_gram': [], 'gen_scale': [], 'subspace': [],
             'dim': [], 'triangle': [], 'radial': [],
             'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': [],
             'ov_shape': [], 'ov_scale': [], 'ov_kl': [], 'score_2': [],
@@ -4793,6 +4794,15 @@ def train_stageC_diffusion_generator(
                             G_base_valid = G_base[m][:, m]
                             gram_corr = torch.corrcoef(torch.stack([G_tgt_valid.flatten(), G_base_valid.flatten()]))[0,1].item()
                             print(f"[RESID-DIFF-GRAM] Gram_corr={gram_corr:.4f} (>0.95=alignment bug, <0.8=generator geometry wrong)")
+
+                            # [RESID-DIFF-CDIST] Translation-invariant distance-matrix correlation
+                            # This is more robust than Gram which can be affected by centering
+                            V_tgt_valid = V_target[0, m]  # (n_valid, D)
+                            V_base_valid = V_base[0, m]
+                            D_tgt = torch.cdist(V_tgt_valid, V_tgt_valid)  # (n_valid, n_valid)
+                            D_base = torch.cdist(V_base_valid, V_base_valid)
+                            cdist_corr = torch.corrcoef(torch.stack([D_tgt.flatten(), D_base.flatten()]))[0,1].item()
+                            print(f"[RESID-DIFF-CDIST] cdist_corr={cdist_corr:.4f} (translation-invariant geometry check)")
 
                             # [RESID-DIFF-WEIGHTS] Print gen_align weight to verify it's active
                             print(f"[RESID-DIFF-WEIGHTS] gen_align={WEIGHTS.get('gen_align', 0.0)}")
@@ -6008,6 +6018,7 @@ def train_stageC_diffusion_generator(
             L_st_dist = torch.tensor(0.0, device=device)
             L_edm_tail = torch.tensor(0.0, device=device)
             L_gen_align = torch.tensor(0.0, device=device)
+            L_gen_gram = torch.tensor(0.0, device=device)  # NEW: Gram matrix loss for generator
             L_dim = torch.zeros((), device=device)
             L_triangle = torch.zeros((), device=device)
             L_radial = torch.zeros((), device=device)
@@ -6033,6 +6044,7 @@ def train_stageC_diffusion_generator(
             L_st_dist = safe_loss(L_st_dist, "L_st_dist", max_val=50.0, global_step=global_step)
             L_edm_tail = safe_loss(L_edm_tail, "L_edm_tail", max_val=50.0, global_step=global_step)
             L_gen_align = safe_loss(L_gen_align, "L_gen_align", max_val=50.0, global_step=global_step)
+            L_gen_gram = safe_loss(L_gen_gram, "L_gen_gram", max_val=50.0, global_step=global_step)
             L_dim = safe_loss(L_dim, "L_dim", max_val=50.0, global_step=global_step)
             L_triangle = safe_loss(L_triangle, "L_triangle", max_val=50.0, global_step=global_step)
             L_radial = safe_loss(L_radial, "L_radial", max_val=50.0, global_step=global_step)
@@ -8691,6 +8703,18 @@ def train_stageC_diffusion_generator(
                         L_gen_align = uet.rigid_align_mse_no_scale(V_gen_struct_L, V_target_struct, mask)
                         # Use anchor-clamped V_gen_centered_L for scale loss
                         L_gen_scale = uet.rms_log_loss(V_gen_centered_L, V_target_batch, mask)
+
+                        # NEW: Gram matrix loss for generator (gauge-invariant geometry)
+                        # Unlike Procrustes MSE, this has direct gradients and doesn't rely on SVD
+                        if WEIGHTS.get('gen_gram', 0.0) > 0:
+                            # Compute Gram matrices (pairwise inner products)
+                            G_gen = V_gen_struct_L @ V_gen_struct_L.transpose(1, 2)  # (B, N, N)
+                            G_tgt = V_target_struct @ V_target_struct.transpose(1, 2)  # (B, N, N)
+
+                            # Masked MSE over valid pairs
+                            mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)  # (B, N, N)
+                            diff_gram = (G_gen - G_tgt).pow(2) * mask_2d
+                            L_gen_gram = diff_gram.sum() / mask_2d.sum().clamp(min=1)
                         
                         # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
                         # This ensures generator learns correct local neighborhood distances
@@ -9175,6 +9199,7 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['st_dist'] * L_st_dist +
                     WEIGHTS['edm_tail'] * L_edm_tail +
                     WEIGHTS['gen_align'] * L_gen_align +
+                    WEIGHTS.get('gen_gram', 0) * L_gen_gram +    # NEW: Gram loss for generator
                     WEIGHTS.get('gen_scale', 0) * L_gen_scale +  # PATCH 8
                     WEIGHTS['dim'] * L_dim +
                     WEIGHTS['triangle'] * L_triangle +
@@ -10156,13 +10181,14 @@ def train_stageC_diffusion_generator(
 
                     # [GEN-GRAD] Phase 1.2: Log generator loss contribution vs total
                     gen_align_contrib = WEIGHTS['gen_align'] * L_gen_align.item() if not is_sc else 0.0
+                    gen_gram_contrib = WEIGHTS.get('gen_gram', 0) * L_gen_gram.item() if not is_sc else 0.0
                     gen_scale_contrib = WEIGHTS.get('gen_scale', 0) * L_gen_scale.item() if not is_sc else 0.0
                     score_contrib = WEIGHTS.get('score', 1.0) * L_score.item()
-                    gen_total_contrib = gen_align_contrib + gen_scale_contrib
+                    gen_total_contrib = gen_align_contrib + gen_gram_contrib + gen_scale_contrib
                     total_loss_approx = L_total.item() if L_total is not None else 1.0
                     gen_pct = 100.0 * gen_total_contrib / max(total_loss_approx, 1e-8)
 
-                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
+                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_gram_contrib={gen_gram_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
                     print(f"  [GEN-GRAD] score_contrib={score_contrib:.4e} gen_total_contrib={gen_total_contrib:.4e} ({gen_pct:.1f}%)")
 
                     if gen_pct < 1.0 and not is_sc:
@@ -10275,6 +10301,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['ordinal_sc'] += L_ordinal_sc.item()
             epoch_losses['edm_tail'] += L_edm_tail.item()
             epoch_losses['gen_align'] += L_gen_align.item()
+            epoch_losses['gen_gram'] += L_gen_gram.item()
             epoch_losses['dim'] += L_dim.item()
             epoch_losses['triangle'] += L_triangle.item()
             epoch_losses['radial'] += L_radial.item()
@@ -11602,7 +11629,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale', 'ctx_edge'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'gen_gram', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale', 'ctx_edge'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
@@ -11620,6 +11647,9 @@ def train_stageC_diffusion_generator(
         # store + history
         epoch_losses = epoch_means
         for k, v in epoch_losses.items():
+            # Backward compat: add missing keys to history
+            if k not in history['epoch_avg']:
+                history['epoch_avg'][k] = []
             history['epoch_avg'][k].append(v)
         history['epoch'].append(epoch + 1)
 
@@ -11637,6 +11667,7 @@ def train_stageC_diffusion_generator(
             WEIGHTS['st_dist']  * epoch_losses['st_dist']  +   
             WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
             WEIGHTS['gen_align']* epoch_losses['gen_align']+
+            WEIGHTS.get('gen_gram', 0) * epoch_losses.get('gen_gram', 0) +
             WEIGHTS['dim']      * epoch_losses['dim']      +
             WEIGHTS['triangle'] * epoch_losses['triangle'] +
             WEIGHTS['radial']   * epoch_losses['radial']   +
