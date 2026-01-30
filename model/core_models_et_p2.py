@@ -14270,24 +14270,28 @@ def sample_patch_residual_diffusion_v2(
     }
 
 
-def _forward_edm_x0_pred(score_net, x_t, sigma, H, mask, sigma_data):
-    """Forward pass through score net to get x0 prediction (EDM parameterization)."""
-    # EDM c_skip and c_out
-    c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
-    c_out = sigma * sigma_data / (sigma**2 + sigma_data**2).sqrt()
-    c_in = 1.0 / (sigma**2 + sigma_data**2).sqrt()
-    c_noise = 0.25 * sigma.log()
-
-    # Scale input
-    x_in = c_in * x_t
-
-    # Get F(x) from network
-    F_x = score_net(x_in, c_noise, H, mask)
-
-    # x0 prediction
-    x0 = c_skip * x_t + c_out * F_x
-
-    return x0
+def _forward_edm_x0_pred(score_net, x_t, sigma, H, mask, sigma_data, use_self_cond=True):
+    """Forward pass through score net to get x0 prediction with self-conditioning."""
+    # Use the score_net's forward_edm method which handles preconditioning properly
+    if use_self_cond:
+        # Two-pass self-conditioning
+        x0_pred_0 = score_net.forward_edm(
+            x_t, sigma, H, mask, sigma_data,
+            self_cond=None,
+            center_mask=None,
+        )
+        x0_pred = score_net.forward_edm(
+            x_t, sigma, H, mask, sigma_data,
+            self_cond=x0_pred_0.detach(),
+            center_mask=None,
+        )
+    else:
+        x0_pred = score_net.forward_edm(
+            x_t, sigma, H, mask, sigma_data,
+            self_cond=None,
+            center_mask=None,
+        )
+    return x0_pred
 
 
 def extract_patch_distances_v2(
@@ -15347,7 +15351,7 @@ def sample_sc_edm_patchwise(
     v2_overlap_frac: float = 0.5,
     v2_min_overlap: int = 30,
     # V2 residual diffusion params
-    v2_n_diffusion_steps: int = 50,
+    v2_n_diffusion_steps: int = 200,
     # V2 distance aggregation params
     v2_M_min: int = 2,
     v2_tau_spread: float = 0.30,

@@ -1067,7 +1067,7 @@ class GEMSModel:
         v2_overlap_frac: float = 0.5,
         v2_min_overlap: int = 30,
         # V2 residual diffusion params
-        v2_n_diffusion_steps: int = 50,
+        v2_n_diffusion_steps: int = 200,
         # V2 distance aggregation params
         v2_M_min: int = 2,
         v2_tau_spread: float = 0.30,
