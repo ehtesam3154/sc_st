@@ -2863,6 +2863,12 @@ def train_stageC_diffusion_generator(
 
         # Residual diffusion: diffuse R = V_target - V_base instead of V_target
         'use_residual_diffusion': use_residual_diffusion,
+
+        # ============================================================
+        # SIGMA CAP TRACKING (for inference and checkpoint analysis)
+        # ============================================================
+        'sigma_cap_eff_last': None,           # Effective σ_cap at last save (after ramp/clamp)
+        'max_sigma_cap_eff_seen': 0.0,        # Max σ_cap ever seen during training (monotonic)
     }
 
     # Legacy curriculum override: 7-stage [0.3,...,17.0] with promotion
@@ -4611,6 +4617,11 @@ def train_stageC_diffusion_generator(
                     curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
                     sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, _ = get_sigma_cap_eff(
                         curriculum_state, global_step, sigma_data)
+
+                    # Update sigma cap tracking (for checkpoint and inference)
+                    curriculum_state['sigma_cap_eff_last'] = sigma_cap_eff
+                    curriculum_state['max_sigma_cap_eff_seen'] = max(
+                        curriculum_state.get('max_sigma_cap_eff_seen', 0.0), sigma_cap_eff)
 
                     # Clear ramp state when ramp completes (state mutation happens HERE, not in helper)
                     if not ramp_active and curriculum_state.get('ramp_start_step') is not None:
@@ -10740,6 +10751,11 @@ def train_stageC_diffusion_generator(
                 do_log_cap = (fabric is None or fabric.is_global_zero)
                 sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, _ = get_sigma_cap_eff(
                     curriculum_state, global_step, sigma_data, do_log=do_log_cap)
+
+                # Update sigma cap tracking (for checkpoint and inference)
+                curriculum_state['sigma_cap_eff_last'] = sigma_cap_eff
+                curriculum_state['max_sigma_cap_eff_seen'] = max(
+                    curriculum_state.get('max_sigma_cap_eff_seen', 0.0), sigma_cap_eff)
 
                 # Select closest_sigma: max({s in fixed_eval_sigmas | s <= sigma_cap_eff})
                 # This ensures we don't eval at sigma we're not training on yet
