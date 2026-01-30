@@ -3546,15 +3546,15 @@ def train_stageC_diffusion_generator(
     #     'shape_spec': 0.0,
     # }
 
-    # ChatGPT R2: Scale-first phase - disable conflicting losses to let scale recover
-    # Keep ONLY: score + L_fx_hi + L_out_scale + generator losses
+    # Phase 2: Re-enable structure losses at gentler weights (scale is now healthy)
+    # Keep α=0.5, p_sc=0.0 from scale-first phase
     WEIGHTS = {
         'score': 16.0,         # KEEP: main denoising loss
-        'gram': 0.0,           # OFF: ChatGPT R2 - potential conflict
-        'gram_scale': 0.0,     # OFF: ChatGPT R2 - potential conflict
+        'gram': 1.0,           # RE-ENABLE at half weight (was 2.0)
+        'gram_scale': 1.0,     # RE-ENABLE at half weight (was 2.0)
         'out_scale': 2.0,      # KEEP: learned branch scale calibration
-        'gram_learn': 0.0,     # OFF: ChatGPT R2 - potential conflict
-        'knn_scale': 0.0,      # OFF: ChatGPT R2 - potential conflict
+        'gram_learn': 1.0,     # RE-ENABLE at half weight (was 2.0)
+        'knn_scale': 0.1,      # RE-ENABLE at half weight (was 0.2)
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -3567,14 +3567,14 @@ def train_stageC_diffusion_generator(
         'dim': 0.0,
         'triangle': 0.0,
         'radial': 0.0,
-        'knn_nca': 0.0,        # OFF: ChatGPT R2 - potential conflict
+        'knn_nca': 1.0,        # RE-ENABLE at half weight (was 2.0)
         'repel': 0.0,
         'shape': 0.0,
-        'edge': 0.0,           # OFF: ChatGPT R2 - potential conflict
+        'edge': 2.0,           # RE-ENABLE at half weight (was 4.0)
         'topo': 0.0,
         'shape_spec': 0.0,
-        'subspace': 0.0,       # OFF: ChatGPT R2 - potential conflict
-        'ctx_edge': 0.0,       # OFF: ChatGPT R2 - potential conflict
+        'subspace': 0.25,      # RE-ENABLE at half weight (was 0.5)
+        'ctx_edge': 0.0,       # Keep off for now
         # ========== OVERLAP CONSISTENCY LOSSES (Candidate 1) ==========
         'ov_shape': 0.0,       # Weight set dynamically via overlap_loss_weight_shape
         'ov_scale': 0.0,       # Weight set dynamically via overlap_loss_weight_scale
