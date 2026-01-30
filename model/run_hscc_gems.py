@@ -90,6 +90,13 @@ def parse_args():
                         help='Enable three-gate curriculum-aware early stopping (default: enabled)')
     parser.add_argument('--use_legacy_curriculum', action=argparse.BooleanOptionalAction, default=False,
                         help='Use legacy 7-stage curriculum [0.3,...,17.0] instead of new 3-stage [1,2,3]')
+    # ========== DATA-DEPENDENT SIGMA CAP ==========
+    parser.add_argument('--sigma_cap_safe_mult', type=float, default=3.0,
+                        help='Safety cap multiplier: σ_cap_safe = mult × σ0 (default 3.0, allows 3×σ_data)')
+    parser.add_argument('--sigma_cap_abs_max', type=float, default=None,
+                        help='Optional absolute max σ_cap (e.g., 1.5). None = no absolute limit.')
+    parser.add_argument('--sigma_cap_abs_min', type=float, default=None,
+                        help='Optional absolute min σ_cap. None = no absolute floor.')
 
     parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
                         help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
@@ -652,6 +659,10 @@ def main(args=None):
         curriculum_min_epochs=args.curriculum_min_epochs,
         curriculum_early_stop=args.curriculum_early_stop,
         use_legacy_curriculum=args.use_legacy_curriculum,
+        # ========== DATA-DEPENDENT SIGMA CAP ==========
+        sigma_cap_safe_mult=args.sigma_cap_safe_mult,
+        sigma_cap_abs_max=args.sigma_cap_abs_max,
+        sigma_cap_abs_min=args.sigma_cap_abs_min,
         # ========== NEW: Context augmentation ==========
         z_noise_std=0.0,       # No noise for Phase 1 (focus on clean geometry)
         z_dropout_rate=0.0,    # No dropout for Phase 1

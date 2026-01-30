@@ -2699,6 +2699,10 @@ def train_stageC_diffusion_generator(
     curriculum_min_epochs: int = 100,
     curriculum_early_stop: bool = True,
     use_legacy_curriculum: bool = False,
+    # ========== DATA-DEPENDENT SIGMA CAP ==========
+    sigma_cap_safe_mult: float = 3.0,      # σ_cap_safe = mult × σ0 (allows 3×σ_data by default)
+    sigma_cap_abs_max: float = None,       # Optional absolute ceiling
+    sigma_cap_abs_min: float = None,       # Optional absolute floor
     # NEW: EDM parameters
     P_mean: float = -1.2,          # Log-normal mean for sigma sampling
     P_std: float = 1.2,            # Log-normal std for sigma sampling
@@ -2780,7 +2784,10 @@ def train_stageC_diffusion_generator(
         # NEW 3-stage curriculum (default): [1.0, 2.0, 3.0] × σ_data
         'sigma_cap_mults': [1.0, 2.0, 3.0],
         'current_stage': 2,           # Start at S2 (highest), demote on failure
-        'sigma_cap_safe': 0.30,       # Hard clamp: σ_cap never exceeds this
+        # Data-dependent sigma cap (replaces old absolute sigma_cap_safe=0.30)
+        'sigma_cap_safe_mult': sigma_cap_safe_mult,   # σ_cap_safe = mult × σ0 (from CLI arg)
+        'sigma_cap_abs_max': sigma_cap_abs_max,       # Optional absolute ceiling (from CLI arg)
+        'sigma_cap_abs_min': sigma_cap_abs_min,       # Optional absolute floor (from CLI arg)
         'consecutive_passes': 0,
         'promotion_threshold': 5,
         'stall_count': 0,
@@ -2859,10 +2866,13 @@ def train_stageC_diffusion_generator(
     }
 
     # Legacy curriculum override: 7-stage [0.3,...,17.0] with promotion
+    # NOTE: Legacy uses ABSOLUTE sigma values (not multiples of sigma_data)
     if use_legacy_curriculum:
         curriculum_state['sigma_cap_mults'] = [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0]
         curriculum_state['current_stage'] = 0
-        curriculum_state['sigma_cap_safe'] = 3.0
+        # For legacy mode: remove multiplicative cap, use absolute cap instead
+        del curriculum_state['sigma_cap_safe_mult']
+        curriculum_state['sigma_cap_safe'] = 3.0  # Absolute cap for legacy mode
         curriculum_state['jacc_min_by_mult'] = {
             0.3: 0.15, 0.9: 0.12, 2.3: 0.10, 4.0: 0.09, 7.0: 0.08, 14.0: 0.07, 17.0: 0.07,
         }
@@ -2886,7 +2896,11 @@ def train_stageC_diffusion_generator(
     print(f"  Mode: {'LEGACY 7-stage (promotion)' if use_legacy_curriculum else 'NEW 3-stage (demotion)'}")
     print(f"  sigma_cap_mults: {curriculum_state['sigma_cap_mults']}")
     print(f"  Starting stage: S{curriculum_state['current_stage']}")
-    print(f"  sigma_cap_safe: {curriculum_state.get('sigma_cap_safe', 'N/A')}")
+    print(f"  sigma_cap_safe_mult: {curriculum_state.get('sigma_cap_safe_mult', 'N/A')} (data-dependent cap)")
+    if curriculum_state.get('sigma_cap_abs_max') is not None:
+        print(f"  sigma_cap_abs_max: {curriculum_state['sigma_cap_abs_max']}")
+    if curriculum_state.get('sigma_cap_abs_min') is not None:
+        print(f"  sigma_cap_abs_min: {curriculum_state['sigma_cap_abs_min']}")
     print(f"  cap_band_frac: {curriculum_state['cap_band_frac_default']} ({int(curriculum_state['cap_band_frac_default']*100)}%)")
     print(f"  use_residual_diffusion: {use_residual_diffusion}")
     print(f"{'='*70}\n")
@@ -3752,6 +3766,7 @@ def train_stageC_diffusion_generator(
             # Keys that should ALWAYS use canonical values (config, not runtime state)
             config_keys = [
                 'sigma_cap_mults',
+                'sigma_cap_safe_mult', 'sigma_cap_abs_max', 'sigma_cap_abs_min',  # Data-dependent cap
                 'scale_r_min_by_mult', 'scale_r_min_default',
                 'trace_r_min_by_mult', 'trace_r_min_default',
                 'jacc_min_by_mult',
@@ -4237,24 +4252,79 @@ def train_stageC_diffusion_generator(
     # HELPER: Get effective sigma_cap (accounts for ramp)
     # Pure function - does NOT mutate state
     # =========================================================================
-    def get_sigma_cap_eff(curriculum_state, global_step, sigma_data):
+    def get_sigma_cap_eff(curriculum_state, global_step, sigma_data, do_log=False):
         """
         Single source of truth for effective sigma_cap during ramp.
 
-        Returns: (sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress)
+        Now uses DATA-DEPENDENT safety cap instead of hard absolute clamp.
+        sigma0 = sigma_data_resid (if residual mode) else sigma_data
+        sigma_cap_safe_abs = sigma_cap_safe_mult × sigma0
+
+        Returns: (sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, debug_info)
         - sigma_cap_eff: the actual cap to use for training/eval
-        - sigma_cap_target: the target cap for current stage
+        - sigma_cap_target: the target cap for current stage (before safety clamp)
         - ramp_active: True if ramp is in progress
         - ramp_progress: 0.0-1.0 progress through ramp (0 if not active)
+        - debug_info: dict with sigma0, curr_mult, cap_stage, cap_safe_abs, cap_final
         """
         curr_stage = curriculum_state['current_stage']
-        sigma_cap_target = curriculum_state['sigma_cap_mults'][curr_stage] * sigma_data
+        curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
 
-        # Hard safety clamp
-        sigma_cap_safe = curriculum_state.get('sigma_cap_safe', 3.0)
+        # =====================================================================
+        # Determine sigma0: use sigma_data_resid if residual mode, else sigma_data
+        # =====================================================================
+        use_resid = curriculum_state.get('use_residual_diffusion', False)
+        if use_resid:
+            sigma0 = curriculum_state.get('sigma_data_resid', sigma_data)
+        else:
+            sigma0 = sigma_data
 
+        # Stage cap (before safety clamp)
+        sigma_cap_stage = curr_mult * sigma0
+
+        # =====================================================================
+        # Data-dependent safety cap (with backward compatibility)
+        # Priority: sigma_cap_safe_mult (new) > sigma_cap_safe (old) > default 3.0
+        # =====================================================================
+        if 'sigma_cap_safe_mult' in curriculum_state:
+            # NEW: multiplicative safety cap
+            sigma_cap_safe_mult = curriculum_state['sigma_cap_safe_mult']
+            sigma_cap_safe_abs = sigma_cap_safe_mult * sigma0
+        elif 'sigma_cap_safe' in curriculum_state:
+            # OLD: absolute safety cap (backward compatibility for old checkpoints)
+            sigma_cap_safe_abs = curriculum_state['sigma_cap_safe']
+        else:
+            # DEFAULT: 3.0 × sigma0
+            sigma_cap_safe_abs = 3.0 * sigma0
+
+        # Apply safety cap to get target
+        sigma_cap_target = min(sigma_cap_stage, sigma_cap_safe_abs)
+
+        # =====================================================================
+        # Optional absolute max/min clamps (backstops)
+        # =====================================================================
+        sigma_cap_abs_max = curriculum_state.get('sigma_cap_abs_max')
+        sigma_cap_abs_min = curriculum_state.get('sigma_cap_abs_min')
+
+        if sigma_cap_abs_max is not None:
+            sigma_cap_target = min(sigma_cap_target, sigma_cap_abs_max)
+        if sigma_cap_abs_min is not None:
+            sigma_cap_target = max(sigma_cap_target, sigma_cap_abs_min)
+
+        # =====================================================================
+        # Ramp logic (unchanged, but uses new sigma_cap_target)
+        # =====================================================================
         ramp_start = curriculum_state.get('ramp_start_step')
         ramp_steps = curriculum_state.get('ramp_steps', 300)
+
+        # Build debug info
+        debug_info = {
+            'sigma0': sigma0,
+            'curr_mult': curr_mult,
+            'cap_stage': sigma_cap_stage,
+            'cap_safe_abs': sigma_cap_safe_abs,
+            'cap_target': sigma_cap_target,  # After safety clamp, before ramp
+        }
 
         # Ramp is active if ramp_start_step is set and not yet complete
         # Also need valid ramp_prev_cap and ramp_target_cap
@@ -4264,20 +4334,40 @@ def train_stageC_diffusion_generator(
 
             # If caps are None (e.g., old checkpoint), treat as no ramp
             if prev_cap is None or target_cap is None:
-                sigma_cap_eff = min(sigma_cap_target, sigma_cap_safe)
-                return sigma_cap_eff, sigma_cap_target, False, 1.0
+                sigma_cap_eff = sigma_cap_target
+                debug_info['cap_final'] = sigma_cap_eff
+                if do_log:
+                    print(f"[CURR] sigma0={sigma0:.4f} mult={curr_mult:.1f} "
+                          f"cap_stage={sigma_cap_stage:.4f} cap_safe={sigma_cap_safe_abs:.4f} "
+                          f"cap_final={sigma_cap_eff:.4f}")
+                return sigma_cap_eff, sigma_cap_target, False, 1.0, debug_info
 
             steps_since_ramp = global_step - ramp_start
             if steps_since_ramp < ramp_steps:
                 # Ramp in progress
                 t = steps_since_ramp / ramp_steps
                 sigma_cap_eff = prev_cap + t * (target_cap - prev_cap)
-                sigma_cap_eff = min(sigma_cap_eff, sigma_cap_safe)
-                return sigma_cap_eff, sigma_cap_target, True, t
+                # Also apply safety clamp during ramp
+                sigma_cap_eff = min(sigma_cap_eff, sigma_cap_safe_abs)
+                if sigma_cap_abs_max is not None:
+                    sigma_cap_eff = min(sigma_cap_eff, sigma_cap_abs_max)
+                if sigma_cap_abs_min is not None:
+                    sigma_cap_eff = max(sigma_cap_eff, sigma_cap_abs_min)
+                debug_info['cap_final'] = sigma_cap_eff
+                if do_log:
+                    print(f"[CURR] sigma0={sigma0:.4f} mult={curr_mult:.1f} "
+                          f"cap_stage={sigma_cap_stage:.4f} cap_safe={sigma_cap_safe_abs:.4f} "
+                          f"cap_final={sigma_cap_eff:.4f} (ramp {t:.0%})")
+                return sigma_cap_eff, sigma_cap_target, True, t, debug_info
 
-        # No ramp or ramp complete - apply safety clamp
-        sigma_cap_eff = min(sigma_cap_target, sigma_cap_safe)
-        return sigma_cap_eff, sigma_cap_target, False, 1.0
+        # No ramp or ramp complete
+        sigma_cap_eff = sigma_cap_target
+        debug_info['cap_final'] = sigma_cap_eff
+        if do_log:
+            print(f"[CURR] sigma0={sigma0:.4f} mult={curr_mult:.1f} "
+                  f"cap_stage={sigma_cap_stage:.4f} cap_safe={sigma_cap_safe_abs:.4f} "
+                  f"cap_final={sigma_cap_eff:.4f}")
+        return sigma_cap_eff, sigma_cap_target, False, 1.0, debug_info
 
     def normalize_and_scale_conditioning(H, mask, alpha, eps=1e-8):
         """
@@ -4519,7 +4609,7 @@ def train_stageC_diffusion_generator(
                     # [CURRICULUM] Phase 3: Compute current sigma_cap using helper
                     curr_stage = curriculum_state['current_stage']
                     curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
-                    sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
+                    sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, _ = get_sigma_cap_eff(
                         curriculum_state, global_step, sigma_data)
 
                     # Clear ramp state when ramp completes (state mutation happens HERE, not in helper)
@@ -10646,8 +10736,10 @@ def train_stageC_diffusion_generator(
                 curr_stage = curriculum_state['current_stage']
 
                 # Use EFFECTIVE sigma_cap (accounts for ramp) for eval
-                sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress = get_sigma_cap_eff(
-                    curriculum_state, global_step, sigma_data)
+                # Enable logging here (once per eval) to verify data-dependent cap
+                do_log_cap = (fabric is None or fabric.is_global_zero)
+                sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, _ = get_sigma_cap_eff(
+                    curriculum_state, global_step, sigma_data, do_log=do_log_cap)
 
                 # Select closest_sigma: max({s in fixed_eval_sigmas | s <= sigma_cap_eff})
                 # This ensures we don't eval at sigma we're not training on yet
