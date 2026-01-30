@@ -9302,13 +9302,27 @@ def train_stageC_diffusion_generator(
                                 print(f"[FIX2A] Same-noise coupling: {hi_sigma_mask.sum().item()}/{hi_sigma_mask.shape[0]} "
                                       f"high-σ samples (σ > {sigma_switch_noise:.3f})")
 
-                    # Add noise to view2 target
-                    V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
-                    V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
- 
-                    # Encode view2 context
+                    # Encode view2 context FIRST (needed for residual V_base_2)
                     with torch.autocast(device_type='cuda', dtype=amp_dtype):
                         H_2 = context_encoder(Z_set_2, mask_2)
+
+                    # ========== RESIDUAL DIFFUSION: View 2 ==========
+                    # Must match view 1's residual treatment
+                    if use_resid:
+                        with torch.no_grad():
+                            V_base_2 = generator(H_2, mask_2).detach()
+                        R_target_2 = V_target_2 - V_base_2
+                        # Noise the residual, not the absolute target
+                        V_t_2 = R_target_2 + sigma_pair_3d_ov * eps_2
+                    else:
+                        V_base_2 = None
+                        R_target_2 = None
+                        # Add noise to view2 target (original behavior)
+                        V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2
+
+                    V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
+
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype):
  
                         # Forward pass for view2
                         x0_pred_2_result = score_net.forward_edm(
@@ -9329,7 +9343,9 @@ def train_stageC_diffusion_generator(
                         # ============================================================
 
                         # Compute per-node MSE (same as view1: mean over dims)
-                        err2_node_2 = (x0_pred_2 - V_target_2).pow(2).mean(dim=-1)  # (B_keep, N2)
+                        # In residual mode, use R_target_2; otherwise use V_target_2
+                        target_2_for_score = R_target_2 if use_resid else V_target_2
+                        err2_node_2 = (x0_pred_2 - target_2_for_score).pow(2).mean(dim=-1)  # (B_keep, N2)
 
                         # Per-sample normalization (same as view1)
                         mask_2_f = mask_2.float()  # (B_keep, N2)
@@ -9349,9 +9365,20 @@ def train_stageC_diffusion_generator(
                         # Compute overlap losses
                         # Slice V_target to match the filtered batch
                         V_target_1_ov = V_target[idx_keep]
-                        
+
+                        # ========== RESIDUAL DIFFUSION: Compose absolute coords for overlap ==========
+                        # In residual mode, x0_pred is R_hat (residual). For overlap consistency,
+                        # we need absolute coordinates: V_hat = V_base + R_hat
+                        if use_resid:
+                            V_base_1 = V_base[idx_keep]  # Slice V_base from main batch
+                            V_hat_1_ov = V_base_1 + x0_pred_1  # Compose absolute coords
+                            V_hat_2_ov = V_base_2 + x0_pred_2  # V_base_2 computed earlier
+                        else:
+                            V_hat_1_ov = x0_pred_1  # Already absolute
+                            V_hat_2_ov = x0_pred_2
+
                         ov_loss_dict = compute_overlap_losses(
-                            x0_pred_1, x0_pred_2,
+                            V_hat_1_ov, V_hat_2_ov,  # Use composed coords in residual mode
                             idx1_I, idx2_I, I_mask,
                             mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
