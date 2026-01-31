@@ -9985,6 +9985,13 @@ def train_stageC_diffusion_generator(
                             print(f"  L_ov: shape={L_ov_shape_batch.item():.6f} scale={L_ov_scale_batch.item():.6f} kl={L_ov_kl_batch.item():.6f}")
                             print(f"  weighted_ratio (ov/score)={ratio_ov_score:.4f} (watch if >> 1 early)")
 
+                            # FIX #4: Log difficulty distribution
+                            if 'difficulty_counts' in pair_batch_full:
+                                dc = pair_batch_full['difficulty_counts']
+                                alphas = pair_batch_full.get('effective_alphas', [])
+                                mean_alpha = np.mean(alphas) if alphas else 0.5
+                                print(f"  [FIX4-DIFFICULTY] easy={dc['easy']} medium={dc['medium']} hard={dc['hard']} mean_alpha={mean_alpha:.3f}")
+
                             # ============ [BLOB-CHECK] Collapse detection ============
                             with torch.no_grad():
                                 # View1 blob check

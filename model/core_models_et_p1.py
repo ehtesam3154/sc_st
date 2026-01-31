@@ -2070,6 +2070,10 @@ class STPairSetDataset(Dataset):
         # ========== Paired overlap params ==========
         pair_overlap_alpha: float = 0.5,
         pair_overlap_min_I: int = 16,
+        # ========== FIX #4: Robust pairing params ==========
+        pair_difficulty_probs: tuple = (0.5, 0.3, 0.2),  # (easy, medium, hard)
+        pair_hard_alpha_range: tuple = (0.15, 0.25),     # alpha range for hard pairs
+        pair_medium_center_dist_mult: float = 0.3,       # how far center2 is from center1 (fraction of pool radius)
         # ========== Competitor training params ==========
         compete_train: bool = False,
         compete_n_extra: int = 128,
@@ -2096,6 +2100,11 @@ class STPairSetDataset(Dataset):
         self.pair_overlap_alpha = pair_overlap_alpha
         self.pair_overlap_min_I = pair_overlap_min_I
 
+        # FIX #4: Robust pairing params
+        self.pair_difficulty_probs = pair_difficulty_probs
+        self.pair_hard_alpha_range = pair_hard_alpha_range
+        self.pair_medium_center_dist_mult = pair_medium_center_dist_mult
+
         # Stochastic sampling params
         self.pool_mult = pool_mult
         self.stochastic_tau = stochastic_tau
@@ -2109,6 +2118,9 @@ class STPairSetDataset(Dataset):
         self.compete_k_pos = compete_k_pos
         self.compete_expr_knn_k = compete_expr_knn_k
         self.compete_anchor_only = compete_anchor_only
+
+        # FIX #4: Tracking stats for debug
+        self.pair_difficulty_counts = {'easy': 0, 'medium': 0, 'hard': 0}
 
         # Precompute encoder embeddings for all slides
         self.Z_dict = {}
@@ -2131,6 +2143,8 @@ class STPairSetDataset(Dataset):
 
         print(f"[STPairSetDataset] Created with alpha={pair_overlap_alpha}, "
               f"min_I={pair_overlap_min_I}, n_range=[{n_min},{n_max}]")
+        print(f"[STPairSetDataset] FIX #4: Difficulty probs={pair_difficulty_probs} "
+              f"(easy/medium/hard), hard_alpha={pair_hard_alpha_range}")
 
     def __len__(self):
         return self.num_samples
@@ -2363,6 +2377,11 @@ class STPairSetDataset(Dataset):
     def __getitem__(self, idx):
         """
         Return a PAIR of minisets from the same slide with controlled core overlap.
+
+        FIX #4: Three-tier difficulty system for robust context invariance learning:
+        - EASY (50%): Same center for both views, standard overlap (current behavior)
+        - MEDIUM (30%): Same overlap set I, but exclusive points from different nearby center
+        - HARD (20%): Smaller overlap alpha (0.15-0.25) to prevent overlap-only behavior
         """
         # Pick a slide
         slide_id = np.random.choice(self.slide_ids)
@@ -2373,8 +2392,26 @@ class STPairSetDataset(Dataset):
         n = np.random.randint(self.n_min, self.n_max + 1)
         n = min(n, m)
 
+        # FIX #4: Select difficulty level
+        p_easy, p_medium, p_hard = self.pair_difficulty_probs
+        rand_val = np.random.random()
+        if rand_val < p_easy:
+            difficulty = 'easy'
+        elif rand_val < p_easy + p_medium:
+            difficulty = 'medium'
+        else:
+            difficulty = 'hard'
+
+        # FIX #4: Adjust overlap alpha based on difficulty
+        if difficulty == 'hard':
+            # Use smaller alpha for hard pairs
+            alpha_lo, alpha_hi = self.pair_hard_alpha_range
+            effective_alpha = np.random.uniform(alpha_lo, alpha_hi)
+        else:
+            effective_alpha = self.pair_overlap_alpha
+
         # Compute overlap size
-        n_overlap = max(self.pair_overlap_min_I, int(self.pair_overlap_alpha * n))
+        n_overlap = max(self.pair_overlap_min_I, int(effective_alpha * n))
 
         # If n is too small to satisfy min overlap, bump n up
         if n - 4 < self.pair_overlap_min_I:
@@ -2382,66 +2419,136 @@ class STPairSetDataset(Dataset):
 
         n_overlap = min(n_overlap, n - 4)  # Leave room for non-overlapping points
 
+        # Sample a center point for view1 (and view2 if easy mode)
+        center_idx_1 = np.random.randint(0, m)
 
-        # Sample a center point (shared by both views for locality)
-        center_idx = np.random.randint(0, m)
-
-        # Build a shared pool of candidates near the center
-        D_row = targets.D[center_idx]
+        # Build a shared pool of candidates near center1
+        D_row_1 = targets.D[center_idx_1]
         all_idx = torch.arange(m)
-        mask_self = all_idx != center_idx
-        dists = D_row[mask_self]
-        idx_no_self = all_idx[mask_self]
+        mask_self_1 = all_idx != center_idx_1
+        dists_1 = D_row_1[mask_self_1]
+        idx_no_self_1 = all_idx[mask_self_1]
 
-        sort_order = torch.argsort(dists)
-        sorted_neighbors = idx_no_self[sort_order]
-        sorted_dists = dists[sort_order]
+        sort_order_1 = torch.argsort(dists_1)
+        sorted_neighbors_1 = idx_no_self_1[sort_order_1]
+        sorted_dists_1 = dists_1[sort_order_1]
 
         # Pool size: enough for 2 views with overlap
         n_unique_needed = 2 * n - n_overlap  # Total unique points across both views
-        K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_unique_needed))
+        K_pool = min(sorted_neighbors_1.numel(), int(self.pool_mult * n_unique_needed))
         K_pool = max(K_pool, n_unique_needed)
 
-        pool = sorted_neighbors[:K_pool]
-        pool_d = sorted_dists[:K_pool]
+        pool_1 = sorted_neighbors_1[:K_pool]
+        pool_d_1 = sorted_dists_1[:K_pool]
 
-        # Sample OVERLAP set (I) - shared core points
-        # These are the closest points to center for maximum locality
-        if pool.numel() >= n_overlap:
+        # Sample OVERLAP set (I) - shared core points from center1's neighborhood
+        if pool_1.numel() >= n_overlap:
             # Stochastic sampling for overlap
-            weights_I = torch.softmax(-pool_d / self.stochastic_tau, dim=0)
-            if pool.numel() >= n_overlap:
+            weights_I = torch.softmax(-pool_d_1 / self.stochastic_tau, dim=0)
+            if pool_1.numel() >= n_overlap:
                 sampled_I = torch.multinomial(weights_I, n_overlap, replacement=False)
-                I_indices = pool[sampled_I]
+                I_indices = pool_1[sampled_I]
             else:
-                I_indices = pool[:n_overlap]
+                I_indices = pool_1[:n_overlap]
         else:
-            I_indices = pool
+            I_indices = pool_1
             n_overlap = I_indices.numel()
 
-        # Points available after overlap
+        # Points available after overlap (from center1's pool)
         I_set = set(I_indices.tolist())
-        remaining_pool = torch.tensor([p.item() for p in pool if p.item() not in I_set], dtype=torch.long)
+        remaining_pool_1 = torch.tensor([p.item() for p in pool_1 if p.item() not in I_set], dtype=torch.long)
+
+        # FIX #4: For MEDIUM difficulty, find a second center nearby but different
+        if difficulty == 'medium':
+            # Find center2: a point near center1 but far enough to provide context shift
+            # Use a neighbor at medium distance (30% of pool radius by default)
+            pool_radius = sorted_dists_1[min(K_pool - 1, sorted_dists_1.numel() - 1)].item() if sorted_dists_1.numel() > 0 else 1.0
+            target_dist = self.pair_medium_center_dist_mult * pool_radius
+
+            # Find candidates at roughly the target distance
+            dist_diffs = (sorted_dists_1 - target_dist).abs()
+            # Pick from the 10 closest to target distance, excluding overlap points
+            candidate_mask = torch.ones(sorted_neighbors_1.numel(), dtype=torch.bool)
+            for i, neighbor in enumerate(sorted_neighbors_1.tolist()):
+                if neighbor in I_set or neighbor == center_idx_1:
+                    candidate_mask[i] = False
+
+            valid_candidates = sorted_neighbors_1[candidate_mask]
+            valid_dist_diffs = dist_diffs[candidate_mask[:dist_diffs.numel()]] if dist_diffs.numel() > 0 else torch.tensor([])
+
+            if valid_candidates.numel() > 0:
+                # Pick one of the closest candidates to target distance
+                n_top = min(10, valid_candidates.numel())
+                _, top_indices = valid_dist_diffs[:valid_candidates.numel()].topk(n_top, largest=False)
+                chosen_idx = top_indices[np.random.randint(0, n_top)]
+                center_idx_2 = valid_candidates[chosen_idx].item()
+            else:
+                # Fallback: just use a random point not in overlap
+                available = [i for i in range(m) if i not in I_set and i != center_idx_1]
+                if available:
+                    center_idx_2 = np.random.choice(available)
+                else:
+                    center_idx_2 = center_idx_1  # Fallback to same center
+
+            # Build pool around center2 for view2's exclusive points
+            D_row_2 = targets.D[center_idx_2]
+            mask_self_2 = all_idx != center_idx_2
+            dists_2 = D_row_2[mask_self_2]
+            idx_no_self_2 = all_idx[mask_self_2]
+
+            sort_order_2 = torch.argsort(dists_2)
+            sorted_neighbors_2 = idx_no_self_2[sort_order_2]
+
+            # Remaining pool for view2: neighbors of center2, excluding overlap
+            remaining_pool_2 = torch.tensor(
+                [p.item() for p in sorted_neighbors_2[:K_pool] if p.item() not in I_set and p.item() != center_idx_2],
+                dtype=torch.long
+            )
+        else:
+            # EASY or HARD: same center for both views
+            center_idx_2 = center_idx_1
+            remaining_pool_2 = remaining_pool_1
 
         # Sample non-overlapping points for view1 (A) and view2 (B)
         n_A = n - n_overlap - 1  # -1 for center
         n_B = n - n_overlap - 1
 
-        if remaining_pool.numel() >= n_A + n_B:
-            # Shuffle and split
-            perm = torch.randperm(remaining_pool.numel())
-            A_exclusive = remaining_pool[perm[:n_A]]
-            B_exclusive = remaining_pool[perm[n_A:n_A + n_B]]
+        # View1 exclusive: from center1's pool
+        if remaining_pool_1.numel() >= n_A:
+            perm_1 = torch.randperm(remaining_pool_1.numel())
+            A_exclusive = remaining_pool_1[perm_1[:n_A]]
         else:
-            # Not enough points - use what we have
-            half = remaining_pool.numel() // 2
-            A_exclusive = remaining_pool[:half]
-            B_exclusive = remaining_pool[half:]
+            A_exclusive = remaining_pool_1
+
+        # View2 exclusive: from center2's pool (different in MEDIUM mode)
+        if difficulty == 'medium':
+            # Use center2's pool, ensuring no overlap with A_exclusive
+            A_set = set(A_exclusive.tolist())
+            available_for_B = torch.tensor(
+                [p.item() for p in remaining_pool_2 if p.item() not in A_set],
+                dtype=torch.long
+            )
+            if available_for_B.numel() >= n_B:
+                perm_2 = torch.randperm(available_for_B.numel())
+                B_exclusive = available_for_B[perm_2[:n_B]]
+            else:
+                B_exclusive = available_for_B
+        else:
+            # EASY or HARD: split remaining_pool_1 between A and B
+            if remaining_pool_1.numel() >= n_A + n_B:
+                perm = torch.randperm(remaining_pool_1.numel())
+                A_exclusive = remaining_pool_1[perm[:n_A]]
+                B_exclusive = remaining_pool_1[perm[n_A:n_A + n_B]]
+            else:
+                half = remaining_pool_1.numel() // 2
+                A_exclusive = remaining_pool_1[:half]
+                B_exclusive = remaining_pool_1[half:]
 
         # Build core indices for each view
-        center_tensor = torch.tensor([center_idx], dtype=torch.long)
-        indices_core_1 = torch.cat([center_tensor, I_indices, A_exclusive])
-        indices_core_2 = torch.cat([center_tensor, I_indices, B_exclusive])
+        center_tensor_1 = torch.tensor([center_idx_1], dtype=torch.long)
+        center_tensor_2 = torch.tensor([center_idx_2], dtype=torch.long)
+        indices_core_1 = torch.cat([center_tensor_1, I_indices, A_exclusive])
+        indices_core_2 = torch.cat([center_tensor_2, I_indices, B_exclusive])
 
         # Shuffle cores
         indices_core_1 = indices_core_1[torch.randperm(indices_core_1.numel())]
@@ -2460,10 +2567,14 @@ class STPairSetDataset(Dataset):
         view2 = self._build_miniset_dict(targets, indices_all_2, anchor_mask_2, slide_id)
 
         # Compute overlap mapping (using global_uid for safety)
-        # Include center_idx as shared overlap point
-        I_indices_with_center = torch.cat([I_indices, torch.tensor([center_idx], dtype=torch.long)])
-        I_global_uids = (slide_id << 32) + I_indices_with_center.long()
+        # For EASY/HARD: Include center_idx as shared overlap point
+        # For MEDIUM: centers are different, so only I_indices are overlap
+        if difficulty == 'medium':
+            I_indices_for_overlap = I_indices  # Centers are different, not shared
+        else:
+            I_indices_for_overlap = torch.cat([I_indices, torch.tensor([center_idx_1], dtype=torch.long)])
 
+        I_global_uids = (slide_id << 32) + I_indices_for_overlap.long()
 
         # Build index mapping: for each point in I, find its position in view1 and view2
         idx1_I = []
@@ -2483,12 +2594,17 @@ class STPairSetDataset(Dataset):
         idx1_I = torch.tensor(idx1_I, dtype=torch.long)
         idx2_I = torch.tensor(idx2_I, dtype=torch.long)
 
+        # FIX #4: Track difficulty counts (thread-safe increment)
+        self.pair_difficulty_counts[difficulty] += 1
+
         # Overlap info
         overlap_mapping = {
             'idx1_I': idx1_I,  # Positions in view1 of shared points
             'idx2_I': idx2_I,  # Positions in view2 of shared points
             'I_size': len(idx1_I),
             'slide_id': slide_id,
+            'difficulty': difficulty,  # FIX #4: Track difficulty for debugging
+            'effective_alpha': effective_alpha,  # FIX #4: Track actual alpha used
         }
 
         return {
@@ -2509,6 +2625,8 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     - 'idx2_I': (batch_size, max_I) positions in view2 of overlap points
     - 'I_mask': (batch_size, max_I) validity mask for overlap points
     - 'I_sizes': (batch_size,) number of overlap points per sample
+    - 'difficulty_counts': FIX #4 - dict with counts of easy/medium/hard pairs in batch
+    - 'effective_alphas': FIX #4 - list of effective alpha values used
     """
     batch_size = len(batch)
 
@@ -2531,6 +2649,10 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     I_mask_batch = torch.zeros(batch_size, max_I, dtype=torch.bool, device=device)
     I_sizes_batch = torch.zeros(batch_size, dtype=torch.long, device=device)
 
+    # FIX #4: Track difficulty distribution in batch
+    difficulty_counts = {'easy': 0, 'medium': 0, 'hard': 0}
+    effective_alphas = []
+
     for i, om in enumerate(overlap_list):
         I_size = om['I_size']
         if I_size > 0:
@@ -2538,6 +2660,11 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             idx2_I_batch[i, :I_size] = om['idx2_I']
             I_mask_batch[i, :I_size] = True
         I_sizes_batch[i] = I_size
+
+        # FIX #4: Count difficulties
+        difficulty = om.get('difficulty', 'easy')
+        difficulty_counts[difficulty] += 1
+        effective_alphas.append(om.get('effective_alpha', 0.5))
 
     return {
         'view1': view1_batch,
@@ -2547,6 +2674,9 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'I_mask': I_mask_batch,
         'I_sizes': I_sizes_batch,
         'is_pair_batch': True,
+        # FIX #4: Include difficulty info
+        'difficulty_counts': difficulty_counts,
+        'effective_alphas': effective_alphas,
     }
 
 
