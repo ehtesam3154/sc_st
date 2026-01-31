@@ -170,9 +170,11 @@ def compute_overlap_losses(
         tr_G2 = G2.trace() + eps
 
         # (1) Shape loss: normalized Gram Frobenius distance (scale-free)
+        # FIX #2: Normalize by n_I² to remove overlap-size bias
+        # Using .mean() instead of .sum() divides by n_I × n_I automatically
         G1_norm = G1 / tr_G1
         G2_norm = G2 / tr_G2
-        shape_loss_b = (G1_norm - G2_norm).pow(2).sum()
+        shape_loss_b = (G1_norm - G2_norm).pow(2).mean()  # FIX #2: .mean() instead of .sum()
         L_ov_shape = L_ov_shape + shape_loss_b
 
         # (2) Scale loss: squared log-trace difference (between views)
@@ -9623,6 +9625,13 @@ def train_stageC_diffusion_generator(
                             V_hat_1_ov = x0_pred_1  # Already absolute
                             V_hat_2_ov = x0_pred_2
 
+                        # FIX #3: Dynamic sigma_0_hi threshold (70% of curriculum cap)
+                        # This ensures the high-σ scale anchor actually activates within training range
+                        curr_stage_for_hi = curriculum_state['current_stage']
+                        curr_mult_for_hi = curriculum_state['sigma_cap_mults'][curr_stage_for_hi]
+                        sigma_cap_for_hi = curr_mult_for_hi * sigma_data
+                        sigma_0_hi_dynamic = 0.7 * sigma_cap_for_hi  # 70% of current cap
+
                         ov_loss_dict = compute_overlap_losses(
                             V_hat_1_ov, V_hat_2_ov,  # Use composed coords in residual mode
                             idx1_I, idx2_I, I_mask,
@@ -9632,7 +9641,7 @@ def train_stageC_diffusion_generator(
                             sigma_t=sigma_pair_3d_ov,
                             V_target_1=V_target_1_ov,
                             V_target_2=V_target_2,
-                            sigma_0_hi=0.5,  # threshold for high-σ anchor
+                            sigma_0_hi=sigma_0_hi_dynamic,  # FIX #3: dynamic threshold (70% of sigma_cap)
                             # [TRY 2] Per-sample SNR gating for KL
                             sigma_data=sigma_data,
                             kl_gate_power=2.0,  # c_skip^2 gating
@@ -9839,36 +9848,47 @@ def train_stageC_diffusion_generator(
                                 ov_jaccard_k10.extend(ov_loss_dict['debug_info']['jaccard_k10'])
 
                             # ============ [OVLP-VS-GLOBAL] Overlap vs Global health ============
+                            # FIX #1: In residual mode, use absolute predictions (V_hat) and aligned targets
                             if global_step % overlap_debug_every == 0:
                                 with torch.no_grad():
                                     # Get overlap Jaccard from the debug info
                                     ov_jacc = ov_loss_dict['debug_info'].get('jaccard_k10', [])
                                     ov_jacc_mean = np.mean(ov_jacc) if ov_jacc else 0.0
-                                    
+
                                     # Get overlap scale ratio from loss dict
                                     ov_scale_r = ov_loss_dict.get('debug_scale_ratio', 1.0)
-                                    
+
+                                    # FIX #1: Use absolute predictions and aligned targets
+                                    # In residual mode: V_hat = V_base + R_hat (already computed as V_hat_1_ov)
+                                    # Target should be V_target_aligned (in same frame as V_base)
+                                    if use_resid:
+                                        pred_for_diag = V_hat_1_ov  # Absolute prediction
+                                        tgt_for_diag = V_target_aligned[idx_keep]  # Aligned target
+                                    else:
+                                        pred_for_diag = x0_pred_1  # Already absolute
+                                        tgt_for_diag = V_target[idx_keep]
+
                                     # Compute GLOBAL Jaccard@10 on view1 (full set, not just overlap)
                                     global_jacc_sum = 0.0
                                     global_jacc_cnt = 0
-                                    for b in range(min(4, x0_pred_1.shape[0])):
+                                    for b in range(min(4, pred_for_diag.shape[0])):
                                         m_b = mask_ov[b].bool()
                                         n_valid = int(m_b.sum().item())
                                         if n_valid < 15:
                                             continue
-                                        
-                                        pred_b = x0_pred_1[b, m_b]
-                                        tgt_b = V_target[idx_keep][b, m_b]
-                                        
+
+                                        pred_b = pred_for_diag[b, m_b]
+                                        tgt_b = tgt_for_diag[b, m_b]
+
                                         D_pred = torch.cdist(pred_b, pred_b)
                                         D_tgt = torch.cdist(tgt_b, tgt_b)
-                                        
+
                                         k_j = min(10, n_valid - 1)
                                         _, knn_pred = D_pred.topk(k_j + 1, largest=False)
                                         _, knn_tgt = D_tgt.topk(k_j + 1, largest=False)
                                         knn_pred = knn_pred[:, 1:]
                                         knn_tgt = knn_tgt[:, 1:]
-                                        
+
                                         for i in range(n_valid):
                                             set_pred = set(knn_pred[i].tolist())
                                             set_tgt = set(knn_tgt[i].tolist())
@@ -9877,18 +9897,19 @@ def train_stageC_diffusion_generator(
                                             if union > 0:
                                                 global_jacc_sum += inter / union
                                                 global_jacc_cnt += 1
-                                    
+
                                     global_jacc_mean = global_jacc_sum / max(global_jacc_cnt, 1)
-                                    
-                                    # Global scale ratio
+
+                                    # Global scale ratio (using absolute predictions and aligned targets)
                                     m1_f = mask_ov.unsqueeze(-1).float()
-                                    rms_pred_g = (x0_pred_1.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                    rms_pred_g = (pred_for_diag.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                     rms_pred_g = rms_pred_g.sqrt().item()
-                                    rms_tgt_g = (V_target[idx_keep].pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                    rms_tgt_g = (tgt_for_diag.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                     rms_tgt_g = rms_tgt_g.sqrt().item()
                                     global_scale_r = rms_pred_g / max(rms_tgt_g, 1e-8)
-                                    
-                                    print(f"\n[OVLP-VS-GLOBAL] step={global_step}")
+
+                                    mode_str = "RESID(V_hat vs V_aligned)" if use_resid else "STD"
+                                    print(f"\n[OVLP-VS-GLOBAL] step={global_step} mode={mode_str}")
                                     print(f"  Overlap:  Jacc@10={ov_jacc_mean:.4f}")
                                     print(f"  Global:   Jacc@10={global_jacc_mean:.4f} scale_r={global_scale_r:.4f}")
                                     print(f"  Delta:    ov-global Jacc={ov_jacc_mean - global_jacc_mean:.4f}")
@@ -9901,9 +9922,9 @@ def train_stageC_diffusion_generator(
                         if global_step % overlap_debug_every == 0:
                             rank = dist.get_rank() if dist.is_initialized() else 0
                             print(f"  [rank={rank}] valid_batch_count={ov_loss_dict['valid_batch_count']}")
-                            print(f"  [rank={rank}] hi_scale_count={ov_loss_dict['hi_scale_count']}")  # NEW
+                            print(f"  [rank={rank}] hi_scale_count={ov_loss_dict['hi_scale_count']} (σ > {sigma_0_hi_dynamic:.4f})")  # FIX #3: show dynamic threshold
                             print(f"  [rank={rank}] L_score_2={L_score_2.item():.6f} (view2 scale anchor)")
-                            print(f"  [rank={rank}] L_hi_scale={ov_loss_dict['L_hi_scale'].item():.6f} (high-σ scale anchor)")  # NEW
+                            print(f"  [rank={rank}] L_hi_scale={ov_loss_dict['L_hi_scale'].item():.6f} (high-σ scale anchor, threshold={sigma_0_hi_dynamic:.4f})")  # FIX #3
                             if ov_loss_dict['debug_info']['hi_scale_ratio']:  # NEW
                                 print(f"  [rank={rank}] hi_scale_ratio: mean={np.mean(ov_loss_dict['debug_info']['hi_scale_ratio']):.4f}")
                             if ov_loss_dict['debug_info']['I_sizes']:
@@ -9911,25 +9932,39 @@ def train_stageC_diffusion_generator(
                                     f"mean={np.mean(ov_loss_dict['debug_info']['I_sizes']):.1f}")
 
                             # ============ [PAIR-SCALE] View1 vs View2 scale comparison ============
+                            # FIX #1: In residual mode, use absolute predictions and aligned targets
                             with torch.no_grad():
                                 m1_f = mask_ov.unsqueeze(-1).float()
                                 m2_f = mask_2.unsqueeze(-1).float()
-                                
-                                rms_pred_1 = (x0_pred_1.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+
+                                # FIX #1: Use absolute predictions and aligned targets
+                                if use_resid:
+                                    pred_1_scale = V_hat_1_ov  # Absolute prediction
+                                    tgt_1_scale = V_target_aligned[idx_keep]  # Aligned target
+                                    pred_2_scale = V_hat_2_ov  # Absolute prediction
+                                    tgt_2_scale = V_target_2_aligned  # Aligned target
+                                else:
+                                    pred_1_scale = x0_pred_1
+                                    tgt_1_scale = V_target[idx_keep]
+                                    pred_2_scale = x0_pred_2
+                                    tgt_2_scale = V_target_2
+
+                                rms_pred_1 = (pred_1_scale.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                 rms_pred_1 = rms_pred_1.sqrt().item()
-                                rms_tgt_1 = (V_target[idx_keep].pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                rms_tgt_1 = (tgt_1_scale.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                 rms_tgt_1 = rms_tgt_1.sqrt().item()
                                 scale_r_1 = rms_pred_1 / max(rms_tgt_1, 1e-8)
-                                
-                                rms_pred_2 = (x0_pred_2.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
+
+                                rms_pred_2 = (pred_2_scale.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
                                 rms_pred_2 = rms_pred_2.sqrt().item()
-                                rms_tgt_2 = (V_target_2.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
+                                rms_tgt_2 = (tgt_2_scale.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
                                 rms_tgt_2 = rms_tgt_2.sqrt().item()
                                 scale_r_2 = rms_pred_2 / max(rms_tgt_2, 1e-8)
-                                
+
                                 scale_gap = abs(np.log(scale_r_1 + 1e-8) - np.log(scale_r_2 + 1e-8))
-                                
-                                print(f"\n[PAIR-SCALE] step={global_step}")
+
+                                mode_str = "RESID(V_hat vs V_aligned)" if use_resid else "STD"
+                                print(f"\n[PAIR-SCALE] step={global_step} mode={mode_str}")
                                 print(f"  View1: rms_pred={rms_pred_1:.4f} rms_tgt={rms_tgt_1:.4f} scale_r={scale_r_1:.4f}")
                                 print(f"  View2: rms_pred={rms_pred_2:.4f} rms_tgt={rms_tgt_2:.4f} scale_r={scale_r_2:.4f}")
                                 print(f"  scale_gap (|log diff|)={scale_gap:.4f} (want < 0.1)")
