@@ -10120,18 +10120,21 @@ def train_stageC_diffusion_generator(
                             # ============ [PAIR-LOSS] Loss component breakdown ============
                             L_score_1_val = L_score.item() if isinstance(L_score, torch.Tensor) else 0.0
                             L_score_2_val = L_score_2.item()
-                            L_ov_total = L_ov_shape_batch.item() + L_ov_scale_batch.item() + L_ov_kl_batch.item()
+                            # FIX: Use GATED KL (what training uses) not ungated for ratio calc
+                            # Ungated L_ov_kl_batch includes high-σ samples; gated is suppressed at high σ
+                            L_ov_kl_gated_val = L_ov_kl_gated.item() if torch.is_tensor(L_ov_kl_gated) else L_ov_kl_gated
+                            L_ov_total_gated = L_ov_shape_batch.item() + L_ov_scale_batch.item() + L_ov_kl_gated_val
                             w_score = WEIGHTS.get('score', 1.0)
                             w_ov = overlap_loss_weight_shape + overlap_loss_weight_scale + overlap_loss_weight_kl
-                            
+
                             score_contrib = w_score * (L_score_1_val + L_score_2_val)
-                            ov_contrib = w_ov * L_ov_total if L_ov_total > 0 else 0.0
+                            ov_contrib = w_ov * L_ov_total_gated if L_ov_total_gated > 0 else 0.0
                             ratio_ov_score = ov_contrib / max(score_contrib, 1e-8)
-                            
+
                             print(f"\n[PAIR-LOSS] step={global_step}")
                             print(f"  L_score_1={L_score_1_val:.6f} L_score_2={L_score_2_val:.6f}")
-                            print(f"  L_ov: shape={L_ov_shape_batch.item():.6f} scale={L_ov_scale_batch.item():.6f} kl={L_ov_kl_batch.item():.6f}")
-                            print(f"  weighted_ratio (ov/score)={ratio_ov_score:.4f} (watch if >> 1 early)")
+                            print(f"  L_ov: shape={L_ov_shape_batch.item():.6f} scale={L_ov_scale_batch.item():.6f} kl_gated={L_ov_kl_gated_val:.6f} (kl_raw={L_ov_kl_batch.item():.6f})")
+                            print(f"  weighted_ratio (ov/score)={ratio_ov_score:.4f} [uses gated KL]")
 
                             # FIX #4: Log difficulty distribution
                             if 'difficulty_counts' in pair_batch_full:
