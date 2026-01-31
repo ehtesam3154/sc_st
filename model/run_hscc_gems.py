@@ -1076,11 +1076,9 @@ def main(args=None):
                         tau_mode="adaptive_kth",
                         ensure_connected=True,
                         local_refine=False,
-                        # Anchored sequential sampling
-                        inference_mode=args.inference_mode,  # "anchored" or "unanchored"
-                        anchor_sampling_mode="align_vote_only" if args.inference_mode == "anchored" else "off",
-                        commit_frac=0.6,
-                        seq_align_dim=32,
+                        # V2 pipeline for residual diffusion
+                        use_v2_pipeline=args.use_residual_diffusion,
+                        use_residual_diffusion=args.use_residual_diffusion,
                     )
 
                     
