@@ -4041,6 +4041,17 @@ def train_stageC_diffusion_generator(
             print(f"[RESID-DIFF] Will recompute sigma_data_resid at step {curriculum_state['sigma_resid_recompute_step']}")
 
     sigma_data_resid = sync_scalar(sigma_data_resid, device)
+
+    # Apply floor to sigma_data_resid to prevent it from being too small
+    # This ensures the score network sees a meaningful signal-to-noise range
+    SIGMA_RESID_FLOOR_MULT = 0.1  # Floor = 10% of sigma_data
+    sigma_resid_floor = SIGMA_RESID_FLOOR_MULT * sigma_data
+    if sigma_resid_valid and sigma_data_resid < sigma_resid_floor:
+        if fabric is None or fabric.is_global_zero:
+            print(f"[RESID-DIFF] WARNING: sigma_data_resid={sigma_data_resid:.4f} < floor={sigma_resid_floor:.4f}")
+            print(f"[RESID-DIFF] Clamping to floor to ensure meaningful SNR range")
+        sigma_data_resid = sigma_resid_floor
+
     curriculum_state['sigma_data_resid'] = sigma_data_resid
     curriculum_state['sigma_resid_valid'] = sigma_resid_valid
     if sigma_resid_valid:
@@ -4934,6 +4945,24 @@ def train_stageC_diffusion_generator(
 
                 # ========== RESIDUAL DIFFUSION: Compute V_base and R_target ==========
                 use_resid = curriculum_state.get('use_residual_diffusion', False)
+
+                # ========== SIGMA_EDM: sigma to use for EDM preconditioning ==========
+                # When in residual mode with valid sigma_data_resid, use sigma_data_resid
+                # for forward_edm preconditioning and loss weighting. This ensures the
+                # c_skip/c_out coefficients are calibrated to the residual scale, not V scale.
+                sigma_resid_valid = curriculum_state.get('sigma_resid_valid', False)
+                if use_resid and sigma_resid_valid:
+                    sigma_edm = curriculum_state.get('sigma_data_resid_locked',
+                                curriculum_state.get('sigma_data_resid', sigma_data))
+                else:
+                    sigma_edm = sigma_data
+
+                # Log sigma_edm periodically
+                if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                    print(f"[SIGMA-EDM] step={global_step} sigma_edm={sigma_edm:.4f} "
+                          f"(use_resid={use_resid}, sigma_resid_valid={sigma_resid_valid}, "
+                          f"sigma_data={sigma_data:.4f})")
+
                 if use_resid:
                     # For residual diffusion: always compute V_base from generator (detached)
                     with torch.no_grad():
@@ -5423,21 +5452,21 @@ def train_stageC_diffusion_generator(
                         with torch.no_grad():
                             # First pass: no self-conditioning
                             x0_pred_0_result = score_net.forward_edm(
-                                V_t, sigma_flat, H_train, mask, sigma_data,
+                                V_t, sigma_flat, H_train, mask, sigma_edm,
                                 self_cond=None, return_debug=False
                             )
                             if isinstance(x0_pred_0_result, tuple):
                                 x0_pred_0_tmp = x0_pred_0_result[0]
                             else:
                                 x0_pred_0_tmp = x0_pred_0_result
-                        
+
                         # Second pass: use first pass output as self-conditioning
                         result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            V_t, sigma_flat, H_train, mask, sigma_edm,
                             self_cond=x0_pred_0_tmp.detach(),  # stopgrad
                             return_debug=return_debug
                         )
-                        
+
                         # Debug self-conditioning effectiveness
                         if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
@@ -5445,27 +5474,27 @@ def train_stageC_diffusion_generator(
                                     x0_pred_final = result[0]
                                 else:
                                     x0_pred_final = result
-                                
+
                                 diff = (x0_pred_final - x0_pred_0_tmp).abs()
                                 mask_f = mask.unsqueeze(-1).float()
                                 diff_mean = (diff * mask_f).sum() / mask_f.sum()
                                 x0_scale = (x0_pred_final.abs() * mask_f).sum() / mask_f.sum()
                                 rel_diff = diff_mean / x0_scale.clamp(min=1e-6)
-                                
+
                                 print(f"\n[SELF-COND] step={global_step} mode={self_cond_mode}")
                                 print(f"  Relative change from pass1 to pass2: {rel_diff.item()*100:.2f}%")
 
                     elif self_cond_mode == 'none':
                         # No self-conditioning
                         result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            V_t, sigma_flat, H_train, mask, sigma_edm,
                             self_cond=None, return_debug=return_debug
                         )
-                        
+
                     else:
                         # Fallback for old behavior (should not happen with new args)
                         result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            V_t, sigma_flat, H_train, mask, sigma_edm,
                             self_cond=None, return_debug=return_debug
                         )
 
@@ -5538,9 +5567,9 @@ def train_stageC_diffusion_generator(
                     if global_step % 100 == 0 and use_self_cond and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             print(f"\n[DEBUG-SELFCOND] Step {global_step} - Self-cond effectiveness:")
-                            
+
                             # Compare x0_pred with and without self-cond for same input
-                            x0_no_sc = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
+                            x0_no_sc = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_edm,
                                                              self_cond=None)
                             if isinstance(x0_no_sc, tuple):
                                 x0_no_sc = x0_no_sc[0]
@@ -5645,8 +5674,8 @@ def train_stageC_diffusion_generator(
                     sigma_flat = sigma_t.view(-1).float()  # (B,)
 
                     # EDM weight: (σ² + σ_d²) / (σ · σ_d)²  (returns (B,))
-                    # EDM weight: (σ² + σ_d²) / (σ · σ_d)²  (returns (B,))
-                    w_raw = uet.edm_loss_weight(sigma_flat, sigma_data).float()
+                    # Use sigma_edm (= sigma_data_resid in residual mode) for proper weighting
+                    w_raw = uet.edm_loss_weight(sigma_flat, sigma_edm).float()
 
                     # --- HIGH-SIGMA COMPENSATION: g(σ) = (σ/σ₀)^p for σ > σ₀ ---
                     # This compensates for high-σ scale collapse by boosting loss weight
@@ -11297,8 +11326,16 @@ def train_stageC_diffusion_generator(
                         # Enable promotion ramp for smooth σ_cap transition
                         # Store actual caps (not mults) for cleaner interpolation
                         ramp_steps = curriculum_state.get('ramp_steps', 300)
-                        old_cap = old_mult * sigma_data
-                        new_cap = new_mult * sigma_data
+                        # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                        use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                        sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                        if use_resid_ramp and sigma_resid_valid_ramp:
+                            sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                          curriculum_state.get('sigma_data_resid', sigma_data))
+                        else:
+                            sigma0_ramp = sigma_data
+                        old_cap = old_mult * sigma0_ramp
+                        new_cap = new_mult * sigma0_ramp
                         curriculum_state['ramp_start_step'] = global_step
                         curriculum_state['ramp_prev_cap'] = old_cap
                         curriculum_state['ramp_target_cap'] = new_cap
@@ -11364,8 +11401,16 @@ def train_stageC_diffusion_generator(
 
                         # Enable demotion ramp
                         ramp_steps = curriculum_state.get('ramp_steps', 300)
-                        old_cap = old_mult * sigma_data
-                        new_cap = new_mult * sigma_data
+                        # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                        use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                        sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                        if use_resid_ramp and sigma_resid_valid_ramp:
+                            sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                          curriculum_state.get('sigma_data_resid', sigma_data))
+                        else:
+                            sigma0_ramp = sigma_data
+                        old_cap = old_mult * sigma0_ramp
+                        new_cap = new_mult * sigma0_ramp
                         curriculum_state['ramp_start_step'] = global_step
                         curriculum_state['ramp_prev_cap'] = old_cap
                         curriculum_state['ramp_target_cap'] = new_cap
@@ -11837,8 +11882,16 @@ def train_stageC_diffusion_generator(
 
                                 # Enable promotion ramp for smooth σ_cap transition
                                 ramp_steps = curriculum_state.get('ramp_steps', 300)
-                                old_cap = old_mult * sigma_data
-                                new_cap = new_mult * sigma_data
+                                # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                                use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                                sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                                if use_resid_ramp and sigma_resid_valid_ramp:
+                                    sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                                  curriculum_state.get('sigma_data_resid', sigma_data))
+                                else:
+                                    sigma0_ramp = sigma_data
+                                old_cap = old_mult * sigma0_ramp
+                                new_cap = new_mult * sigma0_ramp
                                 curriculum_state['ramp_start_step'] = global_step
                                 curriculum_state['ramp_prev_cap'] = old_cap
                                 curriculum_state['ramp_target_cap'] = new_cap
@@ -11886,8 +11939,16 @@ def train_stageC_diffusion_generator(
 
                                     # Enable ramp for smooth transition
                                     ramp_steps = curriculum_state.get('ramp_steps', 300)
-                                    old_cap = old_mult * sigma_data
-                                    new_cap = new_mult * sigma_data
+                                    # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                                    use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                                    sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                                    if use_resid_ramp and sigma_resid_valid_ramp:
+                                        sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                                      curriculum_state.get('sigma_data_resid', sigma_data))
+                                    else:
+                                        sigma0_ramp = sigma_data
+                                    old_cap = old_mult * sigma0_ramp
+                                    new_cap = new_mult * sigma0_ramp
                                     curriculum_state['ramp_start_step'] = global_step
                                     curriculum_state['ramp_prev_cap'] = old_cap
                                     curriculum_state['ramp_target_cap'] = new_cap
@@ -15333,10 +15394,10 @@ def _sample_sc_edm_patchwise_v2(
     # Determine sigma_start for diffusion
     if use_residual_diffusion and sigma_data_resid is not None:
         sigma_start = min(3.0 * sigma_data_resid, sigma_max)
-        # FIX: Use sigma_data for preconditioning to match training
-        # Training uses sigma_data for forward_edm even in residual mode,
+        # Use sigma_data_resid for preconditioning to match training
+        # Training now uses sigma_data_resid for forward_edm in residual mode,
         # so inference must use the same to get consistent c_skip/c_out coefficients
-        sigma_data_effective = sigma_data
+        sigma_data_effective = sigma_data_resid
     else:
         sigma_start = min(sigma_max, 3.0 * sigma_data)
         sigma_data_effective = sigma_data
