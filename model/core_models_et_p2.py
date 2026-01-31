@@ -9554,17 +9554,26 @@ def train_stageC_diffusion_generator(
 
                     # ========== RESIDUAL DIFFUSION: View 2 ==========
                     # Must match view 1's residual treatment (including frame alignment!)
+                    #
+                    # FIX #1 (ROBUST): Compute generator outputs WITH gradients for overlap consistency
+                    # This allows the generator to learn context-invariant geometry directly.
+                    # V_base_2 (detached) is still used for residual target computation.
                     if use_resid:
+                        # Compute generator output WITH gradients (for Fix #1 generator overlap loss)
+                        V_gen_2 = generator(H_2, mask_2)  # WITH gradients
+                        V_base_2 = V_gen_2.detach()  # Detached for residual target (no gradient here)
+
+                        # CRITICAL: Align V_target_2 to V_base_2's frame (same as view 1)
                         with torch.no_grad():
-                            V_base_2 = generator(H_2, mask_2).detach()
-                            # CRITICAL: Align V_target_2 to V_base_2's frame (same as view 1)
                             V_target_2_aligned = uet.rigid_align_apply_no_scale(V_target_2, V_base_2, mask_2)
                         R_target_2 = V_target_2_aligned - V_base_2
                         # Noise the residual, not the absolute target
                         V_t_2 = R_target_2 + sigma_pair_3d_ov * eps_2
                     else:
+                        V_gen_2 = None
                         V_base_2 = None
                         R_target_2 = None
+                        V_target_2_aligned = V_target_2  # For Fix #2: use original if not residual mode
                         # Add noise to view2 target (original behavior)
                         V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2
 
@@ -9609,6 +9618,145 @@ def train_stageC_diffusion_generator(
                         # Add view2 score loss with same weight as main score loss
                         L_total = L_total + WEIGHTS.get('score', 1.0) * L_score_2
                         L_score_2_batch = L_score_2  # Store for epoch tracking
+
+                        # ============================================================
+                        # ROBUST FIX #1: Generator-level overlap consistency loss
+                        # ============================================================
+                        # This enforces that the generator produces consistent geometry
+                        # for overlap cells regardless of context (exclusive nodes).
+                        # Shrinks "context variance" at the base level, making residual
+                        # diffusion's job well-posed.
+                        #
+                        # For overlap set I, we compute:
+                        # - Shape loss: (1/n_I^2) * ||G1_norm - G2_norm||_F^2
+                        # - Scale loss: (log(tr(G1)) - log(tr(G2)))^2
+                        # ============================================================
+                        L_gen_ov_shape = torch.tensor(0.0, device=device)
+                        L_gen_ov_scale = torch.tensor(0.0, device=device)
+                        gen_ov_valid_count = 0
+
+                        if use_resid and V_gen_2 is not None:
+                            # Compute V_gen_1 WITH gradients (slice H and run generator)
+                            H_ov = H[idx_keep]  # Slice context encoding for view1
+                            V_gen_1 = generator(H_ov, mask_ov)  # WITH gradients
+
+                            # Compute generator overlap consistency loss on overlap indices
+                            B_ov = V_gen_1.shape[0]
+                            for b in range(B_ov):
+                                I_valid_b = I_mask[b]  # (max_I,)
+                                n_I_b = I_valid_b.sum().item()
+                                if n_I_b < 5:  # Need enough points for meaningful loss
+                                    continue
+
+                                # Get overlap indices for this sample
+                                idx1_b = idx1_I[b, I_valid_b]  # Positions in view1
+                                idx2_b = idx2_I[b, I_valid_b]  # Positions in view2
+
+                                # Extract generator outputs on overlap
+                                V_g1_I = V_gen_1[b, idx1_b]  # (n_I, D)
+                                V_g2_I = V_gen_2[b, idx2_b]  # (n_I, D)
+
+                                # Center (remove mean)
+                                V_g1_I_c = V_g1_I - V_g1_I.mean(dim=0, keepdim=True)
+                                V_g2_I_c = V_g2_I - V_g2_I.mean(dim=0, keepdim=True)
+
+                                # Compute Gram matrices
+                                G1 = V_g1_I_c @ V_g1_I_c.T  # (n_I, n_I)
+                                G2 = V_g2_I_c @ V_g2_I_c.T  # (n_I, n_I)
+
+                                eps = 1e-8
+                                tr_G1 = G1.trace() + eps
+                                tr_G2 = G2.trace() + eps
+
+                                # Shape loss: normalized Gram Frobenius (scale-free)
+                                G1_norm = G1 / tr_G1
+                                G2_norm = G2 / tr_G2
+                                shape_loss_b = (G1_norm - G2_norm).pow(2).mean()  # Normalized by n_I^2
+                                L_gen_ov_shape = L_gen_ov_shape + shape_loss_b
+
+                                # Scale loss: log-trace difference
+                                scale_loss_b = (torch.log(tr_G1) - torch.log(tr_G2)).pow(2)
+                                L_gen_ov_scale = L_gen_ov_scale + scale_loss_b
+
+                                gen_ov_valid_count += 1
+
+                            # Normalize by valid count
+                            if gen_ov_valid_count > 0:
+                                L_gen_ov_shape = L_gen_ov_shape / gen_ov_valid_count
+                                L_gen_ov_scale = L_gen_ov_scale / gen_ov_valid_count
+
+                                # Add to total loss with generator weights
+                                # Use gen_gram weight for shape, gen_scale weight for scale
+                                w_gen_ov_shape = WEIGHTS.get('gen_gram', 10.0) * 0.5  # Half weight for overlap
+                                w_gen_ov_scale = WEIGHTS.get('gen_scale', 10.0) * 0.5
+                                L_total = L_total + w_gen_ov_shape * L_gen_ov_shape
+                                L_total = L_total + w_gen_ov_scale * L_gen_ov_scale
+
+                        # ============================================================
+                        # ROBUST FIX #2: Symmetrize view2 supervision
+                        # ============================================================
+                        # Apply Gram shape and scale losses to view2 against its own
+                        # aligned target. This prevents view2 from drifting into
+                        # "match overlap but be globally weird" behavior.
+                        # ============================================================
+                        L_gram_2 = torch.tensor(0.0, device=device)
+                        L_gram_scale_2 = torch.tensor(0.0, device=device)
+
+                        if WEIGHTS.get('gram', 0) > 0 or WEIGHTS.get('gram_scale', 0) > 0:
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                # Use V_hat_2 (absolute prediction) and V_target_2_aligned (target)
+                                # First, compose absolute prediction for view2
+                                if use_resid:
+                                    V_pred_2_abs = V_base_2 + x0_pred_2  # Absolute prediction
+                                    V_tgt_2_abs = V_target_2_aligned  # Aligned target
+                                else:
+                                    V_pred_2_abs = x0_pred_2
+                                    V_tgt_2_abs = V_target_2
+
+                                # Center both (mask-aware)
+                                m2_f = mask_2.unsqueeze(-1).float()  # (B, N, 1)
+                                m2_sum = m2_f.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1, 1)
+
+                                V_pred_2_c = V_pred_2_abs - (V_pred_2_abs * m2_f).sum(dim=1, keepdim=True) / m2_sum
+                                V_pred_2_c = V_pred_2_c * m2_f
+                                V_tgt_2_c = V_tgt_2_abs - (V_tgt_2_abs * m2_f).sum(dim=1, keepdim=True) / m2_sum
+                                V_tgt_2_c = V_tgt_2_c * m2_f
+
+                                # Compute Gram matrices
+                                Gp_2 = V_pred_2_c @ V_pred_2_c.transpose(1, 2)  # (B, N, N)
+                                Gt_2 = V_tgt_2_c @ V_tgt_2_c.transpose(1, 2)  # (B, N, N)
+
+                                # Valid pair mask
+                                m2_bool = mask_2.bool()
+                                MM_2 = (m2_bool.unsqueeze(-1) & m2_bool.unsqueeze(-2)).float()
+                                N2 = mask_2.shape[1]
+                                eye_2 = torch.eye(N2, dtype=torch.bool, device=device).unsqueeze(0)
+                                P_off_2 = (MM_2.bool() & (~eye_2)).float()
+
+                                # Gram shape loss (scale-normalized)
+                                if WEIGHTS.get('gram', 0) > 0:
+                                    # Normalize by trace for scale-invariant comparison
+                                    tr_p_2 = (Gp_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-8)
+                                    tr_t_2 = (Gt_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-8)
+                                    Gp_2_norm = Gp_2 / tr_p_2
+                                    Gt_2_norm = Gt_2 / tr_t_2
+
+                                    diff_2 = (Gp_2_norm - Gt_2_norm) * P_off_2
+                                    pair_cnt_2 = P_off_2.sum(dim=(1, 2)).clamp(min=1.0)
+                                    L_gram_2 = (diff_2.pow(2).sum(dim=(1, 2)) / pair_cnt_2).mean()
+
+                                    # Add to total (half weight for view2)
+                                    L_total = L_total + WEIGHTS.get('gram', 2.0) * 0.5 * L_gram_2
+
+                                # Gram scale loss (trace matching)
+                                if WEIGHTS.get('gram_scale', 0) > 0:
+                                    tr_p_2_flat = (Gp_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1)  # (B,)
+                                    tr_t_2_flat = (Gt_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1)  # (B,)
+                                    log_ratio_2 = torch.log(tr_p_2_flat + 1e-8) - torch.log(tr_t_2_flat + 1e-8)
+                                    L_gram_scale_2 = (log_ratio_2 ** 2).mean()
+
+                                    # Add to total (half weight for view2)
+                                    L_total = L_total + WEIGHTS.get('gram_scale', 2.0) * 0.5 * L_gram_scale_2
 
                         # Compute overlap losses
                         # Slice V_target to match the filtered batch
@@ -9991,6 +10139,14 @@ def train_stageC_diffusion_generator(
                                 alphas = pair_batch_full.get('effective_alphas', [])
                                 mean_alpha = np.mean(alphas) if alphas else 0.5
                                 print(f"  [FIX4-DIFFICULTY] easy={dc['easy']} medium={dc['medium']} hard={dc['hard']} mean_alpha={mean_alpha:.3f}")
+
+                            # ROBUST FIX #1 & #2: Log new losses
+                            L_gen_ov_shape_val = L_gen_ov_shape.item() if torch.is_tensor(L_gen_ov_shape) else L_gen_ov_shape
+                            L_gen_ov_scale_val = L_gen_ov_scale.item() if torch.is_tensor(L_gen_ov_scale) else L_gen_ov_scale
+                            L_gram_2_val = L_gram_2.item() if torch.is_tensor(L_gram_2) else L_gram_2
+                            L_gram_scale_2_val = L_gram_scale_2.item() if torch.is_tensor(L_gram_scale_2) else L_gram_scale_2
+                            print(f"  [FIX-ROBUST] L_gen_ov: shape={L_gen_ov_shape_val:.6f} scale={L_gen_ov_scale_val:.6f} (gen context inv)")
+                            print(f"  [FIX-ROBUST] L_view2: gram={L_gram_2_val:.6f} gram_scale={L_gram_scale_2_val:.6f} (view2 geo)")
 
                             # ============ [BLOB-CHECK] Collapse detection ============
                             with torch.no_grad():
