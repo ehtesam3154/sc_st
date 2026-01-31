@@ -5422,7 +5422,7 @@ def train_stageC_diffusion_generator(
                     if self_cond_mode == 'standard' and score_net.self_conditioning:
                         # Standard two-pass self-conditioning (matches inference)
                         with torch.no_grad():
-                            # First pass: no self-conditioning
+                            # First pass: no self-conditioning (no gradients needed)
                             x0_pred_0_result = score_net.forward_edm(
                                 V_t, sigma_flat, H_train, mask, sigma_data,
                                 self_cond=None, return_debug=False
@@ -5431,14 +5431,34 @@ def train_stageC_diffusion_generator(
                                 x0_pred_0_tmp = x0_pred_0_result[0]
                             else:
                                 x0_pred_0_tmp = x0_pred_0_result
-                        
+
                         # Second pass: use first pass output as self-conditioning
-                        result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
-                            self_cond=x0_pred_0_tmp.detach(),  # stopgrad
-                            return_debug=return_debug
-                        )
-                        
+                        # GRADIENT CHECKPOINTING: recompute activations during backward to save memory
+                        # Disable checkpointing for debug steps to allow return_debug=True
+                        use_checkpoint_v1 = (global_step % 500 != 0)  # Skip checkpoint on debug steps
+
+                        if use_checkpoint_v1:
+                            # Checkpointed forward: autocast INSIDE function, return_debug=False
+                            self_cond_detached = x0_pred_0_tmp.detach()
+                            def _view1_forward_sc(V_t, sigma_flat, H_train, mask, self_cond_detached):
+                                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                                    return score_net.forward_edm(
+                                        V_t, sigma_flat, H_train, mask, sigma_data,
+                                        self_cond=self_cond_detached, return_debug=False
+                                    )
+                            result = grad_checkpoint(
+                                _view1_forward_sc,
+                                V_t, sigma_flat, H_train, mask, self_cond_detached,
+                                use_reentrant=False
+                            )
+                        else:
+                            # Debug step: no checkpointing, allow return_debug
+                            result = score_net.forward_edm(
+                                V_t, sigma_flat, H_train, mask, sigma_data,
+                                self_cond=x0_pred_0_tmp.detach(),
+                                return_debug=return_debug
+                            )
+
                         # Debug self-conditioning effectiveness
                         if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
@@ -5446,29 +5466,61 @@ def train_stageC_diffusion_generator(
                                     x0_pred_final = result[0]
                                 else:
                                     x0_pred_final = result
-                                
+
                                 diff = (x0_pred_final - x0_pred_0_tmp).abs()
                                 mask_f = mask.unsqueeze(-1).float()
                                 diff_mean = (diff * mask_f).sum() / mask_f.sum()
                                 x0_scale = (x0_pred_final.abs() * mask_f).sum() / mask_f.sum()
                                 rel_diff = diff_mean / x0_scale.clamp(min=1e-6)
-                                
+
                                 print(f"\n[SELF-COND] step={global_step} mode={self_cond_mode}")
                                 print(f"  Relative change from pass1 to pass2: {rel_diff.item()*100:.2f}%")
 
                     elif self_cond_mode == 'none':
                         # No self-conditioning
-                        result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
-                            self_cond=None, return_debug=return_debug
-                        )
-                        
+                        # GRADIENT CHECKPOINTING for memory savings
+                        use_checkpoint_v1 = (global_step % 500 != 0)
+
+                        if use_checkpoint_v1:
+                            def _view1_forward_no_sc(V_t, sigma_flat, H_train, mask):
+                                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                                    return score_net.forward_edm(
+                                        V_t, sigma_flat, H_train, mask, sigma_data,
+                                        self_cond=None, return_debug=False
+                                    )
+                            result = grad_checkpoint(
+                                _view1_forward_no_sc,
+                                V_t, sigma_flat, H_train, mask,
+                                use_reentrant=False
+                            )
+                        else:
+                            result = score_net.forward_edm(
+                                V_t, sigma_flat, H_train, mask, sigma_data,
+                                self_cond=None, return_debug=return_debug
+                            )
+
                     else:
                         # Fallback for old behavior (should not happen with new args)
-                        result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
-                            self_cond=None, return_debug=return_debug
-                        )
+                        # Also checkpointed for consistency
+                        use_checkpoint_v1 = (global_step % 500 != 0)
+
+                        if use_checkpoint_v1:
+                            def _view1_forward_fallback(V_t, sigma_flat, H_train, mask):
+                                with torch.autocast(device_type='cuda', dtype=amp_dtype):
+                                    return score_net.forward_edm(
+                                        V_t, sigma_flat, H_train, mask, sigma_data,
+                                        self_cond=None, return_debug=False
+                                    )
+                            result = grad_checkpoint(
+                                _view1_forward_fallback,
+                                V_t, sigma_flat, H_train, mask,
+                                use_reentrant=False
+                            )
+                        else:
+                            result = score_net.forward_edm(
+                                V_t, sigma_flat, H_train, mask, sigma_data,
+                                self_cond=None, return_debug=return_debug
+                            )
 
                                         
                     if isinstance(result, tuple):
