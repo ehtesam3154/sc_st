@@ -131,6 +131,9 @@ class GEMSModel:
         # ---- Resume Stage C ----
         resume_ckpt_path: Optional[str] = None,
         resume_reset_optimizer: bool = False,
+        # ---- Generator capacity ----
+        gen_n_blocks: int = 2,  # Number of ISAB blocks in generator (default 2)
+        gen_isab_m: Optional[int] = None,  # Generator ISAB inducing points (default: same as isab_m)
     ):
 
         """
@@ -173,9 +176,17 @@ class GEMSModel:
                 'anchor_geom_mode': anchor_geom_mode,
                 'anchor_geom_min_unknown': anchor_geom_min_unknown,
                 'anchor_geom_debug_every': anchor_geom_debug_every,
+            },
+            'generator': {
+                'gen_n_blocks': gen_n_blocks,
+                'gen_isab_m': gen_isab_m if gen_isab_m is not None else isab_m,
             }
 
         }
+
+        # Store generator capacity params
+        self.gen_n_blocks = gen_n_blocks
+        self.gen_isab_m = gen_isab_m if gen_isab_m is not None else isab_m
         
         # Store anchor_train for later use
         self.anchor_train = anchor_train
@@ -208,7 +219,7 @@ class GEMSModel:
         
         self.generator = MetricSetGenerator(
             c_dim=c_dim, D_latent=D_latent, n_heads=n_heads,
-            n_blocks=2, isab_m=isab_m
+            n_blocks=self.gen_n_blocks, isab_m=self.gen_isab_m
         ).to(device)
         
         # self.score_net = DiffusionScoreNet(

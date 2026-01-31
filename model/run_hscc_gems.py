@@ -164,7 +164,13 @@ def parse_args():
                         help='Minimum unknown points to use anchor_geom')
     parser.add_argument('--anchor_geom_debug_every', type=int, default=200,
                         help='Debug logging interval for anchor geometry')
-    
+
+    # ========== GENERATOR CAPACITY ==========
+    parser.add_argument('--gen_n_blocks', type=int, default=2,
+                        help='Number of ISAB blocks in generator (default 2, increase for more capacity)')
+    parser.add_argument('--gen_isab_m', type=int, default=None,
+                        help='Generator ISAB inducing points (default: same as isab_m)')
+
     # ========== INFERENCE MODE ==========
     parser.add_argument('--inference_mode', type=str, default='unanchored',
                         choices=['unanchored', 'anchored'],
@@ -379,7 +385,10 @@ def main(args=None):
         anchor_train=args.anchor_train,
         anchor_geom_losses=args.anchor_geom_losses,
         anchor_geom_mode=args.anchor_geom_mode,
-        anchor_geom_min_unknown=args.anchor_geom_min_unknown
+        anchor_geom_min_unknown=args.anchor_geom_min_unknown,
+        # ========== Generator capacity ==========
+        gen_n_blocks=args.gen_n_blocks,
+        gen_isab_m=args.gen_isab_m,
     )
 
     # ---------- Stage A & B on rank-0 only ----------
