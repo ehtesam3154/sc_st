@@ -15333,7 +15333,10 @@ def _sample_sc_edm_patchwise_v2(
     # Determine sigma_start for diffusion
     if use_residual_diffusion and sigma_data_resid is not None:
         sigma_start = min(3.0 * sigma_data_resid, sigma_max)
-        sigma_data_effective = sigma_data_resid
+        # FIX: Use sigma_data for preconditioning to match training
+        # Training uses sigma_data for forward_edm even in residual mode,
+        # so inference must use the same to get consistent c_skip/c_out coefficients
+        sigma_data_effective = sigma_data
     else:
         sigma_start = min(sigma_max, 3.0 * sigma_data)
         sigma_data_effective = sigma_data
