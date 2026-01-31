@@ -2786,8 +2786,12 @@ def train_stageC_diffusion_generator(
     # Legacy 7-stage: uses absolute sigma values [0.3, 0.9, ..., 17.0]
     # =========================================================================
     curriculum_state = {
-        # NEW 3-stage curriculum (default): [1.0, 2.0, 3.0] × σ_data
-        'sigma_cap_mults': [1.0, 2.0, 3.0],
+        # NEW 4-stage curriculum (default): [1.0, 2.0, 3.0, 4.0] × σ_data
+        # Stage 0: 1× sigma0 (warmup)
+        # Stage 1: 2× sigma0
+        # Stage 2: 3× sigma0
+        # Stage 3: 4× sigma0 (full training)
+        'sigma_cap_mults': [1.0, 2.0, 3.0, 4.0],
         'current_stage': 0,           # Start at S0 (lowest), promote on success (easy→hard)
         # Data-dependent sigma cap (replaces old absolute sigma_cap_safe=0.30)
         'sigma_cap_safe_mult': sigma_cap_safe_mult,   # σ_cap_safe = mult × σ0 (from CLI arg)
@@ -2799,23 +2803,23 @@ def train_stageC_diffusion_generator(
         'stall_limit': 6,
         'generator_stable': False,
         'gen_consecutive_passes': 0,
-        # Thresholds for 3-stage (Jacc ≥ 0.10 for all)
+        # Thresholds for 4-stage (Jacc ≥ 0.10 for all)
         'jacc_min_by_mult': {
-            1.0: 0.10, 2.0: 0.10, 3.0: 0.10,
+            1.0: 0.10, 2.0: 0.10, 3.0: 0.10, 4.0: 0.10,
         },
-        # Scale_r thresholds: S0→S1: ≥0.85, S1→S2: ≥0.80
+        # Scale_r thresholds: progressively relaxed
         'scale_r_min_by_mult': {
-            1.0: 0.85, 2.0: 0.80, 3.0: 0.75,
+            1.0: 0.85, 2.0: 0.80, 3.0: 0.75, 4.0: 0.70,
         },
-        'scale_r_min_default': 0.75,
+        'scale_r_min_default': 0.70,
         'trace_r_min_by_mult': {
-            1.0: 0.69, 2.0: 0.61, 3.0: 0.53,
+            1.0: 0.69, 2.0: 0.61, 3.0: 0.53, 4.0: 0.45,
         },
-        'trace_r_min_default': 0.53,
+        'trace_r_min_default': 0.45,
         'scale_r_min_final': 0.80,
         'trace_r_min_final': 0.60,
-        # Cap-band: ramp up with stage (low at S0 for clean warmup, higher at S2)
-        'cap_band_frac_by_stage': {0: 0.2, 1: 0.3, 2: 0.5},
+        # Cap-band: ramp up with stage (low at S0 for clean warmup, higher at S3)
+        'cap_band_frac_by_stage': {0: 0.2, 1: 0.3, 2: 0.4, 3: 0.5},
         'cap_band_frac_default': 0.3,
         'cap_band_lo_mult': 0.6,       # Lower bound = 0.6 × σ_cap (was 0.7)
         # History for tracking
