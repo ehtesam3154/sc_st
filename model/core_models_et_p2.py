@@ -27,7 +27,6 @@ import json
 from datetime import datetime
 
 from torch.utils.data import DataLoader
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from core_models_et_p1 import collate_minisets, collate_sc_minisets, STPairSetDataset, collate_pair_minisets
 from tqdm.auto import tqdm
 import sys
@@ -9581,19 +9580,11 @@ def train_stageC_diffusion_generator(
                     V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
 
                     with torch.autocast(device_type='cuda', dtype=amp_dtype):
-
-                        # Forward pass for view2 WITH GRADIENT CHECKPOINTING
-                        # This trades compute for memory - recomputes activations during backward
-                        def _view2_forward(V_t_2, sigma_pair_ov, H_2, mask_2):
-                            return score_net.forward_edm(
-                                V_t_2, sigma_pair_ov, H_2, mask_2, sigma_data,
-                                self_cond=None, return_debug=False
-                            )
-
-                        x0_pred_2_result = grad_checkpoint(
-                            _view2_forward,
-                            V_t_2, sigma_pair_ov, H_2, mask_2,
-                            use_reentrant=False
+ 
+                        # Forward pass for view2
+                        x0_pred_2_result = score_net.forward_edm(
+                            V_t_2, sigma_pair_ov, H_2, mask_2, sigma_data,  # Use sliced sigma_pair_ov
+                            self_cond=None, return_debug=False
                         )
 
                         if isinstance(x0_pred_2_result, tuple):
