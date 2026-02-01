@@ -121,6 +121,18 @@ sc_slide_ids = torch.tensor(
     dtype=torch.long, device=device
 )
 
+# SC patient IDs for patient-level CORAL (cross-patient alignment within SC)
+# Patient 0 = P2, Patient 1 = P10
+sc_patient_ids = torch.tensor(
+    np.concatenate([
+        np.full(X_p2_st3.shape[0], 0, dtype=int),   # Patient 0: P2_ST3
+        np.full(X_p2_sc.shape[0], 0, dtype=int),    # Patient 0: P2_SC
+        np.full(X_p10_st3.shape[0], 1, dtype=int),  # Patient 1: P10_ST3
+        np.full(X_p10_sc.shape[0], 1, dtype=int),   # Patient 1: P10_SC
+    ]),
+    dtype=torch.long, device=device
+)
+
 print(f"✓ SC expr: {sc_expr.shape}")
 print(f"  - P2_ST3:  {X_p2_st3.shape[0]} cells (SC slide 0)")
 print(f"  - P2_SC:   {X_p2_sc.shape[0]} cells (SC slide 1)")
@@ -166,7 +178,8 @@ encoder, projector, discriminator, hist = train_encoder(
     st_coords=st_coords,
     sc_gene_expr=sc_expr,
     slide_ids=slide_ids,
-    sc_slide_ids=sc_slide_ids,  # NEW: Enable per-SC-slide balancing
+    sc_slide_ids=sc_slide_ids,  # Enable per-SC-slide balancing
+    sc_patient_ids=sc_patient_ids,  # Enable patient-level CORAL for P2↔P10 alignment
     n_epochs=500,  # Shorter for testing
     batch_size=256,
     lr=1e-3,
@@ -189,6 +202,7 @@ encoder, projector, discriminator, hist = train_encoder(
     aug_scale_jitter=0.1,
     # Domain adversary
     adv_slide_weight=50.0,
+    patient_coral_weight=10.0,  # Patient alignment within SC domain
     adv_warmup_epochs=50,
     adv_ramp_epochs=200,
     grl_alpha_max=1.0,

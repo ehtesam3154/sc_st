@@ -110,6 +110,7 @@ def train_encoder(
     sc_gene_expr: torch.Tensor,
     slide_ids: Optional[torch.Tensor] = None,
     sc_slide_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-slide IDs for balanced sampling
+    sc_patient_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-sample patient IDs for patient CORAL
     n_epochs: int = 1000,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -159,6 +160,7 @@ def train_encoder(
     aug_scale_jitter: float = 0.2,
     # Slide adversary parameters
     adv_slide_weight: float = 50.0,
+    patient_coral_weight: float = 10.0,  # Weight for patient-level CORAL (cross-patient alignment)
     adv_warmup_epochs: int = 50,
     adv_ramp_epochs: int = 200,
     grl_alpha_max: float = 1.0,
@@ -220,6 +222,8 @@ def train_encoder(
         slide_ids = slide_ids.to(device)
     if sc_slide_ids is not None:
         sc_slide_ids = sc_slide_ids.to(device)
+    if sc_patient_ids is not None:
+        sc_patient_ids = sc_patient_ids.to(device)
 
     # Normalize ST coordinates (pose-invariant)
     # st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
@@ -317,6 +321,16 @@ def train_encoder(
         else:
             print(f"[VICReg] SC slide balancing: disabled (all SC pooled)")
 
+        # Report patient CORAL status
+        if sc_patient_ids is not None:
+            n_patients = len(torch.unique(sc_patient_ids))
+            if n_patients > 1:
+                print(f"[VICReg] Patient CORAL: enabled ({n_patients} patients in SC)")
+            else:
+                print(f"[VICReg] Patient CORAL: disabled (only 1 patient in SC)")
+        else:
+            print(f"[VICReg] Patient CORAL: disabled (sc_patient_ids not provided)")
+
         # Build projector
         h_dim = model.n_embedding[-1]
         if vicreg_use_projector:
@@ -353,6 +367,8 @@ def train_encoder(
         print(f"  Augmentations: dropout={aug_gene_dropout}, noise={aug_gauss_std}, jitter={aug_scale_jitter}")
         print(f"  Adversary: weight={adv_slide_weight}, warmup={adv_warmup_epochs}, ramp={adv_ramp_epochs}")
         print("  CORAL: ST↔SC alignment enabled (on same z_cond used by adversary)")
+        if sc_patient_ids is not None:
+            print(f"  Patient CORAL: weight={patient_coral_weight} (aligns patients within SC domain)")
         print(f"  [GPT5.2-FIX] adv_representation_mode='{adv_representation_mode}', adv_use_layernorm={adv_use_layernorm}")
         if adv_representation_mode == 'ln_avg_aug':
             print("  [WARNING] Using legacy ln_avg_aug mode - this causes train/inference mismatch!")
@@ -361,6 +377,7 @@ def train_encoder(
 
         history_vicreg = {
             'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_adv': [], 'loss_coral': [],
+            'loss_patient_coral': [],  # NEW: Patient-level CORAL for cross-patient alignment
             'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
             'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': []
@@ -551,6 +568,37 @@ def train_encoder(
             if z_st.shape[0] > 8 and z_sc.shape[0] > 8:
                 loss_coral = coral_loss(z_st, z_sc)
 
+            # ========== NEW: Patient-level CORAL within SC ==========
+            loss_patient_coral = torch.tensor(0.0, device=device)
+            if sc_patient_ids is not None and is_sc.sum() > 16:
+                # Get SC indices in batch and their global positions
+                sc_batch_mask = is_sc
+                sc_global_idx = idx[sc_batch_mask] - n_st  # Convert to SC-local indices
+
+                # Get patient IDs for SC samples in this batch
+                batch_patient_ids = sc_patient_ids[sc_global_idx]
+                unique_patients = torch.unique(batch_patient_ids)
+
+                # Only compute if we have multiple patients in this batch
+                if len(unique_patients) >= 2:
+                    z_sc_batch = z_cond[sc_batch_mask]
+
+                    # Split by patient and compute pairwise CORAL
+                    patient_corals = []
+                    for i in range(len(unique_patients)):
+                        for j in range(i + 1, len(unique_patients)):
+                            p_i, p_j = unique_patients[i], unique_patients[j]
+                            mask_i = (batch_patient_ids == p_i)
+                            mask_j = (batch_patient_ids == p_j)
+
+                            if mask_i.sum() > 4 and mask_j.sum() > 4:
+                                z_pi = z_sc_batch[mask_i]
+                                z_pj = z_sc_batch[mask_j]
+                                patient_corals.append(coral_loss(z_pi, z_pj))
+
+                    if len(patient_corals) > 0:
+                        loss_patient_coral = torch.stack(patient_corals).mean()
+
             logits_adv = discriminator(grad_reverse(z_cond, alpha))
             loss_adv_enc = F.cross_entropy(logits_adv, s_batch)
 
@@ -584,7 +632,9 @@ def train_encoder(
                     ))
 
             coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
-            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral + local_w * loss_local
+            # Patient CORAL uses same ramp as domain CORAL
+            patient_coral_w = coral_w * patient_coral_weight if sc_patient_ids is not None else 0.0
+            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral + local_w * loss_local + patient_coral_w * loss_patient_coral
 
             
             # Optionally log encoder gradient norms before step
@@ -655,10 +705,11 @@ def train_encoder(
             # Logging
             if epoch % 50 == 0 or (epoch < 5 or epoch > (n_epochs - 25)):
                 local_str = f", Local={loss_local.item():.4f}" if use_local_align and epoch >= local_align_warmup else ""
+                patient_coral_str = f", PatCORAL={loss_patient_coral.item():.6f}" if sc_patient_ids is not None else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
                 print(f"Epoch {epoch}/{n_epochs} | "
                     f"Loss={loss_total.item():.4f} "
-                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{local_str}) | "
+                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{patient_coral_str}{local_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
                     f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}")
@@ -682,6 +733,7 @@ def train_encoder(
             history_vicreg['loss_vicreg'].append(loss_vicreg.item())
             history_vicreg['loss_adv'].append(loss_adv.item())
             history_vicreg['loss_coral'].append(loss_coral.item())
+            history_vicreg['loss_patient_coral'].append(loss_patient_coral.item() if sc_patient_ids is not None else 0.0)
             history_vicreg['loss_local'].append(loss_local.item() if use_local_align else 0.0)
             history_vicreg['vicreg_inv'].append(vicreg_stats['inv'])
             history_vicreg['vicreg_var'].append(vicreg_stats['var'])
