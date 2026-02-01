@@ -10841,6 +10841,16 @@ def train_stageC_diffusion_generator(
         # Run every epoch so curriculum promotion is responsive
         # (5 consecutive passes = 5 epochs per stage, not 25)
         run_fixed_eval = True
+
+        # Compute sigma_edm for evaluation (same logic as training loop)
+        use_resid_eval = curriculum_state.get('use_residual_diffusion', False)
+        sigma_resid_valid_eval = curriculum_state.get('sigma_resid_valid', False)
+        if use_resid_eval and sigma_resid_valid_eval:
+            sigma_edm_eval = curriculum_state.get('sigma_data_resid_locked',
+                             curriculum_state.get('sigma_data_resid', sigma_data))
+        else:
+            sigma_edm_eval = sigma_data
+
         if (fabric is None or fabric.is_global_zero) and use_st and run_fixed_eval:
             fixed_eval_sigmas = [0.05, 0.15, 0.40, 0.70, 1.20, 2.40]
 
@@ -11076,7 +11086,7 @@ def train_stageC_diffusion_generator(
                         V_t_p = V_target_fixed + sigma_p_3d * eps_p
                         V_t_p = V_t_p * mask_fixed.unsqueeze(-1).float()
                         
-                        x0_p = score_net.forward_edm(V_t_p, sigma_p, H_fixed, mask_fixed, sigma_data, self_cond=None)
+                        x0_p = score_net.forward_edm(V_t_p, sigma_p, H_fixed, mask_fixed, sigma_edm_eval, self_cond=None)
                         if isinstance(x0_p, tuple):
                             x0_p = x0_p[0]
                         
@@ -11145,7 +11155,7 @@ def train_stageC_diffusion_generator(
                 V_t_promo = V_t_promo * mask_fixed.unsqueeze(-1).float()
 
                 with torch.no_grad():
-                    x0_promo = score_net.forward_edm(V_t_promo, sigma_promo, H_fixed, mask_fixed, sigma_data, self_cond=None)
+                    x0_promo = score_net.forward_edm(V_t_promo, sigma_promo, H_fixed, mask_fixed, sigma_edm_eval, self_cond=None)
                     if isinstance(x0_promo, tuple):
                         x0_promo = x0_promo[0]
 
@@ -11658,7 +11668,7 @@ def train_stageC_diffusion_generator(
                         V_t_test = V_t_test * mask_fb.unsqueeze(-1).float()
                         
                         sigma_batch = torch.full((V_t_test.shape[0],), sigma_test, device=device)
-                        x0_pred_test = score_net.forward_edm(V_t_test, sigma_batch, H_fb, mask_fb, sigma_data, self_cond=None)
+                        x0_pred_test = score_net.forward_edm(V_t_test, sigma_batch, H_fb, mask_fb, sigma_edm_eval, self_cond=None)
                         if isinstance(x0_pred_test, tuple):
                             x0_pred_test = x0_pred_test[0]
                         
