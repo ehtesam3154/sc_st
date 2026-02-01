@@ -6893,22 +6893,22 @@ def train_stageC_diffusion_generator(
                                     # Two-pass self-conditioning for replacement branch
                                     with torch.no_grad():
                                         x0_pred_rep_0_result = score_net.forward_edm(
-                                            V_t, sigma_flat, H_rep, mask, sigma_data,
+                                            V_t, sigma_flat, H_rep, mask, sigma_edm,
                                             self_cond=None, return_debug=False
                                         )
                                         if isinstance(x0_pred_rep_0_result, tuple):
                                             x0_pred_rep_0 = x0_pred_rep_0_result[0]
                                         else:
                                             x0_pred_rep_0 = x0_pred_rep_0_result
-                                    
+
                                     x0_pred_rep_result = score_net.forward_edm(
-                                        V_t, sigma_flat, H_rep, mask, sigma_data,
+                                        V_t, sigma_flat, H_rep, mask, sigma_edm,
                                         self_cond=x0_pred_rep_0.detach(),
                                         return_debug=False
                                     )
                                 else:
                                     x0_pred_rep_result = score_net.forward_edm(
-                                        V_t, sigma_flat, H_rep, mask, sigma_data,
+                                        V_t, sigma_flat, H_rep, mask, sigma_edm,
                                         self_cond=None, return_debug=False
                                     )
                                 
@@ -9675,9 +9675,9 @@ def train_stageC_diffusion_generator(
 
                     with torch.autocast(device_type='cuda', dtype=amp_dtype):
  
-                        # Forward pass for view2
+                        # Forward pass for view2 - use sigma_edm for correct preconditioning
                         x0_pred_2_result = score_net.forward_edm(
-                            V_t_2, sigma_pair_ov, H_2, mask_2, sigma_data,  # Use sliced sigma_pair_ov
+                            V_t_2, sigma_pair_ov, H_2, mask_2, sigma_edm,
                             self_cond=None, return_debug=False
                         )
 
