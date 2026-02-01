@@ -263,38 +263,14 @@ class GEMSModel:
         st_coords: torch.Tensor,
         sc_gene_expr: torch.Tensor,
         slide_ids: Optional[torch.Tensor] = None,
-        sc_slide_ids: Optional[torch.Tensor] = None,
-        sc_patient_ids: Optional[torch.Tensor] = None,
         n_epochs: int = 1000,
         batch_size: int = 256,
         lr: float = 1e-3,
         outf: str = 'output',
-        # Multi-patient parameters
-        adv_slide_weight: float = 50.0,
-        patient_coral_weight: float = 10.0,
-        # Reproducibility
-        seed: Optional[int] = None,
-        use_best_checkpoint: bool = True,
     ):
         """
         Train shared encoder (Stage A) using fixed VICReg + adversary config.
         This is now the only supported Stage A path.
-
-        Args:
-            st_gene_expr: ST expression tensor (n_st, n_genes)
-            st_coords: ST coordinates tensor (n_st, 2)
-            sc_gene_expr: SC expression tensor (n_sc, n_genes)
-            slide_ids: ST slide IDs for balanced sampling (n_st,)
-            sc_slide_ids: SC slide IDs for per-slide balancing (n_sc,)
-            sc_patient_ids: SC patient IDs for patient-level CORAL (n_sc,)
-            n_epochs: Number of training epochs
-            batch_size: Batch size
-            lr: Learning rate
-            outf: Output directory
-            adv_slide_weight: Domain adversary weight
-            patient_coral_weight: Patient-level CORAL weight (cross-patient alignment)
-            seed: Random seed for reproducibility
-            use_best_checkpoint: Return best model by alignment instead of final
         """
         print("\n" + "="*60)
         print("STAGE A: Training Shared Encoder (VICReg + GRL)")
@@ -312,8 +288,6 @@ class GEMSModel:
             st_coords=st_coords,
             sc_gene_expr=sc_gene_expr,
             slide_ids=slide_ids,
-            sc_slide_ids=sc_slide_ids,
-            sc_patient_ids=sc_patient_ids,
             n_epochs=n_epochs,
             batch_size=batch_size,
             lr=lr,
@@ -335,8 +309,7 @@ class GEMSModel:
             aug_gauss_std=0.01,
             aug_scale_jitter=0.1,
             # Domain adversary
-            adv_slide_weight=adv_slide_weight,
-            patient_coral_weight=patient_coral_weight,
+            adv_slide_weight=50.0,
             adv_warmup_epochs=50,
             adv_ramp_epochs=200,
             grl_alpha_max=1.0,
@@ -354,9 +327,6 @@ class GEMSModel:
             local_align_bidirectional=True,
             local_align_weight=4.0,
             local_align_tau_z=0.07,
-            # Reproducibility
-            seed=seed,
-            use_best_checkpoint=use_best_checkpoint,
             return_aux=True
         )
 

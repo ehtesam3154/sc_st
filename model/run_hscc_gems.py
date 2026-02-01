@@ -14,7 +14,7 @@ import seaborn as sns
 import utils_et as uet
 import torch.distributed as dist
 from scipy.ndimage import gaussian_filter1d
-from ssl_utils import filter_informative_genes, set_seed
+import os
 
 
 
@@ -278,69 +278,34 @@ def parse_args():
     parser.add_argument('--stageA_balanced_slides', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Balance batch sampling across slides in Stage A')
-
-    # ========== Multi-patient training ==========
-    parser.add_argument('--multipatient', action=argparse.BooleanOptionalAction, default=False,
-                        help='Enable multi-patient training (include P10 in SC domain)')
-    parser.add_argument('--patient_coral_weight', type=float, default=10.0,
-                        help='Patient-level CORAL weight for cross-patient alignment')
-    parser.add_argument('--stageA_seed', type=int, default=42,
-                        help='Random seed for Stage A reproducibility')
-    parser.add_argument('--use_best_checkpoint', action=argparse.BooleanOptionalAction, default=True,
-                        help='Use best checkpoint by alignment instead of final epoch')
-
-    # ========== Gene filtering ==========
-    parser.add_argument('--gene_filter', action=argparse.BooleanOptionalAction, default=True,
-                        help='Filter genes by sparsity and variance')
-    parser.add_argument('--gene_max_zero_frac', type=float, default=0.85,
-                        help='Max allowed zero fraction per gene (default 0.85)')
-    parser.add_argument('--gene_min_variance', type=float, default=0.01,
-                        help='Min required variance per gene (default 0.01)')
-
+    
     return parser.parse_args()
 
 
-def load_hscc_data(multipatient: bool = False):
+def load_hscc_data():
     """
     Load hSCC data: 2 ST slides for training, 1 ST slide for inference.
     Follows hSCC_gems.ipynb data loading structure.
-
-    Args:
-        multipatient: If True, also load P10 data for multi-patient training
-
-    Returns:
-        If multipatient=False: (scadata, stadata1, stadata2, stadata3)
-        If multipatient=True:  (scadata, stadata1, stadata2, stadata3, p10_st3, p10_sc)
     """
     print("Loading hSCC data...")
-
+    
     # Load SC data (used as test data, like ST2 in mouse_brain)
     # scadata = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/scP2.h5ad')
     # Treat ST3 as the "SC" domain for now (so we have GT coords)
     scadata = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/stP2rep3.h5ad')
 
+    
     # Load 3 ST datasets (use first 2 for training, 3rd for inference)
     stadata1 = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/stP2.h5ad')
     stadata2 = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/stP2rep2.h5ad')
     stadata3 = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/stP2rep3.h5ad')
-
-    all_data = [scadata, stadata1, stadata2, stadata3]
-
-    # Load P10 data if multi-patient mode
-    p10_st3 = None
-    p10_sc = None
-    if multipatient:
-        print("Loading P10 data for multi-patient training...")
-        p10_st3 = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/stP10rep3.h5ad')
-        p10_sc = sc.read_h5ad('/home/ehtesamul/sc_st/data/cSCC/processed/scP10.h5ad')
-        all_data.extend([p10_st3, p10_sc])
-
+    
     # Normalize and log transform
     print("Normalizing data...")
-    for adata in all_data:
+    for adata in [scadata, stadata1, stadata2, stadata3]:
         sc.pp.normalize_total(adata)
         sc.pp.log1p(adata)
-
+    
     # Create rough cell types for SC data (from hSCC_gems.ipynb)
     if 'level1_celltype' in scadata.obs.columns:
         print("Creating rough cell types...")
@@ -358,8 +323,7 @@ def load_hscc_data(multipatient: bool = False):
     else:
         print("No celltype metadata in scadata (ST3). Skipping celltype relabeling.")
 
-    if multipatient:
-        return scadata, stadata1, stadata2, stadata3, p10_st3, p10_sc
+    
     return scadata, stadata1, stadata2, stadata3
 
 
@@ -388,50 +352,15 @@ def main(args=None):
     fabric.launch()
 
     # ---------- Load data on all ranks (OK) ----------
-    p10_st3, p10_sc = None, None
-    if args.multipatient:
-        scadata, stadata1, stadata2, stadata3, p10_st3, p10_sc = load_hscc_data(multipatient=True)
-    else:
-        scadata, stadata1, stadata2, stadata3 = load_hscc_data(multipatient=False)
+    scadata, stadata1, stadata2, stadata3 = load_hscc_data()
 
     # ---------- Get common genes ----------
-    gene_sets = [set(scadata.var_names), set(stadata1.var_names),
-                 set(stadata2.var_names), set(stadata3.var_names)]
-    if args.multipatient:
-        gene_sets.extend([set(p10_st3.var_names), set(p10_sc.var_names)])
-
-    common = sorted(list(set.intersection(*gene_sets)))
-
-    if fabric.is_global_zero:
-        print(f"Common genes across all datasets: {len(common)}")
-
-    # ---------- Gene filtering ----------
-    if args.gene_filter and fabric.is_global_zero:
-        # Extract expression for filtering
-        def _extract(adata, genes):
-            X = adata[:, genes].X
-            return X.toarray() if hasattr(X, 'toarray') else X
-
-        sources_for_filter = {
-            'P2_ST1': _extract(stadata1, common),
-            'P2_ST2': _extract(stadata2, common),
-            'P2_ST3': _extract(stadata3, common),
-            'P2_SC': _extract(scadata, common),
-        }
-        if args.multipatient:
-            sources_for_filter['P10_ST3'] = _extract(p10_st3, common)
-            sources_for_filter['P10_SC'] = _extract(p10_sc, common)
-
-        common = filter_informative_genes(
-            sources_for_filter, common,
-            max_zero_frac=args.gene_max_zero_frac,
-            min_variance=args.gene_min_variance,
-            verbose=True
-        )
-
+    common = sorted(list(set(scadata.var_names) & set(stadata1.var_names) & 
+                         set(stadata2.var_names) & set(stadata3.var_names)))
     n_genes = len(common)
+    
     if fabric.is_global_zero:
-        print(f"Final gene count after filtering: {n_genes}")
+        print(f"Common genes across all datasets: {n_genes}")
 
     # ---------- Build model (same across ranks) ----------
     model = GEMSModel(
@@ -464,71 +393,28 @@ def main(args=None):
 
     # ---------- Stage A & B on rank-0 only ----------
     if fabric.is_global_zero:
-        # Set seed for reproducibility BEFORE any random operations
-        if args.stageA_seed is not None:
-            set_seed(args.stageA_seed)
-
         # Extract tensors
-
-        # SC expression - combine all SC domain sources
-        # In multi-patient mode: P2_ST3, P2_SC (scadata is P2_ST3), P10_ST3, P10_SC
-        # In single-patient mode: just scadata (P2_ST3)
-        X_p2_st3 = scadata[:, common].X
-        if hasattr(X_p2_st3, "toarray"): X_p2_st3 = X_p2_st3.toarray()
-
-        if args.multipatient:
-            X_p10_st3 = p10_st3[:, common].X
-            X_p10_sc = p10_sc[:, common].X
-            if hasattr(X_p10_st3, "toarray"): X_p10_st3 = X_p10_st3.toarray()
-            if hasattr(X_p10_sc, "toarray"): X_p10_sc = X_p10_sc.toarray()
-
-            # Stack all SC domain sources
-            sc_expr = torch.tensor(
-                np.vstack([X_p2_st3, X_p10_st3, X_p10_sc]),
-                dtype=torch.float32, device=fabric.device
-            )
-
-            # SC slide IDs for balanced sampling (0=P2_ST3, 1=P10_ST3, 2=P10_SC)
-            sc_slide_ids = torch.tensor(
-                np.concatenate([
-                    np.full(X_p2_st3.shape[0], 0, dtype=int),
-                    np.full(X_p10_st3.shape[0], 1, dtype=int),
-                    np.full(X_p10_sc.shape[0], 2, dtype=int),
-                ]),
-                dtype=torch.long, device=fabric.device
-            )
-
-            # SC patient IDs for patient-level CORAL (0=P2, 1=P10)
-            sc_patient_ids = torch.tensor(
-                np.concatenate([
-                    np.full(X_p2_st3.shape[0], 0, dtype=int),   # P2
-                    np.full(X_p10_st3.shape[0], 1, dtype=int),  # P10
-                    np.full(X_p10_sc.shape[0], 1, dtype=int),   # P10
-                ]),
-                dtype=torch.long, device=fabric.device
-            )
-
-            print(f"[Multi-patient] SC domain: P2_ST3({X_p2_st3.shape[0]}) + P10_ST3({X_p10_st3.shape[0]}) + P10_SC({X_p10_sc.shape[0]})")
-        else:
-            sc_expr = torch.tensor(X_p2_st3, dtype=torch.float32, device=fabric.device)
-            sc_slide_ids = None
-            sc_patient_ids = None
-
+        
+        # SC expression
+        X_sc = scadata[:, common].X
+        if hasattr(X_sc, "toarray"): X_sc = X_sc.toarray()
+        sc_expr = torch.tensor(X_sc, dtype=torch.float32, device=fabric.device)
+        
         # ST expression from 2 training slides (stadata1, stadata2)
         X_st1 = stadata1[:, common].X
         X_st2 = stadata2[:, common].X
         if hasattr(X_st1, "toarray"): X_st1 = X_st1.toarray()
         if hasattr(X_st2, "toarray"): X_st2 = X_st2.toarray()
-
+        
         # Combine training ST data
         st_expr = torch.tensor(np.vstack([X_st1, X_st2]), dtype=torch.float32, device=fabric.device)
-
+        
         # ST coordinates from 2 training slides
         st_coords1 = stadata1.obsm['spatial']
         st_coords2 = stadata2.obsm['spatial']
-        st_coords_raw = torch.tensor(np.vstack([st_coords1, st_coords2]),
+        st_coords_raw = torch.tensor(np.vstack([st_coords1, st_coords2]), 
                                      dtype=torch.float32, device=fabric.device)
-
+        
         # Slide IDs (0 for slide1, 1 for slide2)
         slide_ids = torch.tensor(
             np.concatenate([
@@ -618,18 +504,10 @@ def main(args=None):
                     st_coords=st_coords,
                     sc_gene_expr=sc_expr,
                     slide_ids=slide_ids,
-                    sc_slide_ids=sc_slide_ids,
-                    sc_patient_ids=sc_patient_ids,
                     n_epochs=stageA_epochs,
                     batch_size=256,
                     lr=1e-3,
                     outf=outdir,
-                    # Multi-patient parameters
-                    adv_slide_weight=args.adv_slide_weight,
-                    patient_coral_weight=args.patient_coral_weight,
-                    # Reproducibility
-                    seed=args.stageA_seed,
-                    use_best_checkpoint=args.use_best_checkpoint,
                 )
 
 
