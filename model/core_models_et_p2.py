@@ -5797,7 +5797,8 @@ def train_stageC_diffusion_generator(
                     gate_hi_score = None
                     if (EXP_SCORE_HI_BOOST or EXP_SCORE_FX_HI):
                         with torch.no_grad():
-                            c_skip_hi = (sigma_data ** 2) / (sigma_flat ** 2 + sigma_data ** 2 + 1e-12)
+                            # Use sigma_edm (= sigma_data_resid in residual mode) for correct c_skip
+                            c_skip_hi = (sigma_edm ** 2) / (sigma_flat ** 2 + sigma_edm ** 2 + 1e-12)
                             noise_score_hi = -torch.log(c_skip_hi + 1e-12)  # (B,)
                             score_hi_gate.update(noise_score_hi)
                             gate_hi_score = score_hi_gate.gate(noise_score_hi, torch.ones_like(noise_score_hi))
@@ -6009,9 +6010,9 @@ def train_stageC_diffusion_generator(
                     
                     if EXP_SCORE_FX_HI and use_edm:
                         with torch.autocast(device_type='cuda', enabled=False):
-                            # Get EDM scalars for this batch
+                            # Get EDM scalars for this batch - use sigma_edm for correct preconditioning
                             sigma_flat_fx = sigma_t.view(-1).float()
-                            c_skip_fx, c_out_fx, _, _ = uet.edm_precond(sigma_flat_fx, sigma_data)
+                            c_skip_fx, c_out_fx, _, _ = uet.edm_precond(sigma_flat_fx, sigma_edm)
                             c_skip_fx = c_skip_fx.view(-1, 1, 1)  # (B, 1, 1)
                             c_out_fx = c_out_fx.view(-1, 1, 1)    # (B, 1, 1)
                             
@@ -6070,8 +6071,8 @@ def train_stageC_diffusion_generator(
                     
                     if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero) and use_edm:
                         with torch.no_grad():
-                            # Compute noise_score locally (same formula as later in the code)
-                            c_skip_debug = (sigma_data ** 2) / (sigma_flat ** 2 + sigma_data ** 2 + 1e-12)
+                            # Compute noise_score locally - use sigma_edm for correct c_skip
+                            c_skip_debug = (sigma_edm ** 2) / (sigma_flat ** 2 + sigma_edm ** 2 + 1e-12)
                             ns = -torch.log(c_skip_debug + 1e-12)  # (B,) higher = noisier
 
                             # 3 bins: low/mid/high noise by quantiles
@@ -6773,9 +6774,10 @@ def train_stageC_diffusion_generator(
                     
                     if apply_ctx:
                         # ===== COMPUTE SNR GATING =====
+                        # Use sigma_edm for correct SNR in residual mode
                         sigma_flat_ctx = sigma_flat if use_edm else torch.exp(4.0 * t_norm)
                         sigma_sq = sigma_flat_ctx ** 2
-                        snr_w = (sigma_data**2 / (sigma_sq + sigma_data**2)).detach().float()
+                        snr_w = (sigma_edm**2 / (sigma_sq + sigma_edm**2)).detach().float()
                         if snr_w.dim() == 0:
                             snr_w = snr_w.unsqueeze(0)
                         
@@ -7123,14 +7125,14 @@ def train_stageC_diffusion_generator(
                 # ==============================================================================
                 # COMPUTE NOISE METRIC FOR ADAPTIVE GATING
                 # ==============================================================================
-                # noise = -log(c_skip) where c_skip = sigma_data^2 / (sigma^2 + sigma_data^2)
+                # noise = -log(c_skip) where c_skip = sigma_edm^2 / (sigma^2 + sigma_edm^2)
                 # Higher noise score = noisier sample (c_skip closer to 0)
-                # This is dataset-independent because c_skip is normalized by sigma_data
-                
+                # Use sigma_edm (= sigma_data_resid in residual mode) for correct gating
+
                 if use_edm:
                     with torch.no_grad():
                         sigma_flat_gate = sigma_t.view(-1)  # (B,)
-                        c_skip_b = (sigma_data ** 2) / (sigma_flat_gate ** 2 + sigma_data ** 2 + 1e-12)
+                        c_skip_b = (sigma_edm ** 2) / (sigma_flat_gate ** 2 + sigma_edm ** 2 + 1e-12)
                         noise_score = -torch.log(c_skip_b + 1e-12)  # (B,) higher = noisier
                         
                         # Base gate from CFG dropout
@@ -7496,9 +7498,9 @@ def train_stageC_diffusion_generator(
                     
                     if use_edm and WEIGHTS.get('gram_learn', 0) > 0:
                         with torch.autocast(device_type='cuda', enabled=False):
-                            # Get preconditioning scalars
+                            # Get preconditioning scalars - use sigma_edm for correct c_skip
                             sigma_flat_gl = sigma_t.view(-1).float()
-                            c_skip_gl, c_out_gl, _, _ = uet.edm_precond(sigma_flat_gl, sigma_data)
+                            c_skip_gl, c_out_gl, _, _ = uet.edm_precond(sigma_flat_gl, sigma_edm)
                             c_skip_1d = c_skip_gl.view(-1)  # (B,)
                             c_out_1d = c_out_gl.view(-1).clamp(min=1e-6)  # (B,)
                             
@@ -7697,8 +7699,9 @@ def train_stageC_diffusion_generator(
                         
                         if use_edm and WEIGHTS.get('out_scale', 0) > 0:
                             with torch.autocast(device_type='cuda', enabled=False):
+                                # Use sigma_edm for correct c_skip/c_out in residual mode
                                 sigma_flat_f = sigma_flat.float()
-                                c_skip_b, c_out_b, c_in_b, _ = uet.edm_precond(sigma_flat_f, sigma_data)
+                                c_skip_b, c_out_b, c_in_b, _ = uet.edm_precond(sigma_flat_f, sigma_edm)
                                 # c_skip_b, c_out_b: (B, 1, 1)
                                 
                                 # Center noisy input and clean target in the SAME way as V_geom
@@ -9927,8 +9930,8 @@ def train_stageC_diffusion_generator(
                             # Only for samples where σ > σ_switch
                             # ============================================================
                             if n_hi > 0:
-                                # Compute EDM preconditioning for ALL samples (needed for indexing)
-                                c_skip_ov, c_out_ov, c_in_ov, _ = uet.edm_precond(sigma_pair_ov, sigma_data)
+                                # Compute EDM preconditioning for ALL samples - use sigma_edm
+                                c_skip_ov, c_out_ov, c_in_ov, _ = uet.edm_precond(sigma_pair_ov, sigma_edm)
                                 # c_skip_ov: (B,) -> expand to (B, 1, 1)
                                 c_skip_ov_3d = c_skip_ov.view(-1, 1, 1)
                                 c_out_ov_3d = c_out_ov.view(-1, 1, 1)
