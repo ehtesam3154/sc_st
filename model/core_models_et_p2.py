@@ -8467,35 +8467,45 @@ def train_stageC_diffusion_generator(
                         if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc:
                             with torch.no_grad():
                                 print(f"\n[DEBUG-GEN-VS-DIFF] Step {global_step} - Generator vs Diffusion neighbor structure:")
-                                
+
                                 # Get generator output
                                 V_gen_debug = generator(H_train, mask)
-                                
+
+                                # In residual mode, x0_pred is R_pred (residual), not V
+                                # We need to compute V_final = V_base + R_pred for fair comparison
+                                if use_resid and 'V_base' in dir() and V_base is not None:
+                                    V_diff_debug = V_base + x0_pred  # Compose: V = V_base + R
+                                    diff_label = "Diffusion (V_base+R)"
+                                else:
+                                    V_diff_debug = x0_pred
+                                    diff_label = "Diffusion"
+
                                 # Compute k-NN Jaccard for both
                                 k = 15
-                                for name, V_test in [("Generator", V_gen_debug), ("Diffusion", x0_pred)]:
+                                for name, V_test in [("Generator", V_gen_debug), (diff_label, V_diff_debug)]:
                                     # Sample a few points from batch
                                     b_idx = 0
                                     m = mask[b_idx]
                                     valid_idx = m.nonzero(as_tuple=True)[0]
-                                    
+
                                     if len(valid_idx) > 20:
                                         v_test = V_test[b_idx:b_idx+1]
                                         v_tgt = V_target[b_idx:b_idx+1]
                                         m_batch = mask[b_idx:b_idx+1]
-                                        
+
                                         jaccard = uet.knn_jaccard_soft(v_test, v_tgt, m_batch, k=k)
                                         print(f"  {name}: k={k} Jaccard={jaccard.item():.4f}")
-                                
+
                                 # Per-sigma breakdown for diffusion
                                 for lo, hi in [(0.0, 0.3), (0.3, 1.0), (1.0, float('inf'))]:
                                     in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
                                     if in_bin.any() and in_bin.sum() >= 2:
+                                        # Use V_diff_debug (composed) for fair comparison
                                         jaccard_bin = uet.knn_jaccard_soft(
-                                            x0_pred[in_bin][:2], V_target[in_bin][:2], 
+                                            V_diff_debug[in_bin][:2], V_target[in_bin][:2],
                                             mask[in_bin][:2], k=k
                                         )
-                                        print(f"  Diffusion σ∈[{lo:.1f},{hi:.1f}): Jaccard={jaccard_bin.item():.4f}")
+                                        print(f"  {diff_label} σ∈[{lo:.1f},{hi:.1f}): Jaccard={jaccard_bin.item():.4f}")
 
 
                         # ========== COMPREHENSIVE GEOMETRY DIAGNOSTICS ==========
