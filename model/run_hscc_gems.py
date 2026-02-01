@@ -91,8 +91,8 @@ def parse_args():
     parser.add_argument('--use_legacy_curriculum', action=argparse.BooleanOptionalAction, default=False,
                         help='Use legacy 7-stage curriculum [0.3,...,17.0] instead of new 3-stage [1,2,3]')
     # ========== DATA-DEPENDENT SIGMA CAP ==========
-    parser.add_argument('--sigma_cap_safe_mult', type=float, default=3.0,
-                        help='Safety cap multiplier: σ_cap_safe = mult × σ0 (default 3.0, allows 3×σ_data)')
+    parser.add_argument('--sigma_cap_safe_mult', type=float, default=None,
+                        help='Safety cap multiplier: σ_cap_safe = mult × σ0. If None, auto-computed from curriculum_target_stage+1 (e.g., stage 3 → 4.0×σ_data)')
     parser.add_argument('--sigma_cap_abs_max', type=float, default=None,
                         help='Optional absolute max σ_cap (e.g., 1.5). None = no absolute limit.')
     parser.add_argument('--sigma_cap_abs_min', type=float, default=None,
@@ -341,7 +341,25 @@ def main(args=None):
     stageC_batch = args.batch_size
     lr = args.lr
     outdir = args.outdir
-    
+
+    # ========== AUTO-COMPUTE sigma_cap_safe_mult FROM curriculum_target_stage ==========
+    # The safety cap must be >= the target stage multiplier to allow full training
+    # Stage multipliers are [1.0, 2.0, 3.0, 4.0] for stages 0, 1, 2, 3
+    curriculum_mults = [1.0, 2.0, 3.0, 4.0]
+    target_stage_mult = curriculum_mults[min(args.curriculum_target_stage, len(curriculum_mults)-1)]
+
+    if args.sigma_cap_safe_mult is None:
+        # Auto-compute: set to target stage multiplier (allows training at that stage)
+        args.sigma_cap_safe_mult = target_stage_mult
+        print(f"[AUTO] sigma_cap_safe_mult set to {args.sigma_cap_safe_mult:.1f} (from curriculum_target_stage={args.curriculum_target_stage})")
+    elif args.sigma_cap_safe_mult < target_stage_mult:
+        # User-specified value is too low - WARN
+        print(f"\n{'='*70}")
+        print(f"[WARNING] sigma_cap_safe_mult={args.sigma_cap_safe_mult:.1f} < curriculum_target_stage mult={target_stage_mult:.1f}")
+        print(f"          This will PREVENT training from reaching the target stage's full σ_cap!")
+        print(f"          Consider setting --sigma_cap_safe_mult {target_stage_mult:.1f} or higher.")
+        print(f"{'='*70}\n")
+
     # ========== NEW: Auto-switch to anchored output directory if anchor training enabled ==========
     if args.anchor_train and 'anchored' not in outdir:
         outdir = outdir.replace('gems_hscc_2slides_output', 'gems_hscc_2slides_output_anchored')

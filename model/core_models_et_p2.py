@@ -2703,7 +2703,7 @@ def train_stageC_diffusion_generator(
     curriculum_early_stop: bool = True,
     use_legacy_curriculum: bool = False,
     # ========== DATA-DEPENDENT SIGMA CAP ==========
-    sigma_cap_safe_mult: float = 3.0,      # σ_cap_safe = mult × σ0 (allows 3×σ_data by default)
+    sigma_cap_safe_mult: float = None,     # σ_cap_safe = mult × σ0. If None, uses target stage mult (e.g., stage 3 → 4.0)
     sigma_cap_abs_max: float = None,       # Optional absolute ceiling
     sigma_cap_abs_min: float = None,       # Optional absolute floor
     # NEW: EDM parameters
@@ -2785,6 +2785,15 @@ def train_stageC_diffusion_generator(
     # Demotion enabled as safety valve if failing badly at higher stages
     # Legacy 7-stage: uses absolute sigma values [0.3, 0.9, ..., 17.0]
     # =========================================================================
+
+    # Auto-compute sigma_cap_safe_mult if not provided
+    _curriculum_mults = [1.0, 2.0, 3.0, 4.0]
+    if sigma_cap_safe_mult is None:
+        # Default: use target stage multiplier to allow full training at target stage
+        _target_mult = _curriculum_mults[min(curriculum_target_stage, len(_curriculum_mults)-1)]
+        sigma_cap_safe_mult = _target_mult
+        print(f"[CURRICULUM] Auto-computed sigma_cap_safe_mult={sigma_cap_safe_mult:.1f} from target_stage={curriculum_target_stage}")
+
     curriculum_state = {
         # NEW 4-stage curriculum (default): [1.0, 2.0, 3.0, 4.0] × σ_data
         # Stage 0: 1× sigma0 (warmup)
@@ -4404,9 +4413,9 @@ def train_stageC_diffusion_generator(
 
         # =====================================================================
         # Data-dependent safety cap (with backward compatibility)
-        # Priority: sigma_cap_safe_mult (new) > sigma_cap_safe (old) > default 3.0
+        # Priority: sigma_cap_safe_mult (new) > sigma_cap_safe (old) > default from target_stage
         # =====================================================================
-        if 'sigma_cap_safe_mult' in curriculum_state:
+        if 'sigma_cap_safe_mult' in curriculum_state and curriculum_state['sigma_cap_safe_mult'] is not None:
             # NEW: multiplicative safety cap
             sigma_cap_safe_mult = curriculum_state['sigma_cap_safe_mult']
             sigma_cap_safe_abs = sigma_cap_safe_mult * sigma0
@@ -4414,8 +4423,11 @@ def train_stageC_diffusion_generator(
             # OLD: absolute safety cap (backward compatibility for old checkpoints)
             sigma_cap_safe_abs = curriculum_state['sigma_cap_safe']
         else:
-            # DEFAULT: 3.0 × sigma0
-            sigma_cap_safe_abs = 3.0 * sigma0
+            # DEFAULT: Use target stage multiplier to allow full training at target
+            target_stage = curriculum_state.get('target_stage', len(curriculum_state.get('sigma_cap_mults', [1,2,3,4])) - 1)
+            mults = curriculum_state.get('sigma_cap_mults', [1.0, 2.0, 3.0, 4.0])
+            default_mult = mults[min(target_stage, len(mults)-1)]
+            sigma_cap_safe_abs = default_mult * sigma0
 
         # Apply safety cap to get target
         sigma_cap_target = min(sigma_cap_stage, sigma_cap_safe_abs)
