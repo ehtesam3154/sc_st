@@ -7,6 +7,10 @@ Phase 1 only: Stage A + Stage B + Stage C diffusion training.
 No finetuning, no inference.
 
 Usage:
+    # With YAML config:
+    python hscc_p2_all.py --config configs/hscc_p2_all.yaml
+
+    # Or with CLI args:
     python hscc_p2_all.py --devices 2 --stageC_epochs 200
 """
 
@@ -14,6 +18,7 @@ import os
 import sys
 import argparse
 import shutil
+import yaml
 from pathlib import Path
 from datetime import datetime
 
@@ -59,8 +64,19 @@ def ensure_disk_space(path, min_gb=10.0):
         )
 
 
+def load_config(config_path: str) -> dict:
+    """Load YAML config file."""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config if config else {}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='GEMS Training - P2 All (Multi-patient Stage A)')
+
+    # Config file (loaded first, then CLI args override)
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to YAML config file')
 
     # Training config
     parser.add_argument('--devices', type=int, default=2)
@@ -225,7 +241,20 @@ def parse_args():
     # Balanced slide sampling
     parser.add_argument('--stageA_balanced_slides', action=argparse.BooleanOptionalAction, default=True)
 
-    return parser.parse_args()
+    # First parse to check for config file
+    args, remaining = parser.parse_known_args()
+
+    # If config file provided, load it and set as defaults
+    if args.config is not None:
+        config = load_config(args.config)
+        # Convert YAML keys (may use underscores) to match argparse
+        parser.set_defaults(**config)
+        print(f"[CONFIG] Loaded config from: {args.config}")
+
+    # Re-parse with config as defaults (CLI args override config)
+    args = parser.parse_args()
+
+    return args
 
 
 def load_multipatient_data():

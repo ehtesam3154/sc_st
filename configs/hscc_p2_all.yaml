@@ -1,0 +1,115 @@
+# ============================================================================
+# HSCC P2 All - Multi-patient Phase 1 Training Config
+# ============================================================================
+# Usage:
+#   cd ~/sc_st/model
+#   PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+#       hscc_p2_all.py --config ../configs/hscc_p2_all.yaml 2>&1 | tee hscc_p2all.log
+#
+# CLI args override config values, e.g.:
+#   hscc_p2_all.py --config ../configs/hscc_p2_all.yaml --stageC_epochs 400
+# ============================================================================
+
+# ========== HARDWARE ==========
+devices: 4
+precision: "16-mixed"
+seed: 42
+
+# ========== TRAINING ==========
+stageA_epochs: 1200
+stageC_epochs: 300
+batch_size: 32
+lr: 1.0e-4
+num_st_samples: 4500
+outdir: gems_hscc_p2all_v1
+
+# ========== GENERATOR ==========
+gen_n_blocks: 6
+gen_isab_m: 128
+
+# ========== SELF-CONDITIONING ==========
+self_cond_mode: standard
+
+# ========== CURRICULUM ==========
+curriculum_target_stage: 3
+curriculum_min_epochs: 200
+curriculum_early_stop: true
+use_legacy_curriculum: false
+
+# ========== MINISET SAMPLING ==========
+pool_mult: 1.5
+stochastic_tau: 1.0
+
+# ========== RESIDUAL DIFFUSION ==========
+use_residual_diffusion: true
+
+# ========== PAIRED OVERLAP ==========
+train_pair_overlap: true
+pair_overlap_alpha: 0.5
+pair_overlap_min_I: 20
+overlap_loss_weight_shape: 1.0
+overlap_loss_weight_scale: 0.5
+overlap_loss_weight_kl: 1.0
+overlap_kl_tau: 0.5
+overlap_sigma_thresh: 1.0
+overlap_debug_every: 100
+
+# ========== STAGE A (VICReg + Adversary) ==========
+# Note: PATIENT_CORAL_WEIGHT and ADV_SLIDE_WEIGHT are set in hscc_p2_all.py directly
+stageA_obj: vicreg_adv
+vicreg_lambda_inv: 25.0
+vicreg_lambda_var: 25.0
+vicreg_lambda_cov: 1.0
+vicreg_gamma: 1.0
+vicreg_eps: 1.0e-4
+vicreg_project_dim: 256
+vicreg_use_projector: true
+vicreg_float32_stats: true
+
+# Expression augmentations
+aug_gene_dropout: 0.2
+aug_gauss_std: 0.01
+aug_scale_jitter: 0.2
+
+# Adversary
+grl_alpha_max: 1.0
+disc_hidden: 256
+disc_dropout: 0.1
+stageA_balanced_slides: true
+
+# ========== GEOMETRY ==========
+use_canonicalize: true
+use_dist_bias: true
+dist_bins: 24
+dist_head_shared: true
+use_angle_features: true
+angle_bins: 8
+knn_k: 12
+self_conditioning: true
+sc_feat_mode: concat
+landmarks_L: 16
+
+# ========== ANCHORED TRAINING (disabled by default) ==========
+anchor_train: false
+# anchor_p_uncond: 0.50
+# anchor_frac_min: 0.10
+# anchor_frac_max: 0.30
+
+# ========== CONTEXT REPLACEMENT ==========
+ctx_replace_variant: permute
+ctx_loss_weight: 0.0
+ctx_replace_p: 0.5
+ctx_snr_thresh: 0.3
+
+# ========== EARLY STOPPING ==========
+enable_early_stop: false
+early_stop_min_epochs: 12
+early_stop_patience: 6
+early_stop_threshold: 0.01
+
+# ========== COMPETITOR TRAINING (disabled by default) ==========
+compete_train: false
+
+# ========== RESUME (uncomment to resume from checkpoint) ==========
+# resume_stageC_ckpt: /home/ehtesamul/sc_st/model/gems_hscc_p2all_v1/phase1_st_checkpoint.pt
+# skip_stageA: true
