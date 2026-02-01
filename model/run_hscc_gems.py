@@ -14,7 +14,7 @@ import seaborn as sns
 import utils_et as uet
 import torch.distributed as dist
 from scipy.ndimage import gaussian_filter1d
-import os
+from ssl_utils import filter_informative_genes
 
 
 
@@ -355,12 +355,29 @@ def main(args=None):
     scadata, stadata1, stadata2, stadata3 = load_hscc_data()
 
     # ---------- Get common genes ----------
-    common = sorted(list(set(scadata.var_names) & set(stadata1.var_names) & 
-                         set(stadata2.var_names) & set(stadata3.var_names)))
-    n_genes = len(common)
-    
+    # Only need ST1, ST2, ST3 - scadata is same as stadata3 (stP2rep3.h5ad)
+    common = sorted(list(set(stadata1.var_names) & set(stadata2.var_names) & set(stadata3.var_names)))
+
     if fabric.is_global_zero:
-        print(f"Common genes across all datasets: {n_genes}")
+        print(f"Common genes across ST1, ST2, ST3: {len(common)}")
+
+    # ---------- Filter to informative genes ----------
+    # Keep genes with <85% zeros AND variance > 0.01 in ALL ST slides
+    # Done on all ranks to ensure consistent n_genes for model building
+    def _extract(adata, genes):
+        X = adata[:, genes].X
+        return X.toarray() if hasattr(X, 'toarray') else X
+
+    sources_for_filter = {
+        'ST1': _extract(stadata1, common),
+        'ST2': _extract(stadata2, common),
+        'ST3': _extract(stadata3, common),
+    }
+    common = filter_informative_genes(sources_for_filter, common, verbose=fabric.is_global_zero)
+
+    n_genes = len(common)
+    if fabric.is_global_zero:
+        print(f"Genes after filtering: {n_genes}")
 
     # ---------- Build model (same across ranks) ----------
     model = GEMSModel(
