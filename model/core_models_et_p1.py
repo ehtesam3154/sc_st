@@ -186,6 +186,8 @@ def train_encoder(
     local_align_tau_z: float = 0.1,
     local_align_bidirectional: bool = True,
     local_align_warmup: int = 100,  # Start after discriminator warmup
+    # ========== Reproducibility ==========
+    seed: Optional[int] = None,  # Random seed for reproducibility
 ):
 
     """
@@ -211,7 +213,24 @@ def train_encoder(
         mmdbatch: MMD batch fraction
         device: torch device
         outf: output directory
+        seed: random seed for reproducibility (sets torch, numpy, python random)
     """
+    # ========== Set random seeds for reproducibility ==========
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        # For full determinism (may slow down training)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[Stage A] Random seed set to {seed} for reproducibility")
+        print(f"  NOTE: For full reproducibility, also call ssl_utils.set_seed({seed})")
+        print(f"        BEFORE creating the encoder to seed weight initialization.")
+
     model = model.to(device)
     model.train()
     

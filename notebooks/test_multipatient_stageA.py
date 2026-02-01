@@ -17,9 +17,17 @@ import sys
 sys.path.insert(0, '/home/ehtesamul/sc_st/model')
 
 from core_models_et_p1 import SharedEncoder, train_encoder
+from ssl_utils import set_seed
 import utils_et as uet
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# ===================================================================
+# SET SEED FOR REPRODUCIBILITY
+# ===================================================================
+# Must be set BEFORE creating the encoder to seed weight initialization
+SEED = 42
+set_seed(SEED)
 
 print("="*70)
 print("MULTI-PATIENT STAGE A: VICReg + Domain Adversary")
@@ -221,6 +229,8 @@ encoder, projector, discriminator, hist = train_encoder(
     local_align_bidirectional=True,
     local_align_weight=4.0,
     local_align_tau_z=0.07,
+    # Reproducibility
+    seed=SEED,
 )
 
 print("\n✓ VICReg Stage A training complete!")
@@ -238,6 +248,9 @@ print("EVALUATION: Domain Mixing")
 print("="*70)
 
 N_MAX = 2000
+
+# Reset seed for reproducible evaluation
+set_seed(SEED)
 
 def subsample(X, n_max, device):
     if not isinstance(X, torch.Tensor):

@@ -13,6 +13,40 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from typing import Tuple, Dict, Optional
 import math
+import random
+import numpy as np
+
+
+# ==============================================================================
+# REPRODUCIBILITY
+# ==============================================================================
+
+def set_seed(seed: int, deterministic: bool = True) -> None:
+    """
+    Set random seeds for reproducibility.
+
+    Call this BEFORE creating any models or data loaders.
+
+    Args:
+        seed: Random seed to use
+        deterministic: If True, also sets CUDA to deterministic mode (slower but reproducible)
+
+    Example:
+        from ssl_utils import set_seed
+        set_seed(42)
+        encoder = SharedEncoder(...)  # Now initialized with seed 42
+        train_encoder(model=encoder, ..., seed=42)  # Training also seeded
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"[set_seed] Random seed set to {seed} (deterministic={deterministic})")
 
 
 # ==============================================================================
