@@ -231,6 +231,8 @@ encoder, projector, discriminator, hist = train_encoder(
     local_align_tau_z=0.07,
     # Reproducibility
     seed=SEED,
+    # Use best checkpoint (by alignment score) instead of final epoch
+    use_best_checkpoint=True,
 )
 
 print("\n✓ VICReg Stage A training complete!")

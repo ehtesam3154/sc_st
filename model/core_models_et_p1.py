@@ -188,6 +188,8 @@ def train_encoder(
     local_align_warmup: int = 100,  # Start after discriminator warmup
     # ========== Reproducibility ==========
     seed: Optional[int] = None,  # Random seed for reproducibility
+    # ========== Best checkpoint ==========
+    use_best_checkpoint: bool = True,  # Return best model (by alignment) instead of final
 ):
 
     """
@@ -401,7 +403,16 @@ def train_encoder(
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
             'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': []
         }
-        
+
+        # ========== BEST CHECKPOINT TRACKING ==========
+        # Track best alignment based on combined CORAL losses
+        # Lower = better alignment between domains and patients
+        best_alignment_score = float('inf')
+        best_epoch = 0
+        best_encoder_state = None
+        best_projector_state = None
+        best_discriminator_state = None
+
         # Print local alignment config
         if use_local_align:
             print(f"  LOCAL ALIGN: weight={local_align_weight}, tau_x={local_align_tau_x}, "
@@ -573,6 +584,35 @@ def train_encoder(
                     epoch=epoch,
                     verbose=(epoch % 100 == 0)
                 )
+
+            # ========== DISCRIMINATOR HEALTH CHECK & REVIVAL ==========
+            # If discriminator collapses (always predicts one class), revive it
+            if disc_diag:
+                acc_st = disc_diag.get('disc_acc_class0', 0.5)
+                acc_sc = disc_diag.get('disc_acc_class1', 0.5)
+                min_class_acc = min(acc_st, acc_sc)
+
+                # Discriminator is "dying" if one class accuracy < 0.1
+                if min_class_acc < 0.1 and epoch > adv_warmup_epochs:
+                    # Revival: extra training steps with fresh samples
+                    revival_steps = 20
+                    for _ in range(revival_steps):
+                        # Sample fresh batch
+                        revival_idx = torch.randperm(X_ssl.shape[0], device=device)[:batch_size]
+                        X_revival = X_ssl[revival_idx]
+                        s_revival = domain_ids[revival_idx]
+                        z_revival = model(X_revival).detach()
+                        if adv_use_layernorm:
+                            z_revival = F.layer_norm(z_revival, (z_revival.shape[1],))
+
+                        logits_revival = discriminator(z_revival)
+                        loss_revival = F.cross_entropy(logits_revival, s_revival)
+                        opt_disc.zero_grad(set_to_none=True)
+                        loss_revival.backward()
+                        opt_disc.step()
+
+                    if epoch % 50 == 0:
+                        print(f"  [REVIVAL] Disc collapsed (min_class_acc={min_class_acc:.3f}), did {revival_steps} extra steps")
 
 
             # (B) Train encoder to confuse discriminator via GRL
@@ -763,6 +803,22 @@ def train_encoder(
             history_vicreg['disc_acc_clean'].append(disc_acc_clean)  # NEW: track clean accuracy
             history_vicreg['grl_alpha'].append(alpha)
 
+            # ========== BEST CHECKPOINT SAVING ==========
+            # Only check after warmup when alignment losses are meaningful
+            if epoch >= adv_warmup_epochs + adv_ramp_epochs:
+                # Alignment score = CORAL + patient CORAL (lower = better)
+                alignment_score = loss_coral.item() + loss_patient_coral.item()
+
+                if alignment_score < best_alignment_score:
+                    best_alignment_score = alignment_score
+                    best_epoch = epoch
+                    best_encoder_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    if projector is not None:
+                        best_projector_state = {k: v.cpu().clone() for k, v in projector.state_dict().items()}
+                    best_discriminator_state = {k: v.cpu().clone() for k, v in discriminator.state_dict().items()}
+
+                    if epoch % 100 == 0:
+                        print(f"  [BEST] New best alignment at epoch {epoch}: CORAL={loss_coral.item():.6f}, PatCORAL={loss_patient_coral.item():.6f}")
 
             continue  # Skip geometry code, go to next epoch
 
@@ -1232,15 +1288,33 @@ def train_encoder(
     os.makedirs(outf, exist_ok=True)
     
     if stageA_obj == 'vicreg_adv':
+        # ========== RESTORE BEST CHECKPOINT IF AVAILABLE ==========
+        if use_best_checkpoint and best_encoder_state is not None:
+            print(f"\n[BEST CHECKPOINT] Restoring best model from epoch {best_epoch}")
+            print(f"  Best alignment score: {best_alignment_score:.6f}")
+            model.load_state_dict(best_encoder_state)
+            if projector is not None and best_projector_state is not None:
+                projector.load_state_dict(best_projector_state)
+            if best_discriminator_state is not None:
+                discriminator.load_state_dict(best_discriminator_state)
+        elif use_best_checkpoint:
+            print("\n[BEST CHECKPOINT] No checkpoint saved (training too short or warmup not reached)")
+            print("  Using final model instead")
+
         # Save VICReg history
         import json
         history_path = os.path.join(outf, 'stageA_vicreg_history.json')
         with open(history_path, 'w') as f:
             json.dump(history_vicreg, f, indent=2)
-        
+
         print("\n" + "="*70)
         print("VICReg Training Complete")
         print("="*70)
+        if use_best_checkpoint and best_encoder_state is not None:
+            print(f"Using BEST checkpoint from epoch {best_epoch}")
+            print(f"Best alignment score: {best_alignment_score:.6f}")
+        else:
+            print(f"Using FINAL model from epoch {n_epochs-1}")
         print(f"Final Loss: {history_vicreg['loss_total'][-1]:.4f}")
         print(f"Final VICReg: {history_vicreg['loss_vicreg'][-1]:.3f}")
         print(f"Final std mean: {history_vicreg['std_mean'][-1]:.3f}")
