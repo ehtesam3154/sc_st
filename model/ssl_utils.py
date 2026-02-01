@@ -50,6 +50,78 @@ def set_seed(seed: int, deterministic: bool = True) -> None:
 
 
 # ==============================================================================
+# GENE FILTERING
+# ==============================================================================
+
+def filter_informative_genes(
+    expression_arrays: dict,
+    gene_names: list,
+    max_zero_frac: float = 0.85,
+    min_variance: float = 0.01,
+    verbose: bool = True
+) -> list:
+    """
+    Filter genes to keep only informative ones across ALL data sources.
+
+    A gene is kept if it passes BOTH criteria in ALL sources:
+    1. Zero fraction < max_zero_frac (not too sparse)
+    2. Variance > min_variance (has signal)
+
+    Args:
+        expression_arrays: Dict mapping source name to numpy array (n_cells, n_genes)
+        gene_names: List of gene names corresponding to columns
+        max_zero_frac: Maximum allowed fraction of zeros (default 0.85 = keep if <85% zeros)
+        min_variance: Minimum required variance (default 0.01)
+        verbose: Print per-source statistics
+
+    Returns:
+        List of gene names that pass all filters in all sources
+
+    Example:
+        sources = {
+            'P2_ST1': X_st1,
+            'P2_ST2': X_st2,
+            'P10_ST3': X_p10_st3,
+            'P10_SC': X_p10_sc,
+        }
+        filtered_genes = filter_informative_genes(sources, common_genes)
+    """
+    n_genes = len(gene_names)
+    gene_mask = np.ones(n_genes, dtype=bool)
+
+    if verbose:
+        print(f"\n[Gene Filter] Filtering {n_genes} genes (max_zero={max_zero_frac}, min_var={min_variance})")
+
+    for name, X in expression_arrays.items():
+        if hasattr(X, 'toarray'):
+            X = X.toarray()
+
+        zero_frac = (X == 0).mean(axis=0)
+        variance = X.var(axis=0)
+
+        # Keep if <max_zero_frac zeros AND var > min_variance
+        sparse_ok = zero_frac < max_zero_frac
+        var_ok = variance > min_variance
+        source_mask = sparse_ok & var_ok
+
+        n_pass = source_mask.sum()
+        if verbose:
+            print(f"  {name}: {n_pass}/{n_genes} genes pass")
+
+        gene_mask = gene_mask & source_mask
+
+    # Apply filter
+    filtered_genes = [gene_names[i] for i in range(n_genes) if gene_mask[i]]
+    n_filtered = len(filtered_genes)
+
+    if verbose:
+        print(f"[Gene Filter] Final: {n_filtered}/{n_genes} genes pass ALL sources")
+        print(f"  Removed: {n_genes - n_filtered} low-quality genes")
+
+    return filtered_genes
+
+
+# ==============================================================================
 # DDP-SAFE GATHER LAYER (from Facebook VICReg)
 # ==============================================================================
 
