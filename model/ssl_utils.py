@@ -386,7 +386,130 @@ def sample_balanced_slide_indices(
 
     return indices
 
-    
+
+def sample_balanced_domain_and_slide_indices(
+    domain_ids: torch.Tensor,
+    st_slide_ids: torch.Tensor,
+    sc_slide_ids: Optional[torch.Tensor],
+    batch_size: int,
+    device: str = 'cuda'
+) -> torch.Tensor:
+    """
+    Sample indices with hierarchical balancing for multi-slide SC data.
+
+    1. First level: 50% ST, 50% SC (domain balancing)
+    2. Second level:
+       - Within ST: balance across ST slides (via st_slide_ids)
+       - Within SC: balance across SC slides (via sc_slide_ids)
+
+    Args:
+        domain_ids: (N,) long tensor - 0 for ST, 1 for SC (concatenated)
+        st_slide_ids: (n_st,) slide IDs for ST samples only
+        sc_slide_ids: (n_sc,) slide IDs for SC samples only, or None for single-pool SC
+        batch_size: target batch size (should be even)
+        device: device
+
+    Returns:
+        indices: (batch_size,) sampled global indices into X_ssl
+    """
+    st_mask = (domain_ids == 0)
+    sc_mask = (domain_ids == 1)
+
+    # Global indices for each domain
+    st_global_indices = torch.where(st_mask)[0]
+    sc_global_indices = torch.where(sc_mask)[0]
+
+    n_st = st_global_indices.shape[0]
+    n_sc = sc_global_indices.shape[0]
+
+    # Target: half batch from each domain
+    n_st_sample = batch_size // 2
+    n_sc_sample = batch_size - n_st_sample
+
+    # ========== Sample from ST domain (balanced across ST slides) ==========
+    st_local_idx = _sample_balanced_internal(st_slide_ids, n_st_sample, device)
+    st_batch_global = st_global_indices[st_local_idx]
+
+    # ========== Sample from SC domain (balanced across SC slides if provided) ==========
+    if sc_slide_ids is not None:
+        sc_local_idx = _sample_balanced_internal(sc_slide_ids, n_sc_sample, device)
+    else:
+        # No SC slide balancing - random sample from all SC
+        if n_sc >= n_sc_sample:
+            sc_local_idx = torch.randperm(n_sc, device=device)[:n_sc_sample]
+        else:
+            sc_local_idx = torch.randint(0, n_sc, (n_sc_sample,), device=device)
+
+    sc_batch_global = sc_global_indices[sc_local_idx]
+
+    # Combine and shuffle
+    indices = torch.cat([st_batch_global, sc_batch_global], dim=0)
+    indices = indices[torch.randperm(indices.numel(), device=device)]
+
+    # Debug: verify balance (1% of the time)
+    if torch.rand(1).item() < 0.01:
+        n_st_sampled = (domain_ids[indices] == 0).sum().item()
+        n_sc_sampled = (domain_ids[indices] == 1).sum().item()
+        print(f"[DOMAIN-BALANCE] ST={n_st_sampled}, SC={n_sc_sampled}")
+
+        if sc_slide_ids is not None:
+            sc_idx_local = indices[domain_ids[indices] == 1] - n_st
+            unique_sc_slides = torch.unique(sc_slide_ids)
+            sc_counts = [(sc_slide_ids[sc_idx_local] == s).sum().item() for s in unique_sc_slides]
+            print(f"[SC-SLIDE-BALANCE] Per-slide counts: {sc_counts}")
+
+    return indices
+
+
+def _sample_balanced_internal(
+    slide_ids: torch.Tensor,
+    n_samples: int,
+    device: str
+) -> torch.Tensor:
+    """
+    Internal helper: sample n_samples indices balanced across unique slide_ids.
+    Returns LOCAL indices (0 to len(slide_ids)-1).
+    """
+    unique_slides = torch.unique(slide_ids)
+    n_slides = len(unique_slides)
+
+    samples_per_slide = n_samples // n_slides
+    remainder = n_samples % n_slides
+
+    indices_list = []
+
+    for i, slide_id in enumerate(unique_slides):
+        slide_mask = (slide_ids == slide_id)
+        slide_local_indices = torch.nonzero(slide_mask, as_tuple=True)[0]
+
+        n_sample = samples_per_slide + (1 if i < remainder else 0)
+        if n_sample <= 0:
+            continue
+
+        if len(slide_local_indices) >= n_sample:
+            perm = torch.randperm(len(slide_local_indices), device=device)[:n_sample]
+            sampled = slide_local_indices[perm]
+        else:
+            # Sample with replacement
+            ridx = torch.randint(0, len(slide_local_indices), (n_sample,), device=device)
+            sampled = slide_local_indices[ridx]
+
+        indices_list.append(sampled)
+
+    if len(indices_list) == 0:
+        return torch.randint(0, len(slide_ids), (n_samples,), device=device)
+
+    result = torch.cat(indices_list, dim=0)
+
+    # Ensure exact count
+    if result.numel() > n_samples:
+        result = result[:n_samples]
+    elif result.numel() < n_samples:
+        extra = torch.randint(0, len(slide_ids), (n_samples - result.numel(),), device=device)
+        result = torch.cat([result, extra], dim=0)
+
+    return result
+
 
 # ==============================================================================
 # GRL ALPHA SCHEDULE

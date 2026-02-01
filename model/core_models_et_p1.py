@@ -16,7 +16,8 @@ from torch.utils.data import Dataset
 from ssl_utils import (
     FullGatherLayer, batch_all_gather, GradientReversalFunction, grad_reverse,
     off_diagonal, VICRegLoss, SlideDiscriminator, augment_expression,
-    sample_balanced_slide_indices, grl_alpha_schedule, coral_loss,
+    sample_balanced_slide_indices, sample_balanced_domain_and_slide_indices,
+    grl_alpha_schedule, coral_loss,
     # NEW: diagnostic utilities (GPT 5.2 Pro fix)
     compute_confusion_matrix, compute_entropy, compute_gradient_norms,
     augment_expression_mild, get_adversary_representation, log_adversary_diagnostics
@@ -108,6 +109,7 @@ def train_encoder(
     st_coords: torch.Tensor,
     sc_gene_expr: torch.Tensor,
     slide_ids: Optional[torch.Tensor] = None,
+    sc_slide_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-slide IDs for balanced sampling
     n_epochs: int = 1000,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -198,6 +200,7 @@ def train_encoder(
         st_coords: (n_st, 2) ST coordinates
         sc_gene_expr: (n_sc, n_genes) SC expression
         slide_ids: (n_st,) slide identifiers (default: all zeros)
+        sc_slide_ids: (n_sc,) SC slide identifiers for per-SC-slide balancing (default: None = all pooled)
         n_epochs: training epochs
         batch_size: batch size
         lr: learning rate
@@ -215,6 +218,8 @@ def train_encoder(
     sc_gene_expr = sc_gene_expr.to(device)
     if slide_ids is not None:
         slide_ids = slide_ids.to(device)
+    if sc_slide_ids is not None:
+        sc_slide_ids = sc_slide_ids.to(device)
 
     # Normalize ST coordinates (pose-invariant)
     # st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
@@ -302,6 +307,15 @@ def train_encoder(
         if batch_size % n_domains != 0:
             print(f"[WARNING] batch_size={batch_size} not divisible by {n_domains} "
                 f"(recommend even batch_size for perfectly balanced sampling)")
+
+        # Report slide balancing status
+        n_st_slides = len(torch.unique(slide_ids)) if slide_ids is not None else 1
+        print(f"[VICReg] ST slide balancing: {n_st_slides} slides")
+        if sc_slide_ids is not None:
+            n_sc_slides = len(torch.unique(sc_slide_ids))
+            print(f"[VICReg] SC slide balancing: {n_sc_slides} slides (hierarchical sampling enabled)")
+        else:
+            print(f"[VICReg] SC slide balancing: disabled (all SC pooled)")
 
         # Build projector
         h_dim = model.n_embedding[-1]
@@ -436,7 +450,14 @@ def train_encoder(
             # Sample from all domains (ST slides + SC)
             # ========== Balanced domain sampling ==========
             if stageA_balanced_slides:
-                idx = sample_balanced_slide_indices(domain_ids, batch_size, device)
+                if sc_slide_ids is not None:
+                    # Hierarchical balancing: domain -> slides within domain
+                    idx = sample_balanced_domain_and_slide_indices(
+                        domain_ids, slide_ids, sc_slide_ids, batch_size, device
+                    )
+                else:
+                    # Legacy: just domain balancing (ST vs SC)
+                    idx = sample_balanced_slide_indices(domain_ids, batch_size, device)
             else:
                 idx = torch.randperm(X_ssl.shape[0], device=device)[:batch_size]
 
