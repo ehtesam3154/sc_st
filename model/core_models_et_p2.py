@@ -4106,9 +4106,37 @@ def train_stageC_diffusion_generator(
                 'G_target': fixed_batch_raw['G_target'].cpu(),
                 'n': fixed_batch_raw['n'],
             }
-            print("[PHASE 0] Fixed evaluation batch stored")
-        except:
-            print("[PHASE 0] WARNING: Could not store fixed batch")
+
+            # In residual mode, also store V_base and R_target for correct diagnostics
+            if use_residual_diffusion:
+                with torch.no_grad():
+                    Z_fb = fixed_batch_raw['Z_set'].to(device)
+                    mask_fb = fixed_batch_raw['mask'].to(device)
+                    V_target_fb = fixed_batch_raw['V_target'].to(device)
+
+                    # Get context encoding
+                    Z_fb_encoded = apply_z_ln(Z_fb, context_encoder)
+                    H_fb = context_encoder(Z_fb_encoded, mask_fb)
+
+                    # Compute V_base from generator
+                    V_base_fb = generator(H_fb, mask_fb).detach()
+
+                    # Align V_target to V_base's frame
+                    V_target_aligned_fb = uet.rigid_align_apply_no_scale(V_target_fb, V_base_fb, mask_fb)
+
+                    # Compute R_target
+                    R_target_fb = V_target_aligned_fb - V_base_fb
+
+                    # Store for later use in diagnostics
+                    edm_debug_state['fixed_batch']['V_base'] = V_base_fb.cpu()
+                    edm_debug_state['fixed_batch']['V_target_aligned'] = V_target_aligned_fb.cpu()
+                    edm_debug_state['fixed_batch']['R_target'] = R_target_fb.cpu()
+
+                print("[PHASE 0] Fixed evaluation batch stored (with residual mode data)")
+            else:
+                print("[PHASE 0] Fixed evaluation batch stored")
+        except Exception as e:
+            print(f"[PHASE 0] WARNING: Could not store fixed batch: {e}")
 
         
         # 1.1 Target stats (masked, per-set)
@@ -5199,6 +5227,16 @@ def train_stageC_diffusion_generator(
                 sigma_t_orig = sigma_t.clone().detach()
                 mask_orig = mask.clone().detach()
 
+                # In residual mode, also store the aligned target for correct comparisons
+                use_resid_diag = curriculum_state.get('use_residual_diffusion', False)
+                try:
+                    if use_resid_diag and V_target_aligned is not None:
+                        V_target_aligned_orig = V_target_aligned.clone().detach()
+                    else:
+                        V_target_aligned_orig = V_target_orig  # Fallback to original
+                except NameError:
+                    V_target_aligned_orig = V_target_orig  # V_target_aligned not defined
+
                 if global_step % 2500 == 0 and (fabric is None or fabric.is_global_zero):
                     with torch.no_grad():
                         # --- DEBUG 5: Check noise across sigma bins ---
@@ -5920,17 +5958,27 @@ def train_stageC_diffusion_generator(
                                 (1.00, 2.00, "[1.00-2.00)"),
                                 (2.00, 5.00, "[2.00-5.00)"),
                             ]
-                            
-                            # Compute per-sample scale ratio
+
+                            # In residual mode, use composed V_hat and aligned target for scale comparison
+                            use_resid_bin = curriculum_state.get('use_residual_diffusion', False)
+                            if use_resid_bin:
+                                # V_hat is already composed as V_base + R_pred at this point
+                                V_pred_bin = V_hat  # Full coords
+                                V_tgt_bin = V_target_aligned_orig  # Aligned target
+                            else:
+                                V_pred_bin = x0_pred  # Full coords
+                                V_tgt_bin = V_target  # Original target
+
+                            # Compute per-sample scale ratio - use full coords for comparison
                             m_f = mask.unsqueeze(-1).float()
-                            rms_pred_ps = (x0_pred.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
+                            rms_pred_ps = (V_pred_bin.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
                             rms_pred_ps = rms_pred_ps.sqrt()
-                            rms_tgt_ps = (V_target.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
+                            rms_tgt_ps = (V_tgt_bin.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
                             rms_tgt_ps = rms_tgt_ps.sqrt()
                             scale_r_ps = rms_pred_ps / rms_tgt_ps.clamp(min=1e-8)
-                            
-                            # Gradient proxy: w * (pred - tgt)
-                            grad_proxy = (w_eff.unsqueeze(-1).unsqueeze(-1) * (x0_pred - V_target)).pow(2) * m_f
+
+                            # Gradient proxy: w * (pred - tgt) - use correct targets
+                            grad_proxy = (w_eff.unsqueeze(-1).unsqueeze(-1) * (V_pred_bin - V_tgt_bin)).pow(2) * m_f
                             grad_proxy_ps = grad_proxy.sum(dim=(1,2)).sqrt()
                             
                             print(f"\n[SIGMA-BIN-STATS] step={global_step}")
@@ -8235,8 +8283,8 @@ def train_stageC_diffusion_generator(
                         # =================================================================
                         if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
-                                # ✅ Use CLONED version
-                                Tgt = V_target_orig
+                                # ✅ Use ALIGNED target in residual mode (V_hat is in V_base's frame)
+                                Tgt = V_target_aligned_orig
 
                                 # --- A. COMPUTE SCALE & ERROR RMS ---
                                 mask_f = mask_orig.unsqueeze(-1).float()
@@ -10884,7 +10932,21 @@ def train_stageC_diffusion_generator(
                     mask_fixed = fixed_batch_data['mask'].to(device)
                     V_target_fixed = fixed_batch_data['V_target'].to(device)
                     G_target_fixed = fixed_batch_data['G_target'].to(device)
-                    
+
+                    # Residual mode: load V_base and R_target for correct noising/comparison
+                    if use_resid_eval and 'V_base' in fixed_batch_data:
+                        V_base_fb = fixed_batch_data['V_base'].to(device)
+                        R_target_fb = fixed_batch_data['R_target'].to(device)
+                        V_target_aligned_fb = fixed_batch_data['V_target_aligned'].to(device)
+                        noise_target_fb = R_target_fb  # Noise the residual
+                        compare_target_fb = V_target_aligned_fb  # Compare to aligned target
+                    else:
+                        V_base_fb = None
+                        R_target_fb = None
+                        V_target_aligned_fb = None
+                        noise_target_fb = V_target_fixed  # Noise full coords
+                        compare_target_fb = V_target_fixed  # Compare to original target
+
                     B_fixed = Z_fixed.shape[0]
                     D_lat = score_net.D_latent if hasattr(score_net, 'D_latent') else \
                             score_net.module.D_latent if hasattr(score_net, 'module') else 16
@@ -10980,49 +11042,56 @@ def train_stageC_diffusion_generator(
                         sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
                         sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
                         
-                        eps_fixed = torch.randn_like(V_target_fixed)
-                        V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+                        # In residual mode, noise R_target; otherwise noise V_target
+                        eps_fixed = torch.randn_like(noise_target_fb)
+                        V_t_fixed = noise_target_fb + sigma_fixed_3d * eps_fixed
                         V_t_fixed = V_t_fixed * mask_fixed.unsqueeze(-1).float()
-                        
+
                         for sc_mode in ['no_sc', 'with_sc']:
                             if sc_mode == 'with_sc' and score_net.self_conditioning:
                                 x0_pred_0_eval = score_net.forward_edm(
-                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
-                                    sigma_data, self_cond=None
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed,
+                                    sigma_edm_eval, self_cond=None
                                 )
                                 if isinstance(x0_pred_0_eval, tuple):
                                     x0_pred_0_eval = x0_pred_0_eval[0]
-                                
+
                                 x0_pred_eval = score_net.forward_edm(
-                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
-                                    sigma_data, self_cond=x0_pred_0_eval
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed,
+                                    sigma_edm_eval, self_cond=x0_pred_0_eval
                                 )
                             else:
                                 x0_pred_eval = score_net.forward_edm(
-                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
-                                    sigma_data, self_cond=None
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed,
+                                    sigma_edm_eval, self_cond=None
                                 )
-                            
+
                             if isinstance(x0_pred_eval, tuple):
                                 x0_pred_eval = x0_pred_eval[0]
+
+                            # In residual mode, compose V_base + R_pred for full coordinates
+                            if V_base_fb is not None:
+                                V_pred_full = V_base_fb + x0_pred_eval
+                            else:
+                                V_pred_full = x0_pred_eval
                             
                             mask_f_eval = mask_fixed.unsqueeze(-1).float()
                             valid_count_eval = mask_f_eval.sum()
                             
-                            # Scale ratio (centered)
-                            V_pred_c, _ = uet.center_only(x0_pred_eval, mask_fixed)
-                            V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+                            # Scale ratio (centered) - use full coords for comparison
+                            V_pred_c, _ = uet.center_only(V_pred_full, mask_fixed)
+                            V_tgt_c, _ = uet.center_only(compare_target_fb, mask_fixed)
                             rms_pred = (V_pred_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt()
                             rms_tgt = (V_tgt_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt()
                             scale_ratio = (rms_pred / rms_tgt.clamp(min=1e-8)).item()
-                            
+
                             # Trace ratio
                             G_pred = V_pred_c @ V_pred_c.transpose(1, 2)
                             trace_pred = torch.diagonal(G_pred, dim1=-2, dim2=-1).sum(dim=-1)
                             trace_tgt = torch.diagonal(G_target_fixed, dim1=-2, dim2=-1).sum(dim=-1)
                             trace_ratio = (trace_pred / trace_tgt.clamp(min=1e-8)).mean().item()
-                            
-                            # Jaccard@10 (pure torch, no numpy)
+
+                            # Jaccard@10 (pure torch, no numpy) - use full coords
                             jaccard_sum = 0.0
                             jaccard_count = 0
                             for b in range(min(4, B_fixed)):
@@ -11030,9 +11099,9 @@ def train_stageC_diffusion_generator(
                                 n_valid = int(m_b.sum().item())
                                 if n_valid < 15:
                                     continue
-                                
-                                pred_b = x0_pred_eval[b, m_b]
-                                tgt_b = V_target_fixed[b, m_b]
+
+                                pred_b = V_pred_full[b, m_b]
+                                tgt_b = compare_target_fb[b, m_b]
                                 
                                 D_pred_b = torch.cdist(pred_b, pred_b)
                                 D_tgt_b = torch.cdist(tgt_b, tgt_b)
@@ -11057,9 +11126,8 @@ def train_stageC_diffusion_generator(
 
 
                             # Compute out/tgt (learned branch scale ratio)
-                            # Compute out/tgt (learned branch scale ratio)
                             # Recompute EDM preconditioning for this sigma value
-                            c_skip_fb, c_out_fb, _, _ = uet.edm_precond(sigma_fixed, sigma_data)
+                            c_skip_fb, c_out_fb, _, _ = uet.edm_precond(sigma_fixed, sigma_edm_eval)
                             # c_skip_fb: (B, 1, 1)
 
                             # V_c (centered noisy input) - same as forward_edm does
@@ -11091,25 +11159,33 @@ def train_stageC_diffusion_generator(
                         torch.manual_seed(42 + int(sigma_probe * 1000))
                         sigma_p = torch.full((B_fixed,), sigma_probe, device=device)
                         sigma_p_3d = sigma_p.view(-1, 1, 1)
-                        
-                        eps_p = torch.randn_like(V_target_fixed)
-                        V_t_p = V_target_fixed + sigma_p_3d * eps_p
+
+                        # In residual mode, noise R_target; otherwise noise V_target
+                        eps_p = torch.randn_like(noise_target_fb)
+                        V_t_p = noise_target_fb + sigma_p_3d * eps_p
                         V_t_p = V_t_p * mask_fixed.unsqueeze(-1).float()
-                        
+
                         x0_p = score_net.forward_edm(V_t_p, sigma_p, H_fixed, mask_fixed, sigma_edm_eval, self_cond=None)
                         if isinstance(x0_p, tuple):
                             x0_p = x0_p[0]
-                        
-                        # Scale ratio
-                        V_p_c, _ = uet.center_only(x0_p, mask_fixed)
+
+                        # In residual mode, compose V_base + R_pred for scale comparison
+                        if V_base_fb is not None:
+                            V_pred_p = V_base_fb + x0_p
+                        else:
+                            V_pred_p = x0_p
+
+                        # Scale ratio - use full coords vs aligned target
+                        V_p_c, _ = uet.center_only(V_pred_p, mask_fixed)
+                        V_tgt_p_c, _ = uet.center_only(compare_target_fb, mask_fixed)
                         rms_p = (V_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
-                        rms_t = (V_tgt_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
+                        rms_t = (V_tgt_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
                         scale_r_p = rms_p / max(rms_t, 1e-8)
-                        
+
                         # Compare to noisy input scale
                         V_t_p_c, _ = uet.center_only(V_t_p, mask_fixed)
                         rms_noisy = (V_t_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
-                        
+
                         print(f"\n[HI-SIGMA-PROBE] σ={sigma_probe}: scale_r={scale_r_p:.3f} (want ~1.0), "
                               f"rms_pred={rms_p:.4f}, rms_tgt={rms_t:.4f}, rms_noisy={rms_noisy:.4f}")
                 
@@ -11151,17 +11227,19 @@ def train_stageC_diffusion_generator(
                           f"{' (ramp ' + f'{ramp_progress:.0%})' if ramp_active else ''}")
 
                 # Cache eps_promo ONCE per run (deterministic, no RNG contamination)
+                # Shape must match noise target (R_target in residual mode, V_target otherwise)
                 if 'eps_promo_cached' not in edm_debug_state:
                     promo_gen = torch.Generator(device=device)
                     promo_gen.manual_seed(42)
                     edm_debug_state['eps_promo_cached'] = torch.randn(
-                        V_target_fixed.shape, generator=promo_gen, device=device, dtype=V_target_fixed.dtype
+                        noise_target_fb.shape, generator=promo_gen, device=device, dtype=noise_target_fb.dtype
                     )
 
                 sigma_promo = torch.full((B_fixed,), closest_sigma, device=device)
                 sigma_promo_3d = sigma_promo.view(-1, 1, 1)
                 eps_promo = edm_debug_state['eps_promo_cached']
-                V_t_promo = V_target_fixed + sigma_promo_3d * eps_promo
+                # In residual mode, noise R_target; otherwise noise V_target
+                V_t_promo = noise_target_fb + sigma_promo_3d * eps_promo
                 V_t_promo = V_t_promo * mask_fixed.unsqueeze(-1).float()
 
                 with torch.no_grad():
@@ -11169,20 +11247,28 @@ def train_stageC_diffusion_generator(
                     if isinstance(x0_promo, tuple):
                         x0_promo = x0_promo[0]
 
-                    # Compute metrics at sigma_cap
-                    V_promo_c, _ = uet.center_only(x0_promo, mask_fixed)
+                    # In residual mode, compose V_base + R_pred for full coordinates
+                    if V_base_fb is not None:
+                        V_promo_full = V_base_fb + x0_promo
+                    else:
+                        V_promo_full = x0_promo
+
+                    # Compute metrics at sigma_cap - use full coords vs aligned target
+                    V_promo_c, _ = uet.center_only(V_promo_full, mask_fixed)
+                    V_tgt_promo_c, _ = uet.center_only(compare_target_fb, mask_fixed)
                     mask_f_promo = mask_fixed.unsqueeze(-1).float()
                     valid_cnt_promo = mask_f_promo.sum()
 
                     rms_promo = (V_promo_c.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
-                    rms_tgt_promo = (V_tgt_c_gen.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
+                    rms_tgt_promo = (V_tgt_promo_c.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
                     scale_r_promo = (rms_promo / rms_tgt_promo.clamp(min=1e-8)).item()
 
                     G_promo = V_promo_c @ V_promo_c.transpose(1, 2)
                     trace_promo = torch.diagonal(G_promo, dim1=-2, dim2=-1).sum(dim=-1)
-                    trace_r_promo = (trace_promo / trace_tgt_gen.clamp(min=1e-8)).mean().item()
+                    trace_tgt_promo = torch.diagonal(V_tgt_promo_c @ V_tgt_promo_c.transpose(1, 2), dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_r_promo = (trace_promo / trace_tgt_promo.clamp(min=1e-8)).mean().item()
 
-                    # Jacc@10 at sigma_cap
+                    # Jacc@10 at sigma_cap - use full coords vs aligned target
                     jacc_sum_promo = 0.0
                     jacc_cnt_promo = 0
                     for b in range(min(4, B_fixed)):
@@ -11190,8 +11276,8 @@ def train_stageC_diffusion_generator(
                         n_v = int(m_b.sum().item())
                         if n_v < 15:
                             continue
-                        pred_b = x0_promo[b, m_b]
-                        tgt_b = V_target_fixed[b, m_b]
+                        pred_b = V_promo_full[b, m_b]
+                        tgt_b = compare_target_fb[b, m_b]
                         D_pred_b = torch.cdist(pred_b, pred_b)
                         D_tgt_b = torch.cdist(tgt_b, tgt_b)
                         k_j = min(10, n_v - 1)
@@ -11653,48 +11739,73 @@ def train_stageC_diffusion_generator(
                 print(f"\n" + "="*70)
                 print(f"[PHASE 7] Learning Checks (Epoch {epoch+1})")
                 print("="*70)
-                
+
                 with torch.no_grad():
                     # Load fixed batch
                     fb = edm_debug_state['fixed_batch']
                     Z_fb = fb['Z_set'].to(device)
                     mask_fb = fb['mask'].to(device)
                     V_target_fb = fb['V_target'].to(device)
-                    
+
+                    # In residual mode, load V_base and R_target for correct noising/comparison
+                    use_resid_p7 = curriculum_state.get('use_residual_diffusion', False)
+                    if use_resid_p7 and 'V_base' in fb:
+                        V_base_p7 = fb['V_base'].to(device)
+                        R_target_p7 = fb['R_target'].to(device)
+                        V_target_aligned_p7 = fb['V_target_aligned'].to(device)
+                        noise_target_p7 = R_target_p7  # Noise the residual
+                        compare_target_p7 = V_target_aligned_p7  # Compare to aligned target
+                    else:
+                        V_base_p7 = None
+                        noise_target_p7 = V_target_fb  # Noise full coords
+                        compare_target_p7 = V_target_fb  # Compare to original target
+
                     H_fb = context_encoder(Z_fb, mask_fb)
-                    
+
                     # Test at 3 sigma levels (p20, p50, p80 of training distribution)
                     sigma_test_levels = [
                         sigma_refine_max * 0.2,  # Low noise
                         sigma_refine_max * 0.5,  # Medium
                         sigma_refine_max * 0.8,  # High
                     ]
-                    
+
                     print("\n[PHASE 7.1] One-step Denoise Improvement:")
-                    eps_seed = torch.randn_like(V_target_fb)
-                    
+                    # Noise correct target (R_target in residual mode, V_target otherwise)
+                    eps_seed = torch.randn_like(noise_target_p7)
+
                     for sigma_test in sigma_test_levels:
-                        V_t_test = V_target_fb + sigma_test * eps_seed
+                        V_t_test = noise_target_p7 + sigma_test * eps_seed
                         V_t_test = V_t_test * mask_fb.unsqueeze(-1).float()
-                        
+
                         sigma_batch = torch.full((V_t_test.shape[0],), sigma_test, device=device)
                         x0_pred_test = score_net.forward_edm(V_t_test, sigma_batch, H_fb, mask_fb, sigma_edm_eval, self_cond=None)
                         if isinstance(x0_pred_test, tuple):
                             x0_pred_test = x0_pred_test[0]
-                        
-                        # MSE: model vs baseline
-                        err_model = (x0_pred_test - V_target_fb).pow(2).sum(dim=-1)  # (B, N)
-                        err_baseline = (V_t_test - V_target_fb).pow(2).sum(dim=-1)
-                        
+
+                        # In residual mode, compose V_base + R_pred for full coordinates
+                        if V_base_p7 is not None:
+                            V_pred_test = V_base_p7 + x0_pred_test
+                        else:
+                            V_pred_test = x0_pred_test
+
+                        # MSE: model vs baseline - use full coords for comparison
+                        err_model = (V_pred_test - compare_target_p7).pow(2).sum(dim=-1)  # (B, N)
+                        if V_base_p7 is not None:
+                            # In residual mode, baseline is V_base + noisy_R = V_base + R_target + noise
+                            baseline_test = V_base_p7 + V_t_test  # V_base + noisy_residual
+                        else:
+                            baseline_test = V_t_test
+                        err_baseline = (baseline_test - compare_target_p7).pow(2).sum(dim=-1)
+
                         mask_f = mask_fb.float()
                         mse_model = (err_model * mask_f).sum() / mask_f.sum()
                         mse_baseline = (err_baseline * mask_f).sum() / mask_f.sum()
-                        
+
                         ratio = mse_model / (mse_baseline + 1e-8)
-                        
+
                         print(f"  sigma={sigma_test:.4f}: mse_model={mse_model:.6f} "
                               f"mse_baseline={mse_baseline:.6f} ratio={ratio:.4f}")
-                        
+
                         if ratio < 1.0:
                             print(f"    ✓ Model beats baseline")
                         else:
