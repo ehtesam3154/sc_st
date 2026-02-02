@@ -804,18 +804,37 @@ def train_encoder(
             history_vicreg['grl_alpha'].append(alpha)
 
             # ========== BEST CHECKPOINT SAVING ==========
-            # Only check after warmup when alignment losses are meaningful
-            if epoch >= adv_warmup_epochs + adv_ramp_epochs:
-                # NEW: Use per-class discriminator accuracy balance instead of CORAL
-                # Lower = better: both classes should have accuracy close to 0.5 (true confusion)
+            # Only check after warmup, and evaluate every 50 epochs on FULL dataset for stability
+            if epoch >= adv_warmup_epochs + adv_ramp_epochs and epoch % 50 == 0:
+                # Evaluate on full dataset (or subsample) for stable alignment metric
                 with torch.no_grad():
-                    preds = logits_post.argmax(dim=1)
-                    # Per-class accuracy on clean embeddings
-                    mask_0 = (s_batch == 0)
-                    mask_1 = (s_batch == 1)
-                    acc_class0 = (preds[mask_0] == 0).float().mean().item() if mask_0.sum() > 0 else 0.5
-                    acc_class1 = (preds[mask_1] == 1).float().mean().item() if mask_1.sum() > 0 else 0.5
-                    # Alignment score: max deviation from 0.5 for either class (lower = better)
+                    # Use up to 2000 samples per domain for speed
+                    max_eval = 2000
+                    idx_st_eval = torch.arange(n_st, device=device)
+                    idx_sc_eval = torch.arange(n_st, n_st + n_sc, device=device)
+                    if n_st > max_eval:
+                        idx_st_eval = idx_st_eval[torch.randperm(n_st, device=device)[:max_eval]]
+                    if n_sc > max_eval:
+                        idx_sc_eval = idx_sc_eval[torch.randperm(n_sc, device=device)[:max_eval]]
+
+                    # Get embeddings for ST and SC
+                    z_st_eval = model(X_ssl[idx_st_eval])
+                    z_sc_eval = model(X_ssl[idx_sc_eval])
+                    if adv_use_layernorm:
+                        z_st_eval = F.layer_norm(z_st_eval, (z_st_eval.shape[1],))
+                        z_sc_eval = F.layer_norm(z_sc_eval, (z_sc_eval.shape[1],))
+
+                    # Get discriminator predictions
+                    logits_st = discriminator(z_st_eval)
+                    logits_sc = discriminator(z_sc_eval)
+                    pred_st = logits_st.argmax(dim=1)
+                    pred_sc = logits_sc.argmax(dim=1)
+
+                    # Per-class accuracy (ST should be 0, SC should be 1)
+                    acc_class0 = (pred_st == 0).float().mean().item()  # ST correctly predicted as ST
+                    acc_class1 = (pred_sc == 1).float().mean().item()  # SC correctly predicted as SC
+
+                    # Alignment score: max deviation from 0.5 (lower = better, means confusion)
                     alignment_score = max(abs(acc_class0 - 0.5), abs(acc_class1 - 0.5))
 
                 if alignment_score < best_alignment_score:
@@ -825,9 +844,9 @@ def train_encoder(
                     if projector is not None:
                         best_projector_state = {k: v.cpu().clone() for k, v in projector.state_dict().items()}
                     best_discriminator_state = {k: v.cpu().clone() for k, v in discriminator.state_dict().items()}
-
-                    if epoch % 100 == 0:
-                        print(f"  [BEST] New best alignment at epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, score={alignment_score:.4f}")
+                    print(f"  [BEST] New best at epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, score={alignment_score:.4f}")
+                elif epoch % 100 == 0:
+                    print(f"  [EVAL] Epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, score={alignment_score:.4f} (best={best_alignment_score:.4f})")
 
             continue  # Skip geometry code, go to next epoch
 
