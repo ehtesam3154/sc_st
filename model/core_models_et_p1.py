@@ -16,7 +16,8 @@ from torch.utils.data import Dataset
 from ssl_utils import (
     FullGatherLayer, batch_all_gather, GradientReversalFunction, grad_reverse,
     off_diagonal, VICRegLoss, SlideDiscriminator, augment_expression,
-    sample_balanced_slide_indices, grl_alpha_schedule, coral_loss,
+    sample_balanced_slide_indices, sample_balanced_domain_and_slide_indices,
+    grl_alpha_schedule, coral_loss,
     # NEW: diagnostic utilities (GPT 5.2 Pro fix)
     compute_confusion_matrix, compute_entropy, compute_gradient_norms,
     augment_expression_mild, get_adversary_representation, log_adversary_diagnostics
@@ -108,6 +109,8 @@ def train_encoder(
     st_coords: torch.Tensor,
     sc_gene_expr: torch.Tensor,
     slide_ids: Optional[torch.Tensor] = None,
+    sc_slide_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-slide IDs for balanced sampling
+    sc_patient_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-sample patient IDs for patient CORAL
     n_epochs: int = 1000,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -157,6 +160,7 @@ def train_encoder(
     aug_scale_jitter: float = 0.2,
     # Slide adversary parameters
     adv_slide_weight: float = 50.0,
+    patient_coral_weight: float = 10.0,  # Weight for patient-level CORAL (cross-patient alignment)
     adv_warmup_epochs: int = 50,
     adv_ramp_epochs: int = 200,
     grl_alpha_max: float = 1.0,
@@ -182,6 +186,10 @@ def train_encoder(
     local_align_tau_z: float = 0.1,
     local_align_bidirectional: bool = True,
     local_align_warmup: int = 100,  # Start after discriminator warmup
+    # ========== Reproducibility ==========
+    seed: Optional[int] = None,  # Random seed for reproducibility
+    # ========== Best checkpoint ==========
+    use_best_checkpoint: bool = True,  # Return best model (by alignment) instead of final
 ):
 
     """
@@ -198,6 +206,7 @@ def train_encoder(
         st_coords: (n_st, 2) ST coordinates
         sc_gene_expr: (n_sc, n_genes) SC expression
         slide_ids: (n_st,) slide identifiers (default: all zeros)
+        sc_slide_ids: (n_sc,) SC slide identifiers for per-SC-slide balancing (default: None = all pooled)
         n_epochs: training epochs
         batch_size: batch size
         lr: learning rate
@@ -206,7 +215,24 @@ def train_encoder(
         mmdbatch: MMD batch fraction
         device: torch device
         outf: output directory
+        seed: random seed for reproducibility (sets torch, numpy, python random)
     """
+    # ========== Set random seeds for reproducibility ==========
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        # For full determinism (may slow down training)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[Stage A] Random seed set to {seed} for reproducibility")
+        print(f"  NOTE: For full reproducibility, also call ssl_utils.set_seed({seed})")
+        print(f"        BEFORE creating the encoder to seed weight initialization.")
+
     model = model.to(device)
     model.train()
     
@@ -215,6 +241,10 @@ def train_encoder(
     sc_gene_expr = sc_gene_expr.to(device)
     if slide_ids is not None:
         slide_ids = slide_ids.to(device)
+    if sc_slide_ids is not None:
+        sc_slide_ids = sc_slide_ids.to(device)
+    if sc_patient_ids is not None:
+        sc_patient_ids = sc_patient_ids.to(device)
 
     # Normalize ST coordinates (pose-invariant)
     # st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
@@ -303,6 +333,25 @@ def train_encoder(
             print(f"[WARNING] batch_size={batch_size} not divisible by {n_domains} "
                 f"(recommend even batch_size for perfectly balanced sampling)")
 
+        # Report slide balancing status
+        n_st_slides = len(torch.unique(slide_ids)) if slide_ids is not None else 1
+        print(f"[VICReg] ST slide balancing: {n_st_slides} slides")
+        if sc_slide_ids is not None:
+            n_sc_slides = len(torch.unique(sc_slide_ids))
+            print(f"[VICReg] SC slide balancing: {n_sc_slides} slides (hierarchical sampling enabled)")
+        else:
+            print(f"[VICReg] SC slide balancing: disabled (all SC pooled)")
+
+        # Report patient CORAL status
+        if sc_patient_ids is not None:
+            n_patients = len(torch.unique(sc_patient_ids))
+            if n_patients > 1:
+                print(f"[VICReg] Patient CORAL: enabled ({n_patients} patients in SC)")
+            else:
+                print(f"[VICReg] Patient CORAL: disabled (only 1 patient in SC)")
+        else:
+            print(f"[VICReg] Patient CORAL: disabled (sc_patient_ids not provided)")
+
         # Build projector
         h_dim = model.n_embedding[-1]
         if vicreg_use_projector:
@@ -339,6 +388,8 @@ def train_encoder(
         print(f"  Augmentations: dropout={aug_gene_dropout}, noise={aug_gauss_std}, jitter={aug_scale_jitter}")
         print(f"  Adversary: weight={adv_slide_weight}, warmup={adv_warmup_epochs}, ramp={adv_ramp_epochs}")
         print("  CORAL: ST↔SC alignment enabled (on same z_cond used by adversary)")
+        if sc_patient_ids is not None:
+            print(f"  Patient CORAL: weight={patient_coral_weight} (aligns patients within SC domain)")
         print(f"  [GPT5.2-FIX] adv_representation_mode='{adv_representation_mode}', adv_use_layernorm={adv_use_layernorm}")
         if adv_representation_mode == 'ln_avg_aug':
             print("  [WARNING] Using legacy ln_avg_aug mode - this causes train/inference mismatch!")
@@ -347,11 +398,21 @@ def train_encoder(
 
         history_vicreg = {
             'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_adv': [], 'loss_coral': [],
+            'loss_patient_coral': [],  # NEW: Patient-level CORAL for cross-patient alignment
             'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
             'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': []
         }
-        
+
+        # ========== BEST CHECKPOINT TRACKING ==========
+        # Track best alignment based on combined CORAL losses
+        # Lower = better alignment between domains and patients
+        best_alignment_score = float('inf')
+        best_epoch = 0
+        best_encoder_state = None
+        best_projector_state = None
+        best_discriminator_state = None
+
         # Print local alignment config
         if use_local_align:
             print(f"  LOCAL ALIGN: weight={local_align_weight}, tau_x={local_align_tau_x}, "
@@ -436,7 +497,14 @@ def train_encoder(
             # Sample from all domains (ST slides + SC)
             # ========== Balanced domain sampling ==========
             if stageA_balanced_slides:
-                idx = sample_balanced_slide_indices(domain_ids, batch_size, device)
+                if sc_slide_ids is not None:
+                    # Hierarchical balancing: domain -> slides within domain
+                    idx = sample_balanced_domain_and_slide_indices(
+                        domain_ids, slide_ids, sc_slide_ids, batch_size, device
+                    )
+                else:
+                    # Legacy: just domain balancing (ST vs SC)
+                    idx = sample_balanced_slide_indices(domain_ids, batch_size, device)
             else:
                 idx = torch.randperm(X_ssl.shape[0], device=device)[:batch_size]
 
@@ -517,6 +585,35 @@ def train_encoder(
                     verbose=(epoch % 100 == 0)
                 )
 
+            # ========== DISCRIMINATOR HEALTH CHECK & REVIVAL ==========
+            # If discriminator collapses (always predicts one class), revive it
+            if disc_diag:
+                acc_st = disc_diag.get('disc_acc_class0', 0.5)
+                acc_sc = disc_diag.get('disc_acc_class1', 0.5)
+                min_class_acc = min(acc_st, acc_sc)
+
+                # Discriminator is "dying" if one class accuracy < 0.1
+                if min_class_acc < 0.1 and epoch > adv_warmup_epochs:
+                    # Revival: extra training steps with fresh samples
+                    revival_steps = 20
+                    for _ in range(revival_steps):
+                        # Sample fresh batch
+                        revival_idx = torch.randperm(X_ssl.shape[0], device=device)[:batch_size]
+                        X_revival = X_ssl[revival_idx]
+                        s_revival = domain_ids[revival_idx]
+                        z_revival = model(X_revival).detach()
+                        if adv_use_layernorm:
+                            z_revival = F.layer_norm(z_revival, (z_revival.shape[1],))
+
+                        logits_revival = discriminator(z_revival)
+                        loss_revival = F.cross_entropy(logits_revival, s_revival)
+                        opt_disc.zero_grad(set_to_none=True)
+                        loss_revival.backward()
+                        opt_disc.step()
+
+                    if epoch % 50 == 0:
+                        print(f"  [REVIVAL] Disc collapsed (min_class_acc={min_class_acc:.3f}), did {revival_steps} extra steps")
+
 
             # (B) Train encoder to confuse discriminator via GRL
             for p in discriminator.parameters():
@@ -529,6 +626,37 @@ def train_encoder(
             z_sc = z_cond[is_sc]
             if z_st.shape[0] > 8 and z_sc.shape[0] > 8:
                 loss_coral = coral_loss(z_st, z_sc)
+
+            # ========== NEW: Patient-level CORAL within SC ==========
+            loss_patient_coral = torch.tensor(0.0, device=device)
+            if sc_patient_ids is not None and is_sc.sum() > 16:
+                # Get SC indices in batch and their global positions
+                sc_batch_mask = is_sc
+                sc_global_idx = idx[sc_batch_mask] - n_st  # Convert to SC-local indices
+
+                # Get patient IDs for SC samples in this batch
+                batch_patient_ids = sc_patient_ids[sc_global_idx]
+                unique_patients = torch.unique(batch_patient_ids)
+
+                # Only compute if we have multiple patients in this batch
+                if len(unique_patients) >= 2:
+                    z_sc_batch = z_cond[sc_batch_mask]
+
+                    # Split by patient and compute pairwise CORAL
+                    patient_corals = []
+                    for i in range(len(unique_patients)):
+                        for j in range(i + 1, len(unique_patients)):
+                            p_i, p_j = unique_patients[i], unique_patients[j]
+                            mask_i = (batch_patient_ids == p_i)
+                            mask_j = (batch_patient_ids == p_j)
+
+                            if mask_i.sum() > 4 and mask_j.sum() > 4:
+                                z_pi = z_sc_batch[mask_i]
+                                z_pj = z_sc_batch[mask_j]
+                                patient_corals.append(coral_loss(z_pi, z_pj))
+
+                    if len(patient_corals) > 0:
+                        loss_patient_coral = torch.stack(patient_corals).mean()
 
             logits_adv = discriminator(grad_reverse(z_cond, alpha))
             loss_adv_enc = F.cross_entropy(logits_adv, s_batch)
@@ -563,7 +691,9 @@ def train_encoder(
                     ))
 
             coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
-            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral + local_w * loss_local
+            # Patient CORAL uses same ramp as domain CORAL
+            patient_coral_w = coral_w * patient_coral_weight if sc_patient_ids is not None else 0.0
+            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral + local_w * loss_local + patient_coral_w * loss_patient_coral
 
             
             # Optionally log encoder gradient norms before step
@@ -634,10 +764,11 @@ def train_encoder(
             # Logging
             if epoch % 50 == 0 or (epoch < 5 or epoch > (n_epochs - 25)):
                 local_str = f", Local={loss_local.item():.4f}" if use_local_align and epoch >= local_align_warmup else ""
+                patient_coral_str = f", PatCORAL={loss_patient_coral.item():.6f}" if sc_patient_ids is not None else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
                 print(f"Epoch {epoch}/{n_epochs} | "
                     f"Loss={loss_total.item():.4f} "
-                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{local_str}) | "
+                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{patient_coral_str}{local_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
                     f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}")
@@ -661,6 +792,7 @@ def train_encoder(
             history_vicreg['loss_vicreg'].append(loss_vicreg.item())
             history_vicreg['loss_adv'].append(loss_adv.item())
             history_vicreg['loss_coral'].append(loss_coral.item())
+            history_vicreg['loss_patient_coral'].append(loss_patient_coral.item() if sc_patient_ids is not None else 0.0)
             history_vicreg['loss_local'].append(loss_local.item() if use_local_align else 0.0)
             history_vicreg['vicreg_inv'].append(vicreg_stats['inv'])
             history_vicreg['vicreg_var'].append(vicreg_stats['var'])
@@ -671,7 +803,50 @@ def train_encoder(
             history_vicreg['disc_acc_clean'].append(disc_acc_clean)  # NEW: track clean accuracy
             history_vicreg['grl_alpha'].append(alpha)
 
-
+            # ========== BEST CHECKPOINT SAVING ==========
+            # Only check after warmup, and evaluate every 50 epochs on FULL dataset for stability
+            if epoch >= adv_warmup_epochs + adv_ramp_epochs and epoch % 50 == 0:
+                # Evaluate on full dataset (or subsample) for stable alignment metric
+                with torch.no_grad():
+                    # Use up to 2000 samples per domain for speed
+                    max_eval = 2000
+                    idx_st_eval = torch.arange(n_st, device=device)
+                    idx_sc_eval = torch.arange(n_st, n_st + n_sc, device=device)
+                    if n_st > max_eval:
+                        idx_st_eval = idx_st_eval[torch.randperm(n_st, device=device)[:max_eval]]
+                    if n_sc > max_eval:
+                        idx_sc_eval = idx_sc_eval[torch.randperm(n_sc, device=device)[:max_eval]]
+ 
+                    # Get embeddings for ST and SC
+                    z_st_eval = model(X_ssl[idx_st_eval])
+                    z_sc_eval = model(X_ssl[idx_sc_eval])
+                    if adv_use_layernorm:
+                        z_st_eval = F.layer_norm(z_st_eval, (z_st_eval.shape[1],))
+                        z_sc_eval = F.layer_norm(z_sc_eval, (z_sc_eval.shape[1],))
+ 
+                    # Get discriminator predictions
+                    logits_st = discriminator(z_st_eval)
+                    logits_sc = discriminator(z_sc_eval)
+                    pred_st = logits_st.argmax(dim=1)
+                    pred_sc = logits_sc.argmax(dim=1)
+ 
+                    # Per-class accuracy (ST should be 0, SC should be 1)
+                    acc_class0 = (pred_st == 0).float().mean().item()  # ST correctly predicted as ST
+                    acc_class1 = (pred_sc == 1).float().mean().item()  # SC correctly predicted as SC
+ 
+                    # Alignment score: max deviation from 0.5 (lower = better, means confusion)
+                    alignment_score = max(abs(acc_class0 - 0.5), abs(acc_class1 - 0.5))
+ 
+                if alignment_score < best_alignment_score:
+                    best_alignment_score = alignment_score
+                    best_epoch = epoch
+                    best_encoder_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    if projector is not None:
+                        best_projector_state = {k: v.cpu().clone() for k, v in projector.state_dict().items()}
+                    best_discriminator_state = {k: v.cpu().clone() for k, v in discriminator.state_dict().items()}
+                    print(f"  [BEST] New best at epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, score={alignment_score:.4f}")
+                elif epoch % 100 == 0:
+                    print(f"  [EVAL] Epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, score={alignment_score:.4f} (best={best_alignment_score:.4f})")
             continue  # Skip geometry code, go to next epoch
 
         
@@ -750,8 +925,8 @@ def train_encoder(
                     center_coord = st_coords_norm[center_global]
                     dists = torch.norm(coords_slide - center_coord, dim=1)
                     
-                    # Build pool (use ceiling for fractional pool_mult)
-                    K_pool = min(math.ceil(pool_mult * n_core), n_s - 1)
+                    # Build pool
+                    K_pool = min(int(pool_mult * n_core), n_s - 1)
                     K_pool = max(K_pool, n_core - 1)
                     
                     # Sort by distance (exclude self)
@@ -817,10 +992,9 @@ def train_encoder(
                 center_coord = st_coords_norm[center_global]
                 dists = torch.norm(coords_slide - center_coord, dim=1)
                 
-                # Use ceiling for fractional pool_mult
-                K_pool = min(math.ceil(pool_mult * n_core), n_s - 1)
+                K_pool = min(int(pool_mult * n_core), n_s - 1)
                 K_pool = max(K_pool, n_core - 1)
-
+                
                 dists_no_self = dists.clone()
                 dists_no_self[center_local] = float('inf')
                 sorted_idx = torch.argsort(dists_no_self)
@@ -1141,15 +1315,33 @@ def train_encoder(
     os.makedirs(outf, exist_ok=True)
     
     if stageA_obj == 'vicreg_adv':
+        # ========== RESTORE BEST CHECKPOINT IF AVAILABLE ==========
+        if use_best_checkpoint and best_encoder_state is not None:
+            print(f"\n[BEST CHECKPOINT] Restoring best model from epoch {best_epoch}")
+            print(f"  Best alignment score: {best_alignment_score:.6f}")
+            model.load_state_dict(best_encoder_state)
+            if projector is not None and best_projector_state is not None:
+                projector.load_state_dict(best_projector_state)
+            if best_discriminator_state is not None:
+                discriminator.load_state_dict(best_discriminator_state)
+        elif use_best_checkpoint:
+            print("\n[BEST CHECKPOINT] No checkpoint saved (training too short or warmup not reached)")
+            print("  Using final model instead")
+
         # Save VICReg history
         import json
         history_path = os.path.join(outf, 'stageA_vicreg_history.json')
         with open(history_path, 'w') as f:
             json.dump(history_vicreg, f, indent=2)
-        
+
         print("\n" + "="*70)
         print("VICReg Training Complete")
         print("="*70)
+        if use_best_checkpoint and best_encoder_state is not None:
+            print(f"Using BEST checkpoint from epoch {best_epoch}")
+            print(f"Best alignment score: {best_alignment_score:.6f}")
+        else:
+            print(f"Using FINAL model from epoch {n_epochs-1}")
         print(f"Final Loss: {history_vicreg['loss_total'][-1]:.4f}")
         print(f"Final VICReg: {history_vicreg['loss_vicreg'][-1]:.3f}")
         print(f"Final std mean: {history_vicreg['std_mean'][-1]:.3f}")
@@ -1576,8 +1768,7 @@ class STSetDataset(Dataset):
             sorted_dists = dists[sort_order]
 
             n_neighbors_needed = n - 1
-            # Use ceiling to handle fractional pool_mult values properly
-            K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n))
+            K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n))
             K_pool = max(K_pool, n_neighbors_needed)
 
             pool = sorted_neighbors[:K_pool]
@@ -2072,6 +2263,10 @@ class STPairSetDataset(Dataset):
         # ========== Paired overlap params ==========
         pair_overlap_alpha: float = 0.5,
         pair_overlap_min_I: int = 16,
+        # ========== FIX #4: Robust pairing params ==========
+        pair_difficulty_probs: tuple = (0.5, 0.3, 0.2),  # (easy, medium, hard)
+        pair_hard_alpha_range: tuple = (0.15, 0.25),     # alpha range for hard pairs
+        pair_medium_center_dist_mult: float = 0.3,       # how far center2 is from center1 (fraction of pool radius)
         # ========== Competitor training params ==========
         compete_train: bool = False,
         compete_n_extra: int = 128,
@@ -2098,6 +2293,11 @@ class STPairSetDataset(Dataset):
         self.pair_overlap_alpha = pair_overlap_alpha
         self.pair_overlap_min_I = pair_overlap_min_I
 
+        # FIX #4: Robust pairing params
+        self.pair_difficulty_probs = pair_difficulty_probs
+        self.pair_hard_alpha_range = pair_hard_alpha_range
+        self.pair_medium_center_dist_mult = pair_medium_center_dist_mult
+
         # Stochastic sampling params
         self.pool_mult = pool_mult
         self.stochastic_tau = stochastic_tau
@@ -2111,6 +2311,9 @@ class STPairSetDataset(Dataset):
         self.compete_k_pos = compete_k_pos
         self.compete_expr_knn_k = compete_expr_knn_k
         self.compete_anchor_only = compete_anchor_only
+
+        # FIX #4: Tracking stats for debug
+        self.pair_difficulty_counts = {'easy': 0, 'medium': 0, 'hard': 0}
 
         # Precompute encoder embeddings for all slides
         self.Z_dict = {}
@@ -2133,6 +2336,8 @@ class STPairSetDataset(Dataset):
 
         print(f"[STPairSetDataset] Created with alpha={pair_overlap_alpha}, "
               f"min_I={pair_overlap_min_I}, n_range=[{n_min},{n_max}]")
+        print(f"[STPairSetDataset] FIX #4: Difficulty probs={pair_difficulty_probs} "
+              f"(easy/medium/hard), hard_alpha={pair_hard_alpha_range}")
 
     def __len__(self):
         return self.num_samples
@@ -2161,8 +2366,7 @@ class STPairSetDataset(Dataset):
         sorted_dists = dists[sort_order]
 
         n_neighbors_needed = n_core - 1
-        # Use ceiling to handle fractional pool_mult values properly
-        K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n_core))
+        K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_core))
         K_pool = max(K_pool, n_neighbors_needed)
 
         pool = sorted_neighbors[:K_pool]
@@ -2366,6 +2570,11 @@ class STPairSetDataset(Dataset):
     def __getitem__(self, idx):
         """
         Return a PAIR of minisets from the same slide with controlled core overlap.
+
+        FIX #4: Three-tier difficulty system for robust context invariance learning:
+        - EASY (50%): Same center for both views, standard overlap (current behavior)
+        - MEDIUM (30%): Same overlap set I, but exclusive points from different nearby center
+        - HARD (20%): Smaller overlap alpha (0.15-0.25) to prevent overlap-only behavior
         """
         # Pick a slide
         slide_id = np.random.choice(self.slide_ids)
@@ -2376,8 +2585,26 @@ class STPairSetDataset(Dataset):
         n = np.random.randint(self.n_min, self.n_max + 1)
         n = min(n, m)
 
+        # FIX #4: Select difficulty level
+        p_easy, p_medium, p_hard = self.pair_difficulty_probs
+        rand_val = np.random.random()
+        if rand_val < p_easy:
+            difficulty = 'easy'
+        elif rand_val < p_easy + p_medium:
+            difficulty = 'medium'
+        else:
+            difficulty = 'hard'
+
+        # FIX #4: Adjust overlap alpha based on difficulty
+        if difficulty == 'hard':
+            # Use smaller alpha for hard pairs
+            alpha_lo, alpha_hi = self.pair_hard_alpha_range
+            effective_alpha = np.random.uniform(alpha_lo, alpha_hi)
+        else:
+            effective_alpha = self.pair_overlap_alpha
+
         # Compute overlap size
-        n_overlap = max(self.pair_overlap_min_I, int(self.pair_overlap_alpha * n))
+        n_overlap = max(self.pair_overlap_min_I, int(effective_alpha * n))
 
         # If n is too small to satisfy min overlap, bump n up
         if n - 4 < self.pair_overlap_min_I:
@@ -2385,67 +2612,136 @@ class STPairSetDataset(Dataset):
 
         n_overlap = min(n_overlap, n - 4)  # Leave room for non-overlapping points
 
+        # Sample a center point for view1 (and view2 if easy mode)
+        center_idx_1 = np.random.randint(0, m)
 
-        # Sample a center point (shared by both views for locality)
-        center_idx = np.random.randint(0, m)
-
-        # Build a shared pool of candidates near the center
-        D_row = targets.D[center_idx]
+        # Build a shared pool of candidates near center1
+        D_row_1 = targets.D[center_idx_1]
         all_idx = torch.arange(m)
-        mask_self = all_idx != center_idx
-        dists = D_row[mask_self]
-        idx_no_self = all_idx[mask_self]
+        mask_self_1 = all_idx != center_idx_1
+        dists_1 = D_row_1[mask_self_1]
+        idx_no_self_1 = all_idx[mask_self_1]
 
-        sort_order = torch.argsort(dists)
-        sorted_neighbors = idx_no_self[sort_order]
-        sorted_dists = dists[sort_order]
+        sort_order_1 = torch.argsort(dists_1)
+        sorted_neighbors_1 = idx_no_self_1[sort_order_1]
+        sorted_dists_1 = dists_1[sort_order_1]
 
         # Pool size: enough for 2 views with overlap
         n_unique_needed = 2 * n - n_overlap  # Total unique points across both views
-        # Use ceiling to handle fractional pool_mult values properly
-        K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n_unique_needed))
+        K_pool = min(sorted_neighbors_1.numel(), int(self.pool_mult * n_unique_needed))
         K_pool = max(K_pool, n_unique_needed)
 
-        pool = sorted_neighbors[:K_pool]
-        pool_d = sorted_dists[:K_pool]
+        pool_1 = sorted_neighbors_1[:K_pool]
+        pool_d_1 = sorted_dists_1[:K_pool]
 
-        # Sample OVERLAP set (I) - shared core points
-        # These are the closest points to center for maximum locality
-        if pool.numel() >= n_overlap:
+        # Sample OVERLAP set (I) - shared core points from center1's neighborhood
+        if pool_1.numel() >= n_overlap:
             # Stochastic sampling for overlap
-            weights_I = torch.softmax(-pool_d / self.stochastic_tau, dim=0)
-            if pool.numel() >= n_overlap:
+            weights_I = torch.softmax(-pool_d_1 / self.stochastic_tau, dim=0)
+            if pool_1.numel() >= n_overlap:
                 sampled_I = torch.multinomial(weights_I, n_overlap, replacement=False)
-                I_indices = pool[sampled_I]
+                I_indices = pool_1[sampled_I]
             else:
-                I_indices = pool[:n_overlap]
+                I_indices = pool_1[:n_overlap]
         else:
-            I_indices = pool
+            I_indices = pool_1
             n_overlap = I_indices.numel()
 
-        # Points available after overlap
+        # Points available after overlap (from center1's pool)
         I_set = set(I_indices.tolist())
-        remaining_pool = torch.tensor([p.item() for p in pool if p.item() not in I_set], dtype=torch.long)
+        remaining_pool_1 = torch.tensor([p.item() for p in pool_1 if p.item() not in I_set], dtype=torch.long)
+
+        # FIX #4: For MEDIUM difficulty, find a second center nearby but different
+        if difficulty == 'medium':
+            # Find center2: a point near center1 but far enough to provide context shift
+            # Use a neighbor at medium distance (30% of pool radius by default)
+            pool_radius = sorted_dists_1[min(K_pool - 1, sorted_dists_1.numel() - 1)].item() if sorted_dists_1.numel() > 0 else 1.0
+            target_dist = self.pair_medium_center_dist_mult * pool_radius
+
+            # Find candidates at roughly the target distance
+            dist_diffs = (sorted_dists_1 - target_dist).abs()
+            # Pick from the 10 closest to target distance, excluding overlap points
+            candidate_mask = torch.ones(sorted_neighbors_1.numel(), dtype=torch.bool)
+            for i, neighbor in enumerate(sorted_neighbors_1.tolist()):
+                if neighbor in I_set or neighbor == center_idx_1:
+                    candidate_mask[i] = False
+
+            valid_candidates = sorted_neighbors_1[candidate_mask]
+            valid_dist_diffs = dist_diffs[candidate_mask[:dist_diffs.numel()]] if dist_diffs.numel() > 0 else torch.tensor([])
+
+            if valid_candidates.numel() > 0:
+                # Pick one of the closest candidates to target distance
+                n_top = min(10, valid_candidates.numel())
+                _, top_indices = valid_dist_diffs[:valid_candidates.numel()].topk(n_top, largest=False)
+                chosen_idx = top_indices[np.random.randint(0, n_top)]
+                center_idx_2 = valid_candidates[chosen_idx].item()
+            else:
+                # Fallback: just use a random point not in overlap
+                available = [i for i in range(m) if i not in I_set and i != center_idx_1]
+                if available:
+                    center_idx_2 = np.random.choice(available)
+                else:
+                    center_idx_2 = center_idx_1  # Fallback to same center
+
+            # Build pool around center2 for view2's exclusive points
+            D_row_2 = targets.D[center_idx_2]
+            mask_self_2 = all_idx != center_idx_2
+            dists_2 = D_row_2[mask_self_2]
+            idx_no_self_2 = all_idx[mask_self_2]
+
+            sort_order_2 = torch.argsort(dists_2)
+            sorted_neighbors_2 = idx_no_self_2[sort_order_2]
+
+            # Remaining pool for view2: neighbors of center2, excluding overlap
+            remaining_pool_2 = torch.tensor(
+                [p.item() for p in sorted_neighbors_2[:K_pool] if p.item() not in I_set and p.item() != center_idx_2],
+                dtype=torch.long
+            )
+        else:
+            # EASY or HARD: same center for both views
+            center_idx_2 = center_idx_1
+            remaining_pool_2 = remaining_pool_1
 
         # Sample non-overlapping points for view1 (A) and view2 (B)
         n_A = n - n_overlap - 1  # -1 for center
         n_B = n - n_overlap - 1
 
-        if remaining_pool.numel() >= n_A + n_B:
-            # Shuffle and split
-            perm = torch.randperm(remaining_pool.numel())
-            A_exclusive = remaining_pool[perm[:n_A]]
-            B_exclusive = remaining_pool[perm[n_A:n_A + n_B]]
+        # View1 exclusive: from center1's pool
+        if remaining_pool_1.numel() >= n_A:
+            perm_1 = torch.randperm(remaining_pool_1.numel())
+            A_exclusive = remaining_pool_1[perm_1[:n_A]]
         else:
-            # Not enough points - use what we have
-            half = remaining_pool.numel() // 2
-            A_exclusive = remaining_pool[:half]
-            B_exclusive = remaining_pool[half:]
+            A_exclusive = remaining_pool_1
+
+        # View2 exclusive: from center2's pool (different in MEDIUM mode)
+        if difficulty == 'medium':
+            # Use center2's pool, ensuring no overlap with A_exclusive
+            A_set = set(A_exclusive.tolist())
+            available_for_B = torch.tensor(
+                [p.item() for p in remaining_pool_2 if p.item() not in A_set],
+                dtype=torch.long
+            )
+            if available_for_B.numel() >= n_B:
+                perm_2 = torch.randperm(available_for_B.numel())
+                B_exclusive = available_for_B[perm_2[:n_B]]
+            else:
+                B_exclusive = available_for_B
+        else:
+            # EASY or HARD: split remaining_pool_1 between A and B
+            if remaining_pool_1.numel() >= n_A + n_B:
+                perm = torch.randperm(remaining_pool_1.numel())
+                A_exclusive = remaining_pool_1[perm[:n_A]]
+                B_exclusive = remaining_pool_1[perm[n_A:n_A + n_B]]
+            else:
+                half = remaining_pool_1.numel() // 2
+                A_exclusive = remaining_pool_1[:half]
+                B_exclusive = remaining_pool_1[half:]
 
         # Build core indices for each view
-        center_tensor = torch.tensor([center_idx], dtype=torch.long)
-        indices_core_1 = torch.cat([center_tensor, I_indices, A_exclusive])
-        indices_core_2 = torch.cat([center_tensor, I_indices, B_exclusive])
+        center_tensor_1 = torch.tensor([center_idx_1], dtype=torch.long)
+        center_tensor_2 = torch.tensor([center_idx_2], dtype=torch.long)
+        indices_core_1 = torch.cat([center_tensor_1, I_indices, A_exclusive])
+        indices_core_2 = torch.cat([center_tensor_2, I_indices, B_exclusive])
 
         # Shuffle cores
         indices_core_1 = indices_core_1[torch.randperm(indices_core_1.numel())]
@@ -2464,10 +2760,14 @@ class STPairSetDataset(Dataset):
         view2 = self._build_miniset_dict(targets, indices_all_2, anchor_mask_2, slide_id)
 
         # Compute overlap mapping (using global_uid for safety)
-        # Include center_idx as shared overlap point
-        I_indices_with_center = torch.cat([I_indices, torch.tensor([center_idx], dtype=torch.long)])
-        I_global_uids = (slide_id << 32) + I_indices_with_center.long()
+        # For EASY/HARD: Include center_idx as shared overlap point
+        # For MEDIUM: centers are different, so only I_indices are overlap
+        if difficulty == 'medium':
+            I_indices_for_overlap = I_indices  # Centers are different, not shared
+        else:
+            I_indices_for_overlap = torch.cat([I_indices, torch.tensor([center_idx_1], dtype=torch.long)])
 
+        I_global_uids = (slide_id << 32) + I_indices_for_overlap.long()
 
         # Build index mapping: for each point in I, find its position in view1 and view2
         idx1_I = []
@@ -2487,12 +2787,17 @@ class STPairSetDataset(Dataset):
         idx1_I = torch.tensor(idx1_I, dtype=torch.long)
         idx2_I = torch.tensor(idx2_I, dtype=torch.long)
 
+        # FIX #4: Track difficulty counts (thread-safe increment)
+        self.pair_difficulty_counts[difficulty] += 1
+
         # Overlap info
         overlap_mapping = {
             'idx1_I': idx1_I,  # Positions in view1 of shared points
             'idx2_I': idx2_I,  # Positions in view2 of shared points
             'I_size': len(idx1_I),
             'slide_id': slide_id,
+            'difficulty': difficulty,  # FIX #4: Track difficulty for debugging
+            'effective_alpha': effective_alpha,  # FIX #4: Track actual alpha used
         }
 
         return {
@@ -2513,6 +2818,8 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     - 'idx2_I': (batch_size, max_I) positions in view2 of overlap points
     - 'I_mask': (batch_size, max_I) validity mask for overlap points
     - 'I_sizes': (batch_size,) number of overlap points per sample
+    - 'difficulty_counts': FIX #4 - dict with counts of easy/medium/hard pairs in batch
+    - 'effective_alphas': FIX #4 - list of effective alpha values used
     """
     batch_size = len(batch)
 
@@ -2535,6 +2842,10 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     I_mask_batch = torch.zeros(batch_size, max_I, dtype=torch.bool, device=device)
     I_sizes_batch = torch.zeros(batch_size, dtype=torch.long, device=device)
 
+    # FIX #4: Track difficulty distribution in batch
+    difficulty_counts = {'easy': 0, 'medium': 0, 'hard': 0}
+    effective_alphas = []
+
     for i, om in enumerate(overlap_list):
         I_size = om['I_size']
         if I_size > 0:
@@ -2542,6 +2853,11 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             idx2_I_batch[i, :I_size] = om['idx2_I']
             I_mask_batch[i, :I_size] = True
         I_sizes_batch[i] = I_size
+
+        # FIX #4: Count difficulties
+        difficulty = om.get('difficulty', 'easy')
+        difficulty_counts[difficulty] += 1
+        effective_alphas.append(om.get('effective_alpha', 0.5))
 
     return {
         'view1': view1_batch,
@@ -2551,6 +2867,9 @@ def collate_pair_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'I_mask': I_mask_batch,
         'I_sizes': I_sizes_batch,
         'is_pair_batch': True,
+        # FIX #4: Include difficulty info
+        'difficulty_counts': difficulty_counts,
+        'effective_alphas': effective_alphas,
     }
 
 
@@ -2862,8 +3181,7 @@ class SCSetDataset(Dataset):
             sorted_dists = dists_no_self[sort_order]
 
             n_neighbors_needed = n_set - 1
-            # Use ceiling to handle fractional pool_mult values properly
-            K_pool = min(sorted_neighbors.numel(), math.ceil(self.pool_mult * n_set))
+            K_pool = min(sorted_neighbors.numel(), int(self.pool_mult * n_set))
             K_pool = max(K_pool, n_neighbors_needed)
 
             pool = sorted_neighbors[:K_pool]
