@@ -161,6 +161,7 @@ def train_encoder(
     # Slide adversary parameters
     adv_slide_weight: float = 50.0,
     patient_coral_weight: float = 10.0,  # Weight for patient-level CORAL (cross-patient alignment)
+    source_coral_weight: float = 50.0,  # Weight for pairwise source CORAL (align ALL sources)
     adv_warmup_epochs: int = 50,
     adv_ramp_epochs: int = 200,
     grl_alpha_max: float = 1.0,
@@ -399,7 +400,8 @@ def train_encoder(
 
         history_vicreg = {
             'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_adv': [], 'loss_coral': [],
-            'loss_patient_coral': [],  # NEW: Patient-level CORAL for cross-patient alignment
+            'loss_patient_coral': [],  # Patient-level CORAL for cross-patient alignment
+            'loss_source_coral': [],  # Pairwise source CORAL for all-source alignment
             'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
             'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': []
@@ -695,10 +697,40 @@ def train_encoder(
                         (epoch - local_align_warmup) / max(1, adv_ramp_epochs), 0.0, 1.0
                     ))
 
+            # ========== NEW: Pairwise Source CORAL (align ALL sources) ==========
+            # This is more stable than N-class adversary - directly minimizes distribution differences
+            loss_source_coral = torch.tensor(0.0, device=device)
+            if st_source_ids is not None and sc_source_ids is not None:
+                # Get source IDs for samples in this batch
+                all_source_ids_batch = torch.cat([st_source_ids, sc_source_ids], dim=0).to(device)
+                batch_source_ids = all_source_ids_batch[idx]
+                unique_sources_in_batch = torch.unique(batch_source_ids)
+
+                # Compute pairwise CORAL between all source pairs present in batch
+                source_corals = []
+                for i in range(len(unique_sources_in_batch)):
+                    for j in range(i + 1, len(unique_sources_in_batch)):
+                        src_i, src_j = unique_sources_in_batch[i], unique_sources_in_batch[j]
+                        mask_i = (batch_source_ids == src_i)
+                        mask_j = (batch_source_ids == src_j)
+
+                        # Need enough samples for stable covariance estimation
+                        if mask_i.sum() >= 8 and mask_j.sum() >= 8:
+                            z_i = z_cond[mask_i]
+                            z_j = z_cond[mask_j]
+                            source_corals.append(coral_loss(z_i, z_j))
+
+                if len(source_corals) > 0:
+                    loss_source_coral = torch.stack(source_corals).mean()
+
             coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
             # Patient CORAL uses same ramp as domain CORAL
             patient_coral_w = coral_w * patient_coral_weight if sc_patient_ids is not None else 0.0
-            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral + local_w * loss_local + patient_coral_w * loss_patient_coral
+            # Source CORAL uses same ramp
+            source_coral_w = coral_w * source_coral_weight if (st_source_ids is not None and sc_source_ids is not None) else 0.0
+            loss_total = (loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral +
+                         local_w * loss_local + patient_coral_w * loss_patient_coral +
+                         source_coral_w * loss_source_coral)
 
             
             # Optionally log encoder gradient norms before step
@@ -766,14 +798,14 @@ def train_encoder(
 
 
             # Logging
-            # Logging
             if epoch % 50 == 0 or (epoch < 5 or epoch > (n_epochs - 25)):
                 local_str = f", Local={loss_local.item():.4f}" if use_local_align and epoch >= local_align_warmup else ""
                 patient_coral_str = f", PatCORAL={loss_patient_coral.item():.6f}" if sc_patient_ids is not None else ""
+                source_coral_str = f", SrcCORAL={loss_source_coral.item():.6f}" if (st_source_ids is not None and sc_source_ids is not None) else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
                 print(f"Epoch {epoch}/{n_epochs} | "
                     f"Loss={loss_total.item():.4f} "
-                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{patient_coral_str}{local_str}) | "
+                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{patient_coral_str}{source_coral_str}{local_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
                     f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}")
@@ -798,6 +830,7 @@ def train_encoder(
             history_vicreg['loss_adv'].append(loss_adv.item())
             history_vicreg['loss_coral'].append(loss_coral.item())
             history_vicreg['loss_patient_coral'].append(loss_patient_coral.item() if sc_patient_ids is not None else 0.0)
+            history_vicreg['loss_source_coral'].append(loss_source_coral.item() if (st_source_ids is not None and sc_source_ids is not None) else 0.0)
             history_vicreg['loss_local'].append(loss_local.item() if use_local_align else 0.0)
             history_vicreg['vicreg_inv'].append(vicreg_stats['inv'])
             history_vicreg['vicreg_var'].append(vicreg_stats['var'])
