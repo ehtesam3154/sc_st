@@ -614,6 +614,62 @@ def _sample_balanced_internal(
     return result
 
 
+def sample_balanced_source_indices(
+    source_ids: torch.Tensor,
+    batch_size: int,
+    device: str = 'cuda'
+) -> torch.Tensor:
+    """
+    Sample indices balanced across ALL unique source IDs.
+
+    For N-class source adversary where we want equal representation
+    from each source (P2_ST1, P2_ST2, P2_ST3, P2_SC, P10_ST3, P10_SC, etc.)
+
+    Args:
+        source_ids: (N,) long tensor with source labels (0, 1, 2, ..., n_sources-1)
+        batch_size: target batch size
+        device: device
+
+    Returns:
+        indices: (batch_size,) sampled global indices
+    """
+    unique_sources = torch.unique(source_ids)
+    n_sources = len(unique_sources)
+
+    samples_per_source = batch_size // n_sources
+    remainder = batch_size % n_sources
+
+    indices_list = []
+
+    for i, src_id in enumerate(unique_sources):
+        src_mask = (source_ids == src_id)
+        src_indices = torch.nonzero(src_mask, as_tuple=True)[0]
+
+        n_sample = samples_per_source + (1 if i < remainder else 0)
+        if n_sample <= 0:
+            continue
+
+        if len(src_indices) >= n_sample:
+            perm = torch.randperm(len(src_indices), device=device)[:n_sample]
+            sampled = src_indices[perm]
+        else:
+            # Sample with replacement if source is small
+            ridx = torch.randint(0, len(src_indices), (n_sample,), device=device)
+            sampled = src_indices[ridx]
+
+        indices_list.append(sampled)
+
+    if len(indices_list) == 0:
+        return torch.randperm(len(source_ids), device=device)[:batch_size]
+
+    result = torch.cat(indices_list, dim=0)
+
+    # Shuffle so sources are interleaved
+    result = result[torch.randperm(result.numel(), device=device)]
+
+    return result
+
+
 # ==============================================================================
 # GRL ALPHA SCHEDULE
 # ==============================================================================

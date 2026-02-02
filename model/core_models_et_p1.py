@@ -296,6 +296,7 @@ def train_encoder(
         from ssl_utils import (
             VICRegLoss, SlideDiscriminator, grad_reverse,
             augment_expression, sample_balanced_slide_indices,
+            sample_balanced_source_indices,  # NEW: for N-class source adversary
             grl_alpha_schedule, coral_loss, compute_local_alignment_loss
         )
         
@@ -496,7 +497,10 @@ def train_encoder(
             # ========== Balanced domain sampling ==========
             # Sample from all domains (ST slides + SC)
             # ========== Balanced domain sampling ==========
-            if stageA_balanced_slides:
+            if use_source_adversary and st_source_ids is not None:
+                # N-class source adversary: balance across ALL sources
+                idx = sample_balanced_source_indices(domain_ids, batch_size, device)
+            elif stageA_balanced_slides:
                 if sc_slide_ids is not None:
                     # Hierarchical balancing: domain -> slides within domain
                     idx = sample_balanced_domain_and_slide_indices(
@@ -620,8 +624,9 @@ def train_encoder(
                 p.requires_grad_(False)
 
             # CORAL between ST and SC on the SAME z_cond space
+            # For source adversary: ST samples are idx < n_st, SC samples are idx >= n_st
             loss_coral = torch.tensor(0.0, device=device)
-            is_sc = (s_batch == SC_LABEL)
+            is_sc = (idx >= n_st)  # FIXED: use position, not source_id
             z_st = z_cond[~is_sc]
             z_sc = z_cond[is_sc]
             if z_st.shape[0] > 8 and z_sc.shape[0] > 8:
