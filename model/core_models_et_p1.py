@@ -111,6 +111,10 @@ def train_encoder(
     slide_ids: Optional[torch.Tensor] = None,
     sc_slide_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-slide IDs for balanced sampling
     sc_patient_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-sample patient IDs for patient CORAL
+    # ========== NEW: N-class Source Adversary ==========
+    st_source_ids: Optional[torch.Tensor] = None,  # (n_st,) Source IDs for ST samples (e.g., 0=ST1, 1=ST2)
+    sc_source_ids: Optional[torch.Tensor] = None,  # (n_sc,) Source IDs for SC samples (e.g., 2=ST3, 3=SC_P2, 4=ST3_P5, 5=SC_P5)
+    use_source_adversary: bool = False,  # True = N-class source adversary, False = 2-class domain adversary
     n_epochs: int = 1000,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -246,6 +250,11 @@ def train_encoder(
         sc_slide_ids = sc_slide_ids.to(device)
     if sc_patient_ids is not None:
         sc_patient_ids = sc_patient_ids.to(device)
+    # NEW: Source adversary setup
+    if st_source_ids is not None:
+        st_source_ids = st_source_ids.to(device)
+    if sc_source_ids is not None:
+        sc_source_ids = sc_source_ids.to(device)
 
     # Normalize ST coordinates (pose-invariant)
     # st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
@@ -316,21 +325,47 @@ def train_encoder(
         else:
             print(f"[VICReg] ST slide_ids already contiguous: 0..{n_st_slides-1}")
 
-        # ---- Binary domain labels: ST=0, SC=1 ----
+        # ---- Domain/Source labels setup ----
         n_st = st_gene_expr.shape[0]
         n_sc = sc_gene_expr.shape[0]
 
         X_ssl = torch.cat([st_gene_expr, sc_gene_expr], dim=0)
-        domain_ids = torch.cat([
-            torch.zeros(n_st, device=device, dtype=torch.long),
-            torch.ones(n_sc, device=device, dtype=torch.long),
-        ], dim=0)
 
-        ST_LABEL = 0
-        SC_LABEL = 1
-        n_domains = 2
+        # ========== NEW: N-class Source Adversary ==========
+        if use_source_adversary and st_source_ids is not None and sc_source_ids is not None:
+            # Combine source IDs from ST and SC
+            all_source_ids = torch.cat([st_source_ids, sc_source_ids], dim=0).to(device)
+            unique_sources = torch.unique(all_source_ids)
+            n_sources = len(unique_sources)
 
-        print(f"[VICReg] Domain setup: ST(n={n_st}) vs SC(n={n_sc}) => {n_domains} domains")
+            # Remap to contiguous 0..n_sources-1 if needed
+            if not torch.equal(unique_sources.sort().values, torch.arange(n_sources, device=device)):
+                print(f"[VICReg] Remapping source_ids from {unique_sources.tolist()} to 0..{n_sources-1}")
+                source_id_map = {int(s.item()): i for i, s in enumerate(unique_sources.sort().values)}
+                all_source_ids = torch.tensor([source_id_map[int(s.item())] for s in all_source_ids],
+                                              dtype=torch.long, device=device)
+
+            # Use source_ids for adversary instead of domain_ids
+            domain_ids = all_source_ids  # Reuse variable name for minimal code changes
+            n_domains = n_sources
+
+            print(f"\n[VICReg] SOURCE ADVERSARY MODE: {n_sources} sources")
+            # Count samples per source
+            for src_id in range(n_sources):
+                n_src = (domain_ids == src_id).sum().item()
+                print(f"  Source {src_id}: {n_src} samples")
+        else:
+            # Original: Binary domain labels (ST=0, SC=1)
+            domain_ids = torch.cat([
+                torch.zeros(n_st, device=device, dtype=torch.long),
+                torch.ones(n_sc, device=device, dtype=torch.long),
+            ], dim=0)
+            n_domains = 2
+            print(f"[VICReg] Domain setup: ST(n={n_st}) vs SC(n={n_sc}) => {n_domains} domains")
+
+        ST_LABEL = 0  # Keep for CORAL (first n_st samples are always "ST-like")
+        SC_LABEL = 1  # Keep for CORAL
+
         if batch_size % n_domains != 0:
             print(f"[WARNING] batch_size={batch_size} not divisible by {n_domains} "
                 f"(recommend even batch_size for perfectly balanced sampling)")
@@ -363,11 +398,14 @@ def train_encoder(
             projector = None
             print("  No projector (VICReg on backbone)")
 
-        # Build DOMAIN discriminator (binary ST vs SC)
+        # Build DOMAIN/SOURCE discriminator
         discriminator = SlideDiscriminator(
             h_dim, n_domains, disc_hidden, disc_dropout
         ).to(device)
-        print(f"  Discriminator: {h_dim} → {n_domains} (ST vs SC)")
+        if use_source_adversary and st_source_ids is not None:
+            print(f"  Discriminator: {h_dim} → {n_domains} (source adversary)")
+        else:
+            print(f"  Discriminator: {h_dim} → {n_domains} (ST vs SC)")
 
         # VICReg loss
         vicreg_loss_fn = VICRegLoss(
