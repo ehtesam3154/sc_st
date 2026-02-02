@@ -131,6 +131,9 @@ class GEMSModel:
         # ---- Resume Stage C ----
         resume_ckpt_path: Optional[str] = None,
         resume_reset_optimizer: bool = False,
+        # ---- Generator capacity ----
+        gen_n_blocks: int = 2,  # Number of ISAB blocks in generator (default 2)
+        gen_isab_m: Optional[int] = None,  # Generator ISAB inducing points (default: same as isab_m)
     ):
 
         """
@@ -173,9 +176,17 @@ class GEMSModel:
                 'anchor_geom_mode': anchor_geom_mode,
                 'anchor_geom_min_unknown': anchor_geom_min_unknown,
                 'anchor_geom_debug_every': anchor_geom_debug_every,
+            },
+            'generator': {
+                'gen_n_blocks': gen_n_blocks,
+                'gen_isab_m': gen_isab_m if gen_isab_m is not None else isab_m,
             }
 
         }
+
+        # Store generator capacity params
+        self.gen_n_blocks = gen_n_blocks
+        self.gen_isab_m = gen_isab_m if gen_isab_m is not None else isab_m
         
         # Store anchor_train for later use
         self.anchor_train = anchor_train
@@ -208,7 +219,7 @@ class GEMSModel:
         
         self.generator = MetricSetGenerator(
             c_dim=c_dim, D_latent=D_latent, n_heads=n_heads,
-            n_blocks=2, isab_m=isab_m
+            n_blocks=self.gen_n_blocks, isab_m=self.gen_isab_m
         ).to(device)
         
         # self.score_net = DiffusionScoreNet(
@@ -382,11 +393,20 @@ class GEMSModel:
         precision: str = "16-mixed",
         logger = None,
         log_interval: int = 10,
-        # Early stopping
+        # Early stopping (legacy, non-curriculum)
         enable_early_stop: bool = True,
         early_stop_min_epochs: int = 12,
         early_stop_patience: int = 6,
         early_stop_threshold: float = 0.01,
+        # Curriculum early stopping (three-gate)
+        curriculum_target_stage: int = 6,
+        curriculum_min_epochs: int = 100,
+        curriculum_early_stop: bool = True,
+        use_legacy_curriculum: bool = False,
+        # ========== DATA-DEPENDENT SIGMA CAP ==========
+        sigma_cap_safe_mult: float = 3.0,
+        sigma_cap_abs_max: float = None,
+        sigma_cap_abs_min: float = None,
         phase_name: str = "Mixed",  # "ST-only" or "Fine-tune" or "Mixed"
         # NEW: Stochastic kNN sampling parameters (for STSetDataset)
         # NOTE: For small slides (<1000 spots), use 1.5-2.0 to maintain spatial locality
@@ -437,6 +457,9 @@ class GEMSModel:
         ctx_debug_every: int = 100,
         # ========== SELF-CONDITIONING MODE ==========
         self_cond_mode: str = 'standard',
+        # ========== RESIDUAL DIFFUSION ==========
+        use_residual_diffusion: bool = False,
+        sigma_resid_recompute_step: int = 3000,
         # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
         train_pair_overlap: bool = False,
         pair_overlap_alpha: float = 0.5,
@@ -583,6 +606,14 @@ class GEMSModel:
             early_stop_min_epochs=early_stop_min_epochs,
             early_stop_patience=early_stop_patience,
             early_stop_threshold=early_stop_threshold,
+            curriculum_target_stage=curriculum_target_stage,
+            curriculum_min_epochs=curriculum_min_epochs,
+            curriculum_early_stop=curriculum_early_stop,
+            use_legacy_curriculum=use_legacy_curriculum,
+            # ========== DATA-DEPENDENT SIGMA CAP ==========
+            sigma_cap_safe_mult=sigma_cap_safe_mult,
+            sigma_cap_abs_max=sigma_cap_abs_max,
+            sigma_cap_abs_min=sigma_cap_abs_min,
             # NEW: Context augmentation
             z_noise_std=z_noise_std,
             z_dropout_rate=z_dropout_rate,
@@ -621,6 +652,9 @@ class GEMSModel:
             ctx_debug_every=ctx_debug_every,
             # ========== SELF-CONDITIONING MODE ==========
             self_cond_mode=self_cond_mode,
+            # ========== RESIDUAL DIFFUSION ==========
+            use_residual_diffusion=use_residual_diffusion,
+            sigma_resid_recompute_step=sigma_resid_recompute_step,
             # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
             train_pair_overlap=train_pair_overlap,
             pair_overlap_alpha=pair_overlap_alpha,
@@ -699,7 +733,7 @@ class GEMSModel:
                                and rebuild context_encoder if needed
         """
         import copy
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # ========== AUTO-DETECT ANCHOR MODE ==========
         if auto_detect_anchor:
@@ -728,14 +762,26 @@ class GEMSModel:
                 
                 print(f"[ANCHOR-LOAD] Rebuilt context_encoder: input_dim={self.context_encoder.input_dim}")
         
-        # Now load state dicts
+        # Now load state dicts (with safety checks for missing keys)
         if 'encoder' in checkpoint:
             self.encoder.load_state_dict(checkpoint['encoder'])
         else:
-            print("[LOAD] WARNING: encoder not found in checkpoint; load it separately.")
-        self.context_encoder.load_state_dict(checkpoint['context_encoder'])
-        self.generator.load_state_dict(checkpoint['generator'])
-        self.score_net.load_state_dict(checkpoint['score_net'])
+            print("[LOAD] WARNING: encoder not found in checkpoint; keeping current weights.")
+
+        if 'context_encoder' in checkpoint:
+            self.context_encoder.load_state_dict(checkpoint['context_encoder'])
+        else:
+            print("[LOAD] WARNING: context_encoder not found in checkpoint; keeping current weights.")
+
+        if 'generator' in checkpoint:
+            self.generator.load_state_dict(checkpoint['generator'])
+        else:
+            print("[LOAD] WARNING: generator not found in checkpoint; keeping current weights.")
+
+        if 'score_net' in checkpoint:
+            self.score_net.load_state_dict(checkpoint['score_net'])
+        else:
+            print("[LOAD] WARNING: score_net not found in checkpoint; keeping current weights.")
         
         if 'sigma_data' in checkpoint:
             self.sigma_data = checkpoint['sigma_data']
@@ -743,7 +789,26 @@ class GEMSModel:
             self.sigma_min = checkpoint['sigma_min']
         if 'sigma_max' in checkpoint:
             self.sigma_max = checkpoint['sigma_max']
-        
+
+        # Load curriculum_state and extract sigma parameters for inference
+        if 'curriculum_state' in checkpoint:
+            cs = checkpoint['curriculum_state']
+            # sigma_data_resid: locked value after generator warmup
+            if cs.get('sigma_resid_valid', False) and cs.get('sigma_data_resid_locked') is not None:
+                self.sigma_data_resid = cs['sigma_data_resid_locked']
+                print(f"  Loaded sigma_data_resid={self.sigma_data_resid:.6f} (from curriculum_state)")
+            elif cs.get('sigma_data_resid') is not None:
+                self.sigma_data_resid = cs['sigma_data_resid']
+                print(f"  Loaded sigma_data_resid={self.sigma_data_resid:.6f} (unlocked, may be unstable)")
+
+            # max_sigma_cap_eff_seen: recommended max sigma for inference
+            if cs.get('max_sigma_cap_eff_seen', 0) > 0:
+                self.max_sigma_cap_eff_seen = cs['max_sigma_cap_eff_seen']
+                print(f"  Loaded max_sigma_cap_eff_seen={self.max_sigma_cap_eff_seen:.4f} (recommended sigma_max for inference)")
+
+            # Store curriculum state for reference
+            self.curriculum_state = cs
+
         # Load config if available
         if 'cfg' in checkpoint:
             self.cfg = checkpoint['cfg']
@@ -998,6 +1063,32 @@ class GEMSModel:
         debug_gen_vs_noise: bool = False,
         ablate_use_generator_init: bool = False,
         ablate_use_pure_noise_init: bool = False,
+        # =========================================================================
+        # V2 DISTANCE-FIRST STITCHING PIPELINE PARAMS
+        # =========================================================================
+        use_v2_pipeline: bool = False,
+        use_residual_diffusion: bool = False,
+        sigma_data_resid: Optional[float] = None,
+        # V2 locality graph params
+        v2_k_Z: int = 40,
+        v2_k_sigma: int = 10,
+        v2_tau_jaccard: float = 0.10,
+        v2_min_shared: int = 5,
+        # V2 patch sampling params
+        v2_overlap_frac: float = 0.5,
+        v2_min_overlap: int = 30,
+        # V2 residual diffusion params
+        v2_n_diffusion_steps: int = 200,
+        # V2 distance aggregation params
+        v2_M_min: int = 2,
+        v2_tau_spread: float = 0.30,
+        v2_spread_alpha: float = 10.0,
+        # V2 global solve params
+        v2_n_landmarks: int = 256,
+        v2_global_iters: int = 1000,
+        v2_global_lr: float = 0.01,
+        v2_huber_delta: float = 0.1,
+        v2_anchor_lambda: float = 0.1,
 
     ) -> Dict[str, torch.Tensor]:
 
@@ -1028,14 +1119,28 @@ class GEMSModel:
             sigma_min = getattr(self, 'sigma_min', 0.002)
         if sigma_max is None:
             sigma_max = getattr(self, 'sigma_max', 80.0)
-        
+
+        # Check if sigma_max is appropriate based on training curriculum
+        max_sigma_trained = getattr(self, 'max_sigma_cap_eff_seen', None)
+        if max_sigma_trained is not None and sigma_max > max_sigma_trained * 1.1:
+            print(f"[SIGMA-WARNING] sigma_max={sigma_max:.4f} exceeds max trained sigma={max_sigma_trained:.4f}")
+            print(f"[SIGMA-WARNING] Consider using sigma_max={max_sigma_trained:.4f} for better results")
+
         print(f"[Inference] Using sigma_min={sigma_min:.6f}, sigma_max={sigma_max:.2f}, sigma_data={sigma_data:.4f}")
+        if max_sigma_trained is not None:
+            print(f"[Inference] max_sigma_cap_eff_seen={max_sigma_trained:.4f} (recommended upper bound)")
         print(f"[DEBUG_TAG][INFER-SIGMA] sigma_min={sigma_min:.6f} sigma_max={sigma_max:.6f} sigma_data={sigma_data:.6f}")
 
         if sigma_data is None:
             raise ValueError("sigma_data not set - load from checkpoint or compute from data")
 
-
+        # Auto-populate sigma_data_resid for V2 pipeline if not provided
+        if use_v2_pipeline and use_residual_diffusion and sigma_data_resid is None:
+            sigma_data_resid = getattr(self, 'sigma_data_resid', None)
+            if sigma_data_resid is not None:
+                print(f"[V2-INFER] Auto-loaded sigma_data_resid={sigma_data_resid:.6f} from model")
+            else:
+                print("[V2-WARNING] use_residual_diffusion=True but sigma_data_resid not found in model")
 
         # Use EMA weights for inference if available
         ctx_enc = self.context_encoder_ema if self.context_encoder_ema is not None else self.context_encoder
@@ -1118,6 +1223,25 @@ class GEMSModel:
             debug_gen_vs_noise=debug_gen_vs_noise,
             ablate_use_generator_init=ablate_use_generator_init,
             ablate_use_pure_noise_init=ablate_use_pure_noise_init,
+            # --- V2 DISTANCE-FIRST STITCHING PIPELINE ---
+            use_v2_pipeline=use_v2_pipeline,
+            use_residual_diffusion=use_residual_diffusion,
+            sigma_data_resid=sigma_data_resid,
+            v2_k_Z=v2_k_Z,
+            v2_k_sigma=v2_k_sigma,
+            v2_tau_jaccard=v2_tau_jaccard,
+            v2_min_shared=v2_min_shared,
+            v2_overlap_frac=v2_overlap_frac,
+            v2_min_overlap=v2_min_overlap,
+            v2_n_diffusion_steps=v2_n_diffusion_steps,
+            v2_M_min=v2_M_min,
+            v2_tau_spread=v2_tau_spread,
+            v2_spread_alpha=v2_spread_alpha,
+            v2_n_landmarks=v2_n_landmarks,
+            v2_global_iters=v2_global_iters,
+            v2_global_lr=v2_global_lr,
+            v2_huber_delta=v2_huber_delta,
+            v2_anchor_lambda=v2_anchor_lambda,
         )
         return res
 
