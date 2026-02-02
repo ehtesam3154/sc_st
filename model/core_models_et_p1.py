@@ -806,8 +806,17 @@ def train_encoder(
             # ========== BEST CHECKPOINT SAVING ==========
             # Only check after warmup when alignment losses are meaningful
             if epoch >= adv_warmup_epochs + adv_ramp_epochs:
-                # Alignment score = CORAL + patient CORAL (lower = better)
-                alignment_score = loss_coral.item() + loss_patient_coral.item()
+                # NEW: Use per-class discriminator accuracy balance instead of CORAL
+                # Lower = better: both classes should have accuracy close to 0.5 (true confusion)
+                with torch.no_grad():
+                    preds = logits_post.argmax(dim=1)
+                    # Per-class accuracy on clean embeddings
+                    mask_0 = (s_batch == 0)
+                    mask_1 = (s_batch == 1)
+                    acc_class0 = (preds[mask_0] == 0).float().mean().item() if mask_0.sum() > 0 else 0.5
+                    acc_class1 = (preds[mask_1] == 1).float().mean().item() if mask_1.sum() > 0 else 0.5
+                    # Alignment score: max deviation from 0.5 for either class (lower = better)
+                    alignment_score = max(abs(acc_class0 - 0.5), abs(acc_class1 - 0.5))
 
                 if alignment_score < best_alignment_score:
                     best_alignment_score = alignment_score
@@ -818,7 +827,7 @@ def train_encoder(
                     best_discriminator_state = {k: v.cpu().clone() for k, v in discriminator.state_dict().items()}
 
                     if epoch % 100 == 0:
-                        print(f"  [BEST] New best alignment at epoch {epoch}: CORAL={loss_coral.item():.6f}, PatCORAL={loss_patient_coral.item():.6f}")
+                        print(f"  [BEST] New best alignment at epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, score={alignment_score:.4f}")
 
             continue  # Skip geometry code, go to next epoch
 
