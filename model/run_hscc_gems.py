@@ -14,7 +14,7 @@ import seaborn as sns
 import utils_et as uet
 import torch.distributed as dist
 from scipy.ndimage import gaussian_filter1d
-import os
+from ssl_utils import filter_informative_genes
 
 
 
@@ -73,13 +73,30 @@ def parse_args():
 
     # Early stopping
     parser.add_argument('--enable_early_stop', action='store_true', default=False,
-                        help='Enable early stopping')
+                        help='Enable early stopping (legacy, only used when curriculum is disabled)')
     parser.add_argument('--early_stop_min_epochs', type=int, default=12,
                         help='Minimum epochs before early stopping kicks in')
     parser.add_argument('--early_stop_patience', type=int, default=6,
                         help='Epochs to wait without improvement before stopping')
     parser.add_argument('--early_stop_threshold', type=float, default=0.01,
-                        help='Relative improvement threshold (e.g., 0.01 = 1%)')
+                        help='Relative improvement threshold (e.g., 0.01 = 1%%)')
+
+    # ========== CURRICULUM EARLY STOPPING ==========
+    parser.add_argument('--curriculum_target_stage', type=int, default=2,
+                        help='Target curriculum stage for Gate A (0-indexed, default 2 = final stage for 3-stage curriculum)')
+    parser.add_argument('--curriculum_min_epochs', type=int, default=100,
+                        help='Minimum epochs before three-gate stopping is allowed')
+    parser.add_argument('--curriculum_early_stop', action=argparse.BooleanOptionalAction, default=True,
+                        help='Enable three-gate curriculum-aware early stopping (default: enabled)')
+    parser.add_argument('--use_legacy_curriculum', action=argparse.BooleanOptionalAction, default=False,
+                        help='Use legacy 7-stage curriculum [0.3,...,17.0] instead of new 3-stage [1,2,3]')
+    # ========== DATA-DEPENDENT SIGMA CAP ==========
+    parser.add_argument('--sigma_cap_safe_mult', type=float, default=None,
+                        help='Safety cap multiplier: σ_cap_safe = mult × σ0. If None, auto-computed from curriculum_target_stage+1 (e.g., stage 3 → 4.0×σ_data)')
+    parser.add_argument('--sigma_cap_abs_max', type=float, default=None,
+                        help='Optional absolute max σ_cap (e.g., 1.5). None = no absolute limit.')
+    parser.add_argument('--sigma_cap_abs_min', type=float, default=None,
+                        help='Optional absolute min σ_cap. None = no absolute floor.')
 
     parser.add_argument('--sc_finetune_epochs', type=int, default=None, 
                         help='SC fine-tune epochs (default: auto = 50%% of ST best epoch, clamped [10,50])')
@@ -147,7 +164,13 @@ def parse_args():
                         help='Minimum unknown points to use anchor_geom')
     parser.add_argument('--anchor_geom_debug_every', type=int, default=200,
                         help='Debug logging interval for anchor geometry')
-    
+
+    # ========== GENERATOR CAPACITY ==========
+    parser.add_argument('--gen_n_blocks', type=int, default=2,
+                        help='Number of ISAB blocks in generator (default 2, increase for more capacity)')
+    parser.add_argument('--gen_isab_m', type=int, default=None,
+                        help='Generator ISAB inducing points (default: same as isab_m)')
+
     # ========== INFERENCE MODE ==========
     parser.add_argument('--inference_mode', type=str, default='unanchored',
                         choices=['unanchored', 'anchored'],
@@ -172,7 +195,13 @@ def parse_args():
     parser.add_argument('--self_cond_mode', type=str, default='standard',
                         choices=['none', 'standard'],
                         help='Self-conditioning mode: none (disabled) or standard (two-pass)')
-    
+
+    # ========== RESIDUAL DIFFUSION ==========
+    parser.add_argument('--use_residual_diffusion', action=argparse.BooleanOptionalAction, default=False,
+                        help='Enable residual diffusion: diffuse R = V_target - V_base instead of V_target')
+    parser.add_argument('--sigma_resid_recompute_step', type=int, default=3000,
+                        help='Step at which to recompute sigma_data_resid (after generator warmup)')
+
     # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
     parser.add_argument('--train_pair_overlap', action=argparse.BooleanOptionalAction, default=False,
                         help='Enable paired overlapping minisets for overlap-consistency training')
@@ -312,6 +341,24 @@ def main(args=None):
     stageC_batch = args.batch_size
     lr = args.lr
     outdir = args.outdir
+
+    # ========== AUTO-COMPUTE sigma_cap_safe_mult FROM curriculum_target_stage ==========
+    # The safety cap must be >= the target stage multiplier to allow full training
+    # Stage multipliers are [1.0, 2.0, 3.0, 4.0] for stages 0, 1, 2, 3
+    curriculum_mults = [1.0, 2.0, 3.0, 4.0]
+    target_stage_mult = curriculum_mults[min(args.curriculum_target_stage, len(curriculum_mults)-1)]
+ 
+    if args.sigma_cap_safe_mult is None:
+        # Auto-compute: set to target stage multiplier (allows training at that stage)
+        args.sigma_cap_safe_mult = target_stage_mult
+        print(f"[AUTO] sigma_cap_safe_mult set to {args.sigma_cap_safe_mult:.1f} (from curriculum_target_stage={args.curriculum_target_stage})")
+    elif args.sigma_cap_safe_mult < target_stage_mult:
+        # User-specified value is too low - WARN
+        print(f"\n{'='*70}")
+        print(f"[WARNING] sigma_cap_safe_mult={args.sigma_cap_safe_mult:.1f} < curriculum_target_stage mult={target_stage_mult:.1f}")
+        print(f"          This will PREVENT training from reaching the target stage's full σ_cap!")
+        print(f"          Consider setting --sigma_cap_safe_mult {target_stage_mult:.1f} or higher.")
+        print(f"{'='*70}\n")
     
     # ========== NEW: Auto-switch to anchored output directory if anchor training enabled ==========
     if args.anchor_train and 'anchored' not in outdir:
@@ -326,12 +373,29 @@ def main(args=None):
     scadata, stadata1, stadata2, stadata3 = load_hscc_data()
 
     # ---------- Get common genes ----------
-    common = sorted(list(set(scadata.var_names) & set(stadata1.var_names) & 
-                         set(stadata2.var_names) & set(stadata3.var_names)))
-    n_genes = len(common)
-    
+    # Only need ST1, ST2, ST3 - scadata is same as stadata3 (stP2rep3.h5ad)
+    common = sorted(list(set(stadata1.var_names) & set(stadata2.var_names) & set(stadata3.var_names)))
+
     if fabric.is_global_zero:
-        print(f"Common genes across all datasets: {n_genes}")
+        print(f"Common genes across ST1, ST2, ST3: {len(common)}")
+
+    # ---------- Filter to informative genes ----------
+    # Keep genes with <85% zeros AND variance > 0.01 in ALL ST slides
+    # Done on all ranks to ensure consistent n_genes for model building
+    def _extract(adata, genes):
+        X = adata[:, genes].X
+        return X.toarray() if hasattr(X, 'toarray') else X
+
+    sources_for_filter = {
+        'ST1': _extract(stadata1, common),
+        'ST2': _extract(stadata2, common),
+        'ST3': _extract(stadata3, common),
+    }
+    common = filter_informative_genes(sources_for_filter, common, verbose=fabric.is_global_zero)
+
+    n_genes = len(common)
+    if fabric.is_global_zero:
+        print(f"Genes after filtering: {n_genes}")
 
     # ---------- Build model (same across ranks) ----------
     model = GEMSModel(
@@ -356,7 +420,10 @@ def main(args=None):
         anchor_train=args.anchor_train,
         anchor_geom_losses=args.anchor_geom_losses,
         anchor_geom_mode=args.anchor_geom_mode,
-        anchor_geom_min_unknown=args.anchor_geom_min_unknown
+        anchor_geom_min_unknown=args.anchor_geom_min_unknown,
+        # ========== Generator capacity ==========
+        gen_n_blocks=args.gen_n_blocks,
+        gen_isab_m=args.gen_isab_m,
     )
 
     # ---------- Stage A & B on rank-0 only ----------
@@ -451,7 +518,7 @@ def main(args=None):
 
         if resume_ckpt_path and fabric.is_global_zero:
             print(f"[RESUME] Loading full checkpoint: {resume_ckpt_path}")
-            ckpt = torch.load(resume_ckpt_path, map_location=fabric.device)
+            ckpt = torch.load(resume_ckpt_path, map_location=fabric.device, weights_only=False)
             if 'encoder' in ckpt:
                 model.encoder.load_state_dict(ckpt['encoder'])
             if 'context_encoder' in ckpt:
@@ -511,7 +578,7 @@ def main(args=None):
     if not fabric.is_global_zero:
         # Load A/B weights
         path = os.path.join(outdir, "ab_init.pt")
-        ck = torch.load(path, map_location=fabric.device)
+        ck = torch.load(path, map_location=fabric.device, weights_only=False)
         model.encoder.load_state_dict(ck["encoder"])
         model.context_encoder.load_state_dict(ck["context_encoder"])
         model.generator.load_state_dict(ck["generator"])
@@ -634,6 +701,14 @@ def main(args=None):
         early_stop_min_epochs=args.early_stop_min_epochs,
         early_stop_patience=args.early_stop_patience,
         early_stop_threshold=args.early_stop_threshold,
+        curriculum_target_stage=args.curriculum_target_stage,
+        curriculum_min_epochs=args.curriculum_min_epochs,
+        curriculum_early_stop=args.curriculum_early_stop,
+        use_legacy_curriculum=args.use_legacy_curriculum,
+        # ========== DATA-DEPENDENT SIGMA CAP ==========
+        sigma_cap_safe_mult=args.sigma_cap_safe_mult,
+        sigma_cap_abs_max=args.sigma_cap_abs_max,
+        sigma_cap_abs_min=args.sigma_cap_abs_min,
         # ========== NEW: Context augmentation ==========
         z_noise_std=0.0,       # No noise for Phase 1 (focus on clean geometry)
         z_dropout_rate=0.0,    # No dropout for Phase 1
@@ -672,6 +747,9 @@ def main(args=None):
         ctx_debug_every=args.ctx_debug_every,
         # ========== SELF-CONDITIONING MODE ==========
         self_cond_mode=args.self_cond_mode,
+        # ========== RESIDUAL DIFFUSION ==========
+        use_residual_diffusion=args.use_residual_diffusion,
+        sigma_resid_recompute_step=args.sigma_resid_recompute_step,
         # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
         train_pair_overlap=args.train_pair_overlap,
         pair_overlap_alpha=args.pair_overlap_alpha,
@@ -987,10 +1065,10 @@ def main(args=None):
         checkpoint_path_p1 = os.path.join(outdir, "phase1_st_checkpoint.pt")
         
         if os.path.exists(checkpoint_path_p2):
-            checkpoint = torch.load(checkpoint_path_p2, map_location=fabric.device)
+            checkpoint = torch.load(checkpoint_path_p2, map_location=fabric.device, weights_only=False)
             print(f"✓ Loaded checkpoint: phase2_sc_finetuned_checkpoint.pt")
         elif os.path.exists(checkpoint_path_p1):
-            checkpoint = torch.load(checkpoint_path_p1, map_location=fabric.device)
+            checkpoint = torch.load(checkpoint_path_p1, map_location=fabric.device, weights_only=False)
             print(f"✓ Loaded checkpoint: phase1_st_checkpoint.pt")
         else:
             checkpoint = {}
@@ -1042,11 +1120,9 @@ def main(args=None):
                         tau_mode="adaptive_kth",
                         ensure_connected=True,
                         local_refine=False,
-                        # Anchored sequential sampling
-                        inference_mode=args.inference_mode,  # "anchored" or "unanchored"
-                        anchor_sampling_mode="align_vote_only" if args.inference_mode == "anchored" else "off",
-                        commit_frac=0.6,
-                        seq_align_dim=32,
+                        # V2 pipeline for residual diffusion
+                        use_v2_pipeline=args.use_residual_diffusion,
+                        use_residual_diffusion=args.use_residual_diffusion,
                     )
 
                     
