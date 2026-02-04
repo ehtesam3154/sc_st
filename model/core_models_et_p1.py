@@ -1913,6 +1913,266 @@ def train_encoder_cpdic(
 
 
 # ==============================================================================
+# TRAIN_ENCODER_SIMPLE: Simple VICReg + Domain Adversarial (No Projector)
+# ==============================================================================
+# Simpler approach that avoids the pitfalls of CP-DIC:
+# 1. VICReg applied DIRECTLY on encoder output (no projector collapse)
+# 2. Standard domain adversarial without overlap weighting
+# 3. Explicit embedding variance regularization
+# 4. Optional CORAL for additional alignment
+# ==============================================================================
+
+def train_encoder_simple(
+    model: SharedEncoder,
+    st_gene_expr: torch.Tensor,
+    sc_gene_expr: torch.Tensor,
+    slide_ids: Optional[torch.Tensor] = None,
+    sc_slide_ids: Optional[torch.Tensor] = None,
+    n_epochs: int = 1000,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    device: str = 'cuda',
+    outf: str = 'output',
+    # VICReg parameters (applied directly on encoder output)
+    vicreg_lambda_inv: float = 25.0,
+    vicreg_lambda_var: float = 25.0,
+    vicreg_lambda_cov: float = 1.0,
+    vicreg_gamma: float = 1.0,
+    vicreg_eps: float = 1e-4,
+    # Expression augmentation
+    aug_gene_dropout: float = 0.2,
+    aug_gauss_std: float = 0.01,
+    aug_scale_jitter: float = 0.2,
+    # Domain adversarial
+    adv_weight: float = 1.0,
+    adv_warmup_epochs: int = 100,
+    adv_ramp_epochs: int = 200,
+    disc_hidden: int = 256,
+    disc_dropout: float = 0.1,
+    # CORAL alignment
+    coral_weight: float = 10.0,
+    # Extra variance regularization (on top of VICReg)
+    extra_var_weight: float = 10.0,
+    min_std_target: float = 0.5,
+    # Reproducibility
+    seed: Optional[int] = None,
+    # Return auxiliary
+    return_aux: bool = False,
+):
+    """
+    Simple encoder training with VICReg + Domain Adversarial.
+
+    Key differences from CP-DIC:
+    1. NO projector - VICReg directly on encoder output
+    2. NO overlap weighting - standard adversarial
+    3. Explicit variance regularization
+    4. Direct CORAL alignment
+
+    This is more robust and avoids the collapse issues of CP-DIC.
+    """
+    from ssl_utils import VICRegLoss, augment_expression, grad_reverse
+
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    model = model.to(device)
+    model.train()
+
+    st_gene_expr = st_gene_expr.to(device)
+    sc_gene_expr = sc_gene_expr.to(device)
+
+    n_st = st_gene_expr.shape[0]
+    n_sc = sc_gene_expr.shape[0]
+    h_dim = model.n_embedding[-1]
+
+    # Combine data
+    X_all = torch.cat([st_gene_expr, sc_gene_expr], dim=0)
+    domain_labels = torch.cat([
+        torch.zeros(n_st, device=device, dtype=torch.long),
+        torch.ones(n_sc, device=device, dtype=torch.long),
+    ])
+
+    print("\n" + "="*70)
+    print("STAGE A: SIMPLE ENCODER (VICReg + Domain Adversarial)")
+    print("="*70)
+    print(f"  ST samples: {n_st}, SC samples: {n_sc}")
+    print(f"  Embedding dim: {h_dim}")
+    print(f"  VICReg directly on encoder (NO projector)")
+    print(f"  VICReg: λ_inv={vicreg_lambda_inv}, λ_var={vicreg_lambda_var}, λ_cov={vicreg_lambda_cov}")
+    print(f"  Adversarial: weight={adv_weight}, warmup={adv_warmup_epochs}, ramp={adv_ramp_epochs}")
+    print(f"  CORAL: weight={coral_weight}")
+    print(f"  Extra variance: weight={extra_var_weight}, target_std={min_std_target}")
+    print("="*70 + "\n")
+
+    # Simple domain discriminator
+    discriminator = nn.Sequential(
+        nn.Linear(h_dim, disc_hidden),
+        nn.ReLU(),
+        nn.Dropout(disc_dropout),
+        nn.Linear(disc_hidden, disc_hidden),
+        nn.ReLU(),
+        nn.Dropout(disc_dropout),
+        nn.Linear(disc_hidden, 2),
+    ).to(device)
+
+    # VICReg loss
+    vicreg_loss_fn = VICRegLoss(
+        vicreg_lambda_inv, vicreg_lambda_var, vicreg_lambda_cov,
+        vicreg_gamma, vicreg_eps, ddp_gather=False, float32_stats=True
+    )
+
+    # Optimizers
+    opt_enc = torch.optim.Adam(model.parameters(), lr=lr)
+    opt_disc = torch.optim.Adam(discriminator.parameters(), lr=lr * 3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_enc, T_max=n_epochs)
+
+    # History
+    history = {
+        'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_adv': [],
+        'loss_coral': [], 'loss_var_reg': [],
+        'std_mean': [], 'std_min': [], 'disc_acc': []
+    }
+
+    print(f"Training for {n_epochs} epochs...")
+
+    for epoch in range(n_epochs):
+        model.train()
+        discriminator.train()
+
+        # Adversarial schedule
+        if epoch < adv_warmup_epochs:
+            adv_alpha = 0.0
+        elif epoch < adv_warmup_epochs + adv_ramp_epochs:
+            adv_alpha = (epoch - adv_warmup_epochs) / adv_ramp_epochs
+        else:
+            adv_alpha = 1.0
+
+        # Balanced sampling
+        half_batch = batch_size // 2
+        idx_st = torch.randperm(n_st, device=device)[:half_batch]
+        idx_sc = torch.randperm(n_sc, device=device)[:half_batch] + n_st
+        idx = torch.cat([idx_st, idx_sc])
+
+        X_batch = X_all[idx]
+        d_batch = domain_labels[idx]
+
+        # Two views for VICReg
+        X1 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+        X2 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+
+        # Forward - VICReg directly on encoder output
+        z1 = model(X1)
+        z2 = model(X2)
+        z_clean = model(X_batch)
+
+        # VICReg loss (directly on z, not projected)
+        loss_vicreg, vicreg_stats = vicreg_loss_fn(z1, z2)
+
+        # Extra variance regularization - push std toward target
+        z_std = z_clean.std(dim=0)
+        loss_var_reg = F.relu(min_std_target - z_std).pow(2).mean()
+
+        # CORAL loss (align mean and covariance of ST and SC)
+        z_st = z_clean[d_batch == 0]
+        z_sc = z_clean[d_batch == 1]
+
+        # Mean alignment
+        mean_st = z_st.mean(dim=0)
+        mean_sc = z_sc.mean(dim=0)
+        loss_coral_mean = (mean_st - mean_sc).pow(2).mean()
+
+        # Covariance alignment (simplified CORAL)
+        if z_st.shape[0] > 1 and z_sc.shape[0] > 1:
+            z_st_centered = z_st - mean_st
+            z_sc_centered = z_sc - mean_sc
+            cov_st = (z_st_centered.T @ z_st_centered) / (z_st.shape[0] - 1)
+            cov_sc = (z_sc_centered.T @ z_sc_centered) / (z_sc.shape[0] - 1)
+            loss_coral_cov = (cov_st - cov_sc).pow(2).mean()
+        else:
+            loss_coral_cov = torch.tensor(0.0, device=device)
+
+        loss_coral = loss_coral_mean + loss_coral_cov
+
+        # ===== Discriminator training =====
+        if adv_alpha > 0:
+            with torch.no_grad():
+                z_det = z_clean.detach()
+
+            for _ in range(3):
+                logits_d = discriminator(z_det)
+                loss_disc = F.cross_entropy(logits_d, d_batch)
+                opt_disc.zero_grad()
+                loss_disc.backward()
+                opt_disc.step()
+
+            with torch.no_grad():
+                disc_acc = (logits_d.argmax(1) == d_batch).float().mean().item()
+        else:
+            disc_acc = 0.5
+
+        # ===== Encoder training =====
+        for p in discriminator.parameters():
+            p.requires_grad_(False)
+
+        # Adversarial loss
+        if adv_alpha > 0:
+            z_grl = grad_reverse(z_clean, adv_alpha)
+            logits_adv = discriminator(z_grl)
+            loss_adv = F.cross_entropy(logits_adv, d_batch)
+        else:
+            loss_adv = torch.tensor(0.0, device=device)
+
+        # Total loss
+        loss_total = (
+            loss_vicreg
+            + adv_weight * adv_alpha * loss_adv
+            + coral_weight * loss_coral
+            + extra_var_weight * loss_var_reg
+        )
+
+        opt_enc.zero_grad()
+        loss_total.backward()
+        opt_enc.step()
+        scheduler.step()
+
+        for p in discriminator.parameters():
+            p.requires_grad_(True)
+
+        # Logging
+        history['epoch'].append(epoch)
+        history['loss_total'].append(loss_total.item())
+        history['loss_vicreg'].append(loss_vicreg.item())
+        history['loss_adv'].append(loss_adv.item() if adv_alpha > 0 else 0.0)
+        history['loss_coral'].append(loss_coral.item())
+        history['loss_var_reg'].append(loss_var_reg.item())
+        history['std_mean'].append(vicreg_stats['std_mean'])
+        history['std_min'].append(vicreg_stats['std_min'])
+        history['disc_acc'].append(disc_acc)
+
+        if epoch % 100 == 0 or epoch < 5:
+            print(f"Epoch {epoch:4d} | Loss={loss_total.item():.3f} "
+                  f"(VIC={loss_vicreg.item():.2f}, Adv={loss_adv.item():.3f}, "
+                  f"CORAL={loss_coral.item():.4f}, Var={loss_var_reg.item():.4f}) | "
+                  f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
+                  f"disc_acc={disc_acc:.3f}, α={adv_alpha:.2f}")
+
+    # Save
+    os.makedirs(outf, exist_ok=True)
+    ckpt_path = os.path.join(outf, 'encoder_simple.pt')
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"\nSaved encoder to: {ckpt_path}")
+
+    if return_aux:
+        return model, discriminator, history
+    return model
+
+
+# ==============================================================================
 # STAGE B: GEOMETRIC TARGET PRECOMPUTATION
 # ==============================================================================
 
