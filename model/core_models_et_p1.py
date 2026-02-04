@@ -13,15 +13,7 @@ import os
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from torch.utils.data import Dataset
-from ssl_utils import (
-    FullGatherLayer, batch_all_gather, GradientReversalFunction, grad_reverse,
-    off_diagonal, VICRegLoss, SlideDiscriminator, augment_expression,
-    sample_balanced_slide_indices, sample_balanced_domain_and_slide_indices,
-    grl_alpha_schedule, coral_loss,
-    # NEW: diagnostic utilities (GPT 5.2 Pro fix)
-    compute_confusion_matrix, compute_entropy, compute_gradient_norms,
-    augment_expression_mild, get_adversary_representation, log_adversary_diagnostics
-)
+from ssl_utils import *
 import math
 
 
@@ -111,6 +103,9 @@ def train_encoder(
     slide_ids: Optional[torch.Tensor] = None,
     sc_slide_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-slide IDs for balanced sampling
     sc_patient_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-sample patient IDs for patient CORAL
+    st_source_ids: Optional[torch.Tensor] = None,  # NEW: Per-ST-sample source IDs for N-class adversary
+    sc_source_ids: Optional[torch.Tensor] = None,  # NEW: Per-SC-sample source IDs for N-class adversary
+    use_source_adversary: bool = False,  # NEW: Use N-class source adversary instead of binary ST/SC
     n_epochs: int = 1000,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -161,14 +156,18 @@ def train_encoder(
     # Slide adversary parameters
     adv_slide_weight: float = 50.0,
     patient_coral_weight: float = 10.0,  # Weight for patient-level CORAL (cross-patient alignment)
+    source_coral_weight: float = 50.0,   # Weight for source-level CORAL (when use_source_adversary)
+    mmd_weight: float = 20.0,            # Weight for MMD loss between ST and SC
+    mmd_use_l2norm: bool = True,         # L2 normalize embeddings before MMD
+    mmd_ramp: bool = True,               # Ramp MMD weight during training
     adv_warmup_epochs: int = 50,
     adv_ramp_epochs: int = 200,
     grl_alpha_max: float = 1.0,
     disc_hidden: int = 256,
     disc_dropout: float = 0.1,
     # Balanced slide batching
-    # Balanced slide batching
     stageA_balanced_slides: bool = True,
+    inference_dropout_prob: float = 0.5,  # Probability to drop SC slides during training
     return_aux: bool = False,
     # ========== NEW: Adversary representation control (GPT 5.2 Pro fix) ==========
     # These parameters control what representation the discriminator sees
@@ -245,6 +244,10 @@ def train_encoder(
         sc_slide_ids = sc_slide_ids.to(device)
     if sc_patient_ids is not None:
         sc_patient_ids = sc_patient_ids.to(device)
+    if st_source_ids is not None:
+        st_source_ids = st_source_ids.to(device)
+    if sc_source_ids is not None:
+        sc_source_ids = sc_source_ids.to(device)
 
     # Normalize ST coordinates (pose-invariant)
     # st_coords_norm, center, radius = uet.normalize_coordinates_isotropic(st_coords)
@@ -296,9 +299,11 @@ def train_encoder(
         from ssl_utils import (
             VICRegLoss, SlideDiscriminator, grad_reverse,
             augment_expression, sample_balanced_slide_indices,
-            grl_alpha_schedule, coral_loss, compute_local_alignment_loss
+            sample_balanced_source_indices,
+            grl_alpha_schedule, coral_loss, compute_local_alignment_loss,
+            mmd_rbf_loss
         )
-        
+
         print("\n" + "="*70)
         print("STAGE A MODE: VICReg + Domain Adversary (ST vs SC)")
         print("="*70 + "\n")
@@ -314,19 +319,35 @@ def train_encoder(
         else:
             print(f"[VICReg] ST slide_ids already contiguous: 0..{n_st_slides-1}")
 
-        # ---- Binary domain labels: ST=0, SC=1 ----
         n_st = st_gene_expr.shape[0]
         n_sc = sc_gene_expr.shape[0]
-
         X_ssl = torch.cat([st_gene_expr, sc_gene_expr], dim=0)
-        domain_ids = torch.cat([
-            torch.zeros(n_st, device=device, dtype=torch.long),
-            torch.ones(n_sc, device=device, dtype=torch.long),
-        ], dim=0)
+
+        # ---- N-class source adversary OR binary domain labels ----
+        if use_source_adversary and st_source_ids is not None and sc_source_ids is not None:
+            all_source_ids = torch.cat([st_source_ids, sc_source_ids], dim=0).to(device)
+            unique_sources = torch.unique(all_source_ids)
+            n_sources = len(unique_sources)
+            if not torch.equal(unique_sources.sort().values, torch.arange(n_sources, device=device)):
+                source_id_map = {int(s.item()): i for i, s in enumerate(unique_sources.sort().values)}
+                all_source_ids = torch.tensor([source_id_map[int(s.item())] for s in all_source_ids],
+                                              dtype=torch.long, device=device)
+            domain_ids = all_source_ids
+            n_domains = n_sources
+            print(f"\n[VICReg] SOURCE ADVERSARY MODE: {n_sources} sources")
+            for src_id in range(n_sources):
+                n_src = (domain_ids == src_id).sum().item()
+                print(f"  Source {src_id}: {n_src} samples")
+        else:
+            # Binary domain labels: ST=0, SC=1
+            domain_ids = torch.cat([
+                torch.zeros(n_st, device=device, dtype=torch.long),
+                torch.ones(n_sc, device=device, dtype=torch.long),
+            ], dim=0)
+            n_domains = 2
 
         ST_LABEL = 0
         SC_LABEL = 1
-        n_domains = 2
 
         print(f"[VICReg] Domain setup: ST(n={n_st}) vs SC(n={n_sc}) => {n_domains} domains")
         if batch_size % n_domains != 0:
@@ -398,7 +419,9 @@ def train_encoder(
 
         history_vicreg = {
             'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_adv': [], 'loss_coral': [],
+            'loss_mmd': [], 'mmd_sigma': [],  # NEW: MMD loss between ST and SC
             'loss_patient_coral': [],  # NEW: Patient-level CORAL for cross-patient alignment
+            'loss_source_coral': [],   # NEW: Source-level CORAL (when use_source_adversary)
             'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
             'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': []
@@ -658,6 +681,35 @@ def train_encoder(
                     if len(patient_corals) > 0:
                         loss_patient_coral = torch.stack(patient_corals).mean()
 
+            # ========== NEW: MMD Loss between ST and SC ==========
+            loss_mmd = torch.tensor(0.0, device=device)
+            mmd_sigma_used = 0.0
+            if mmd_weight > 0 and z_st.shape[0] > 8 and z_sc.shape[0] > 8:
+                # Optionally L2 normalize before MMD
+                z_st_mmd = F.normalize(z_st, p=2, dim=1) if mmd_use_l2norm else z_st
+                z_sc_mmd = F.normalize(z_sc, p=2, dim=1) if mmd_use_l2norm else z_sc
+                loss_mmd, mmd_sigma_used = mmd_rbf_loss(z_st_mmd, z_sc_mmd, return_sigma=True)
+
+            # ========== NEW: Source CORAL (when use_source_adversary) ==========
+            loss_source_coral = torch.tensor(0.0, device=device)
+            if use_source_adversary and st_source_ids is not None and sc_source_ids is not None:
+                # Compute CORAL between each pair of sources
+                batch_source_ids = all_source_ids[idx]
+                unique_batch_sources = torch.unique(batch_source_ids)
+                if len(unique_batch_sources) >= 2:
+                    source_corals = []
+                    for i in range(len(unique_batch_sources)):
+                        for j in range(i + 1, len(unique_batch_sources)):
+                            src_i, src_j = unique_batch_sources[i], unique_batch_sources[j]
+                            mask_i = (batch_source_ids == src_i)
+                            mask_j = (batch_source_ids == src_j)
+                            if mask_i.sum() > 4 and mask_j.sum() > 4:
+                                z_si = z_cond[mask_i]
+                                z_sj = z_cond[mask_j]
+                                source_corals.append(coral_loss(z_si, z_sj))
+                    if len(source_corals) > 0:
+                        loss_source_coral = torch.stack(source_corals).mean()
+
             logits_adv = discriminator(grad_reverse(z_cond, alpha))
             loss_adv_enc = F.cross_entropy(logits_adv, s_batch)
 
@@ -693,7 +745,18 @@ def train_encoder(
             coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
             # Patient CORAL uses same ramp as domain CORAL
             patient_coral_w = coral_w * patient_coral_weight if sc_patient_ids is not None else 0.0
-            loss_total = loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral + local_w * loss_local + patient_coral_w * loss_patient_coral
+            # Source CORAL uses same ramp
+            source_coral_w = coral_w * source_coral_weight if use_source_adversary else 0.0
+            # MMD weight (optionally ramped)
+            mmd_w = mmd_weight * (coral_w if mmd_ramp else 1.0)
+
+            loss_total = (loss_vicreg
+                         + adv_slide_weight * loss_adv_enc
+                         + coral_w * loss_coral
+                         + local_w * loss_local
+                         + patient_coral_w * loss_patient_coral
+                         + source_coral_w * loss_source_coral
+                         + mmd_w * loss_mmd)
 
             
             # Optionally log encoder gradient norms before step
@@ -765,10 +828,12 @@ def train_encoder(
             if epoch % 50 == 0 or (epoch < 5 or epoch > (n_epochs - 25)):
                 local_str = f", Local={loss_local.item():.4f}" if use_local_align and epoch >= local_align_warmup else ""
                 patient_coral_str = f", PatCORAL={loss_patient_coral.item():.6f}" if sc_patient_ids is not None else ""
+                source_coral_str = f", SrcCORAL={loss_source_coral.item():.6f}" if use_source_adversary else ""
+                mmd_str = f", MMD={loss_mmd.item():.6f}" if mmd_weight > 0 else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
                 print(f"Epoch {epoch}/{n_epochs} | "
                     f"Loss={loss_total.item():.4f} "
-                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{patient_coral_str}{local_str}) | "
+                    f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, CORAL={loss_coral.item():.6f}{patient_coral_str}{source_coral_str}{mmd_str}{local_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
                     f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}")
@@ -792,7 +857,10 @@ def train_encoder(
             history_vicreg['loss_vicreg'].append(loss_vicreg.item())
             history_vicreg['loss_adv'].append(loss_adv.item())
             history_vicreg['loss_coral'].append(loss_coral.item())
+            history_vicreg['loss_mmd'].append(loss_mmd.item() if mmd_weight > 0 else 0.0)
+            history_vicreg['mmd_sigma'].append(mmd_sigma_used)
             history_vicreg['loss_patient_coral'].append(loss_patient_coral.item() if sc_patient_ids is not None else 0.0)
+            history_vicreg['loss_source_coral'].append(loss_source_coral.item() if use_source_adversary else 0.0)
             history_vicreg['loss_local'].append(loss_local.item() if use_local_align else 0.0)
             history_vicreg['vicreg_inv'].append(vicreg_stats['inv'])
             history_vicreg['vicreg_var'].append(vicreg_stats['var'])
