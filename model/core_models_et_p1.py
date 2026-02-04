@@ -1737,10 +1737,11 @@ def train_encoder_cpdic(
         q_clean, logits_clean = prototype_head(z_clean)
 
         # Clustering loss (SwAV-style swapped prediction + balance)
-        loss_cluster, cluster_stats = clustering_loss(
+        loss_swap, loss_bal, cluster_stats = clustering_loss(
             logits1, logits2, q1, q2,
             lambda_bal=clustering_balance_weight
         )
+        loss_cluster = loss_swap + clustering_balance_weight * loss_bal
 
         # Update overlap tracker with clean assignments
         with torch.no_grad():
