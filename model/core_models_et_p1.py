@@ -2023,7 +2023,7 @@ def train_encoder_simple(
     # VICReg loss
     vicreg_loss_fn = VICRegLoss(
         vicreg_lambda_inv, vicreg_lambda_var, vicreg_lambda_cov,
-        vicreg_gamma, vicreg_eps, ddp_gather=False, float32_stats=True
+        vicreg_gamma, vicreg_eps, use_ddp_gather=False, compute_stats_fp32=True
     )
 
     # Optimizers
