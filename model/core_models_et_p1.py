@@ -1633,10 +1633,11 @@ def train_encoder_cpdic(
 
     # Overlap tracker for PADA-style weighting
     overlap_tracker = OverlapTracker(
-        n_clusters=n_prototypes,
         n_domains=2,
-        ema_decay=overlap_ema,
-        min_overlap=overlap_min
+        n_prototypes=n_prototypes,
+        beta=overlap_ema,
+        min_overlap=overlap_min,
+        device=device
     )
     print(f"  OverlapTracker: EMA={overlap_ema}, min_overlap={overlap_min}")
 
@@ -1744,7 +1745,8 @@ def train_encoder_cpdic(
         # Update overlap tracker with clean assignments
         with torch.no_grad():
             overlap_tracker.update(q_clean, d_batch)
-            overlap_weights = overlap_tracker.get_overlap_weights()
+            # get_overlap_weights returns (per_sample_weights, per_cluster_weights)
+            sample_overlap_w, cluster_overlap_w = overlap_tracker.get_overlap_weights(q_clean)
 
         # Confidence weights for adversary
         conf_weights = compute_confidence_weights(q_clean, epoch, warmup_epochs=confidence_warmup)
@@ -1782,12 +1784,8 @@ def train_encoder_cpdic(
             logits_adv = discriminator(grad_reverse(z_clean, adv_alpha), q_clean)
 
             # Per-sample weighting: overlap * confidence
-            sample_weights = torch.ones(len(idx), device=device)
-
-            # Get overlap weight for each sample based on its cluster assignment
-            cluster_assignments = q_clean.argmax(dim=1)
-            for i, (cluster_id, domain) in enumerate(zip(cluster_assignments, d_batch)):
-                sample_weights[i] = overlap_weights[cluster_id.item()] * conf_weights[i]
+            # sample_overlap_w already computed from get_overlap_weights
+            sample_weights = sample_overlap_w * conf_weights
 
             # Weighted cross-entropy
             ce_per_sample = F.cross_entropy(logits_adv, d_batch, reduction='none')
@@ -1845,16 +1843,16 @@ def train_encoder_cpdic(
         history['disc_acc_sc'].append(disc_acc_sc)
         history['cluster_entropy_st'].append(ent_st)
         history['cluster_entropy_sc'].append(ent_sc)
-        history['overlap_mean'].append(overlap_weights.mean().item())
-        history['overlap_min'].append(overlap_weights.min().item())
-        history['overlap_max'].append(overlap_weights.max().item())
+        history['overlap_mean'].append(cluster_overlap_w.mean().item())
+        history['overlap_min'].append(cluster_overlap_w.min().item())
+        history['overlap_max'].append(cluster_overlap_w.max().item())
         history['confidence_mean'].append(conf_weights.mean().item())
         history['adv_alpha'].append(adv_alpha)
 
         # Print progress
         if epoch % 50 == 0 or epoch < 5 or epoch > n_epochs - 5:
             phase_str = f"Phase {phase}"
-            overlap_str = f"overlap=[{overlap_weights.min().item():.3f},{overlap_weights.max().item():.3f}]"
+            overlap_str = f"overlap=[{cluster_overlap_w.min().item():.3f},{cluster_overlap_w.max().item():.3f}]"
             print(f"Epoch {epoch}/{n_epochs} [{phase_str}] | "
                   f"Loss={loss_total.item():.4f} "
                   f"(VIC={loss_vicreg.item():.3f}, Clust={loss_cluster.item():.4f}, Adv={loss_adv.item():.3f}) | "
@@ -1898,7 +1896,7 @@ def train_encoder_cpdic(
     aux_dict = {
         'prototype_head': prototype_head.state_dict(),
         'discriminator': discriminator.state_dict(),
-        'overlap_tracker_mass': overlap_tracker.mass,
+        'overlap_tracker_stats': overlap_tracker.get_cluster_stats(),
         'history': history,
     }
     if projector is not None:
