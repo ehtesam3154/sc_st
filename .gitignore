@@ -24,3 +24,6 @@ env/
 *.pt
 *.pth
 *.ckpt
+
+# Local experiment notebooks (not tracked)
+claude_hscc_encoder.ipynb
