@@ -1441,6 +1441,477 @@ def train_encoder(
     return model
 
 
+# ==============================================================================
+# TRAIN_ENCODER_CPDIC: Conditional Partial Domain-Invariant Clustering
+# ==============================================================================
+# This training mode is designed to handle PARTIAL DOMAIN OVERLAP, where the
+# patient/source composition differs between ST and SC domains.
+#
+# Key differences from vicreg_adv mode:
+# 1. NO global CORAL/MMD - these fail when compositions differ
+# 2. Unsupervised clustering head (SwAV-style) discovers cell states
+# 3. CDAN-style conditional adversary conditions on discovered states
+# 4. PADA-style overlap weighting downweights unshared clusters
+# 5. Phased training: VICReg+clustering → ramp adversary → full objective
+# ==============================================================================
+
+def train_encoder_cpdic(
+    model: SharedEncoder,
+    st_gene_expr: torch.Tensor,
+    sc_gene_expr: torch.Tensor,
+    slide_ids: Optional[torch.Tensor] = None,
+    sc_slide_ids: Optional[torch.Tensor] = None,
+    n_epochs: int = 1000,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    device: str = 'cuda',
+    outf: str = 'output',
+    # VICReg parameters
+    vicreg_lambda_inv: float = 25.0,
+    vicreg_lambda_var: float = 25.0,
+    vicreg_lambda_cov: float = 1.0,
+    vicreg_gamma: float = 1.0,
+    vicreg_eps: float = 1e-4,
+    vicreg_project_dim: int = 256,
+    vicreg_use_projector: bool = True,
+    vicreg_float32_stats: bool = True,
+    vicreg_ddp_gather: bool = True,
+    # Expression augmentation parameters
+    aug_gene_dropout: float = 0.2,
+    aug_gauss_std: float = 0.01,
+    aug_scale_jitter: float = 0.2,
+    # CP-DIC specific parameters
+    n_prototypes: int = 50,
+    prototype_tau: float = 0.1,
+    clustering_weight: float = 1.0,
+    clustering_balance_weight: float = 0.5,
+    adv_weight: float = 50.0,
+    # Phased training schedule
+    phase1_epochs: int = 100,   # VICReg + clustering only
+    phase2_epochs: int = 100,   # Ramp adversary
+    # phase3 = remaining epochs: full objective
+    # Conditional discriminator parameters
+    disc_hidden: int = 256,
+    disc_dropout: float = 0.1,
+    disc_steps: int = 5,
+    # Overlap tracking
+    overlap_ema: float = 0.99,
+    overlap_min: float = 0.01,
+    # Confidence weighting
+    confidence_warmup: int = 100,
+    # Reproducibility
+    seed: Optional[int] = None,
+    # Checkpoint
+    use_best_checkpoint: bool = True,
+    # Return auxiliary modules
+    return_aux: bool = False,
+):
+    """
+    Train encoder using CP-DIC (Conditional Partial Domain-Invariant Clustering).
+
+    This is designed for scenarios where patient/source composition differs
+    between ST and SC domains (partial domain overlap).
+
+    Training phases:
+    - Phase 1 (0 to phase1_epochs): VICReg + clustering only
+    - Phase 2 (phase1_epochs to phase1_epochs+phase2_epochs): Ramp conditional adversary
+    - Phase 3 (remaining): Full objective with all components
+
+    Args:
+        model: SharedEncoder instance
+        st_gene_expr: (n_st, n_genes) ST expression
+        sc_gene_expr: (n_sc, n_genes) SC expression
+        slide_ids: (n_st,) ST slide identifiers
+        sc_slide_ids: (n_sc,) SC slide identifiers (optional)
+        n_epochs: total training epochs
+        batch_size: batch size
+        lr: learning rate
+        device: torch device
+        outf: output directory
+        n_prototypes: number of prototype clusters
+        prototype_tau: softmax temperature for cluster assignments
+        clustering_weight: weight for clustering loss
+        clustering_balance_weight: weight for cluster balance regularizer
+        adv_weight: weight for conditional adversary loss
+        phase1_epochs: epochs for phase 1 (VICReg + clustering)
+        phase2_epochs: epochs for phase 2 (adversary ramp)
+        disc_hidden: hidden dim for conditional discriminator
+        disc_dropout: dropout for conditional discriminator
+        disc_steps: discriminator steps per encoder step
+        overlap_ema: EMA decay for overlap tracking
+        overlap_min: minimum overlap weight
+        confidence_warmup: epochs before confidence weighting kicks in
+        seed: random seed for reproducibility
+        use_best_checkpoint: return best model instead of final
+        return_aux: if True, return auxiliary modules
+
+    Returns:
+        model (or model, prototype_head, discriminator, overlap_tracker, history if return_aux)
+    """
+    from ssl_utils import (
+        VICRegLoss, augment_expression, sample_balanced_slide_indices,
+        grl_alpha_schedule, grad_reverse,
+        PrototypeHead, ConditionalDiscriminator, OverlapTracker,
+        clustering_loss, compute_confidence_weights, cpdic_diagnostic_log
+    )
+
+    # Set random seeds
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[CP-DIC] Random seed set to {seed}")
+
+    model = model.to(device)
+    model.train()
+
+    st_gene_expr = st_gene_expr.to(device)
+    sc_gene_expr = sc_gene_expr.to(device)
+
+    if slide_ids is not None:
+        slide_ids = slide_ids.to(device)
+    if sc_slide_ids is not None:
+        sc_slide_ids = sc_slide_ids.to(device)
+
+    n_st = st_gene_expr.shape[0]
+    n_sc = sc_gene_expr.shape[0]
+    X_ssl = torch.cat([st_gene_expr, sc_gene_expr], dim=0)
+
+    # Domain labels: ST=0, SC=1
+    domain_ids = torch.cat([
+        torch.zeros(n_st, device=device, dtype=torch.long),
+        torch.ones(n_sc, device=device, dtype=torch.long),
+    ], dim=0)
+
+    ST_LABEL = 0
+    SC_LABEL = 1
+
+    print("\n" + "="*70)
+    print("STAGE A MODE: CP-DIC (Conditional Partial Domain-Invariant Clustering)")
+    print("="*70)
+    print(f"  ST samples: {n_st}, SC samples: {n_sc}")
+    print(f"  Prototypes: {n_prototypes}, tau: {prototype_tau}")
+    print(f"  Phase 1 (VICReg+cluster): epochs 0-{phase1_epochs}")
+    print(f"  Phase 2 (ramp adversary): epochs {phase1_epochs}-{phase1_epochs+phase2_epochs}")
+    print(f"  Phase 3 (full objective): epochs {phase1_epochs+phase2_epochs}+")
+    print(f"  NO global CORAL/MMD (partial domain overlap safe)")
+    print("="*70 + "\n")
+
+    # Build modules
+    h_dim = model.n_embedding[-1]
+
+    # Projector for VICReg
+    if vicreg_use_projector:
+        projector = build_vicreg_projector(h_dim, vicreg_project_dim).to(device)
+        print(f"  Projector: {h_dim} → {vicreg_project_dim}")
+    else:
+        projector = None
+
+    # Prototype head for clustering
+    prototype_head = PrototypeHead(
+        embed_dim=h_dim,
+        n_prototypes=n_prototypes,
+        tau=prototype_tau
+    ).to(device)
+    print(f"  PrototypeHead: {h_dim} → {n_prototypes} prototypes")
+
+    # Conditional discriminator (CDAN-style)
+    discriminator = ConditionalDiscriminator(
+        embed_dim=h_dim,
+        n_prototypes=n_prototypes,
+        n_domains=2,
+        hidden_dim=disc_hidden,
+        dropout=disc_dropout
+    ).to(device)
+    print(f"  ConditionalDiscriminator: ({h_dim}+{n_prototypes}) → 2 domains")
+
+    # Overlap tracker for PADA-style weighting
+    overlap_tracker = OverlapTracker(
+        n_clusters=n_prototypes,
+        n_domains=2,
+        ema_decay=overlap_ema,
+        min_overlap=overlap_min
+    )
+    print(f"  OverlapTracker: EMA={overlap_ema}, min_overlap={overlap_min}")
+
+    # VICReg loss
+    vicreg_loss_fn = VICRegLoss(
+        vicreg_lambda_inv, vicreg_lambda_var, vicreg_lambda_cov,
+        vicreg_gamma, vicreg_eps, vicreg_ddp_gather, vicreg_float32_stats
+    )
+    print(f"  VICReg: λ_inv={vicreg_lambda_inv}, λ_var={vicreg_lambda_var}, λ_cov={vicreg_lambda_cov}")
+
+    # Optimizers
+    enc_params = list(model.parameters()) + list(prototype_head.parameters())
+    if projector is not None:
+        enc_params += list(projector.parameters())
+
+    opt_enc = torch.optim.Adam(enc_params, lr=lr)
+    opt_disc = torch.optim.Adam(discriminator.parameters(), lr=3.0 * lr, weight_decay=1e-4)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_enc, T_max=n_epochs)
+
+    print(f"  Augmentations: dropout={aug_gene_dropout}, noise={aug_gauss_std}, jitter={aug_scale_jitter}")
+    print(f"  Weights: clustering={clustering_weight}, balance={clustering_balance_weight}, adv={adv_weight}")
+    print("="*70 + "\n")
+
+    # History
+    history = {
+        'epoch': [], 'loss_total': [], 'loss_vicreg': [], 'loss_cluster': [],
+        'loss_adv': [], 'phase': [],
+        'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
+        'std_mean': [], 'std_min': [],
+        'disc_acc': [], 'disc_acc_st': [], 'disc_acc_sc': [],
+        'cluster_entropy_st': [], 'cluster_entropy_sc': [],
+        'overlap_mean': [], 'overlap_min': [], 'overlap_max': [],
+        'confidence_mean': [], 'adv_alpha': []
+    }
+
+    # Best checkpoint tracking
+    best_alignment_score = float('inf')
+    best_epoch = 0
+    best_encoder_state = None
+    best_prototype_state = None
+    best_projector_state = None
+    best_discriminator_state = None
+
+    # Training loop
+    print(f"Training encoder (CP-DIC) for {n_epochs} epochs...")
+    for epoch in range(n_epochs):
+        model.train()
+        prototype_head.train()
+        discriminator.train()
+        if projector is not None:
+            projector.train()
+
+        # Determine training phase
+        if epoch < phase1_epochs:
+            phase = 1
+            adv_alpha = 0.0
+        elif epoch < phase1_epochs + phase2_epochs:
+            phase = 2
+            # Linear ramp from 0 to 1
+            adv_alpha = (epoch - phase1_epochs) / phase2_epochs
+        else:
+            phase = 3
+            adv_alpha = 1.0
+
+        # Balanced sampling: equal ST and SC
+        half_batch = batch_size // 2
+        idx_st = torch.randperm(n_st, device=device)[:half_batch]
+        idx_sc = torch.randperm(n_sc, device=device)[:half_batch] + n_st
+        idx = torch.cat([idx_st, idx_sc])
+
+        X_batch = X_ssl[idx]
+        d_batch = domain_ids[idx]  # 0=ST, 1=SC
+
+        # Two augmented views for VICReg
+        X1 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+        X2 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+
+        # Forward through encoder
+        z1 = model(X1)
+        z2 = model(X2)
+        z_clean = model(X_batch)  # Clean for adversary
+
+        # VICReg on projected space
+        if projector is not None:
+            y1 = projector(z1)
+            y2 = projector(z2)
+        else:
+            y1 = z1
+            y2 = z2
+
+        loss_vicreg, vicreg_stats = vicreg_loss_fn(y1, y2)
+
+        # Clustering on clean embeddings
+        q1, logits1 = prototype_head(z1)
+        q2, logits2 = prototype_head(z2)
+        q_clean, logits_clean = prototype_head(z_clean)
+
+        # Clustering loss (SwAV-style swapped prediction + balance)
+        loss_cluster, cluster_stats = clustering_loss(
+            logits1, logits2, q1, q2,
+            lambda_bal=clustering_balance_weight
+        )
+
+        # Update overlap tracker with clean assignments
+        with torch.no_grad():
+            overlap_tracker.update(q_clean, d_batch)
+            overlap_weights = overlap_tracker.get_overlap_weights()
+
+        # Confidence weights for adversary
+        conf_weights = compute_confidence_weights(q_clean, epoch, warmup_epochs=confidence_warmup)
+
+        # ========== Discriminator training ==========
+        disc_loss_val = 0.0
+        disc_acc_val = 0.0
+
+        if phase >= 2:  # Only train discriminator in phase 2+
+            with torch.no_grad():
+                z_det = z_clean.detach()
+                q_det = q_clean.detach()
+
+            for _ in range(disc_steps):
+                logits_d = discriminator(z_det, q_det)
+                loss_disc = F.cross_entropy(logits_d, d_batch)
+
+                opt_disc.zero_grad(set_to_none=True)
+                loss_disc.backward()
+                opt_disc.step()
+
+                with torch.no_grad():
+                    pred = logits_d.argmax(dim=1)
+                    disc_acc_val = (pred == d_batch).float().mean().item()
+                    disc_loss_val = loss_disc.item()
+
+        # ========== Encoder training ==========
+        # Freeze discriminator for encoder update
+        for p in discriminator.parameters():
+            p.requires_grad_(False)
+
+        # Adversarial loss with overlap and confidence weighting
+        loss_adv = torch.tensor(0.0, device=device)
+        if phase >= 2:
+            logits_adv = discriminator(grad_reverse(z_clean, adv_alpha), q_clean)
+
+            # Per-sample weighting: overlap * confidence
+            sample_weights = torch.ones(len(idx), device=device)
+
+            # Get overlap weight for each sample based on its cluster assignment
+            cluster_assignments = q_clean.argmax(dim=1)
+            for i, (cluster_id, domain) in enumerate(zip(cluster_assignments, d_batch)):
+                sample_weights[i] = overlap_weights[cluster_id.item()] * conf_weights[i]
+
+            # Weighted cross-entropy
+            ce_per_sample = F.cross_entropy(logits_adv, d_batch, reduction='none')
+            loss_adv = (ce_per_sample * sample_weights).mean()
+
+        # Total loss
+        loss_total = (loss_vicreg
+                     + clustering_weight * loss_cluster
+                     + adv_weight * adv_alpha * loss_adv)
+
+        opt_enc.zero_grad(set_to_none=True)
+        loss_total.backward()
+        opt_enc.step()
+        scheduler.step()
+
+        # Unfreeze discriminator
+        for p in discriminator.parameters():
+            p.requires_grad_(True)
+
+        # ========== Logging ==========
+        with torch.no_grad():
+            # Per-domain discriminator accuracy
+            is_st = (d_batch == ST_LABEL)
+            is_sc = (d_batch == SC_LABEL)
+
+            if phase >= 2:
+                logits_check = discriminator(z_clean, q_clean)
+                pred_check = logits_check.argmax(dim=1)
+                disc_acc_st = (pred_check[is_st] == ST_LABEL).float().mean().item() if is_st.sum() > 0 else 0.5
+                disc_acc_sc = (pred_check[is_sc] == SC_LABEL).float().mean().item() if is_sc.sum() > 0 else 0.5
+            else:
+                disc_acc_st = 0.5
+                disc_acc_sc = 0.5
+
+            # Cluster entropy per domain
+            q_st = q_clean[is_st]
+            q_sc = q_clean[is_sc]
+            ent_st = -(q_st * torch.log(q_st + 1e-8)).sum(dim=1).mean().item() if is_st.sum() > 0 else 0.0
+            ent_sc = -(q_sc * torch.log(q_sc + 1e-8)).sum(dim=1).mean().item() if is_sc.sum() > 0 else 0.0
+
+        # Log to history
+        history['epoch'].append(epoch)
+        history['loss_total'].append(loss_total.item())
+        history['loss_vicreg'].append(loss_vicreg.item())
+        history['loss_cluster'].append(loss_cluster.item())
+        history['loss_adv'].append(loss_adv.item() if phase >= 2 else 0.0)
+        history['phase'].append(phase)
+        history['vicreg_inv'].append(vicreg_stats['inv'])
+        history['vicreg_var'].append(vicreg_stats['var'])
+        history['vicreg_cov'].append(vicreg_stats['cov'])
+        history['std_mean'].append(vicreg_stats['std_mean'])
+        history['std_min'].append(vicreg_stats['std_min'])
+        history['disc_acc'].append(disc_acc_val)
+        history['disc_acc_st'].append(disc_acc_st)
+        history['disc_acc_sc'].append(disc_acc_sc)
+        history['cluster_entropy_st'].append(ent_st)
+        history['cluster_entropy_sc'].append(ent_sc)
+        history['overlap_mean'].append(overlap_weights.mean().item())
+        history['overlap_min'].append(overlap_weights.min().item())
+        history['overlap_max'].append(overlap_weights.max().item())
+        history['confidence_mean'].append(conf_weights.mean().item())
+        history['adv_alpha'].append(adv_alpha)
+
+        # Print progress
+        if epoch % 50 == 0 or epoch < 5 or epoch > n_epochs - 5:
+            phase_str = f"Phase {phase}"
+            overlap_str = f"overlap=[{overlap_weights.min().item():.3f},{overlap_weights.max().item():.3f}]"
+            print(f"Epoch {epoch}/{n_epochs} [{phase_str}] | "
+                  f"Loss={loss_total.item():.4f} "
+                  f"(VIC={loss_vicreg.item():.3f}, Clust={loss_cluster.item():.4f}, Adv={loss_adv.item():.3f}) | "
+                  f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
+                  f"disc: ST={disc_acc_st:.3f}, SC={disc_acc_sc:.3f} | "
+                  f"{overlap_str}, α={adv_alpha:.2f}")
+
+        # Best checkpoint (after phase 2 warmup)
+        if phase >= 3 and epoch % 50 == 0:
+            # Alignment score: how well the discriminator can distinguish domains
+            # Lower = better (means embeddings are domain-invariant)
+            alignment_score = max(abs(disc_acc_st - 0.5), abs(disc_acc_sc - 0.5))
+
+            if alignment_score < best_alignment_score:
+                best_alignment_score = alignment_score
+                best_epoch = epoch
+                best_encoder_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_prototype_state = {k: v.cpu().clone() for k, v in prototype_head.state_dict().items()}
+                if projector is not None:
+                    best_projector_state = {k: v.cpu().clone() for k, v in projector.state_dict().items()}
+                best_discriminator_state = {k: v.cpu().clone() for k, v in discriminator.state_dict().items()}
+                print(f"  [BEST] New best at epoch {epoch}: ST={disc_acc_st:.3f}, SC={disc_acc_sc:.3f}, score={alignment_score:.4f}")
+
+    # Restore best checkpoint if requested
+    if use_best_checkpoint and best_encoder_state is not None:
+        print(f"\n[CP-DIC] Restoring best checkpoint from epoch {best_epoch} (score={best_alignment_score:.4f})")
+        model.load_state_dict(best_encoder_state)
+        prototype_head.load_state_dict(best_prototype_state)
+        if projector is not None and best_projector_state is not None:
+            projector.load_state_dict(best_projector_state)
+        discriminator.load_state_dict(best_discriminator_state)
+
+    # Save checkpoint
+    os.makedirs(outf, exist_ok=True)
+    ckpt_path = os.path.join(outf, 'encoder_cpdic.pt')
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"[CP-DIC] Saved encoder to: {ckpt_path}")
+
+    # Save auxiliary modules
+    aux_path = os.path.join(outf, 'cpdic_modules.pt')
+    aux_dict = {
+        'prototype_head': prototype_head.state_dict(),
+        'discriminator': discriminator.state_dict(),
+        'overlap_tracker_mass': overlap_tracker.mass,
+        'history': history,
+    }
+    if projector is not None:
+        aux_dict['projector'] = projector.state_dict()
+    torch.save(aux_dict, aux_path)
+    print(f"[CP-DIC] Saved auxiliary modules to: {aux_path}")
+
+    print("CP-DIC encoder training complete!")
+
+    if return_aux:
+        return model, prototype_head, discriminator, overlap_tracker, history
+    return model
+
 
 # ==============================================================================
 # STAGE B: GEOMETRIC TARGET PRECOMPUTATION

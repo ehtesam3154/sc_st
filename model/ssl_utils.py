@@ -1204,3 +1204,331 @@ def mmd_rbf_loss(
 
    mmd = mmd / len(sigmas)
    return (mmd, base_sigma) if return_sigma else mmd
+
+
+# ==============================================================================
+# CP-DIC: CONDITIONAL PARTIAL DOMAIN-INVARIANT CLUSTERING
+# ==============================================================================
+# Based on CDAN (Conditional Adversarial Domain Adaptation) and
+# PADA (Partial Adversarial Domain Adaptation) principles.
+# Key idea: align domains conditionally on discovered cell states,
+# with overlap weighting to handle composition differences.
+# ==============================================================================
+
+
+class PrototypeHead(nn.Module):
+    """
+    Learnable prototype head for unsupervised cell state discovery.
+
+    Produces soft cluster assignments q = softmax(z @ C.T / tau).
+    Prototypes are normalized each forward pass for stability.
+    """
+    def __init__(self, embed_dim: int = 128, n_prototypes: int = 50, tau: float = 0.1):
+        super().__init__()
+        self.prototypes = nn.Parameter(torch.randn(n_prototypes, embed_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.tau = tau
+        self.n_prototypes = n_prototypes
+        self.embed_dim = embed_dim
+
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            z: (B, D) embeddings from encoder
+
+        Returns:
+            q: (B, K) soft cluster assignments
+            logits: (B, K) raw logits before softmax
+        """
+        # Normalize prototypes each forward pass (critical for stability)
+        with torch.no_grad():
+            self.prototypes.data = F.normalize(self.prototypes.data, dim=1)
+
+        z_norm = F.normalize(z, dim=1)
+        c_norm = F.normalize(self.prototypes, dim=1)
+        logits = z_norm @ c_norm.T / self.tau  # (B, K)
+        q = F.softmax(logits, dim=1)
+        return q, logits
+
+
+class ConditionalDiscriminator(nn.Module):
+    """
+    CDAN-style conditional discriminator.
+
+    Takes concat(z, q) as input where q is the cluster assignment.
+    This makes the adversary work within each discovered cell state,
+    preventing it from using patient composition as a shortcut.
+    """
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        n_prototypes: int = 50,
+        n_domains: int = 2,
+        hidden_dim: int = 256,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        input_dim = embed_dim + n_prototypes  # concat(z, q)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_domains)
+        )
+
+    def forward(self, z: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: (B, D) embeddings (should be passed through GRL for encoder training)
+            q: (B, K) cluster assignments (should be detached)
+
+        Returns:
+            logits: (B, n_domains) domain prediction logits
+        """
+        x = torch.cat([z, q], dim=1)  # (B, D+K)
+        return self.net(x)
+
+
+class OverlapTracker:
+    """
+    Track cluster mass per domain with EMA for stable overlap weights.
+
+    Uses geometric mean instead of min for smoother overlap estimation.
+    Maintains running estimates across batches to reduce noise.
+    """
+    def __init__(
+        self,
+        n_domains: int,
+        n_prototypes: int,
+        beta: float = 0.99,
+        min_overlap: float = 0.01,
+        device: str = 'cuda'
+    ):
+        self.beta = beta
+        self.n_domains = n_domains
+        self.n_prototypes = n_prototypes
+        self.min_overlap = min_overlap
+        self.device = device
+        # Initialize uniform
+        self.ema_p = {d: torch.ones(n_prototypes, device=device) / n_prototypes
+                      for d in range(n_domains)}
+        self.initialized = {d: False for d in range(n_domains)}
+
+    def update(self, q: torch.Tensor, domain_ids: torch.Tensor):
+        """
+        Update EMA estimates of cluster mass per domain.
+
+        Args:
+            q: (B, K) soft cluster assignments
+            domain_ids: (B,) domain labels
+        """
+        with torch.no_grad():
+            for d in range(self.n_domains):
+                mask = (domain_ids == d)
+                if mask.sum() > 0:
+                    p_batch = q[mask].mean(0)
+                    if not self.initialized[d]:
+                        self.ema_p[d] = p_batch.clone()
+                        self.initialized[d] = True
+                    else:
+                        self.ema_p[d] = self.beta * self.ema_p[d] + (1 - self.beta) * p_batch
+
+    def get_overlap_weights(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute per-sample overlap weights.
+
+        Uses geometric mean of cluster masses across domains (smoother than min).
+
+        Args:
+            q: (B, K) soft cluster assignments
+
+        Returns:
+            w: (B,) per-sample overlap weights
+            a: (K,) per-cluster overlap scores
+        """
+        # Geometric mean (smoother than min)
+        a = torch.ones(self.n_prototypes, device=self.device)
+        for d in range(self.n_domains):
+            a = a * self.ema_p[d]
+        a = torch.pow(a, 1.0 / self.n_domains)  # K-th root for K domains
+
+        # Clamp to avoid completely ignoring rare shared clusters
+        a = torch.clamp(a, min=self.min_overlap)
+
+        # Per-sample weight: weighted sum over clusters
+        w = (q * a).sum(dim=1)  # (B,)
+        return w, a
+
+    def get_cluster_stats(self) -> Dict[str, torch.Tensor]:
+        """Get current EMA cluster mass estimates for logging."""
+        return {f'domain_{d}': self.ema_p[d].clone() for d in range(self.n_domains)}
+
+
+def swapped_soft_ce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Soft cross-entropy with detached soft target.
+
+    Args:
+        logits: (B, K) raw logits
+        target: (B, K) soft target distribution (should be detached)
+
+    Returns:
+        scalar loss
+    """
+    logp = F.log_softmax(logits, dim=1)
+    return -(target * logp).sum(dim=1).mean()
+
+
+def clustering_loss(
+    logits1: torch.Tensor,
+    logits2: torch.Tensor,
+    q1: torch.Tensor,
+    q2: torch.Tensor,
+    lambda_bal: float = 0.5
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """
+    SwAV-style clustering loss with balance regularizer.
+
+    Components:
+    1. Swapped soft prediction: use q1 to predict q2 and vice versa
+    2. Balance regularizer: prevent prototype collapse via KL to uniform
+
+    Args:
+        logits1, logits2: (B, K) raw logits from two augmented views
+        q1, q2: (B, K) soft assignments from two augmented views
+        lambda_bal: weight for balance regularizer
+
+    Returns:
+        loss_swap: swapped prediction loss
+        loss_bal: balance regularizer loss
+        stats: dict with diagnostic statistics
+    """
+    K = q1.shape[1]
+
+    # Soft swapped prediction (not hard argmax!)
+    loss_swap = 0.5 * (swapped_soft_ce(logits1, q2.detach()) +
+                       swapped_soft_ce(logits2, q1.detach()))
+
+    # Balance regularizer - prevent prototype collapse
+    uniform = torch.full((K,), 1.0 / K, device=q1.device)
+    q_bar = 0.5 * (q1.mean(0) + q2.mean(0))
+    loss_bal = F.kl_div((q_bar + 1e-8).log(), uniform, reduction="batchmean")
+
+    # Diagnostic stats
+    with torch.no_grad():
+        # Entropy of mean assignment (higher = more balanced)
+        bal_entropy = -(q_bar * (q_bar + 1e-8).log()).sum().item()
+        max_entropy = math.log(K)
+
+        # Number of "active" prototypes (mass > 1/K/2)
+        n_active = (q_bar > 0.5 / K).sum().item()
+
+        # Top-5 prototype masses
+        top5_mass = q_bar.topk(5).values.tolist()
+
+    stats = {
+        'bal_entropy': bal_entropy,
+        'bal_entropy_ratio': bal_entropy / max_entropy,
+        'n_active_protos': n_active,
+        'top5_mass': top5_mass,
+    }
+
+    return loss_swap, loss_bal, stats
+
+
+def compute_confidence_weights(
+    q: torch.Tensor,
+    epoch: int,
+    warmup_epochs: int = 100
+) -> torch.Tensor:
+    """
+    Compute confidence weights based on entropy of cluster assignments.
+
+    High-confidence samples (low entropy) get higher weight.
+    During warmup, returns ones (no weighting).
+
+    Args:
+        q: (B, K) soft cluster assignments
+        epoch: current training epoch
+        warmup_epochs: epochs before confidence weighting kicks in
+
+    Returns:
+        w_conf: (B,) confidence weights in [0, 1]
+    """
+    K = q.shape[1]
+
+    # Entropy per sample
+    entropy = -(q * (q + 1e-8).log()).sum(dim=1)  # (B,)
+    max_entropy = math.log(K)
+
+    # Confidence = 1 - normalized_entropy
+    w_conf = 1 - entropy / max_entropy
+    w_conf = torch.clamp(w_conf, 0.0, 1.0)
+
+    # During warmup, don't use confidence weighting
+    if epoch < warmup_epochs:
+        w_conf = torch.ones_like(w_conf)
+
+    return w_conf
+
+
+def cpdic_diagnostic_log(
+    epoch: int,
+    q: torch.Tensor,
+    domain_ids: torch.Tensor,
+    w_conf: torch.Tensor,
+    w_overlap: torch.Tensor,
+    overlap_tracker: OverlapTracker,
+    cluster_stats: Dict[str, float],
+    verbose: bool = True
+) -> Dict[str, float]:
+    """
+    Comprehensive logging for CP-DIC training diagnostics.
+
+    Args:
+        epoch: current epoch
+        q: (B, K) cluster assignments
+        domain_ids: (B,) domain labels
+        w_conf: (B,) confidence weights
+        w_overlap: (B,) overlap weights
+        overlap_tracker: OverlapTracker instance
+        cluster_stats: stats from clustering_loss
+        verbose: print to console
+
+    Returns:
+        stats dict for history tracking
+    """
+    with torch.no_grad():
+        K = q.shape[1]
+
+        # Combined weights
+        w_total = w_conf * w_overlap
+
+        # Per-domain cluster mass
+        domain_stats = overlap_tracker.get_cluster_stats()
+
+        # Overlap scores
+        _, a = overlap_tracker.get_overlap_weights(q)
+
+        stats = {
+            'w_conf_mean': w_conf.mean().item(),
+            'w_conf_min': w_conf.min().item(),
+            'w_overlap_mean': w_overlap.mean().item(),
+            'w_overlap_min': w_overlap.min().item(),
+            'w_total_mean': w_total.mean().item(),
+            'overlap_a_mean': a.mean().item(),
+            'overlap_a_max': a.max().item(),
+            **cluster_stats,
+        }
+
+        if verbose and epoch % 50 == 0:
+            print(f"  [CP-DIC] Epoch {epoch}:")
+            print(f"    Weights: conf={w_conf.mean():.3f}, overlap={w_overlap.mean():.3f}, total={w_total.mean():.3f}")
+            print(f"    Clusters: active={cluster_stats['n_active_protos']:.0f}/{K}, bal_ent_ratio={cluster_stats['bal_entropy_ratio']:.3f}")
+            print(f"    Overlap: mean={a.mean():.4f}, max={a.max():.4f}")
+            print(f"    Top-5 proto mass: {[f'{m:.3f}' for m in cluster_stats['top5_mass']]}")
+
+        return stats
