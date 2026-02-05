@@ -960,7 +960,8 @@ class DiffusionScoreNet(nn.Module):
         knn_k: int = 12,
         self_conditioning: bool = True,
         sc_feat_mode: str ='concat',
-        use_st_dist_head: bool = True
+        use_st_dist_head: bool = True,
+        verbose: bool = False
     ):
         """
         Args:
@@ -971,11 +972,13 @@ class DiffusionScoreNet(nn.Module):
             isab_m: number of inducing points
             time_emb_dim: dimension of time embedding
             ln: layer normalization
+            verbose: enable debug printing during forward pass
         """
         super().__init__()
         self.D_latent = D_latent
         self.c_dim = c_dim
         self.time_emb_dim = time_emb_dim
+        self.verbose = verbose
 
         # Store new config
         self.use_canonicalize = use_canonicalize
@@ -1167,7 +1170,7 @@ class DiffusionScoreNet(nn.Module):
 
 
         # DEBUG: Log geometry source usage
-        if self.training and (torch.rand(()).item() < 0.01):
+        if self.verbose and self.training and (torch.rand(()).item() < 0.01):
             with torch.no_grad():
                 has_sc = (self_cond_canon is not None)
                 n_low = int((geom_gate > 0.5).sum().item())
@@ -1212,10 +1215,10 @@ class DiffusionScoreNet(nn.Module):
         # Identity: rms(sc_feat)/rms(V_in) ≈ rms(sc_canon)/rms(x_raw)
         # This is because V_in = c_in * x_raw and sc_feat = c_in * sc_canon
         
-        if self.training and self_cond_canon is not None and (torch.rand(()).item() < 0.005):
+        if self.verbose and self.training and self_cond_canon is not None and (torch.rand(()).item() < 0.005):
             with torch.no_grad():
                 mask_f = mask.unsqueeze(-1).float()
-                
+
                 # Per-sample RMS computation
                 def _per_sample_rms(tensor, mf):
                     """Compute RMS per sample, return (B,) tensor."""
@@ -1223,23 +1226,23 @@ class DiffusionScoreNet(nn.Module):
                     denom = mf.sum(dim=(1, 2)).clamp_min(1)  # (B,)
                     sq_sum = (tensor.pow(2) * mf).sum(dim=(1, 2))  # (B,)
                     return (sq_sum / denom).sqrt()  # (B,)
-                
+
                 rms_vin = _per_sample_rms(V_in, mask_f)  # (B,)
                 rms_sc_scaled = _per_sample_rms(self_cond_feat_input, mask_f)  # (B,)
                 rms_sc_canon = _per_sample_rms(self_cond_canon, mask_f)  # (B,)
-                
+
                 # Get x_raw_canon for identity check
                 if x_raw is not None:
                     x_raw_canon, _ = uet.center_only(x_raw, mask)
                     rms_xraw = _per_sample_rms(x_raw_canon, mask_f)
                 else:
                     rms_xraw = rms_vin  # Fallback
-                
+
                 # Compute per-sample ratios
                 ratio_scaled = rms_sc_scaled / rms_vin.clamp_min(1e-8)  # (B,)
                 ratio_raw = rms_sc_canon / rms_xraw.clamp_min(1e-8)  # (B,)
                 ratio_error = (ratio_scaled - ratio_raw).abs()  # (B,)
-                
+
                 # Print statistics using torch (no numpy needed)
                 print(f"\n[DEBUG-SC-SCALE] Self-cond identity check:")
                 print(f"  IDENTITY: rms(sc_feat)/rms(V_in) should ≈ rms(sc_canon)/rms(x_raw)")
@@ -1248,7 +1251,7 @@ class DiffusionScoreNet(nn.Module):
                 print(f"  ratio_raw:    median={ratio_raw.median():.3f} "
                       f"p10={ratio_raw.quantile(0.1):.3f} p90={ratio_raw.quantile(0.9):.3f}")
                 print(f"  ratio_error:  median={ratio_error.median():.4f} max={ratio_error.max():.4f}")
-                
+
                 if ratio_error.median() > 0.1:
                     print(f"  ⚠️ WARNING: Identity violated! Check self_cond scaling logic.")
 
@@ -1274,13 +1277,13 @@ class DiffusionScoreNet(nn.Module):
 
 
         # --- DEBUG: Verify coordinate features are not gated ---
-        if self.training and (torch.rand(()).item() < 0.000000005):  # ~0.5% of steps
+        if self.verbose and self.training and (torch.rand(()).item() < 0.000000005):  # ~0.5% of steps
             with torch.no_grad():
                 sigma_for_dbg = sigma_for_gating if sigma_raw is not None else torch.zeros(B, device=V_t.device)
-                
+
                 # Check coordinate feature is same as V_in
                 coord_ratio = V_coord_feat.norm() / V_in.norm().clamp(min=1e-8)
-                
+
                 # Per-sigma-bin check
                 sigma_bins = [(0.0, 0.1), (0.1, 0.3), (0.3, 0.5), (0.5, 1.0), (1.0, float('inf'))]
                 print(f"\n[DEBUG-COORD-FEAT] Coordinate feature verification:")
@@ -1290,11 +1293,11 @@ class DiffusionScoreNet(nn.Module):
                         v_in_bin = V_in[in_bin]
                         v_coord_bin = V_coord_feat[in_bin]
                         mask_bin = mask[in_bin].unsqueeze(-1).float()
-                        
+
                         rms_vin = (v_in_bin.pow(2) * mask_bin).sum().div(mask_bin.sum()).sqrt().item()
                         rms_coord = (v_coord_bin.pow(2) * mask_bin).sum().div(mask_bin.sum()).sqrt().item()
                         ratio = rms_coord / max(rms_vin, 1e-8)
-                        
+
                         status = "✅" if abs(ratio - 1.0) < 0.01 else "❌ GATED!"
                         print(f"  σ∈[{lo:.1f},{hi:.1f}): rms(V_in)={rms_vin:.4f}, "
                             f"rms(V_coord)={rms_coord:.4f}, ratio={ratio:.4f} {status}")
@@ -1339,7 +1342,7 @@ class DiffusionScoreNet(nn.Module):
                 attn_bias = attn_bias * validity_gate
                 
                 # DEBUG: Log when bias is being zeroed due to invalid geometry (should be rare)
-                if self.training and (torch.rand(()).item() < 0.001):
+                if self.verbose and self.training and (torch.rand(()).item() < 0.001):
                     n_valid_geom = geom_ok.sum().item()
                     n_total = geom_ok.numel()
                     if n_valid_geom < n_total:
@@ -1593,6 +1596,7 @@ def run_ab_tests_fixed_batch(
     fixed_eval_sigmas: list,
     device: str,
     epoch: int,
+    use_z_ln: bool = True,
 ):
     """
     Run A/B tests on fixed batch to diagnose σ/time conditioning issues.
@@ -1636,8 +1640,9 @@ def run_ab_tests_fixed_batch(
         # Get D_latent from score_net (handle DDP wrapper)
         D_lat = score_net_unwrapped.D_latent
 
-        Z_fixed = apply_z_ln(Z_fixed, context_encoder)
-        
+        if use_z_ln:
+            Z_fixed = apply_z_ln(Z_fixed, context_encoder)
+
         H_fixed = context_encoder(Z_fixed, mask_fixed)
         
         mask_f = mask_fixed.unsqueeze(-1).float()
@@ -2283,6 +2288,7 @@ def run_probe_eval_multi_sigma(
     global_step: int = 0,
     epoch: int = 0,
     fabric = None,
+    use_z_ln: bool = True,
 ) -> Dict[float, Dict[str, float]]:
     """
     Evaluate the model on a fixed probe batch at MULTIPLE sigma levels.
@@ -2328,9 +2334,9 @@ def run_probe_eval_multi_sigma(
     
     with torch.no_grad():
         B, N, D = V_target.shape
-        Z_probe = apply_z_ln(Z_probe, context_encoder)
+        if use_z_ln:
+            Z_probe = apply_z_ln(Z_probe, context_encoder)
 
-        
         # Get context (same for all sigmas)
         H = context_encoder(Z_probe, mask_probe)
         
@@ -2490,6 +2496,7 @@ def run_probe_open_loop_sample(
     epoch: int = 0,
     trace_sigmas: List[float] = None,
     fabric = None,
+    use_z_ln: bool = True,
 ) -> Dict[str, float]:
     """
     Run open-loop EDM sampling on the fixed probe batch.
@@ -2555,7 +2562,8 @@ def run_probe_open_loop_sample(
         sigmas = (sigma_max ** (1/rho) + step_indices * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
         sigmas[-1] = 0  # Final sigma is 0 (clean)
 
-        Z_probe = apply_z_ln(Z_probe, context_encoder)
+        if use_z_ln:
+            Z_probe = apply_z_ln(Z_probe, context_encoder)
         # ========== Get context (once) ==========
         H = context_encoder(Z_probe, mask_probe)
         
@@ -2749,9 +2757,11 @@ def train_stageC_diffusion_generator(
     overlap_sigma_thresh: float = 0.5,
     disable_ctx_loss_when_overlap: bool = True,
     overlap_debug_every: int = 100,
+    # ========== Z LAYER NORMALIZATION ==========
+    use_z_ln: bool = True,  # If True, apply layer norm to Z_set before context encoding
 
 ):
-    
+
     # Initialize debug tracking
     global debug_state
     debug_state = {
@@ -4087,8 +4097,9 @@ def train_stageC_diffusion_generator(
                 
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
-            # === Z_ln conditioning: normalize Z_set before augmentation ===
-            Z_set = apply_z_ln(Z_set, context_encoder)
+            # === Z_ln conditioning: normalize Z_set before augmentation (if enabled) ===
+            if use_z_ln:
+                Z_set = apply_z_ln(Z_set, context_encoder)
 
 
             # Core membership mask (core points of the sampled ST miniset).
@@ -9784,7 +9795,8 @@ def train_stageC_diffusion_generator(
                 
                 with torch.no_grad():
                     Z_fixed = fixed_batch_data['Z_set'].to(device)
-                    Z_fixed = apply_z_ln(Z_fixed, context_encoder)
+                    if use_z_ln:
+                        Z_fixed = apply_z_ln(Z_fixed, context_encoder)
                     mask_fixed = fixed_batch_data['mask'].to(device)
                     V_target_fixed = fixed_batch_data['V_target'].to(device)
                     G_target_fixed = fixed_batch_data['G_target'].to(device)
@@ -10253,6 +10265,7 @@ def train_stageC_diffusion_generator(
                         fixed_eval_sigmas=fixed_eval_sigmas,
                         device=device,
                         epoch=epoch,
+                        use_z_ln=use_z_ln,
                     )
         # =====================================================================
         # PROBE EVALUATION (ChatGPT Hypothesis 4 - Multi-Sigma Discriminative Metrics)
@@ -10273,6 +10286,7 @@ def train_stageC_diffusion_generator(
                 global_step=global_step,
                 epoch=epoch,
                 fabric=fabric,
+                use_z_ln=use_z_ln,
             )
             
             print_probe_results_multi_sigma(probe_results, global_step, epoch)
@@ -10318,6 +10332,7 @@ def train_stageC_diffusion_generator(
                 epoch=epoch,
                 trace_sigmas=PROBE_SAMPLE_TRACE_SIGMAS,
                 fabric=fabric,
+                use_z_ln=use_z_ln,
             )
             
             print_probe_sample_results(sample_results, global_step, epoch)
@@ -12723,6 +12738,8 @@ def sample_sc_edm_patchwise(
     debug_gen_vs_noise: bool = False,
     ablate_use_generator_init: bool = False,
     ablate_use_pure_noise_init: bool = False,
+    # --- Z LAYER NORMALIZATION ---
+    use_z_ln: bool = True,  # If True, apply layer norm to Z_set before context encoding
 
 ) -> Dict[str, torch.Tensor]:
 
@@ -13771,9 +13788,10 @@ def sample_sc_edm_patchwise(
                 if k == 0:
                     print(f"[SAMPLE] Appended zero anchor channel, Z_k shape={Z_k_batched.shape}")
             
-            # ========== Apply Z layer normalization (matches training) ==========
-            Z_k_batched = apply_z_ln(Z_k_batched, context_encoder)
-            
+            # ========== Apply Z layer normalization (matches training, if enabled) ==========
+            if use_z_ln:
+                Z_k_batched = apply_z_ln(Z_k_batched, context_encoder)
+
             H_k = context_encoder(Z_k_batched, mask_k)
 
             
