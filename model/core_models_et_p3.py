@@ -131,6 +131,9 @@ class GEMSModel:
         # ---- Resume Stage C ----
         resume_ckpt_path: Optional[str] = None,
         resume_reset_optimizer: bool = False,
+        # ========== Z LAYER NORMALIZATION & VERBOSE ==========
+        use_z_ln: bool = True,  # If True, apply layer norm to Z embeddings before context encoding
+        verbose: bool = False,  # If True, enable debug printing in DiffusionScoreNet
     ):
 
         """
@@ -184,6 +187,10 @@ class GEMSModel:
         self.anchor_geom_min_unknown = anchor_geom_min_unknown
         self.anchor_geom_debug_every = anchor_geom_debug_every
 
+        # Store use_z_ln and verbose
+        self.use_z_ln = use_z_ln
+        self.verbose = verbose
+
 
 
         # EMA copies (will be populated if loaded from checkpoint or after training)
@@ -217,10 +224,10 @@ class GEMSModel:
         # ).to(device)
 
         self.score_net = DiffusionScoreNet(
-            D_latent=D_latent, 
-            c_dim=c_dim, 
+            D_latent=D_latent,
+            c_dim=c_dim,
             n_heads=n_heads,
-            n_blocks=4, 
+            n_blocks=4,
             isab_m=isab_m,
             use_canonicalize=use_canonicalize,
             use_dist_bias=use_dist_bias,
@@ -231,7 +238,8 @@ class GEMSModel:
             knn_k=knn_k,
             self_conditioning=self_conditioning,
             sc_feat_mode=sc_feat_mode,
-            use_st_dist_head=True
+            use_st_dist_head=True,
+            verbose=verbose,
         ).to(device)
         
         print(f"GEMS Model initialized:")
@@ -632,6 +640,8 @@ class GEMSModel:
             overlap_sigma_thresh=overlap_sigma_thresh,
             disable_ctx_loss_when_overlap=disable_ctx_loss_when_overlap,
             overlap_debug_every=overlap_debug_every,
+            # ========== Z LAYER NORMALIZATION ==========
+            use_z_ln=self.use_z_ln,
         )
 
 
@@ -1118,6 +1128,8 @@ class GEMSModel:
             debug_gen_vs_noise=debug_gen_vs_noise,
             ablate_use_generator_init=ablate_use_generator_init,
             ablate_use_pure_noise_init=ablate_use_pure_noise_init,
+            # --- Z LAYER NORMALIZATION ---
+            use_z_ln=self.use_z_ln,
         )
         return res
 
@@ -1181,18 +1193,19 @@ class GEMSModel:
                 slide_id = miniset['overlap_info']['slide_id']
                 indices = miniset['overlap_info']['indices'][:n]
                 gene_expr = st_gene_expr_dict_cpu[slide_id][indices].to(self.device)
-                
+
                 # Encode
                 Z = self.encoder(gene_expr)
-                Z = F.layer_norm(Z, (Z.shape[1],))
+                if self.use_z_ln:
+                    Z = F.layer_norm(Z, (Z.shape[1],))
 
                 mask = torch.ones(n, dtype=torch.bool, device=self.device)
-                
+
                 # Context
                 Z_batch = Z.unsqueeze(0)
                 mask_batch = mask.unsqueeze(0)
                 H = self.context_encoder(Z_batch, mask_batch)
-                
+
                 st_contexts.append(H.squeeze(0).cpu())
         
         # Concatenate all contexts
@@ -1278,18 +1291,18 @@ class GEMSModel:
                 indices = miniset['global_indices'][:n]
                 gene_expr = sc_gene_expr[indices].to(self.device)
 
-                
                 # Encode
                 Z = self.encoder(gene_expr)
-                Z = F.layer_norm(Z, (Z.shape[1],))
+                if self.use_z_ln:
+                    Z = F.layer_norm(Z, (Z.shape[1],))
 
                 mask = torch.ones(n, dtype=torch.bool, device=self.device)
-                
+
                 # Context
                 Z_batch = Z.unsqueeze(0)
                 mask_batch = mask.unsqueeze(0)
                 H = self.context_encoder(Z_batch, mask_batch)
-                
+
                 sc_contexts.append(H.squeeze(0).cpu())
         
         # Concatenate all contexts
