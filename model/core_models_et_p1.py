@@ -202,6 +202,10 @@ def train_encoder(
     spatial_nce_tau: float = 0.1,
     spatial_nce_n_rand_neg: int = 128,
     spatial_nce_n_anchors: int = 64,
+    # ========== Two-phase training (ChatGPT Step 2) ==========
+    two_phase_training: bool = False,  # Phase 1: VICReg+NCE only, Phase 2: add alignment
+    phase1_epochs: int = 1000,         # Duration of Phase 1
+    phase2_lr_factor: float = 0.1,     # Reduce encoder LR by this factor in Phase 2
 ):
 
     """
@@ -696,9 +700,31 @@ def train_encoder(
         _nce_z_cache_freq = 5  # update cache every N epochs
         print(f"[SpatialNCE] Embedding-mined hard negatives: z_cache updated every {_nce_z_cache_freq} epochs")
 
+    # ========== TWO-PHASE TRAINING CONFIG ==========
+    if two_phase_training:
+        print(f"\n{'='*70}")
+        print(f"TWO-PHASE TRAINING ENABLED")
+        print(f"  Phase 1 (epochs 0-{phase1_epochs-1}): VICReg + SpatialNCE only (no adversary/alignment)")
+        print(f"  Phase 2 (epochs {phase1_epochs}-{n_epochs-1}): Add adversary + alignment, encoder LR *= {phase2_lr_factor}")
+        print(f"{'='*70}\n")
+    _phase2_started = False
+
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
     for epoch in range(n_epochs):
+        # ========== TWO-PHASE: transition check ==========
+        in_phase1 = two_phase_training and epoch < phase1_epochs
+        if two_phase_training and epoch == phase1_epochs and not _phase2_started:
+            _phase2_started = True
+            # Reduce encoder LR for Phase 2
+            for pg in opt_enc.param_groups:
+                pg['lr'] = pg['lr'] * phase2_lr_factor
+            print(f"\n{'='*70}")
+            print(f"[TWO-PHASE] Entering Phase 2 at epoch {epoch}")
+            print(f"  Encoder LR reduced by {phase2_lr_factor}x → {opt_enc.param_groups[0]['lr']:.2e}")
+            print(f"  Adversary + CORAL + MMD now active")
+            print(f"{'='*70}\n")
+
         # ========== BRANCH 1: VICReg Mode ==========
         if stageA_obj == 'vicreg_adv':
             model.train()
@@ -809,7 +835,11 @@ def train_encoder(
 
             loss_vicreg, vicreg_stats = vicreg_loss_fn(y1, y2)
 
-            alpha = grl_alpha_schedule(epoch, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max)
+            # In two-phase training, alpha schedule resets at Phase 2 start
+            if two_phase_training:
+                alpha = grl_alpha_schedule(epoch - phase1_epochs, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max) if not in_phase1 else 0.0
+            else:
+                alpha = grl_alpha_schedule(epoch, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max)
 
             # ------------------------------------------------------------
             # FIX (Run 4.1): Compute conditioning representation from CLEAN input
@@ -832,15 +862,16 @@ def train_encoder(
                 z_cond = z_clean  # Use raw clean embedding
 
             # (A) Train discriminator on DETACHED z_cond
+            # In Phase 1: start disc warmup in last 50 epochs so it's not cold at Phase 2
             with torch.no_grad():
                 z_det = z_cond.detach()
 
             disc_loss_val = 0.0
             disc_acc_val = 0.0
 
-            # Always train disc a bit (even during warmup) so it doesn't start from scratch later
+            _skip_disc = in_phase1 and epoch < (phase1_epochs - 50)
             disc_grad_norms = {}
-            for _ in range(disc_steps):
+            for _ in range(disc_steps if not _skip_disc else 0):
                 logits_d = discriminator(z_det)
                 loss_disc = F.cross_entropy(logits_d, s_batch)
 
@@ -862,7 +893,7 @@ def train_encoder(
             
             # Comprehensive discriminator diagnostics (GPT 5.2 Pro recommendation)
             disc_diag = {}
-            if adv_log_diagnostics:
+            if adv_log_diagnostics and not _skip_disc:
                 disc_diag = log_adversary_diagnostics(
                     logits=logits_d,
                     targets=s_batch,
@@ -874,7 +905,7 @@ def train_encoder(
 
             # ========== DISCRIMINATOR HEALTH CHECK & REVIVAL ==========
             # If discriminator collapses (always predicts one class), revive it
-            if disc_diag:
+            if disc_diag and not _skip_disc:
                 acc_st = disc_diag.get('disc_acc_class0', 0.5)
                 acc_sc = disc_diag.get('disc_acc_class1', 0.5)
                 min_class_acc = min(acc_st, acc_sc)
@@ -1031,16 +1062,36 @@ def train_encoder(
                 if len(source_corals) > 0:
                     loss_source_coral = torch.stack(source_corals).mean()
 
-            coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
+            # In two-phase training, Phase 2 warmup/ramp is relative to phase1_epochs
+            _effective_epoch = (epoch - phase1_epochs) if two_phase_training else epoch
+            _effective_warmup = adv_warmup_epochs
+            _effective_ramp = adv_ramp_epochs
+
+            coral_w = float(np.clip((_effective_epoch - _effective_warmup) / max(1, _effective_ramp), 0.0, 1.0))
             # Patient CORAL uses same ramp as domain CORAL
             patient_coral_w = coral_w * patient_coral_weight if sc_patient_ids is not None else 0.0
             # Source CORAL uses same ramp
             source_coral_w = coral_w * source_coral_weight if (st_source_ids is not None and sc_source_ids is not None) else 0.0
             mmd_w = (coral_w * mmd_weight) if mmd_ramp else mmd_weight
+
+            # ---- Phase 1: zero out ALL alignment terms (VICReg only) ----
+            if in_phase1:
+                alpha = 0.0
+                _adv_w = 0.0
+                coral_w = 0.0
+                patient_coral_w = 0.0
+                source_coral_w = 0.0
+                mmd_w = 0.0
+                local_w = 0.0
+                _centroid_w = 0.0
+            else:
+                _adv_w = adv_slide_weight
+                _centroid_w = centroid_weight
+
             # NOTE: spatial_nce is handled in separate Step S above (not in this loss)
-            loss_total = (loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral +
+            loss_total = (loss_vicreg + _adv_w * loss_adv_enc + coral_w * loss_coral +
                          local_w * loss_local + patient_coral_w * loss_patient_coral +
-                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + centroid_weight * loss_centroid + knn_weight * loss_knn)
+                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + _centroid_w * loss_centroid + knn_weight * loss_knn)
 
             # Optionally log encoder gradient norms before step
             # Backprop for encoder (MISSING BEFORE!)
@@ -1136,7 +1187,8 @@ def train_encoder(
                 source_coral_str = f", SrcCORAL={loss_source_coral.item():.6f}" if (st_source_ids is not None and sc_source_ids is not None) else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
                 nce_str = f", NCE_S={loss_spatial_nce.item():.4f}" if spatial_nce_weight > 0 else ""
-                print(f"Epoch {epoch}/{n_epochs} | "
+                phase_str = f"[P1] " if in_phase1 else (f"[P2] " if two_phase_training else "")
+                print(f"{phase_str}Epoch {epoch}/{n_epochs} | "
                     f"StepM={loss_total.item():.4f} "
                     f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, "
                     f"CORAL={loss_coral.item():.6f}, MMD={loss_mmd.item():.6f}, "
@@ -1184,8 +1236,10 @@ def train_encoder(
             history_vicreg['locality_overlap_after_M'].append(_loc_after_M['overlap_mean'])
 
             # ========== BEST CHECKPOINT SAVING ==========
-            # Only check after warmup, and evaluate every 50 epochs on FULL dataset for stability
-            if epoch >= adv_warmup_epochs + adv_ramp_epochs and epoch % 100 == 0:
+            # In two-phase mode: checkpoint from epoch 100 (first overlap measurement)
+            # In normal mode: only after warmup+ramp
+            _ckpt_min_epoch = 100 if two_phase_training else (adv_warmup_epochs + adv_ramp_epochs)
+            if epoch >= _ckpt_min_epoch and epoch % 100 == 0:
                 # Evaluate on full dataset (or subsample) for stable alignment metric
                 with torch.no_grad():
                     # Use up to 2000 samples per domain for speed
