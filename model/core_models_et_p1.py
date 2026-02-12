@@ -677,6 +677,13 @@ def train_encoder(
         )
         print(f"[SpatialNCE] weight={spatial_nce_weight}, tau={spatial_nce_tau}")
 
+    # Round-robin slide list for Step S (spatial NCE)
+    if spatial_nce_weight > 0 and spatial_nce_data is not None:
+        _nce_unique_slides = torch.unique(slide_ids).cpu().tolist()
+        _nce_slide_cursor = 0
+        print(f"[SpatialNCE] Separate Step S: round-robin over {len(_nce_unique_slides)} slides, "
+              f"n_anchors={spatial_nce_n_anchors}")
+
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
     for epoch in range(n_epochs):
@@ -686,7 +693,33 @@ def train_encoder(
             if projector is not None:
                 projector.train()
             discriminator.train()
-            
+
+            # ========== STEP S: Separate Spatial InfoNCE update (ST only) ==========
+            loss_spatial_nce = torch.tensor(0.0, device=device)
+            if spatial_nce_weight > 0 and spatial_nce_data is not None:
+                from ssl_utils import compute_spatial_infonce_supportset
+                # Round-robin slide selection
+                _nce_slide_pick = _nce_unique_slides[_nce_slide_cursor % len(_nce_unique_slides)]
+                _nce_slide_cursor += 1
+
+                loss_spatial_nce = compute_spatial_infonce_supportset(
+                    model=model,
+                    st_gene_expr=st_gene_expr,
+                    pos_idx=spatial_nce_data['pos_idx'],
+                    far_mask=spatial_nce_data['far_mask'],
+                    hard_neg=spatial_nce_data['hard_neg'],
+                    slide_ids=slide_ids,
+                    tau=spatial_nce_tau,
+                    n_rand_neg=spatial_nce_n_rand_neg,
+                    n_anchors_per_step=spatial_nce_n_anchors,
+                    slide_override=_nce_slide_pick,
+                )
+
+                opt_enc.zero_grad(set_to_none=True)
+                (spatial_nce_weight * loss_spatial_nce).backward()
+                opt_enc.step()
+
+            # ========== STEP M: Mixed ST+SC representation + alignment ==========
             # ========== Balanced domain sampling ==========
             # Sample from all domains (ST slides + SC)
             # ========== Balanced domain sampling ==========
@@ -759,22 +792,6 @@ def train_encoder(
                 loss_knn = knn_consistency_loss_global(idx, z_clean, global_X_knn, Z_cache, k=15)
             else:
                 loss_knn = torch.tensor(0.0, device=device)
-
-            # ========== SPATIAL InfoNCE LOSS (support-set, ST only) ==========
-            loss_spatial_nce = torch.tensor(0.0, device=device)
-            if spatial_nce_weight > 0 and spatial_nce_data is not None:
-                from ssl_utils import compute_spatial_infonce_supportset
-                loss_spatial_nce = compute_spatial_infonce_supportset(
-                    model=model,
-                    st_gene_expr=st_gene_expr,
-                    pos_idx=spatial_nce_data['pos_idx'],
-                    far_mask=spatial_nce_data['far_mask'],
-                    hard_neg=spatial_nce_data['hard_neg'],
-                    slide_ids=slide_ids,
-                    tau=spatial_nce_tau,
-                    n_rand_neg=spatial_nce_n_rand_neg,
-                    n_anchors_per_step=spatial_nce_n_anchors,
-                )   
 
             if adv_use_layernorm:
                 z_cond = F.layer_norm(z_clean, (z_clean.shape[1],))
@@ -987,10 +1004,10 @@ def train_encoder(
             # Source CORAL uses same ramp
             source_coral_w = coral_w * source_coral_weight if (st_source_ids is not None and sc_source_ids is not None) else 0.0
             mmd_w = (coral_w * mmd_weight) if mmd_ramp else mmd_weight
+            # NOTE: spatial_nce is handled in separate Step S above (not in this loss)
             loss_total = (loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral +
                          local_w * loss_local + patient_coral_w * loss_patient_coral +
-                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + centroid_weight * loss_centroid + knn_weight * loss_knn +
-                         spatial_nce_weight * loss_spatial_nce)
+                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + centroid_weight * loss_centroid + knn_weight * loss_knn)
 
             # Optionally log encoder gradient norms before step
             # Backprop for encoder (MISSING BEFORE!)
@@ -1070,12 +1087,13 @@ def train_encoder(
                 patient_coral_str = f", PatCORAL={loss_patient_coral.item():.6f}" if sc_patient_ids is not None else ""
                 source_coral_str = f", SrcCORAL={loss_source_coral.item():.6f}" if (st_source_ids is not None and sc_source_ids is not None) else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
+                nce_str = f", NCE_S={loss_spatial_nce.item():.4f}" if spatial_nce_weight > 0 else ""
                 print(f"Epoch {epoch}/{n_epochs} | "
-                    f"Loss={loss_total.item():.4f} "
+                    f"StepM={loss_total.item():.4f} "
                     f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, "
                     f"CORAL={loss_coral.item():.6f}, MMD={loss_mmd.item():.6f}, "
                     f"MMDw={mmd_w:.2f}, σ={mmd_sigma:.3f}"
-                    f"{patient_coral_str}{source_coral_str}{local_str}) | "
+                    f"{patient_coral_str}{source_coral_str}{local_str}{nce_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
                     f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}"

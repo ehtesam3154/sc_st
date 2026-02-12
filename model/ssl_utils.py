@@ -1356,6 +1356,7 @@ def compute_spatial_infonce_supportset(
     n_rand_neg: int = 128,
     n_anchors_per_step: int = 64,
     return_diagnostics: bool = False,
+    slide_override: Optional[int] = None,
 ):
     """
     Support-set Spatial InfoNCE: explicitly forward-pass all positives,
@@ -1382,6 +1383,7 @@ def compute_spatial_infonce_supportset(
         n_rand_neg:  random far negatives per anchor
         n_anchors_per_step: anchors to sample per slide per step
         return_diagnostics: if True, returns (loss, stats_dict)
+        slide_override: if set, use this slide ID instead of random
 
     Returns:
         loss (or (loss, stats) if return_diagnostics=True)
@@ -1389,9 +1391,12 @@ def compute_spatial_infonce_supportset(
     device = st_gene_expr.device
     n_st = st_gene_expr.shape[0]
 
-    # 1. Pick a random slide, sample anchors from it
+    # 1. Pick a slide (round-robin override or random), sample anchors from it
     unique_slides = torch.unique(slide_ids)
-    slide_pick = unique_slides[torch.randint(len(unique_slides), (1,)).item()]
+    if slide_override is not None:
+        slide_pick = torch.tensor(slide_override, device=device)
+    else:
+        slide_pick = unique_slides[torch.randint(len(unique_slides), (1,)).item()]
     slide_indices = torch.where(slide_ids == slide_pick)[0]
 
     n_avail = slide_indices.shape[0]
@@ -2033,6 +2038,7 @@ def diagnose_spatial_infonce(
     opt_train = torch.optim.Adam(model_train.parameters(), lr=lr)
 
     st_expr_dev = st_gene_expr.to(device)
+    unique_slide_list = torch.unique(slide_ids.to(device)).cpu().tolist()
 
     step_logs = {
         'step': [], 'loss_nce': [], 'loss_vicreg': [],
@@ -2043,7 +2049,27 @@ def diagnose_spatial_infonce(
     }
 
     for step in range(n_diagnostic_steps):
-        # Sample batch for VICReg
+        # --- Step S: Separate spatial NCE update (round-robin slides) ---
+        slide_pick = unique_slide_list[step % len(unique_slide_list)]
+        loss_nce_s, nce_diag_s = compute_spatial_infonce_supportset(
+            model=model_train,
+            st_gene_expr=st_expr_dev,
+            pos_idx=spatial_nce_data['pos_idx'],
+            far_mask=spatial_nce_data['far_mask'],
+            hard_neg=spatial_nce_data['hard_neg'],
+            slide_ids=slide_ids.to(device),
+            tau=spatial_nce_tau,
+            n_rand_neg=spatial_nce_n_rand_neg,
+            n_anchors_per_step=spatial_nce_n_anchors,
+            return_diagnostics=True,
+            slide_override=slide_pick,
+        )
+
+        opt_train.zero_grad(set_to_none=True)
+        (spatial_nce_weight * loss_nce_s).backward()
+        opt_train.step()
+
+        # --- Step M: VICReg on mixed batch (separate step) ---
         idx_s = sample_balanced_domain_and_slide_indices(
             domain_ids, slide_ids.to(device),
             sc_slide_ids.to(device) if sc_slide_ids is not None else None,
@@ -2059,24 +2085,8 @@ def diagnose_spatial_infonce(
 
         loss_vic_s, _ = vicreg_loss_fn(z1_s, z2_s)
 
-        # Support-set spatial InfoNCE (does its own forward pass)
-        loss_nce_s, nce_diag_s = compute_spatial_infonce_supportset(
-            model=model_train,
-            st_gene_expr=st_expr_dev,
-            pos_idx=spatial_nce_data['pos_idx'],
-            far_mask=spatial_nce_data['far_mask'],
-            hard_neg=spatial_nce_data['hard_neg'],
-            slide_ids=slide_ids.to(device),
-            tau=spatial_nce_tau,
-            n_rand_neg=spatial_nce_n_rand_neg,
-            n_anchors_per_step=spatial_nce_n_anchors,
-            return_diagnostics=True,
-        )
-
-        loss_total_s = loss_vic_s + spatial_nce_weight * loss_nce_s
-
         opt_train.zero_grad(set_to_none=True)
-        loss_total_s.backward()
+        loss_vic_s.backward()
         opt_train.step()
 
         # Log
@@ -2099,7 +2109,7 @@ def diagnose_spatial_infonce(
                   f"sim(pos)={nce_diag_s['sim_pos_mean']:.4f} sim(hard)={nce_diag_s['sim_hard_mean']:.4f} "
                   f"sim(rand)={nce_diag_s['sim_rand_mean']:.4f} | "
                   f"active={nce_diag_s['n_active']}/{nce_diag_s['n_anchors']} | "
-                  f"support={nce_diag_s['support_set_size']}")
+                  f"slide={slide_pick} support={nce_diag_s['support_set_size']}")
 
     # Summary
     print("\n" + "-" * 70)
