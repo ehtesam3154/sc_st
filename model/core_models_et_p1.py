@@ -690,6 +690,11 @@ def train_encoder(
         _nce_phys_knn = spatial_nce_data['pos_idx']  # (n_st, k_phys)
         print(f"[SpatialNCE] Locality diagnostic: will log kNN overlap every 100 epochs")
 
+        # Initialize embedding cache for embedding-mined hard negatives (Step 2)
+        _nce_z_cache = None
+        _nce_z_cache_freq = 5  # update cache every N epochs
+        print(f"[SpatialNCE] Embedding-mined hard negatives: z_cache updated every {_nce_z_cache_freq} epochs")
+
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
     for epoch in range(n_epochs):
@@ -710,6 +715,14 @@ def train_encoder(
                 _nce_slide_pick = _nce_unique_slides[_nce_slide_cursor % len(_nce_unique_slides)]
                 _nce_slide_cursor += 1
 
+                # Update embedding cache for hard negative mining
+                if _nce_z_cache is None or epoch % _nce_z_cache_freq == 0:
+                    with torch.no_grad():
+                        _z_parts = []
+                        for _ci in range(0, st_gene_expr.shape[0], 512):
+                            _z_parts.append(model(st_gene_expr[_ci:_ci+512]))
+                        _nce_z_cache = torch.cat(_z_parts, dim=0)
+
                 loss_spatial_nce = compute_spatial_infonce_supportset(
                     model=model,
                     st_gene_expr=st_gene_expr,
@@ -721,6 +734,8 @@ def train_encoder(
                     n_rand_neg=spatial_nce_n_rand_neg,
                     n_anchors_per_step=spatial_nce_n_anchors,
                     slide_override=_nce_slide_pick,
+                    z_cache=_nce_z_cache,
+                    n_hard_mine=20,
                 )
 
                 opt_enc.zero_grad(set_to_none=True)

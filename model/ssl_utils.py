@@ -1357,6 +1357,8 @@ def compute_spatial_infonce_supportset(
     n_anchors_per_step: int = 64,
     return_diagnostics: bool = False,
     slide_override: Optional[int] = None,
+    z_cache: Optional[torch.Tensor] = None,
+    n_hard_mine: int = 20,
 ):
     """
     Support-set Spatial InfoNCE: explicitly forward-pass all positives,
@@ -1384,6 +1386,11 @@ def compute_spatial_infonce_supportset(
         n_anchors_per_step: anchors to sample per slide per step
         return_diagnostics: if True, returns (loss, stats_dict)
         slide_override: if set, use this slide ID instead of random
+        z_cache:     (n_st, d) optional embedding cache for mining hard negatives
+                     in embedding space. When provided, hard negatives are mined
+                     as the top-n_hard_mine most similar far spots in z_cache
+                     instead of using precomputed expression-hard negatives.
+        n_hard_mine: number of hard negatives to mine from z_cache per anchor
 
     Returns:
         loss (or (loss, stats) if return_diagnostics=True)
@@ -1413,14 +1420,30 @@ def compute_spatial_infonce_supportset(
     per_anchor_hard = []
     per_anchor_far = []
 
+    # If z_cache provided, mine hard negatives from embedding space
+    use_emb_mining = z_cache is not None
+    if use_emb_mining:
+        z_cache_norm = F.normalize(z_cache.detach(), dim=1)
+
     for a in anchor_list:
         p = pos_idx[a]
         p = p[p >= 0].cpu().tolist()
         per_anchor_pos.append(p)
         all_needed.update(p)
 
-        h = hard_neg[a]
-        h = h[h >= 0].cpu().tolist()
+        if use_emb_mining:
+            # Mine hard negatives: top-n_hard_mine most similar far spots in embedding space
+            far_of_a_all = torch.where(far_mask[a])[0]
+            if far_of_a_all.numel() > 0:
+                sim_emb = z_cache_norm[a] @ z_cache_norm[far_of_a_all].T
+                m_eff = min(n_hard_mine, far_of_a_all.numel())
+                _, topk_idx = sim_emb.topk(m_eff)
+                h = far_of_a_all[topk_idx].cpu().tolist()
+            else:
+                h = []
+        else:
+            h_t = hard_neg[a]
+            h = h_t[h_t >= 0].cpu().tolist()
         per_anchor_hard.append(h)
         all_needed.update(h)
 
