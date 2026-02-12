@@ -1303,9 +1303,17 @@ def compute_spatial_infonce_loss(
         hard_local = hard_local[hard_local >= 0]
 
         # Random far negatives in batch
-        far_in_batch = far_mask[g_i][batch_idx]
-        far_in_batch[local_i] = False
-        far_candidates = torch.where(far_in_batch)[0]
+        # FIX: far_mask is (n_st, n_st) -- only index with ST batch members
+        n_st_nce = far_mask.shape[0]
+        is_st_in_batch = (batch_idx < n_st_nce)
+        st_local_idx = torch.where(is_st_in_batch)[0]
+        if st_local_idx.numel() > 0:
+            st_globals = batch_idx[st_local_idx]
+            far_among_st = far_mask[g_i][st_globals]
+            far_among_st = far_among_st & (st_local_idx != local_i)
+            far_candidates = st_local_idx[far_among_st]
+        else:
+            far_candidates = torch.tensor([], dtype=torch.long, device=z.device)
         if far_candidates.numel() > n_rand_neg:
             perm = torch.randperm(far_candidates.numel(), device=z.device)[:n_rand_neg]
             rand_neg = far_candidates[perm]
@@ -1412,9 +1420,17 @@ def compute_spatial_infonce_loss_with_diagnostics(
         hard_local = hard_local[hard_local >= 0]
 
         # Random far negatives in batch
-        far_in_batch = far_mask[g_i][batch_idx]
-        far_in_batch[local_i] = False
-        far_candidates = torch.where(far_in_batch)[0]
+        # FIX: far_mask is (n_st, n_st) -- only index with ST batch members
+        n_st_nce = far_mask.shape[0]
+        is_st_in_batch = (batch_idx < n_st_nce)
+        st_local_idx = torch.where(is_st_in_batch)[0]
+        if st_local_idx.numel() > 0:
+            st_globals = batch_idx[st_local_idx]
+            far_among_st = far_mask[g_i][st_globals]
+            far_among_st = far_among_st & (st_local_idx != local_i)
+            far_candidates = st_local_idx[far_among_st]
+        else:
+            far_candidates = torch.tensor([], dtype=torch.long, device=z.device)
         if far_candidates.numel() > n_rand_neg:
             perm = torch.randperm(far_candidates.numel(), device=z.device)[:n_rand_neg]
             rand_neg = far_candidates[perm]
