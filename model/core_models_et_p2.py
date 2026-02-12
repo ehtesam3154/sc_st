@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
-from typing import Dict, List, Tuple, Optional
+import random
+from typing import Dict, List, Tuple, Optional, Any
 import torch.distributed as dist
 
 
@@ -169,9 +170,11 @@ def compute_overlap_losses(
         tr_G2 = G2.trace() + eps
 
         # (1) Shape loss: normalized Gram Frobenius distance (scale-free)
+        # FIX #2: Normalize by n_I² to remove overlap-size bias
+        # Using .mean() instead of .sum() divides by n_I × n_I automatically
         G1_norm = G1 / tr_G1
         G2_norm = G2 / tr_G2
-        shape_loss_b = (G1_norm - G2_norm).pow(2).sum()
+        shape_loss_b = (G1_norm - G2_norm).pow(2).mean()  # FIX #2: .mean() instead of .sum()
         L_ov_shape = L_ov_shape + shape_loss_b
 
         # (2) Scale loss: squared log-trace difference (between views)
@@ -1593,6 +1596,7 @@ def run_ab_tests_fixed_batch(
     fixed_eval_sigmas: list,
     device: str,
     epoch: int,
+    use_z_ln: bool = False
 ):
     """
     Run A/B tests on fixed batch to diagnose σ/time conditioning issues.
@@ -1636,7 +1640,8 @@ def run_ab_tests_fixed_batch(
         # Get D_latent from score_net (handle DDP wrapper)
         D_lat = score_net_unwrapped.D_latent
 
-        Z_fixed = apply_z_ln(Z_fixed, context_encoder)
+        if use_z_ln:
+            Z_fixed = apply_z_ln(Z_fixed, context_encoder)
         
         H_fixed = context_encoder(Z_fixed, mask_fixed)
         
@@ -2283,6 +2288,7 @@ def run_probe_eval_multi_sigma(
     global_step: int = 0,
     epoch: int = 0,
     fabric = None,
+    use_z_ln: bool = False,
 ) -> Dict[float, Dict[str, float]]:
     """
     Evaluate the model on a fixed probe batch at MULTIPLE sigma levels.
@@ -2328,7 +2334,8 @@ def run_probe_eval_multi_sigma(
     
     with torch.no_grad():
         B, N, D = V_target.shape
-        Z_probe = apply_z_ln(Z_probe, context_encoder)
+        if use_z_ln:
+            Z_probe = apply_z_ln(Z_probe, context_encoder)
 
         
         # Get context (same for all sigmas)
@@ -2490,6 +2497,7 @@ def run_probe_open_loop_sample(
     epoch: int = 0,
     trace_sigmas: List[float] = None,
     fabric = None,
+    use_z_ln: bool = False,
 ) -> Dict[str, float]:
     """
     Run open-loop EDM sampling on the fixed probe batch.
@@ -2555,7 +2563,8 @@ def run_probe_open_loop_sample(
         sigmas = (sigma_max ** (1/rho) + step_indices * (sigma_min ** (1/rho) - sigma_max ** (1/rho))) ** rho
         sigmas[-1] = 0  # Final sigma is 0 (clean)
 
-        Z_probe = apply_z_ln(Z_probe, context_encoder)
+        if use_z_ln:
+            Z_probe = apply_z_ln(Z_probe, context_encoder)
         # ========== Get context (once) ==========
         H = context_encoder(Z_probe, mask_probe)
         
@@ -2689,11 +2698,20 @@ def train_stageC_diffusion_generator(
     precision: str = '16-mixed', # "32-true" | "16-mixed" | "bf16-mixed"
     logger = None,
     log_interval: int = 20,
-    # Early stopping parameters
+    # Early stopping parameters (legacy, non-curriculum)
     enable_early_stop: bool = True,
     early_stop_min_epochs: int = 12,
     early_stop_patience: int = 6,
     early_stop_threshold: float = 0.01,  # 1% relative improvement
+    # Curriculum early stopping (three-gate)
+    curriculum_target_stage: int = 6,
+    curriculum_min_epochs: int = 100,
+    curriculum_early_stop: bool = True,
+    use_legacy_curriculum: bool = False,
+    # ========== DATA-DEPENDENT SIGMA CAP ==========
+    sigma_cap_safe_mult: float = None,     # σ_cap_safe = mult × σ0. If None, uses target stage mult (e.g., stage 3 → 4.0)
+    sigma_cap_abs_max: float = None,       # Optional absolute ceiling
+    sigma_cap_abs_min: float = None,       # Optional absolute floor
     # NEW: EDM parameters
     P_mean: float = -1.2,          # Log-normal mean for sigma sampling
     P_std: float = 1.2,            # Log-normal std for sigma sampling
@@ -2738,6 +2756,9 @@ def train_stageC_diffusion_generator(
     ctx_debug_every: int = 100,
     # ========== SELF-CONDITIONING MODE ==========
     self_cond_mode: str = 'standard',
+    # ========== RESIDUAL DIFFUSION ==========
+    use_residual_diffusion: bool = False,
+    sigma_resid_recompute_step: int = 3000,  # Step to recompute sigma_data_resid (after generator warmup)
     # ========== PAIRED OVERLAP TRAINING (Candidate 1) ==========
     train_pair_overlap: bool = False,
     pair_overlap_alpha: float = 0.5,
@@ -2749,6 +2770,7 @@ def train_stageC_diffusion_generator(
     overlap_sigma_thresh: float = 0.5,
     disable_ctx_loss_when_overlap: bool = True,
     overlap_debug_every: int = 100,
+    use_z_ln: bool = False
 
 ):
     
@@ -2766,30 +2788,56 @@ def train_stageC_diffusion_generator(
 
     # =========================================================================
     # [CURRICULUM] Phase 3: σ curriculum state initialization
-    # Ladder of σ_cap values as multiples of σ_data
-    # For σ_data=0.175: [0.05, 0.16, 0.40, 0.70, 1.23, 2.45, 2.98]
+    # NEW 3-stage curriculum: start at S0 (lowest), promote on success (easy→hard)
+    # Demotion enabled as safety valve if failing badly at higher stages
+    # Legacy 7-stage: uses absolute sigma values [0.3, 0.9, ..., 17.0]
     # =========================================================================
+
+    # Auto-compute sigma_cap_safe_mult if not provided
+    _curriculum_mults = [1.0, 2.0, 3.0, 4.0]
+    if sigma_cap_safe_mult is None:
+        # Default: use target stage multiplier to allow full training at target stage
+        _target_mult = _curriculum_mults[min(curriculum_target_stage, len(_curriculum_mults)-1)]
+        sigma_cap_safe_mult = _target_mult
+        print(f"[CURRICULUM] Auto-computed sigma_cap_safe_mult={sigma_cap_safe_mult:.1f} from target_stage={curriculum_target_stage}")
+
     curriculum_state = {
-        'sigma_cap_mults': [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0],  # Multiples of σ_data
-        'current_stage': 0,           # Start at stage 0 (0.3 * σ_data)
-        'consecutive_passes': 0,      # Need 5 consecutive passes for promotion
-        'promotion_threshold': 5,     # User requested 5 instead of 2-3
-        'stall_count': 0,             # Count of failed promotion attempts
-        'stall_limit': 6,             # Stop if stalled for this many evals
-        'generator_stable': False,    # Phase 2: warm-start flag
-        'gen_consecutive_passes': 0,  # Phase 2: generator stability counter
-        # Stricter thresholds at lower σ (tiered)
+        # NEW 4-stage curriculum (default): [1.0, 2.0, 3.0, 4.0] × σ_data
+        # Stage 0: 1× sigma0 (warmup)
+        # Stage 1: 2× sigma0
+        # Stage 2: 3× sigma0
+        # Stage 3: 4× sigma0 (full training)
+        'sigma_cap_mults': [1.0, 2.0, 3.0, 4.0],
+        'current_stage': 0,           # Start at S0 (lowest), promote on success (easy→hard)
+        # Data-dependent sigma cap (replaces old absolute sigma_cap_safe=0.30)
+        'sigma_cap_safe_mult': sigma_cap_safe_mult,   # σ_cap_safe = mult × σ0 (from CLI arg)
+        'sigma_cap_abs_max': sigma_cap_abs_max,       # Optional absolute ceiling (from CLI arg)
+        'sigma_cap_abs_min': sigma_cap_abs_min,       # Optional absolute floor (from CLI arg)
+        'consecutive_passes': 0,
+        'promotion_threshold': 5,
+        'stall_count': 0,
+        'stall_limit': 6,
+        'generator_stable': False,
+        'gen_consecutive_passes': 0,
+        # Thresholds for 4-stage (Jacc ≥ 0.10 for all)
         'jacc_min_by_mult': {
-            0.3: 0.15,   # Stricter at low σ
-            0.9: 0.12,   # Still relatively strict
-            2.3: 0.10,
-            4.0: 0.09,
-            7.0: 0.08,
-            14.0: 0.07,
-            17.0: 0.07,
+            1.0: 0.10, 2.0: 0.10, 3.0: 0.10, 4.0: 0.10,
         },
-        'scale_r_min': 0.80,
-        'trace_r_min': 0.60,
+        # Scale_r thresholds: progressively relaxed
+        'scale_r_min_by_mult': {
+            1.0: 0.85, 2.0: 0.80, 3.0: 0.75, 4.0: 0.70,
+        },
+        'scale_r_min_default': 0.70,
+        'trace_r_min_by_mult': {
+            1.0: 0.69, 2.0: 0.61, 3.0: 0.53, 4.0: 0.45,
+        },
+        'trace_r_min_default': 0.45,
+        'scale_r_min_final': 0.80,
+        'trace_r_min_final': 0.60,
+        # Cap-band: ramp up with stage (low at S0 for clean warmup, higher at S3)
+        'cap_band_frac_by_stage': {0: 0.2, 1: 0.3, 2: 0.4, 3: 0.5},
+        'cap_band_frac_default': 0.3,
+        'cap_band_lo_mult': 0.6,       # Lower bound = 0.6 × σ_cap (was 0.7)
         # History for tracking
         'eval_history': [],           # List of (epoch, metrics_dict)
 
@@ -2799,13 +2847,25 @@ def train_stageC_diffusion_generator(
         # Gate B: metrics stable for K consecutive evals
         # Gate C: cap-band loss plateau (loss for σ near σ_cap stabilized)
         # ============================================================
-        'target_stage': 6,            # Gate A: target stage index (4 = 7.0x σ_data ≈ 1.2)
-                                      # Can adjust. Use len(mults)-1 for full curriculum
+        'target_stage': curriculum_target_stage,  # Gate A: target stage index (CLI arg, default 6 = full)
+        'curriculum_early_stop': curriculum_early_stop,  # Enable/disable three-gate stopping
         'steps_in_stage': 0,          # Reset when promoting to new stage
         'min_steps_per_stage': 1000,  # Minimum steps before promotion/stopping allowed
                                       # For 6000 samples / batch_size=32 ≈ 188 steps/epoch
                                       # 1000 steps ≈ 5.3 epochs minimum per stage
-        'min_epochs': 100,             # Absolute minimum epochs before any stopping
+        'min_steps_at_target': 2000,  # Minimum steps at TARGET stage before "stall at target" can stop
+                                      # ~10.6 epochs at target stage to give it a fair chance
+        # ChatGPT FIX: Dynamic max_steps_per_stage (computed after knowing total epochs)
+        # Formula: (total_steps - target_dwell) / num_stages_to_traverse
+        # Ensures model ALWAYS reaches target stage within epoch budget
+        'max_steps_per_stage': None,  # Will be computed dynamically
+        'target_dwell_frac': 0.20,    # Reserve 20% of total steps for target stage
+        # Promotion ramp: smooth σ_cap transitions to avoid "stage shock"
+        'ramp_steps': 300,            # Interpolate σ_cap over this many steps after promotion
+        'ramp_start_step': None,      # Global step when ramp started (None = no ramp active)
+        'ramp_prev_cap': None,        # Previous σ_cap value (actual cap, not multiplier)
+        'ramp_target_cap': None,      # Target σ_cap value (actual cap, not multiplier)
+        'min_epochs': curriculum_min_epochs,  # Absolute minimum epochs before any stopping (CLI arg, default 100)
 
         # Gate B: Metrics stability tracking (K consecutive passes)
         'metrics_history_K': 5,       # Need K consecutive good evals for Gate B
@@ -2820,7 +2880,73 @@ def train_stageC_diffusion_generator(
         'loss_plateau_threshold': 0.02,  # 2% relative improvement threshold
         'loss_no_improve_count': 0,   # Counter for plateau detection
         'best_cap_band_loss': float('inf'),  # Best cap-band loss at current stage
+
+        # Conditioning strength knob (ChatGPT fix for scale collapse at moderate σ)
+        # Normalizes H to unit RMS then scales by α
+        # This controls conditioning magnitude without changing model architecture
+        'cond_alpha': 0.5,            # ChatGPT: α=0.1 too small, H increases Fx at high σ
+
+        # Residual diffusion: diffuse R = V_target - V_base instead of V_target
+        'use_residual_diffusion': use_residual_diffusion,
+
+        # ============================================================
+        # SIGMA_DATA_RESID VALIDITY TRACKING (Option A fix)
+        # At fresh start, generator is random, so sigma_data_resid is meaningless.
+        # We start with sigma_resid_valid=False and use sigma_data for curriculum.
+        # Once generator is trained (checkpoint resume or recompute trigger),
+        # we compute proper sigma_data_resid with Procrustes alignment and lock it.
+        # ============================================================
+        'sigma_resid_valid': False,           # True once sigma_data_resid is properly computed
+        'sigma_data_resid_locked': None,      # Locked value for curriculum (after validation)
+        'sigma_resid_recompute_step': sigma_resid_recompute_step,  # Step at which to recompute (CLI arg)
+        'sigma_resid_recomputed': False,      # True once recomputation has been done
+
+        # ============================================================
+        # SIGMA CAP TRACKING (for inference and checkpoint analysis)
+        # ============================================================
+        'sigma_cap_eff_last': None,           # Effective σ_cap at last save (after ramp/clamp)
+        'max_sigma_cap_eff_seen': 0.0,        # Max σ_cap ever seen during training (monotonic)
     }
+
+    # Legacy curriculum override: 7-stage [0.3,...,17.0] with promotion
+    # NOTE: Legacy uses ABSOLUTE sigma values (not multiples of sigma_data)
+    if use_legacy_curriculum:
+        curriculum_state['sigma_cap_mults'] = [0.3, 0.9, 2.3, 4.0, 7.0, 14.0, 17.0]
+        curriculum_state['current_stage'] = 0
+        # For legacy mode: remove multiplicative cap, use absolute cap instead
+        del curriculum_state['sigma_cap_safe_mult']
+        curriculum_state['sigma_cap_safe'] = 3.0  # Absolute cap for legacy mode
+        curriculum_state['jacc_min_by_mult'] = {
+            0.3: 0.15, 0.9: 0.12, 2.3: 0.10, 4.0: 0.09, 7.0: 0.08, 14.0: 0.07, 17.0: 0.07,
+        }
+        curriculum_state['scale_r_min_by_mult'] = {
+            0.3: 0.88, 0.9: 0.84, 2.3: 0.75, 4.0: 0.73, 7.0: 0.72, 14.0: 0.68, 17.0: 0.65,
+        }
+        curriculum_state['scale_r_min_default'] = 0.65
+        curriculum_state['trace_r_min_by_mult'] = {
+            0.3: 0.74, 0.9: 0.67, 2.3: 0.53, 4.0: 0.51, 7.0: 0.49, 14.0: 0.44, 17.0: 0.40,
+        }
+        curriculum_state['trace_r_min_default'] = 0.40
+        curriculum_state['cap_band_frac_by_stage'] = {0: 0.4, 1: 0.4, 2: 0.6, 3: 0.6}
+        curriculum_state['cap_band_frac_default'] = 0.7
+        curriculum_state['cap_band_lo_mult'] = 0.7
+
+    # Print curriculum configuration
+    n_stages = len(curriculum_state['sigma_cap_mults'])
+    print(f"\n{'='*70}")
+    print(f"[CURRICULUM] Configuration")
+    print(f"{'='*70}")
+    print(f"  Mode: {'LEGACY 7-stage (absolute σ)' if use_legacy_curriculum else 'NEW 3-stage (easy→hard, promote up)'}")
+    print(f"  sigma_cap_mults: {curriculum_state['sigma_cap_mults']}")
+    print(f"  Starting stage: S{curriculum_state['current_stage']}")
+    print(f"  sigma_cap_safe_mult: {curriculum_state.get('sigma_cap_safe_mult', 'N/A')} (data-dependent cap)")
+    if curriculum_state.get('sigma_cap_abs_max') is not None:
+        print(f"  sigma_cap_abs_max: {curriculum_state['sigma_cap_abs_max']}")
+    if curriculum_state.get('sigma_cap_abs_min') is not None:
+        print(f"  sigma_cap_abs_min: {curriculum_state['sigma_cap_abs_min']}")
+    print(f"  cap_band_frac: {curriculum_state['cap_band_frac_default']} ({int(curriculum_state['cap_band_frac_default']*100)}%)")
+    print(f"  use_residual_diffusion: {use_residual_diffusion}")
+    print(f"{'='*70}\n")
 
     slide_d15_medians = []
     for slide_id in st_dataset.targets_dict:
@@ -3228,6 +3354,38 @@ def train_stageC_diffusion_generator(
 
     LOG_EVERY = steps_per_epoch  # Print once per epoch
 
+    # ========== ChatGPT FIX: Compute dynamic max_steps_per_stage ==========
+    # Formula: (total_steps - target_dwell) / num_stages_to_traverse
+    # This GUARANTEES reaching target stage within the epoch budget
+    total_steps = n_epochs * steps_per_epoch
+    target_stage = curriculum_state['target_stage']
+    num_stages_to_traverse = target_stage  # stages 0 to target_stage-1
+    target_dwell_frac = curriculum_state.get('target_dwell_frac', 0.20)
+    target_dwell_steps = int(total_steps * target_dwell_frac)
+
+    if num_stages_to_traverse > 0:
+        # Reserve target_dwell_steps for target stage, divide rest among stages
+        available_steps = total_steps - target_dwell_steps
+        max_steps_per_stage = max(500, available_steps // num_stages_to_traverse)
+    else:
+        max_steps_per_stage = total_steps  # Already at target
+
+    # Also update min_steps_at_target to be proportional
+    min_steps_at_target = max(500, target_dwell_steps // 2)
+
+    curriculum_state['max_steps_per_stage'] = max_steps_per_stage
+    curriculum_state['min_steps_at_target'] = min_steps_at_target
+
+    if fabric is None or fabric.is_global_zero:
+        print(f"\n[CURRICULUM-BUDGET] Dynamic step allocation:")
+        print(f"  total_epochs={n_epochs}, steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
+        print(f"  target_stage={target_stage}, stages_to_traverse={num_stages_to_traverse}")
+        print(f"  target_dwell_frac={target_dwell_frac:.0%} → target_dwell_steps={target_dwell_steps}")
+        print(f"  max_steps_per_stage={max_steps_per_stage} (hard escape hatch)")
+        print(f"  min_steps_at_target={min_steps_at_target}")
+        print(f"  ramp_steps={curriculum_state.get('ramp_steps', 300)} (smooth promotion transitions)")
+    # =====================================================================
+
     # ========== COMPUTE TRIANGLE EPSILON FOR ST ONLY ==========
     
     triangle_refs = []
@@ -3458,13 +3616,15 @@ def train_stageC_diffusion_generator(
     #     'shape_spec': 0.0,
     # }
 
+    # Phase 2: Re-enable structure losses at gentler weights (scale is now healthy)
+    # Keep α=0.5, p_sc=0.0 from scale-first phase
     WEIGHTS = {
-        'score': 16.0,         # was 1.0, but score is now ~32x smaller; 16 keeps it strong
-        'gram': 2.0,           # was 1.0
-        'gram_scale': 2.0,     # was 1.0
-        'out_scale': 2.0,
-        'gram_learn': 2.0,
-        'knn_scale': 0.2,     # NEW: kNN distance scale calibration
+        'score': 16.0,         # KEEP: main denoising loss
+        'gram': 1.0,           # RE-ENABLE at half weight (was 2.0)
+        'gram_scale': 1.0,     # RE-ENABLE at half weight (was 2.0)
+        'out_scale': 2.0,      # KEEP: learned branch scale calibration
+        'gram_learn': 1.0,     # RE-ENABLE at half weight (was 2.0)
+        'knn_scale': 0.1,      # RE-ENABLE at half weight (was 0.2)
         'heat': 0.0,
         'sw_st': 0.0,
         'sw_sc': 0.0,
@@ -3472,19 +3632,20 @@ def train_stageC_diffusion_generator(
         'ordinal_sc': 0.0,
         'st_dist': 0.0,
         'edm_tail': 0.0,
-        'gen_align': 10.0,     # was 0.5 - will use new gen losses in Patch 8
-        'gen_scale': 10.0,     # NEW: add this key for Patch 8
+        'gen_align': 10.0,     # KEEP: generator alignment (Procrustes MSE)
+        'gen_gram': 10.0,      # NEW: Gram matrix loss for generator (gauge-invariant geometry)
+        'gen_scale': 10.0,     # KEEP: generator scale
         'dim': 0.0,
         'triangle': 0.0,
         'radial': 0.0,
-        'knn_nca': 2.0,
+        'knn_nca': 1.0,        # RE-ENABLE at half weight (was 2.0)
         'repel': 0.0,
         'shape': 0.0,
-        'edge': 4.0,           # was 2.0
+        'edge': 2.0,           # RE-ENABLE at half weight (was 4.0)
         'topo': 0.0,
         'shape_spec': 0.0,
-        'subspace': 0.5,       # NEW: add this key for Patch 7
-        'ctx_edge': 0.05,
+        'subspace': 0.25,      # RE-ENABLE at half weight (was 0.5)
+        'ctx_edge': 0.0,       # Keep off for now
         # ========== OVERLAP CONSISTENCY LOSSES (Candidate 1) ==========
         'ov_shape': 0.0,       # Weight set dynamically via overlap_loss_weight_shape
         'ov_scale': 0.0,       # Weight set dynamically via overlap_loss_weight_scale
@@ -3566,7 +3727,7 @@ def train_stageC_diffusion_generator(
             'total': [], 'score': [], 'gram': [], 'gram_scale': [], 'out_scale': [], 
             'gram_learn': [], 'heat': [],
             'sw_st': [], 'sw_sc': [], 'overlap': [], 'ordinal_sc': [], 'st_dist': [],
-            'edm_tail': [], 'gen_align': [], 'gen_scale': [], 'subspace': [],
+            'edm_tail': [], 'gen_align': [], 'gen_gram': [], 'gen_scale': [], 'subspace': [],
             'dim': [], 'triangle': [], 'radial': [],
             'knn_nca': [], 'knn_scale': [], 'repel': [], 'shape': [], 'edge': [], 'topo': [], 'shape_spec': [],
             'ov_shape': [], 'ov_scale': [], 'ov_kl': [], 'score_2': [],
@@ -3580,9 +3741,10 @@ def train_stageC_diffusion_generator(
     }
 
     start_epoch = 0
+    start_global_step = 0  # Will be restored from checkpoint if available
     if resume_ckpt_path:
         print(f"[RESUME] Loading Stage C checkpoint: {resume_ckpt_path}")
-        ckpt = torch.load(resume_ckpt_path, map_location=device)
+        ckpt = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
 
         if 'context_encoder' in ckpt:
             context_encoder.load_state_dict(ckpt['context_encoder'])
@@ -3598,8 +3760,19 @@ def train_stageC_diffusion_generator(
         if 'score_net_ema' in ckpt:
             score_net_ema.load_state_dict(ckpt['score_net_ema'])
 
+        if 'encoder' in ckpt and encoder is not None:
+            encoder_to_load = encoder.module if hasattr(encoder, 'module') else encoder
+            encoder_to_load.load_state_dict(ckpt['encoder'])
+            print("[RESUME] Loaded encoder state.")
+        elif encoder is not None:
+            print("[RESUME] WARNING: encoder not found in checkpoint; keeping current weights.")
+
         if 'optimizer' in ckpt and not resume_reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
+
+        if 'scheduler' in ckpt and not resume_reset_optimizer:
+            scheduler.load_state_dict(ckpt['scheduler'])
+            print("[RESUME] Loaded scheduler state.")
 
         if 'epoch' in ckpt:
             start_epoch = int(ckpt['epoch']) + 1
@@ -3619,7 +3792,99 @@ def train_stageC_diffusion_generator(
         if 'sigma_max' in ckpt:
             sigma_max = ckpt['sigma_max']
 
-        print(f"[RESUME] start_epoch={start_epoch}, reset_optimizer={resume_reset_optimizer}")
+        # Save canonical config BEFORE loading checkpoint (source of truth)
+        canonical_curriculum = curriculum_state.copy()
+
+        if 'curriculum_state' in ckpt:
+            loaded_state = ckpt['curriculum_state']
+            print(f"[RESUME] Loaded curriculum_state: stage={loaded_state['current_stage']}, "
+                  f"steps_in_stage={loaded_state.get('steps_in_stage', 0)}")
+
+            # ============================================================
+            # MIGRATION: Merge loaded state with canonical config
+            # - Keep runtime state from checkpoint (current_stage, stall_count, etc.)
+            # - Override threshold configs with canonical values (single source of truth)
+            # ============================================================
+
+            # Keys that should ALWAYS use canonical values (config, not runtime state)
+            config_keys = [
+                'sigma_cap_mults',
+                'sigma_cap_safe_mult', 'sigma_cap_abs_max', 'sigma_cap_abs_min',  # Data-dependent cap
+                'scale_r_min_by_mult', 'scale_r_min_default',
+                'trace_r_min_by_mult', 'trace_r_min_default',
+                'jacc_min_by_mult',
+                'scale_r_min_final', 'trace_r_min_final',
+                'cap_band_frac_by_stage', 'cap_band_frac_default', 'cap_band_lo_mult',
+                'promotion_threshold', 'stall_limit',
+                'metrics_history_K', 'min_steps_per_stage', 'min_steps_at_target',
+                'loss_plateau_patience', 'loss_plateau_threshold',
+                'cond_alpha',  # Conditioning strength knob
+                'use_residual_diffusion',  # Residual diffusion mode
+            ]
+
+            # Start with loaded state, then override config keys with canonical values
+            curriculum_state = loaded_state.copy()
+
+            updated_keys = []
+            for key in config_keys:
+                if key in canonical_curriculum:
+                    old_val = curriculum_state.get(key)
+                    new_val = canonical_curriculum[key]
+                    if old_val != new_val:
+                        updated_keys.append(key)
+                    curriculum_state[key] = new_val
+
+            if updated_keys:
+                print(f"[RESUME-MIGRATE] Updated config keys from code: {updated_keys}")
+                # Show current stage threshold for clarity
+                curr_stage = curriculum_state.get('current_stage', 0)
+                sigma_mults = curriculum_state.get('sigma_cap_mults', [0.3])
+                if curr_stage < len(sigma_mults):
+                    curr_mult = sigma_mults[curr_stage]
+                    scale_thresh = curriculum_state['scale_r_min_by_mult'].get(curr_mult,
+                                   curriculum_state['scale_r_min_default'])
+                    print(f"  Current stage {curr_stage} (mult={curr_mult}): scale_r threshold = {scale_thresh}")
+
+            # Reset stall_count if thresholds changed (old stalls based on wrong thresholds)
+            if 'scale_r_min_by_mult' in updated_keys or 'trace_r_min_by_mult' in updated_keys:
+                old_stall = loaded_state.get('stall_count', 0)
+                if old_stall > 0:
+                    curriculum_state['stall_count'] = 0
+                    curriculum_state['consecutive_passes'] = 0
+                    print(f"[RESUME-MIGRATE] Reset stall_count ({old_stall}→0) due to threshold update")
+
+            # Add any NEW keys that didn't exist in old checkpoint
+            new_keys = []
+            for key, val in canonical_curriculum.items():
+                if key not in curriculum_state:
+                    curriculum_state[key] = val
+                    new_keys.append(key)
+            if new_keys:
+                print(f"[RESUME-MIGRATE] Added new keys: {new_keys}")
+
+            # Remove deprecated keys
+            deprecated_keys = ['scale_r_min', 'trace_r_min']  # Old flat thresholds
+            for key in deprecated_keys:
+                if key in curriculum_state:
+                    del curriculum_state[key]
+                    print(f"[RESUME-MIGRATE] Removed deprecated key: {key}")
+
+        # ============================================================
+        # RESTORE global_step (NEW: fixes ramp state consistency)
+        # ============================================================
+        if 'global_step' in ckpt:
+            start_global_step = int(ckpt['global_step'])
+            print(f"[RESUME] Restored global_step={start_global_step}")
+        else:
+            # Old checkpoint without global_step - clear any stale ramp state
+            start_global_step = 0
+            if curriculum_state.get('ramp_start_step') is not None:
+                print(f"[RESUME-MIGRATE] Old checkpoint without global_step, clearing stale ramp state")
+                curriculum_state['ramp_start_step'] = None
+                curriculum_state['ramp_prev_cap'] = None
+                curriculum_state['ramp_target_cap'] = None
+
+        print(f"[RESUME] start_epoch={start_epoch}, start_global_step={start_global_step}, reset_optimizer={resume_reset_optimizer}")
 
 
     # ========== EDM DEBUG STATE INITIALIZATION ==========
@@ -3721,6 +3986,112 @@ def train_stageC_diffusion_generator(
 
     # Store sigma_data on score_net for reference in forward pass
     print(f"[StageC] sigma_data = {sigma_data:.4f}")
+
+    # ========== RESIDUAL DIFFUSION: Compute sigma_data_resid (Option A fix) ==========
+    # At fresh start, generator is random → sigma_data_resid would be meaningless.
+    # Only compute proper sigma_data_resid if:
+    #   1. Resuming from checkpoint (generator is trained), OR
+    #   2. Later during training via recomputation trigger
+    # Always use Procrustes alignment to avoid √2 inflation.
+    sigma_data_resid = sigma_data  # Default to sigma_data (safe fallback)
+    sigma_resid_valid = False      # Will be set True when properly computed
+
+    def compute_sigma_data_resid_aligned(st_loader, context_encoder, generator, device, n_batches=10):
+        """Compute sigma_data_resid using Procrustes-aligned residuals (no scale)."""
+        resid_rms_list = []
+        it = iter(st_loader)
+        for _ in range(min(n_batches, len(st_loader))):
+            sample_batch = next(it, None)
+            if sample_batch is None:
+                break
+
+            if isinstance(sample_batch, dict) and sample_batch.get('is_pair_batch', False):
+                sample_batch = sample_batch['view1']
+
+            V_batch = sample_batch['V_target'].to(device, non_blocking=True)
+            Z_batch = sample_batch['Z_set'].to(device, non_blocking=True)
+            mask_batch = sample_batch['mask'].to(device, non_blocking=True)
+
+            with torch.no_grad():
+                H_batch = context_encoder(Z_batch, mask_batch)
+                V_base_batch = generator(H_batch, mask_batch)
+
+                # CRITICAL: Align V_target to V_base frame using Procrustes (no scale)
+                # This avoids the √2 inflation from frame mismatch
+                V_target_aligned = uet.rigid_align_apply_no_scale(V_batch, V_base_batch, mask_batch)
+                R_batch = V_target_aligned - V_base_batch  # Residual in base frame
+
+            # Compute per-sample RMS of aligned residuals
+            for i in range(min(4, V_batch.shape[0])):
+                m = mask_batch[i].bool()
+                if m.sum() > 0:
+                    R_valid = R_batch[i, m]  # (n_valid, D)
+                    rms = R_valid.pow(2).mean().sqrt().item()
+                    resid_rms_list.append(rms)
+
+        return float(np.median(resid_rms_list)) if resid_rms_list else None
+
+    # Only compute at init if resuming from checkpoint (generator is trained)
+    # Check if checkpoint already has valid sigma_resid (don't recompute if so)
+    checkpoint_has_valid_resid = (resume_ckpt_path and
+                                   curriculum_state.get('sigma_resid_valid', False) and
+                                   curriculum_state.get('sigma_data_resid_locked') is not None)
+
+    if checkpoint_has_valid_resid:
+        # Checkpoint already has valid sigma_resid, use it directly
+        sigma_data_resid = curriculum_state['sigma_data_resid_locked']
+        sigma_resid_valid = True
+        if fabric is None or fabric.is_global_zero:
+            print(f"[RESID-DIFF] Using sigma_data_resid={sigma_data_resid:.4f} from checkpoint [VALID]")
+    elif use_residual_diffusion and use_st and resume_ckpt_path and (fabric is None or fabric.is_global_zero):
+        # Resuming from old checkpoint without valid sigma_resid: compute now
+        print(f"[RESID-DIFF] Computing sigma_data_resid from checkpoint (generator is trained)...")
+        computed_resid = compute_sigma_data_resid_aligned(st_loader, context_encoder, generator, device)
+        if computed_resid is not None:
+            sigma_data_resid = computed_resid
+            sigma_resid_valid = True
+            print(f"[RESID-DIFF] sigma_data_resid = {sigma_data_resid:.4f} (vs sigma_data={sigma_data:.4f}) [VALID]")
+        else:
+            print(f"[RESID-DIFF] Failed to compute sigma_data_resid, using sigma_data={sigma_data:.4f} [INVALID]")
+    elif use_residual_diffusion and not resume_ckpt_path:
+        # Fresh start with residual diffusion: warn user
+        if fabric is None or fabric.is_global_zero:
+            print(f"[RESID-DIFF] WARNING: Fresh start with residual_diffusion=True.")
+            print(f"[RESID-DIFF] Using sigma_data={sigma_data:.4f} until generator is trained.")
+            print(f"[RESID-DIFF] Will recompute sigma_data_resid at step {curriculum_state['sigma_resid_recompute_step']}")
+
+    sigma_data_resid = sync_scalar(sigma_data_resid, device)
+
+    # Apply floor to sigma_data_resid to prevent it from being too small
+    # This ensures the score network sees a meaningful signal-to-noise range
+    SIGMA_RESID_FLOOR_MULT = 0.1  # Floor = 10% of sigma_data
+    sigma_resid_floor = SIGMA_RESID_FLOOR_MULT * sigma_data
+    if sigma_resid_valid and sigma_data_resid < sigma_resid_floor:
+        if fabric is None or fabric.is_global_zero:
+            print(f"[RESID-DIFF] WARNING: sigma_data_resid={sigma_data_resid:.4f} < floor={sigma_resid_floor:.4f}")
+            print(f"[RESID-DIFF] Clamping to floor to ensure meaningful SNR range")
+        sigma_data_resid = sigma_resid_floor
+
+    curriculum_state['sigma_data_resid'] = sigma_data_resid
+    curriculum_state['sigma_resid_valid'] = sigma_resid_valid
+    if sigma_resid_valid:
+        curriculum_state['sigma_data_resid_locked'] = sigma_data_resid
+
+    if fabric is None or fabric.is_global_zero:
+        print(f"\n[CURRICULUM CONFIG]")
+        print(f"  stages: {curriculum_state['sigma_cap_mults']} (× σ_data={sigma_data:.4f})")
+        print(f"  target_stage: {curriculum_state['target_stage']} / {len(curriculum_state['sigma_cap_mults'])-1}")
+        print(f"  min_epochs: {curriculum_state['min_epochs']}")
+        print(f"  three-gate early stop: {curriculum_state.get('curriculum_early_stop', True)}")
+        print(f"  cap-band emphasis: stage→frac = {curriculum_state['cap_band_frac_by_stage']}, "
+              f"default={curriculum_state['cap_band_frac_default']}")
+        print(f"  residual_diffusion: {curriculum_state.get('use_residual_diffusion', False)}")
+        if curriculum_state.get('use_residual_diffusion', False):
+            resid_valid = curriculum_state.get('sigma_resid_valid', False)
+            resid_locked = curriculum_state.get('sigma_data_resid_locked')
+            print(f"  sigma_resid_valid: {resid_valid} (locked={resid_locked})")
+            if not resid_valid:
+                print(f"  NOTE: Using sigma_data={sigma_data:.4f} until recompute at step {curriculum_state.get('sigma_resid_recompute_step', 3000)}")
     
     # Store sigma_data on score_net (handle DDP/Fabric wrapper)
     if hasattr(score_net, 'module'):
@@ -3751,9 +4122,37 @@ def train_stageC_diffusion_generator(
                 'G_target': fixed_batch_raw['G_target'].cpu(),
                 'n': fixed_batch_raw['n'],
             }
-            print("[PHASE 0] Fixed evaluation batch stored")
-        except:
-            print("[PHASE 0] WARNING: Could not store fixed batch")
+
+            # In residual mode, also store V_base and R_target for correct diagnostics
+            if use_residual_diffusion:
+                with torch.no_grad():
+                    Z_fb = fixed_batch_raw['Z_set'].to(device)
+                    mask_fb = fixed_batch_raw['mask'].to(device)
+                    V_target_fb = fixed_batch_raw['V_target'].to(device)
+
+                    # Get context encoding
+                    Z_fb_encoded = apply_z_ln(Z_fb, context_encoder)
+                    H_fb = context_encoder(Z_fb_encoded, mask_fb)
+
+                    # Compute V_base from generator
+                    V_base_fb = generator(H_fb, mask_fb).detach()
+
+                    # Align V_target to V_base's frame
+                    V_target_aligned_fb = uet.rigid_align_apply_no_scale(V_target_fb, V_base_fb, mask_fb)
+
+                    # Compute R_target
+                    R_target_fb = V_target_aligned_fb - V_base_fb
+
+                    # Store for later use in diagnostics
+                    edm_debug_state['fixed_batch']['V_base'] = V_base_fb.cpu()
+                    edm_debug_state['fixed_batch']['V_target_aligned'] = V_target_aligned_fb.cpu()
+                    edm_debug_state['fixed_batch']['R_target'] = R_target_fb.cpu()
+
+                print("[PHASE 0] Fixed evaluation batch stored (with residual mode data)")
+            else:
+                print("[PHASE 0] Fixed evaluation batch stored")
+        except Exception as e:
+            print(f"[PHASE 0] WARNING: Could not store fixed batch: {e}")
 
         
         # 1.1 Target stats (masked, per-set)
@@ -3856,8 +4255,8 @@ def train_stageC_diffusion_generator(
     #--amp scaler choice based on precision---
     use_fp16 = (precision == '16-mixed')
     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
-    
-    global_step = 0
+
+    global_step = start_global_step  # Restore from checkpoint or 0 for fresh start
 
     ema_grads = {
         'score': 1.0,
@@ -3929,7 +4328,7 @@ def train_stageC_diffusion_generator(
     USE_AUTOBALANCE = False
 
     #self conditioning probability
-    p_sc = 0.5 #prob of using self-conditioning in training
+    p_sc = 0.0  # ChatGPT R4: disable self-cond to break potential shrink feedback loop
 
     # Early stopping state
     early_stop_best = float('inf')
@@ -3980,9 +4379,181 @@ def train_stageC_diffusion_generator(
         return result
     
 
+    # =========================================================================
+    # HELPER: Get effective sigma_cap (accounts for ramp)
+    # Pure function - does NOT mutate state
+    # =========================================================================
+    def get_sigma_cap_eff(curriculum_state, global_step, sigma_data, do_log=False):
+        """
+        Single source of truth for effective sigma_cap during ramp.
+
+        Now uses DATA-DEPENDENT safety cap instead of hard absolute clamp.
+        sigma0 = sigma_data_resid (if residual mode) else sigma_data
+        sigma_cap_safe_abs = sigma_cap_safe_mult × sigma0
+
+        Returns: (sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, debug_info)
+        - sigma_cap_eff: the actual cap to use for training/eval
+        - sigma_cap_target: the target cap for current stage (before safety clamp)
+        - ramp_active: True if ramp is in progress
+        - ramp_progress: 0.0-1.0 progress through ramp (0 if not active)
+        - debug_info: dict with sigma0, curr_mult, cap_stage, cap_safe_abs, cap_final
+        """
+        curr_stage = curriculum_state['current_stage']
+        curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
+
+        # =====================================================================
+        # Determine sigma0: use sigma_data_resid ONLY if valid, else sigma_data
+        # Option A fix: sigma_resid_valid ensures we don't use random-generator sigma
+        # =====================================================================
+        use_resid = curriculum_state.get('use_residual_diffusion', False)
+        sigma_resid_valid = curriculum_state.get('sigma_resid_valid', False)
+        if use_resid and sigma_resid_valid:
+            # Use locked value if available (stable reference), else computed value
+            sigma0 = curriculum_state.get('sigma_data_resid_locked',
+                     curriculum_state.get('sigma_data_resid', sigma_data))
+        else:
+            # Fresh start or non-residual mode: use sigma_data
+            sigma0 = sigma_data
+
+        # Stage cap (before safety clamp)
+        sigma_cap_stage = curr_mult * sigma0
+
+        # =====================================================================
+        # Data-dependent safety cap (with backward compatibility)
+        # Priority: sigma_cap_safe_mult (new) > sigma_cap_safe (old) > default from target_stage
+        # =====================================================================
+        if 'sigma_cap_safe_mult' in curriculum_state and curriculum_state['sigma_cap_safe_mult'] is not None:
+            # NEW: multiplicative safety cap
+            sigma_cap_safe_mult = curriculum_state['sigma_cap_safe_mult']
+            sigma_cap_safe_abs = sigma_cap_safe_mult * sigma0
+        elif 'sigma_cap_safe' in curriculum_state:
+            # OLD: absolute safety cap (backward compatibility for old checkpoints)
+            sigma_cap_safe_abs = curriculum_state['sigma_cap_safe']
+        else:
+            # DEFAULT: Use target stage multiplier to allow full training at target
+            target_stage = curriculum_state.get('target_stage', len(curriculum_state.get('sigma_cap_mults', [1,2,3,4])) - 1)
+            mults = curriculum_state.get('sigma_cap_mults', [1.0, 2.0, 3.0, 4.0])
+            default_mult = mults[min(target_stage, len(mults)-1)]
+            sigma_cap_safe_abs = default_mult * sigma0
+
+        # Apply safety cap to get target
+        sigma_cap_target = min(sigma_cap_stage, sigma_cap_safe_abs)
+
+        # =====================================================================
+        # Optional absolute max/min clamps (backstops)
+        # =====================================================================
+        sigma_cap_abs_max = curriculum_state.get('sigma_cap_abs_max')
+        sigma_cap_abs_min = curriculum_state.get('sigma_cap_abs_min')
+
+        if sigma_cap_abs_max is not None:
+            sigma_cap_target = min(sigma_cap_target, sigma_cap_abs_max)
+        if sigma_cap_abs_min is not None:
+            sigma_cap_target = max(sigma_cap_target, sigma_cap_abs_min)
+
+        # =====================================================================
+        # Ramp logic (unchanged, but uses new sigma_cap_target)
+        # =====================================================================
+        ramp_start = curriculum_state.get('ramp_start_step')
+        ramp_steps = curriculum_state.get('ramp_steps', 300)
+
+        # Build debug info
+        debug_info = {
+            'sigma0': sigma0,
+            'curr_mult': curr_mult,
+            'cap_stage': sigma_cap_stage,
+            'cap_safe_abs': sigma_cap_safe_abs,
+            'cap_target': sigma_cap_target,  # After safety clamp, before ramp
+        }
+
+        # Ramp is active if ramp_start_step is set and not yet complete
+        # Also need valid ramp_prev_cap and ramp_target_cap
+        if ramp_start is not None:
+            prev_cap = curriculum_state.get('ramp_prev_cap')
+            target_cap = curriculum_state.get('ramp_target_cap')
+
+            # If caps are None (e.g., old checkpoint), treat as no ramp
+            if prev_cap is None or target_cap is None:
+                sigma_cap_eff = sigma_cap_target
+                debug_info['cap_final'] = sigma_cap_eff
+                if do_log:
+                    print(f"[CURR] sigma0={sigma0:.4f} mult={curr_mult:.1f} "
+                          f"cap_stage={sigma_cap_stage:.4f} cap_safe={sigma_cap_safe_abs:.4f} "
+                          f"cap_final={sigma_cap_eff:.4f}")
+                return sigma_cap_eff, sigma_cap_target, False, 1.0, debug_info
+
+            steps_since_ramp = global_step - ramp_start
+            if steps_since_ramp < ramp_steps:
+                # Ramp in progress
+                t = steps_since_ramp / ramp_steps
+                sigma_cap_eff = prev_cap + t * (target_cap - prev_cap)
+                # Also apply safety clamp during ramp
+                sigma_cap_eff = min(sigma_cap_eff, sigma_cap_safe_abs)
+                if sigma_cap_abs_max is not None:
+                    sigma_cap_eff = min(sigma_cap_eff, sigma_cap_abs_max)
+                if sigma_cap_abs_min is not None:
+                    sigma_cap_eff = max(sigma_cap_eff, sigma_cap_abs_min)
+                debug_info['cap_final'] = sigma_cap_eff
+                if do_log:
+                    print(f"[CURR] sigma0={sigma0:.4f} mult={curr_mult:.1f} "
+                          f"cap_stage={sigma_cap_stage:.4f} cap_safe={sigma_cap_safe_abs:.4f} "
+                          f"cap_final={sigma_cap_eff:.4f} (ramp {t:.0%})")
+                return sigma_cap_eff, sigma_cap_target, True, t, debug_info
+
+        # No ramp or ramp complete
+        sigma_cap_eff = sigma_cap_target
+        debug_info['cap_final'] = sigma_cap_eff
+        if do_log:
+            print(f"[CURR] sigma0={sigma0:.4f} mult={curr_mult:.1f} "
+                  f"cap_stage={sigma_cap_stage:.4f} cap_safe={sigma_cap_safe_abs:.4f} "
+                  f"cap_final={sigma_cap_eff:.4f}")
+        return sigma_cap_eff, sigma_cap_target, False, 1.0, debug_info
+
+    def normalize_and_scale_conditioning(H, mask, alpha, eps=1e-8):
+        """
+        Normalize H to unit RMS (per sample), then scale by alpha.
+
+        ChatGPT fix for scale collapse: conditioning magnitude was suppressing
+        the learned branch. This knob controls conditioning strength without
+        changing model architecture.
+
+        Args:
+            H: (B, N, c_dim) conditioning tensor (after dropout)
+            mask: (B, N) validity mask
+            alpha: scalar conditioning strength
+            eps: numerical stability
+
+        Returns:
+            H_scaled: (B, N, c_dim) normalized and scaled conditioning
+            rms_before: (B,) per-sample RMS before normalization (for logging)
+        """
+        B, N, c_dim = H.shape
+
+        # Mask H for valid positions only
+        mask_f = mask.unsqueeze(-1).float()  # (B, N, 1)
+        H_masked = H * mask_f
+
+        # Compute per-sample RMS with CORRECT denominator (include c_dim)
+        # rms = sqrt(sum(H^2) / (n_valid * c_dim))
+        n_valid = mask.sum(dim=1).float()  # (B,)
+        denominator = (n_valid * c_dim).clamp(min=1.0)  # (B,)
+        sq_sum = (H_masked ** 2).sum(dim=(1, 2))  # (B,)
+        rms_H = (sq_sum / denominator + eps).sqrt()  # (B,)
+
+        # DETACH RMS so context encoder can't game the normalization
+        rms_H = rms_H.detach()
+
+        # Normalize to unit RMS, then scale by alpha
+        H_norm = H / rms_H.view(B, 1, 1).clamp(min=eps)
+        H_scaled = H_norm * alpha
+
+        # Apply mask again (for safety)
+        H_scaled = H_scaled * mask_f
+
+        return H_scaled, rms_H
+
     # Track pin-rate for adaptive clamp (persists across steps within this training run)
     last_pin_rate = 1.0  # Assume worst case initially
-    
+
     for epoch in range(start_epoch, n_epochs):
         epoch_cv_sum = 0.0
         epoch_qent_sum = 0.0
@@ -4088,7 +4659,8 @@ def train_stageC_diffusion_generator(
             Z_set = batch['Z_set'].to(device)
             mask = batch['mask'].to(device)
             # === Z_ln conditioning: normalize Z_set before augmentation ===
-            Z_set = apply_z_ln(Z_set, context_encoder)
+            if use_z_ln:
+                Z_set = apply_z_ln(Z_set, context_encoder)
 
 
             # Core membership mask (core points of the sampled ST miniset).
@@ -4174,20 +4746,68 @@ def train_stageC_diffusion_generator(
 
                 # === EDM: sample sigma from log-normal ===
                 if use_edm:
-                    # [CURRICULUM] Phase 3: Compute current sigma_cap from curriculum state
+                    # [CURRICULUM] Phase 3: Compute current sigma_cap using helper
                     curr_stage = curriculum_state['current_stage']
                     curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
-                    sigma_cap = curr_mult * sigma_data  # Dynamic cap based on curriculum
-                    sigma_cap = min(sigma_cap, sigma_refine_max)  # Never exceed original limit
+                    sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, _ = get_sigma_cap_eff(
+                        curriculum_state, global_step, sigma_data)
 
-                    # sigma = uet.sample_sigma_lognormal(batch_size_real, P_mean, P_std, device)
-                    sigma = uet.sample_sigma_lognormal_stratified(
-                        batch_size_real, P_mean, P_std,
-                        high_sigma_fraction=0.4,  # 40% of batch guaranteed high-σ
-                        high_sigma_threshold=min(0.5, sigma_cap * 0.5),  # Adjust threshold for curriculum
-                        device=device
-                    )
-                    sigma = sigma.clamp(sigma_min, sigma_cap)  # [CURRICULUM] Use sigma_cap instead of sigma_refine_max
+                    # Update sigma cap tracking (for checkpoint and inference)
+                    curriculum_state['sigma_cap_eff_last'] = sigma_cap_eff
+                    curriculum_state['max_sigma_cap_eff_seen'] = max(
+                        curriculum_state.get('max_sigma_cap_eff_seen', 0.0), sigma_cap_eff)
+
+                    # Clear ramp state when ramp completes (state mutation happens HERE, not in helper)
+                    if not ramp_active and curriculum_state.get('ramp_start_step') is not None:
+                        curriculum_state['ramp_start_step'] = None
+                        curriculum_state['ramp_prev_cap'] = None
+                        curriculum_state['ramp_target_cap'] = None
+                        if fabric is None or fabric.is_global_zero:
+                            print(f"  [RAMP] Completed at step={global_step}, σ_cap_eff={sigma_cap_eff:.4f}")
+
+                    # Log ramp progress periodically
+                    if ramp_active and global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        prev_cap = curriculum_state.get('ramp_prev_cap', sigma_cap_eff)
+                        target_cap = curriculum_state.get('ramp_target_cap', sigma_cap_target)
+                        print(f"  [RAMP] step={global_step} progress={ramp_progress:.0%} "
+                              f"σ_cap_eff={sigma_cap_eff:.4f} ({prev_cap:.4f}→{target_cap:.4f})")
+
+                    sigma_cap = min(sigma_cap_eff, sigma_refine_max)  # Never exceed original limit
+
+                    # [CURRICULUM] Cap-band emphasis sampling
+                    # Mixture: cap_band_frac from [0.7*σ_cap, σ_cap], rest from full [σ_min, σ_cap]
+                    cap_band_frac = curriculum_state['cap_band_frac_by_stage'].get(
+                        curr_stage, curriculum_state['cap_band_frac_default'])
+                    cap_band_lo = curriculum_state['cap_band_lo_mult'] * sigma_cap  # 0.7 * σ_cap
+                    cap_band_lo = max(cap_band_lo, sigma_min)  # Safety floor
+
+                    n_cap_band = int(batch_size_real * cap_band_frac)
+                    n_full_range = batch_size_real - n_cap_band
+
+                    sigma_parts = []
+
+                    # (A) Cap-band samples: uniform in log-space over [0.7*σ_cap, σ_cap]
+                    if n_cap_band > 0:
+                        import math
+                        log_lo = math.log(cap_band_lo)
+                        log_hi = math.log(sigma_cap)
+                        if log_hi > log_lo + 1e-8:
+                            log_sigma_cb = torch.rand(n_cap_band, device=device) * (log_hi - log_lo) + log_lo
+                            sigma_parts.append(log_sigma_cb.exp())
+                        else:
+                            # σ_cap ≈ cap_band_lo (very early stage): just use σ_cap
+                            sigma_parts.append(torch.full((n_cap_band,), sigma_cap, device=device))
+
+                    # (B) Full-range samples: log-normal clamped to [σ_min, σ_cap]
+                    if n_full_range > 0:
+                        rnd_normal = torch.randn(n_full_range, device=device)
+                        sigma_full = (rnd_normal * P_std + P_mean).exp()
+                        sigma_full = sigma_full.clamp(sigma_min, sigma_cap)
+                        sigma_parts.append(sigma_full)
+
+                    sigma = torch.cat(sigma_parts, dim=0)
+                    # Shuffle so cap-band and full-range samples are interleaved
+                    sigma = sigma[torch.randperm(sigma.shape[0], device=device)]
                     sigma_t = sigma.view(-1, 1, 1)
 
                     # ========== PHASE 2: SIGMA SAMPLING SANITY ==========
@@ -4195,6 +4815,11 @@ def train_stageC_diffusion_generator(
                         print(f"\n[PHASE 2] Sigma Sampling (step {global_step}):")
                         print(f"  [CURRICULUM] stage={curr_stage} mult={curr_mult:.1f}x sigma_cap={sigma_cap:.4f} "
                               f"(sigma_data={sigma_data:.4f})")
+                        print(f"  [CAP-BAND] frac={cap_band_frac:.0%} band=[{cap_band_lo:.6f}, {sigma_cap:.6f}] "
+                              f"n_cb={n_cap_band} n_full={n_full_range}")
+                        # Actual fraction in cap-band (including full-range samples that landed there)
+                        actual_in_band = ((sigma >= cap_band_lo) & (sigma <= sigma_cap)).float().mean().item()
+                        print(f"  [CAP-BAND] actual_in_band={actual_in_band*100:.1f}%")
                         print(f"  sigma: min={sigma.min():.6f} median={sigma.median():.6f} max={sigma.max():.6f}")
 
                         import math
@@ -4208,7 +4833,7 @@ def train_stageC_diffusion_generator(
                         print(f"  Quantiles: p05={sigma.quantile(0.05):.6f} p25={sigma.quantile(0.25):.6f} "
                               f"p75={sigma.quantile(0.75):.6f} p95={sigma.quantile(0.95):.6f}")
 
-                        # Clamp hit rates
+                        # Clamp hit rates (only relevant for full-range samples now)
                         clamp_low = (sigma <= sigma_min + 1e-6).float().mean().item()
                         clamp_high = (sigma >= sigma_cap - 1e-6).float().mean().item()
                         print(f"  Clamp hit rate: at sigma_min={clamp_low*100:.1f}% at sigma_cap={clamp_high*100:.1f}%")
@@ -4250,6 +4875,38 @@ def train_stageC_diffusion_generator(
                         V_i = uet.factor_from_gram(G_i, D_latent).to(V_target_raw.dtype)
                         V_target[i, :n_valid] = V_i
                     # --------------------------------------------------------
+
+                    # ========== [GRAM-CANON] DEBUG: Verify gauge canonicalization ==========
+                    # ChatGPT requested: check that anchor signs are stable (should all be +1)
+                    if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            # Check first valid sample in batch
+                            for i in range(batch_size_real):
+                                n_valid = int(mask[i].sum().item())
+                                if n_valid > 1:
+                                    V_check = V_target[i, :n_valid]  # (n_valid, D_latent)
+                                    D_check = min(D_latent, n_valid)
+
+                                    # Compute anchor signs (same logic as factor_from_gram)
+                                    abs_max_idx = V_check[:, :D_check].abs().argmax(dim=0)  # (D,)
+                                    col_indices = torch.arange(D_check, device=V_check.device)
+                                    anchor_vals = V_check[abs_max_idx, col_indices]  # (D,)
+
+                                    num_pos = (anchor_vals > 0).sum().item()
+                                    num_neg = (anchor_vals < 0).sum().item()
+                                    num_zero = (anchor_vals == 0).sum().item()
+
+                                    # Reproducibility check: factor same G twice
+                                    G_i = G_target[i, :n_valid, :n_valid].float()
+                                    V_rep1 = uet.factor_from_gram(G_i, D_latent)
+                                    V_rep2 = uet.factor_from_gram(G_i, D_latent)
+                                    repeat_mse = (V_rep1 - V_rep2).pow(2).mean().item()
+
+                                    print(f"  [GRAM-CANON] Anchor signs: +{num_pos} -{num_neg} 0:{num_zero} "
+                                          f"(expect all + after canonicalization)")
+                                    print(f"  [GRAM-CANON] V_target repeat MSE: {repeat_mse:.2e} "
+                                          f"(should be ~0 for reproducibility)")
+                                    break  # Only check first valid sample
 
                     # ========== PROBE BATCH CAPTURE (once, rank-0 only) ==========
                     # Must be AFTER V_target canonicalization so we capture the same
@@ -4338,6 +4995,88 @@ def train_stageC_diffusion_generator(
                     V_gen = generator(H, mask)
                     V_target = V_gen
 
+                # ========== RESIDUAL DIFFUSION: Compute V_base and R_target ==========
+                use_resid = curriculum_state.get('use_residual_diffusion', False)
+
+                # ========== SIGMA_EDM: sigma to use for EDM preconditioning ==========
+                # When in residual mode with valid sigma_data_resid, use sigma_data_resid
+                # for forward_edm preconditioning and loss weighting. This ensures the
+                # c_skip/c_out coefficients are calibrated to the residual scale, not V scale.
+                sigma_resid_valid = curriculum_state.get('sigma_resid_valid', False)
+                if use_resid and sigma_resid_valid:
+                    sigma_edm = curriculum_state.get('sigma_data_resid_locked',
+                                curriculum_state.get('sigma_data_resid', sigma_data))
+                else:
+                    sigma_edm = sigma_data
+
+                # Log sigma_edm periodically
+                if global_step % 500 == 0 and (fabric is None or fabric.is_global_zero):
+                    print(f"[SIGMA-EDM] step={global_step} sigma_edm={sigma_edm:.4f} "
+                          f"(use_resid={use_resid}, sigma_resid_valid={sigma_resid_valid}, "
+                          f"sigma_data={sigma_data:.4f})")
+
+                if use_resid:
+                    # For residual diffusion: always compute V_base from generator (detached)
+                    with torch.no_grad():
+                        V_base = generator(H, mask).detach()  # Detach to prevent gradient flow
+
+                    # CRITICAL FIX: Align V_target to V_base's frame before computing residual
+                    # V_target comes from factor_from_gram() which has arbitrary rotation/reflection.
+                    # V_base is in the generator's learned frame. Without alignment, the residual
+                    # would be dominated by frame mismatch (~√2 × |V_target|), defeating residual diffusion.
+                    with torch.no_grad():
+                        V_target_aligned = uet.rigid_align_apply_no_scale(V_target, V_base, mask)
+
+                    # Compute residual in V_base's frame (now small corrections!)
+                    R_target = V_target_aligned - V_base
+                    # Store for later composition: V_hat = V_base + R_hat (in base frame)
+
+                    # [RESID-DIFF] Diagnostics: log residual statistics periodically
+                    if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                        with torch.no_grad():
+                            mask_f = mask.unsqueeze(-1).float()
+                            valid_count = mask_f.sum() * V_target.shape[-1]
+
+                            rms_tgt = (V_target.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                            rms_base = (V_base.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+                            rms_resid = (R_target.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+
+                            # Also compute unaligned residual to show the fix is working
+                            R_unaligned = V_target - V_base
+                            rms_resid_unaligned = (R_unaligned.pow(2) * mask_f).sum().div(valid_count).sqrt().item()
+
+                            # Residual-to-target ratio (should be << 1 after alignment)
+                            resid_ratio = rms_resid / (rms_tgt + 1e-8)
+                            resid_ratio_unaligned = rms_resid_unaligned / (rms_tgt + 1e-8)
+
+                            print(f"[RESID-DIFF] step={global_step} "
+                                  f"rms_tgt={rms_tgt:.4f} rms_base={rms_base:.4f} "
+                                  f"rms_resid_aligned={rms_resid:.4f} rms_resid_unaligned={rms_resid_unaligned:.4f}")
+                            print(f"[RESID-DIFF] resid/tgt_aligned={resid_ratio:.3f} resid/tgt_unaligned={resid_ratio_unaligned:.3f}")
+
+                            # [RESID-DIFF-GRAM] Check if Gram matrices match (geometry vs just rotation)
+                            G_tgt = (V_target @ V_target.transpose(1,2))[0]  # First sample
+                            G_base = (V_base @ V_base.transpose(1,2))[0]
+                            m = mask[0].bool()
+                            G_tgt_valid = G_tgt[m][:, m]
+                            G_base_valid = G_base[m][:, m]
+                            gram_corr = torch.corrcoef(torch.stack([G_tgt_valid.flatten(), G_base_valid.flatten()]))[0,1].item()
+                            print(f"[RESID-DIFF-GRAM] Gram_corr={gram_corr:.4f} (>0.95=alignment bug, <0.8=generator geometry wrong)")
+
+                            # [RESID-DIFF-CDIST] Translation-invariant distance-matrix correlation
+                            # This is more robust than Gram which can be affected by centering
+                            V_tgt_valid = V_target[0, m]  # (n_valid, D)
+                            V_base_valid = V_base[0, m]
+                            D_tgt = torch.cdist(V_tgt_valid, V_tgt_valid)  # (n_valid, n_valid)
+                            D_base = torch.cdist(V_base_valid, V_base_valid)
+                            cdist_corr = torch.corrcoef(torch.stack([D_tgt.flatten(), D_base.flatten()]))[0,1].item()
+                            print(f"[RESID-DIFF-CDIST] cdist_corr={cdist_corr:.4f} (translation-invariant geometry check)")
+
+                            # [RESID-DIFF-WEIGHTS] Print gen_align weight to verify it's active
+                            print(f"[RESID-DIFF-WEIGHTS] gen_align={WEIGHTS.get('gen_align', 0.0)}")
+                else:
+                    V_base = None
+                    R_target = None
 
                 # =================================================================
                 # [DEBUG] GENERATOR SCALE SANITY CHECK
@@ -4442,26 +5181,60 @@ def train_stageC_diffusion_generator(
                           f"drop_rate={uncond_rate:.4f} FORCE_COND_ONLY={FORCE_COND_ONLY}")
                 # ======== END A/B TEST 2 DEBUG ========
 
-                
+                # ======== CONDITIONING STRENGTH KNOB (ChatGPT fix for scale collapse) ========
+                # Apply AFTER dropout: normalize H_train to unit RMS, then scale by alpha
+                # This controls conditioning magnitude without architecture changes
+                cond_alpha = curriculum_state.get('cond_alpha', 0.1)
+                H_train, rms_H_before = normalize_and_scale_conditioning(H_train, mask, cond_alpha)
+
+                # Logging: verify the knob is working
+                if global_step % 100 == 0 and (fabric is None or fabric.is_global_zero):
+                    # Compute RMS after scaling for verification
+                    mask_f = mask.unsqueeze(-1).float()
+                    n_valid = mask.sum(dim=1).float()
+                    c_dim = H_train.shape[-1]
+                    den = (n_valid * c_dim).clamp(min=1.0)
+                    sq_sum_after = ((H_train * mask_f) ** 2).sum(dim=(1, 2))
+                    rms_H_after = (sq_sum_after / den + 1e-8).sqrt()
+
+                    # Report median and p90 for before/after
+                    rms_before_med = rms_H_before.median().item()
+                    rms_before_p90 = rms_H_before.quantile(0.9).item()
+                    rms_after_med = rms_H_after.median().item()
+                    rms_after_p90 = rms_H_after.quantile(0.9).item()
+
+                    print(f"[COND-SCALE] step={global_step} alpha={cond_alpha:.3f} "
+                          f"rms_before=[med={rms_before_med:.4f}, p90={rms_before_p90:.4f}] "
+                          f"rms_after=[med={rms_after_med:.4f}, p90={rms_after_p90:.4f}] "
+                          f"(expect after≈{cond_alpha:.3f})")
+                # ======== END CONDITIONING STRENGTH KNOB ========
+
                 # For ST: still load G_target (needed for Gram loss later)
                 if not is_sc:
                     G_target = batch['G_target'].to(device)
                 
-                # ===== NOISE AROUND GROUND TRUTH (not generator!) =====
+                # ===== NOISE AROUND GROUND TRUTH (or RESIDUAL in residual mode) =====
                 eps = torch.randn_like(V_target)
                 # eps = eps * mask.unsqueeze(-1).float()
-                V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
+                if use_resid:
+                    # RESIDUAL DIFFUSION: Noise around R_target = V_target - V_base
+                    V_t = R_target + sigma_t * eps  # Noisy residual
+                else:
+                    # STANDARD: Noise around V_target
+                    V_t = V_target + sigma_t * eps  # ← KEY FIX: noise around V_target
                 V_t = V_t * mask.unsqueeze(-1).float()
                 
                 # ========== NEW: Anchored training - clamp anchor positions to clean values ==========
                 if anchor_train and anchor_clamp_clean and anchor_cond_mask is not None and not is_sc:
-                    V_t = uet.apply_anchor_clamp(V_t, V_target, anchor_cond_mask, mask)
+                    # In residual mode, clamp to R_target; in standard mode, clamp to V_target
+                    clamp_target = R_target if use_resid else V_target
+                    V_t = uet.apply_anchor_clamp(V_t, clamp_target, anchor_cond_mask, mask)
                     
                     # Debug: verify clamp worked
                     if global_step % anchor_debug_every == 0 and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             if anchor_cond_mask.any():
-                                anchor_diff = (V_t - V_target).abs()
+                                anchor_diff = (V_t - clamp_target).abs()  # Use clamp_target for correctness
                                 anchor_positions = anchor_cond_mask.unsqueeze(-1).expand_as(V_t)
                                 max_anchor_diff = anchor_diff[anchor_positions].max().item()
                                 sigma_median = sigma_t.median().item()
@@ -4474,26 +5247,45 @@ def train_stageC_diffusion_generator(
                 sigma_t_orig = sigma_t.clone().detach()
                 mask_orig = mask.clone().detach()
 
+                # In residual mode, also store the aligned target for correct comparisons
+                use_resid_diag = curriculum_state.get('use_residual_diffusion', False)
+                try:
+                    if use_resid_diag and V_target_aligned is not None:
+                        V_target_aligned_orig = V_target_aligned.clone().detach()
+                    else:
+                        V_target_aligned_orig = V_target_orig  # Fallback to original
+                except NameError:
+                    V_target_aligned_orig = V_target_orig  # V_target_aligned not defined
+
                 if global_step % 2500 == 0 and (fabric is None or fabric.is_global_zero):
                     with torch.no_grad():
                         # --- DEBUG 5: Check noise across sigma bins ---
                         sigma_for_debug = sigma_t.view(-1) if use_edm else torch.exp(4.0 * t_norm)
                         debug_samples = get_one_sample_per_sigma_bin(sigma_for_debug)
-                        
+
                         for bin_name, b_idx in debug_samples[:2]:  # Check 2 bins max
                             m_b = mask_orig[b_idx].bool()
                             if m_b.sum() > 5:
-                                noise_actual = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
+                                # FIX: Use correct baseline for residual diffusion
+                                # In residual mode, V_t = R_target + σε, so noise = V_t - R_target
+                                # In standard mode, V_t = V_target + σε, so noise = V_t - V_target
+                                if use_resid and R_target is not None:
+                                    clean_baseline = R_target[b_idx]
+                                else:
+                                    clean_baseline = V_target_orig[b_idx]
+
+                                noise_actual = (V_t[b_idx] - clean_baseline)[m_b]
                                 sigma_val = sigma_for_debug[b_idx].item()
                                 noise_expected = (sigma_t_orig[b_idx] * eps_orig[b_idx])[m_b]
                                 diff = (noise_actual - noise_expected).abs().max().item()
-                                
-                                noise_b = (V_t[b_idx] - V_target_orig[b_idx])[m_b]
+
+                                noise_b = (V_t[b_idx] - clean_baseline)[m_b]
                                 noise_std = noise_b.std(dim=0).mean().item()
                                 noise_mean_norm = noise_b.mean(dim=0).norm().item()
                                 sig_b = float(sigma_t_orig[b_idx].view(-1)[0])
 
-                                print(f"[NOISE CHECK] bin={bin_name}, σ={sigma_val:.3f}, sample={b_idx}")
+                                mode_str = "RESID" if (use_resid and R_target is not None) else "STD"
+                                print(f"[NOISE CHECK] bin={bin_name}, σ={sigma_val:.3f}, sample={b_idx}, mode={mode_str}")
 
                                 print(f"\n[NOISE] step={global_step}")
                                 print(f"  equation_diff: {diff:.6f}")
@@ -4722,21 +5514,21 @@ def train_stageC_diffusion_generator(
                         with torch.no_grad():
                             # First pass: no self-conditioning
                             x0_pred_0_result = score_net.forward_edm(
-                                V_t, sigma_flat, H_train, mask, sigma_data,
+                                V_t, sigma_flat, H_train, mask, sigma_edm,
                                 self_cond=None, return_debug=False
                             )
                             if isinstance(x0_pred_0_result, tuple):
                                 x0_pred_0_tmp = x0_pred_0_result[0]
                             else:
                                 x0_pred_0_tmp = x0_pred_0_result
-                        
+
                         # Second pass: use first pass output as self-conditioning
                         result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            V_t, sigma_flat, H_train, mask, sigma_edm,
                             self_cond=x0_pred_0_tmp.detach(),  # stopgrad
                             return_debug=return_debug
                         )
-                        
+
                         # Debug self-conditioning effectiveness
                         if global_step % 200 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
@@ -4744,27 +5536,27 @@ def train_stageC_diffusion_generator(
                                     x0_pred_final = result[0]
                                 else:
                                     x0_pred_final = result
-                                
+
                                 diff = (x0_pred_final - x0_pred_0_tmp).abs()
                                 mask_f = mask.unsqueeze(-1).float()
                                 diff_mean = (diff * mask_f).sum() / mask_f.sum()
                                 x0_scale = (x0_pred_final.abs() * mask_f).sum() / mask_f.sum()
                                 rel_diff = diff_mean / x0_scale.clamp(min=1e-6)
-                                
+
                                 print(f"\n[SELF-COND] step={global_step} mode={self_cond_mode}")
                                 print(f"  Relative change from pass1 to pass2: {rel_diff.item()*100:.2f}%")
 
                     elif self_cond_mode == 'none':
                         # No self-conditioning
                         result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            V_t, sigma_flat, H_train, mask, sigma_edm,
                             self_cond=None, return_debug=return_debug
                         )
-                        
+
                     else:
                         # Fallback for old behavior (should not happen with new args)
                         result = score_net.forward_edm(
-                            V_t, sigma_flat, H_train, mask, sigma_data,
+                            V_t, sigma_flat, H_train, mask, sigma_edm,
                             self_cond=None, return_debug=return_debug
                         )
 
@@ -4837,9 +5629,9 @@ def train_stageC_diffusion_generator(
                     if global_step % 100 == 0 and use_self_cond and (fabric is None or fabric.is_global_zero):
                         with torch.no_grad():
                             print(f"\n[DEBUG-SELFCOND] Step {global_step} - Self-cond effectiveness:")
-                            
+
                             # Compare x0_pred with and without self-cond for same input
-                            x0_no_sc = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_data, 
+                            x0_no_sc = score_net.forward_edm(V_t, sigma_flat, H_train, mask, sigma_edm,
                                                              self_cond=None)
                             if isinstance(x0_no_sc, tuple):
                                 x0_no_sc = x0_no_sc[0]
@@ -4894,8 +5686,12 @@ def train_stageC_diffusion_generator(
                                 
                                 print(f"  σ∈[{lo:.1f},{hi:.1f}): n={n_in_bin}, mse(pred→tgt)={mse_pred:.6f}")
 
-                    # for geom losses, V_hat is x0_pred
-                    V_hat = x0_pred
+                    # for geom losses, V_hat is x0_pred (or V_base + x0_pred in residual mode)
+                    if use_resid:
+                        # RESIDUAL DIFFUSION: x0_pred is R_hat, compose V_hat = V_base + R_hat
+                        V_hat = V_base + x0_pred
+                    else:
+                        V_hat = x0_pred
                     dist_aux = None
                 else:
                     # Self-conditioning logic
@@ -4922,9 +5718,14 @@ def train_stageC_diffusion_generator(
                             eps_pred = result
                             dist_aux = None
 
-                    V_hat = V_t - sigma_t * eps_pred
+                    R_hat = V_t - sigma_t * eps_pred  # Denoised prediction (residual if use_resid)
+                    if use_resid:
+                        # RESIDUAL DIFFUSION: R_hat is the residual, compose V_hat = V_base + R_hat
+                        V_hat = V_base + R_hat
+                    else:
+                        V_hat = R_hat
                     V_hat = V_hat * mask.unsqueeze(-1).float()
-       
+
             # ===== SCORE LOSS (in fp32 for numerical stability) =====
             with torch.autocast(device_type='cuda', enabled=False):
                 mask_fp32 = mask.float()
@@ -4935,8 +5736,8 @@ def train_stageC_diffusion_generator(
                     sigma_flat = sigma_t.view(-1).float()  # (B,)
 
                     # EDM weight: (σ² + σ_d²) / (σ · σ_d)²  (returns (B,))
-                    # EDM weight: (σ² + σ_d²) / (σ · σ_d)²  (returns (B,))
-                    w_raw = uet.edm_loss_weight(sigma_flat, sigma_data).float()
+                    # Use sigma_edm (= sigma_data_resid in residual mode) for proper weighting
+                    w_raw = uet.edm_loss_weight(sigma_flat, sigma_edm).float()
 
                     # --- HIGH-SIGMA COMPENSATION: g(σ) = (σ/σ₀)^p for σ > σ₀ ---
                     # This compensates for high-σ scale collapse by boosting loss weight
@@ -4963,9 +5764,12 @@ def train_stageC_diffusion_generator(
                     cap = edm_debug_state['w_cap_ema'].clamp_min(1e-6)
                     w = cap * torch.tanh(w_raw / cap)  # (B,)
 
-                    # Choose target: ST uses V_target; SC must not require coords.
-                    # If your SC path truly has V_target, keep it; otherwise revert to V_0.
-                    target_x0 = V_target if (not is_sc) else V_0
+                    # Choose target: ST uses V_target (or R_target in residual mode); SC uses V_0.
+                    # In residual mode, the network predicts R_hat, so target is R_target.
+                    if use_resid:
+                        target_x0 = R_target if (not is_sc) else V_0
+                    else:
+                        target_x0 = V_target if (not is_sc) else V_0
                     target_fp32 = target_x0.float()
 
                     # Masked MSE (B, N) mean over latent dims
@@ -5013,7 +5817,8 @@ def train_stageC_diffusion_generator(
                     gate_hi_score = None
                     if (EXP_SCORE_HI_BOOST or EXP_SCORE_FX_HI):
                         with torch.no_grad():
-                            c_skip_hi = (sigma_data ** 2) / (sigma_flat ** 2 + sigma_data ** 2 + 1e-12)
+                            # Use sigma_edm (= sigma_data_resid in residual mode) for correct c_skip
+                            c_skip_hi = (sigma_edm ** 2) / (sigma_flat ** 2 + sigma_edm ** 2 + 1e-12)
                             noise_score_hi = -torch.log(c_skip_hi + 1e-12)  # (B,)
                             score_hi_gate.update(noise_score_hi)
                             gate_hi_score = score_hi_gate.gate(noise_score_hi, torch.ones_like(noise_score_hi))
@@ -5174,17 +5979,27 @@ def train_stageC_diffusion_generator(
                                 (1.00, 2.00, "[1.00-2.00)"),
                                 (2.00, 5.00, "[2.00-5.00)"),
                             ]
-                            
-                            # Compute per-sample scale ratio
+
+                            # In residual mode, use composed V_hat and aligned target for scale comparison
+                            use_resid_bin = curriculum_state.get('use_residual_diffusion', False)
+                            if use_resid_bin:
+                                # V_hat is already composed as V_base + R_pred at this point
+                                V_pred_bin = V_hat  # Full coords
+                                V_tgt_bin = V_target_aligned_orig  # Aligned target
+                            else:
+                                V_pred_bin = x0_pred  # Full coords
+                                V_tgt_bin = V_target  # Original target
+
+                            # Compute per-sample scale ratio - use full coords for comparison
                             m_f = mask.unsqueeze(-1).float()
-                            rms_pred_ps = (x0_pred.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
+                            rms_pred_ps = (V_pred_bin.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
                             rms_pred_ps = rms_pred_ps.sqrt()
-                            rms_tgt_ps = (V_target.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
+                            rms_tgt_ps = (V_tgt_bin.pow(2) * m_f).sum(dim=(1,2)) / m_f.sum(dim=(1,2)).clamp(min=1)
                             rms_tgt_ps = rms_tgt_ps.sqrt()
                             scale_r_ps = rms_pred_ps / rms_tgt_ps.clamp(min=1e-8)
-                            
-                            # Gradient proxy: w * (pred - tgt)
-                            grad_proxy = (w_eff.unsqueeze(-1).unsqueeze(-1) * (x0_pred - V_target)).pow(2) * m_f
+
+                            # Gradient proxy: w * (pred - tgt) - use correct targets
+                            grad_proxy = (w_eff.unsqueeze(-1).unsqueeze(-1) * (V_pred_bin - V_tgt_bin)).pow(2) * m_f
                             grad_proxy_ps = grad_proxy.sum(dim=(1,2)).sqrt()
                             
                             print(f"\n[SIGMA-BIN-STATS] step={global_step}")
@@ -5215,9 +6030,9 @@ def train_stageC_diffusion_generator(
                     
                     if EXP_SCORE_FX_HI and use_edm:
                         with torch.autocast(device_type='cuda', enabled=False):
-                            # Get EDM scalars for this batch
+                            # Get EDM scalars for this batch - use sigma_edm for correct preconditioning
                             sigma_flat_fx = sigma_t.view(-1).float()
-                            c_skip_fx, c_out_fx, _, _ = uet.edm_precond(sigma_flat_fx, sigma_data)
+                            c_skip_fx, c_out_fx, _, _ = uet.edm_precond(sigma_flat_fx, sigma_edm)
                             c_skip_fx = c_skip_fx.view(-1, 1, 1)  # (B, 1, 1)
                             c_out_fx = c_out_fx.view(-1, 1, 1)    # (B, 1, 1)
                             
@@ -5276,8 +6091,8 @@ def train_stageC_diffusion_generator(
                     
                     if (global_step % 200 == 0) and (fabric is None or fabric.is_global_zero) and use_edm:
                         with torch.no_grad():
-                            # Compute noise_score locally (same formula as later in the code)
-                            c_skip_debug = (sigma_data ** 2) / (sigma_flat ** 2 + sigma_data ** 2 + 1e-12)
+                            # Compute noise_score locally - use sigma_edm for correct c_skip
+                            c_skip_debug = (sigma_edm ** 2) / (sigma_flat ** 2 + sigma_edm ** 2 + 1e-12)
                             ns = -torch.log(c_skip_debug + 1e-12)  # (B,) higher = noisier
 
                             # 3 bins: low/mid/high noise by quantiles
@@ -5501,6 +6316,7 @@ def train_stageC_diffusion_generator(
             L_st_dist = torch.tensor(0.0, device=device)
             L_edm_tail = torch.tensor(0.0, device=device)
             L_gen_align = torch.tensor(0.0, device=device)
+            L_gen_gram = torch.tensor(0.0, device=device)  # NEW: Gram matrix loss for generator
             L_dim = torch.zeros((), device=device)
             L_triangle = torch.zeros((), device=device)
             L_radial = torch.zeros((), device=device)
@@ -5526,6 +6342,7 @@ def train_stageC_diffusion_generator(
             L_st_dist = safe_loss(L_st_dist, "L_st_dist", max_val=50.0, global_step=global_step)
             L_edm_tail = safe_loss(L_edm_tail, "L_edm_tail", max_val=50.0, global_step=global_step)
             L_gen_align = safe_loss(L_gen_align, "L_gen_align", max_val=50.0, global_step=global_step)
+            L_gen_gram = safe_loss(L_gen_gram, "L_gen_gram", max_val=50.0, global_step=global_step)
             L_dim = safe_loss(L_dim, "L_dim", max_val=50.0, global_step=global_step)
             L_triangle = safe_loss(L_triangle, "L_triangle", max_val=50.0, global_step=global_step)
             L_radial = safe_loss(L_radial, "L_radial", max_val=50.0, global_step=global_step)
@@ -5557,8 +6374,29 @@ def train_stageC_diffusion_generator(
                 mean = (V_hat_f32 * m_float).sum(dim=1, keepdim=True) / valid_counts.unsqueeze(-1)
                 V_hat_centered = (V_hat_f32 - mean) * m_float  # (B,N,D), centered but NOT clamped
 
-                # --- Step B: Compute V_geom (centered + locally clamped, for STRUCTURE losses) ---
-                # Use kNN-based local scale correction (detached) if we have spatial kNN and this is ST
+                # --- Step A2: Compute V_struct (self-normalized RAW for STRUCTURE losses) ---
+                # ChatGPT fix: Structure losses should be scale-INVARIANT without using V_target
+                # V_struct = V_hat_centered / RMS(V_hat_centered) - inference-feasible, no GT needed
+                # This replaces V_geom (which used V_target distances) for structure supervision
+                rms_per_sample = (V_hat_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                rms_per_sample = rms_per_sample.sqrt().clamp(min=1e-8)  # (B,)
+                # CRITICAL: Detach RMS to prevent backprop through scale normalization
+                # This stops the model from "gaming" the normalization and avoids amplification at high σ
+                V_struct = V_hat_centered / rms_per_sample.detach().view(-1, 1, 1)  # (B,N,D) - scale-normalized
+                V_struct = V_struct * m_float  # Re-apply mask
+
+                # --- Step A3: Compute V_target_struct (normalized target for structure loss comparisons) ---
+                # Must normalize target the SAME way as V_struct for consistent comparisons
+                V_target_centered, _ = uet.center_only(V_target.float(), mask)
+                V_target_centered = V_target_centered * m_float
+                tgt_rms = (V_target_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                tgt_rms = tgt_rms.sqrt().clamp(min=1e-8)
+                V_target_struct = V_target_centered / tgt_rms.view(-1, 1, 1)  # No detach needed - it's GT
+                V_target_struct = V_target_struct * m_float
+
+                # --- Step B: Compute V_geom (DIAGNOSTIC ONLY - NOT for training losses) ---
+                # V_geom uses V_target distances, so NOT inference-feasible
+                # Kept only for diagnostic logging (shows "if scale were perfect")
 
                 # ========== OPTION B FIX: Compute within-miniset kNN from V_target ==========
                 # Problem: batch['knn_spatial'] uses slide-level kNN, but only ~44% of neighbors
@@ -5666,14 +6504,14 @@ def train_stageC_diffusion_generator(
                         use_anchor_geom = (n_unknown.median() >= anchor_geom_min_unknown) and anchor_cond_mask.any()
                         
                         if use_anchor_geom:
-                            # Center the target in the same frame as V_geom for proper clamping
-                            V_target_centered, _ = uet.center_only(V_target.float(), mask)
-                            V_target_centered = V_target_centered * m_float
-                            
+                            # V_target_struct and V_target_centered already computed globally (Step A3)
                             # Create anchor-clamped versions of structure tensors
-                            # V_geom_L: for Gram, Edge, NCA (structure losses)
+                            # V_struct_L: for Gram, Edge, NCA (structure losses) - inference-feasible
+                            V_struct_L = uet.clamp_anchors_for_loss(V_struct, V_target_struct, anchor_cond_mask, mask)
+
+                            # V_geom_L: DIAGNOSTIC ONLY (not for training)
                             V_geom_L = uet.clamp_anchors_for_loss(V_geom, V_target_centered, anchor_cond_mask, mask)
-                            
+
                             # V_hat_centered_L: for knn_scale (raw scale loss needs clamping too)
                             V_hat_centered_L = uet.clamp_anchors_for_loss(V_hat_centered, V_target_centered, anchor_cond_mask, mask)
                             
@@ -5694,12 +6532,14 @@ def train_stageC_diffusion_generator(
                                     print(f"  V_hat_centered_L max_anchor_err={max_anchor_err_scale:.6f} (should be ~0)")
                         else:
                             # Not enough unknown points, use original tensors
-                            V_geom_L = V_geom
+                            V_struct_L = V_struct  # For structure losses
+                            V_geom_L = V_geom      # Diagnostic only
                             V_hat_centered_L = V_hat_centered
                             use_anchor_geom = False
                     else:
                         # No anchor training, use original tensors
-                        V_geom_L = V_geom
+                        V_struct_L = V_struct  # For structure losses
+                        V_geom_L = V_geom      # Diagnostic only
                         V_hat_centered_L = V_hat_centered
                         use_anchor_geom = False
 
@@ -5900,6 +6740,7 @@ def train_stageC_diffusion_generator(
                 else:
                     # SC batches or no spatial kNN: V_geom = V_hat_centered (no clamp available)
                     V_geom = V_hat_centered
+                    V_struct_L = V_struct  # For structure losses (SC has no anchor clamping)
                     # No clamp computed - set variables to None for knn_scale block
                     log_s_unclamped_for_knn = None
                     valid_scale_for_knn = None
@@ -5911,7 +6752,8 @@ def train_stageC_diffusion_generator(
 
             # --- PATCH 7: Low-rank subspace penalty ---
             if not is_sc and WEIGHTS.get('subspace', 0) > 0:
-                L_subspace = uet.variance_outside_topk(V_geom_L, mask, k=2)
+                # ChatGPT FIX: Use V_struct_L (inference-feasible) instead of V_geom_L (GT-referenced)
+                L_subspace = uet.variance_outside_topk(V_struct_L, mask, k=2)
             else:
                 L_subspace = torch.tensor(0.0, device=device)
 
@@ -5952,9 +6794,10 @@ def train_stageC_diffusion_generator(
                     
                     if apply_ctx:
                         # ===== COMPUTE SNR GATING =====
+                        # Use sigma_edm for correct SNR in residual mode
                         sigma_flat_ctx = sigma_flat if use_edm else torch.exp(4.0 * t_norm)
                         sigma_sq = sigma_flat_ctx ** 2
-                        snr_w = (sigma_data**2 / (sigma_sq + sigma_data**2)).detach().float()
+                        snr_w = (sigma_edm**2 / (sigma_sq + sigma_edm**2)).detach().float()
                         if snr_w.dim() == 0:
                             snr_w = snr_w.unsqueeze(0)
                         
@@ -6070,22 +6913,22 @@ def train_stageC_diffusion_generator(
                                     # Two-pass self-conditioning for replacement branch
                                     with torch.no_grad():
                                         x0_pred_rep_0_result = score_net.forward_edm(
-                                            V_t, sigma_flat, H_rep, mask, sigma_data,
+                                            V_t, sigma_flat, H_rep, mask, sigma_edm,
                                             self_cond=None, return_debug=False
                                         )
                                         if isinstance(x0_pred_rep_0_result, tuple):
                                             x0_pred_rep_0 = x0_pred_rep_0_result[0]
                                         else:
                                             x0_pred_rep_0 = x0_pred_rep_0_result
-                                    
+
                                     x0_pred_rep_result = score_net.forward_edm(
-                                        V_t, sigma_flat, H_rep, mask, sigma_data,
+                                        V_t, sigma_flat, H_rep, mask, sigma_edm,
                                         self_cond=x0_pred_rep_0.detach(),
                                         return_debug=False
                                     )
                                 else:
                                     x0_pred_rep_result = score_net.forward_edm(
-                                        V_t, sigma_flat, H_rep, mask, sigma_data,
+                                        V_t, sigma_flat, H_rep, mask, sigma_edm,
                                         self_cond=None, return_debug=False
                                     )
                                 
@@ -6302,14 +7145,14 @@ def train_stageC_diffusion_generator(
                 # ==============================================================================
                 # COMPUTE NOISE METRIC FOR ADAPTIVE GATING
                 # ==============================================================================
-                # noise = -log(c_skip) where c_skip = sigma_data^2 / (sigma^2 + sigma_data^2)
+                # noise = -log(c_skip) where c_skip = sigma_edm^2 / (sigma^2 + sigma_edm^2)
                 # Higher noise score = noisier sample (c_skip closer to 0)
-                # This is dataset-independent because c_skip is normalized by sigma_data
-                
+                # Use sigma_edm (= sigma_data_resid in residual mode) for correct gating
+
                 if use_edm:
                     with torch.no_grad():
                         sigma_flat_gate = sigma_t.view(-1)  # (B,)
-                        c_skip_b = (sigma_data ** 2) / (sigma_flat_gate ** 2 + sigma_data ** 2 + 1e-12)
+                        c_skip_b = (sigma_edm ** 2) / (sigma_flat_gate ** 2 + sigma_edm ** 2 + 1e-12)
                         noise_score = -torch.log(c_skip_b + 1e-12)  # (B,) higher = noisier
                         
                         # Base gate from CFG dropout
@@ -6472,7 +7315,13 @@ def train_stageC_diffusion_generator(
                     # This ensures the target Gram is feasible in D_latent dimensions
                     # (G_target from batch is full-rank from 2D coords, creating impossible pressure)
                     Vt_c_for_gram, _ = uet.center_only(V_target_batch.float(), mask)
-                    Gt = Vt_c_for_gram @ Vt_c_for_gram.transpose(1, 2)  # (B, N, N), rank ≤ D_latent
+                    # ChatGPT FIX: Normalize target the SAME way as V_struct (RMS-normalize)
+                    # This ensures consistent scale-free comparison: Gp vs Gt both normalized
+                    tgt_gram_rms = (Vt_c_for_gram.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                    tgt_gram_rms = tgt_gram_rms.sqrt().clamp(min=1e-8)
+                    Vt_c_for_gram = Vt_c_for_gram / tgt_gram_rms.view(-1, 1, 1)
+                    Vt_c_for_gram = Vt_c_for_gram * m_float  # Re-apply mask
+                    Gt = Vt_c_for_gram @ Vt_c_for_gram.transpose(1, 2)  # (B, N, N), rank ≤ D_latent, scale-normalized
                     # NOTE: MM and P_off masks are applied downstream, no need to multiply here
                     B, N, _ = V_geom.shape
                     
@@ -6486,7 +7335,8 @@ def train_stageC_diffusion_generator(
                                   f"ratio={tr_Gt_new.item()/tr_Gt_old.item():.4f}")
                     
                     # Build predicted Gram *with* true scale
-                    Gp_raw = V_geom_L @ V_geom_L.transpose(1, 2)          # (B,N,N)
+                    # ChatGPT FIX: Use V_struct_L (self-normalized RAW) for inference-feasible structure
+                    Gp_raw = V_struct_L @ V_struct_L.transpose(1, 2)          # (B,N,N)
                     
                     # --- PATCH 6: Diagonal distribution loss (per-point norm matching) ---
                     diag_p = torch.diagonal(Gp_raw, dim1=-2, dim2=-1)  # (B,N)
@@ -6668,9 +7518,9 @@ def train_stageC_diffusion_generator(
                     
                     if use_edm and WEIGHTS.get('gram_learn', 0) > 0:
                         with torch.autocast(device_type='cuda', enabled=False):
-                            # Get preconditioning scalars
+                            # Get preconditioning scalars - use sigma_edm for correct c_skip
                             sigma_flat_gl = sigma_t.view(-1).float()
-                            c_skip_gl, c_out_gl, _, _ = uet.edm_precond(sigma_flat_gl, sigma_data)
+                            c_skip_gl, c_out_gl, _, _ = uet.edm_precond(sigma_flat_gl, sigma_edm)
                             c_skip_1d = c_skip_gl.view(-1)  # (B,)
                             c_out_1d = c_out_gl.view(-1).clamp(min=1e-6)  # (B,)
                             
@@ -6869,8 +7719,9 @@ def train_stageC_diffusion_generator(
                         
                         if use_edm and WEIGHTS.get('out_scale', 0) > 0:
                             with torch.autocast(device_type='cuda', enabled=False):
+                                # Use sigma_edm for correct c_skip/c_out in residual mode
                                 sigma_flat_f = sigma_flat.float()
-                                c_skip_b, c_out_b, c_in_b, _ = uet.edm_precond(sigma_flat_f, sigma_data)
+                                c_skip_b, c_out_b, c_in_b, _ = uet.edm_precond(sigma_flat_f, sigma_edm)
                                 # c_skip_b, c_out_b: (B, 1, 1)
                                 
                                 # Center noisy input and clean target in the SAME way as V_geom
@@ -7010,9 +7861,11 @@ def train_stageC_diffusion_generator(
                         
                         # Compute NCA loss with point weighting
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
+                        # ChatGPT FIX: Use V_struct_L (self-normalized RAW) for inference-feasible structure
+                        # ChatGPT FIX 2: Use V_target_struct (normalized target) for consistent comparison
                         L_knn_per = uet.knn_nca_loss(
-                            V_geom_L,              # Clamped structure tensor
-                            V_target.float(),    # Raw target
+                            V_struct_L,            # Self-normalized structure tensor, inference-feasible
+                            V_target_struct,       # Normalized target (same scale as V_struct)
                             struct_mask,           # Only core non-landmarks (valid kNN indices)
                             k=15,
                             temperature=tau_reference,
@@ -7427,14 +8280,15 @@ def train_stageC_diffusion_generator(
                         #     knn_idx=knn_indices_batch,
                         #     mask=mask
                         # )
-                        # CHANGE 3: Use V_geom (clamped) for edge loss
+                        # CHANGE 3: Use V_struct_L (self-normalized RAW) for edge loss
                         # Edge is a STRUCTURE loss - it measures local neighborhood shape
-                        # Using clamped V_geom removes systematic scale bias from gradients
+                        # ChatGPT FIX: V_struct_L is inference-feasible (no GT needed for scale)
                         # Scale learning happens via knn_scale on V_hat_centered
                         # FIX: Use struct_mask to exclude landmarks/extras with invalid kNN indices
+                        # ChatGPT FIX 2: Use V_target_struct (normalized target) for consistent comparison
                         L_edge_per = uet.edge_log_ratio_loss(
-                            V_pred=V_geom_L,  # Clamped structure tensor, NOT raw x0_pred
-                            V_tgt=V_target.float(),
+                            V_pred=V_struct_L,  # Self-normalized structure tensor, inference-feasible
+                            V_tgt=V_target_struct,  # Normalized target (same scale as V_struct)
                             knn_idx=knn_indices_batch,
                             mask=struct_mask   # Only core non-landmarks (valid kNN indices)
                         )
@@ -7452,8 +8306,8 @@ def train_stageC_diffusion_generator(
                         # =================================================================
                         if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero):
                             with torch.no_grad():
-                                # ✅ Use CLONED version
-                                Tgt = V_target_orig
+                                # ✅ Use ALIGNED target in residual mode (V_hat is in V_base's frame)
+                                Tgt = V_target_aligned_orig
 
                                 # --- A. COMPUTE SCALE & ERROR RMS ---
                                 mask_f = mask_orig.unsqueeze(-1).float()
@@ -7684,35 +8538,45 @@ def train_stageC_diffusion_generator(
                         if global_step % 25 == 0 and (fabric is None or fabric.is_global_zero) and not is_sc:
                             with torch.no_grad():
                                 print(f"\n[DEBUG-GEN-VS-DIFF] Step {global_step} - Generator vs Diffusion neighbor structure:")
-                                
+
                                 # Get generator output
                                 V_gen_debug = generator(H_train, mask)
-                                
+
+                                # In residual mode, x0_pred is R_pred (residual), not V
+                                # We need to compute V_final = V_base + R_pred for fair comparison
+                                if use_resid and 'V_base' in dir() and V_base is not None:
+                                    V_diff_debug = V_base + x0_pred  # Compose: V = V_base + R
+                                    diff_label = "Diffusion (V_base+R)"
+                                else:
+                                    V_diff_debug = x0_pred
+                                    diff_label = "Diffusion"
+
                                 # Compute k-NN Jaccard for both
                                 k = 15
-                                for name, V_test in [("Generator", V_gen_debug), ("Diffusion", x0_pred)]:
+                                for name, V_test in [("Generator", V_gen_debug), (diff_label, V_diff_debug)]:
                                     # Sample a few points from batch
                                     b_idx = 0
                                     m = mask[b_idx]
                                     valid_idx = m.nonzero(as_tuple=True)[0]
-                                    
+
                                     if len(valid_idx) > 20:
                                         v_test = V_test[b_idx:b_idx+1]
                                         v_tgt = V_target[b_idx:b_idx+1]
                                         m_batch = mask[b_idx:b_idx+1]
-                                        
+
                                         jaccard = uet.knn_jaccard_soft(v_test, v_tgt, m_batch, k=k)
                                         print(f"  {name}: k={k} Jaccard={jaccard.item():.4f}")
-                                
+
                                 # Per-sigma breakdown for diffusion
                                 for lo, hi in [(0.0, 0.3), (0.3, 1.0), (1.0, float('inf'))]:
                                     in_bin = (sigma_flat >= lo) & (sigma_flat < hi)
                                     if in_bin.any() and in_bin.sum() >= 2:
+                                        # Use V_diff_debug (composed) for fair comparison
                                         jaccard_bin = uet.knn_jaccard_soft(
-                                            x0_pred[in_bin][:2], V_target[in_bin][:2], 
+                                            V_diff_debug[in_bin][:2], V_target[in_bin][:2],
                                             mask[in_bin][:2], k=k
                                         )
-                                        print(f"  Diffusion σ∈[{lo:.1f},{hi:.1f}): Jaccard={jaccard_bin.item():.4f}")
+                                        print(f"  {diff_label} σ∈[{lo:.1f},{hi:.1f}): Jaccard={jaccard_bin.item():.4f}")
 
 
                         # ========== COMPREHENSIVE GEOMETRY DIAGNOSTICS ==========
@@ -8124,38 +8988,43 @@ def train_stageC_diffusion_generator(
                         # ==================== CHANGE 6: GENERATOR SCALE CLAMP (Option 1 Change B) ====================
 
                         # PATCH 8: Scale-aware generator alignment losses
-                        # FIX: Use within-miniset kNN instead of slide-level kNN
-                        if knn_spatial_for_scale is not None:
-                            # Compute scale correction for GENERATOR (separate from diffusion)
-                            s_corr_gen, _, valid_scale_gen, _, _, _ = uet.compute_local_scale_correction(
-                                V_pred=V_gen_centered,  # Generator output, NOT V_hat_centered
-                                V_tgt=V_target.float(),
-                                mask=mask,
-                                knn_indices=knn_spatial_for_scale,  # Within-miniset kNN
-                                k=15,
-                                max_log_correction=max_log_corr_for_knn if max_log_corr_for_knn is not None else 0.25,
-                            )
+                        # ChatGPT FIX: Use self-normalized V_gen_struct (inference-feasible)
+                        # instead of GT-referenced V_gen_geo (which used compute_local_scale_correction with V_target)
 
-                            # Apply scale correction to generator
-                            V_gen_geo = uet.apply_scale_correction(V_gen_centered, s_corr_gen.detach(), mask)
-                        else:
-                            V_gen_geo = V_gen_centered
+                        # Create V_gen_struct: self-normalized generator output (same as V_struct)
+                        gen_rms = (V_gen_centered.pow(2) * m_float).sum(dim=(1, 2)) / valid_counts.squeeze(-1).clamp(min=1)
+                        gen_rms = gen_rms.sqrt().clamp(min=1e-8)
+                        # Detach RMS to prevent backprop through scale normalization
+                        V_gen_struct = V_gen_centered / gen_rms.detach().view(-1, 1, 1)
+                        V_gen_struct = V_gen_struct * m_float
 
                         # ========== ANCHOR-CLAMP GENERATOR TENSORS ==========
                         if anchor_train and anchor_geom_losses and anchor_cond_mask is not None and use_anchor_geom:
-                            V_target_centered_gen, _ = uet.center_only(V_target.float(), mask)
-                            V_target_centered_gen = V_target_centered_gen * mask.float().unsqueeze(-1)
-                            V_gen_geo_L = uet.clamp_anchors_for_loss(V_gen_geo, V_target_centered_gen, anchor_cond_mask, mask)
-                            V_gen_centered_L = uet.clamp_anchors_for_loss(V_gen_centered, V_target_centered_gen, anchor_cond_mask, mask)
+                            # Use V_target_struct (already computed globally) for consistent normalization
+                            V_gen_struct_L = uet.clamp_anchors_for_loss(V_gen_struct, V_target_struct, anchor_cond_mask, mask)
+                            V_gen_centered_L = uet.clamp_anchors_for_loss(V_gen_centered, V_target_centered, anchor_cond_mask, mask)
                         else:
-                            V_gen_geo_L = V_gen_geo
+                            V_gen_struct_L = V_gen_struct
                             V_gen_centered_L = V_gen_centered
-                        
+
                         # PATCH 8: rotation-only alignment (no scaling) + explicit scale loss
-                        # Use anchor-clamped V_gen_geo_L for alignment
-                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_geo_L, V_target_batch, mask)
+                        # ChatGPT FIX: Use V_gen_struct_L (inference-feasible) for alignment
+                        # Compare against V_target_struct (normalized target) for consistent comparison
+                        L_gen_align = uet.rigid_align_mse_no_scale(V_gen_struct_L, V_target_struct, mask)
                         # Use anchor-clamped V_gen_centered_L for scale loss
                         L_gen_scale = uet.rms_log_loss(V_gen_centered_L, V_target_batch, mask)
+
+                        # NEW: Gram matrix loss for generator (gauge-invariant geometry)
+                        # Unlike Procrustes MSE, this has direct gradients and doesn't rely on SVD
+                        if WEIGHTS.get('gen_gram', 0.0) > 0:
+                            # Compute Gram matrices (pairwise inner products)
+                            G_gen = V_gen_struct_L @ V_gen_struct_L.transpose(1, 2)  # (B, N, N)
+                            G_tgt = V_target_struct @ V_target_struct.transpose(1, 2)  # (B, N, N)
+
+                            # Masked MSE over valid pairs
+                            mask_2d = mask.unsqueeze(1) * mask.unsqueeze(2)  # (B, N, N)
+                            diff_gram = (G_gen - G_tgt).pow(2) * mask_2d
+                            L_gen_gram = diff_gram.sum() / mask_2d.sum().clamp(min=1)
                         
                         # CHANGE 6 ADDITION: Local scale loss for generator (like knn_scale)
                         # This ensures generator learns correct local neighborhood distances
@@ -8640,6 +9509,7 @@ def train_stageC_diffusion_generator(
                     WEIGHTS['st_dist'] * L_st_dist +
                     WEIGHTS['edm_tail'] * L_edm_tail +
                     WEIGHTS['gen_align'] * L_gen_align +
+                    WEIGHTS.get('gen_gram', 0) * L_gen_gram +    # NEW: Gram loss for generator
                     WEIGHTS.get('gen_scale', 0) * L_gen_scale +  # PATCH 8
                     WEIGHTS['dim'] * L_dim +
                     WEIGHTS['triangle'] * L_triangle +
@@ -8710,7 +9580,8 @@ def train_stageC_diffusion_generator(
                     sigma_pair_ov = sigma_pair[idx_keep]  # Was: sigma_pair = sigma_pair[idx_keep]
                     sigma_pair_3d_ov = sigma_pair_3d[idx_keep]  # Was: sigma_pair_3d = sigma_pair_3d[idx_keep]
                     eps_ov = eps[idx_keep]  # Was: eps = eps[idx_keep]
- 
+                    V_t_1 = V_t[idx_keep]  # Noisy view1 input for residual overlap
+
                     # DEBUG: gate + sigma stats
                     if global_step % overlap_debug_every == 0:
                         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -8764,9 +9635,9 @@ def train_stageC_diffusion_generator(
                     # Default OFF to preserve Fix #1 (independent noise) behavior
                     # Turn ON if you see noisy/non-monotone residual loss at high σ
                     # ============================================================
-                    ENABLE_SAME_NOISE = False  # Toggle: True to enable same-noise at high σ
+                    ENABLE_FIX2A_SAME_NOISE = False  # Toggle: True to enable same-noise at high σ
 
-                    if ENABLE_SAME_NOISE:
+                    if ENABLE_FIX2A_SAME_NOISE:
                         curr_stage_noise = curriculum_state['current_stage']
                         curr_mult_noise = curriculum_state['sigma_cap_mults'][curr_stage_noise]
                         sigma_cap_noise = curr_mult_noise * sigma_data
@@ -8791,17 +9662,42 @@ def train_stageC_diffusion_generator(
                                 print(f"[FIX2A] Same-noise coupling: {hi_sigma_mask.sum().item()}/{hi_sigma_mask.shape[0]} "
                                       f"high-σ samples (σ > {sigma_switch_noise:.3f})")
 
-                    # Add noise to view2 target
-                    V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2  # Use sliced sigma_pair_3d_ov
-                    V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
- 
-                    # Encode view2 context
+                    # Encode view2 context FIRST (needed for residual V_base_2)
                     with torch.autocast(device_type='cuda', dtype=amp_dtype):
                         H_2 = context_encoder(Z_set_2, mask_2)
+
+                    # ========== RESIDUAL DIFFUSION: View 2 ==========
+                    # Must match view 1's residual treatment (including frame alignment!)
+                    #
+                    # FIX #1 (ROBUST): Compute generator outputs WITH gradients for overlap consistency
+                    # This allows the generator to learn context-invariant geometry directly.
+                    # V_base_2 (detached) is still used for residual target computation.
+                    if use_resid:
+                        # Compute generator output WITH gradients (for Fix #1 generator overlap loss)
+                        V_gen_2 = generator(H_2, mask_2)  # WITH gradients
+                        V_base_2 = V_gen_2.detach()  # Detached for residual target (no gradient here)
+
+                        # CRITICAL: Align V_target_2 to V_base_2's frame (same as view 1)
+                        with torch.no_grad():
+                            V_target_2_aligned = uet.rigid_align_apply_no_scale(V_target_2, V_base_2, mask_2)
+                        R_target_2 = V_target_2_aligned - V_base_2
+                        # Noise the residual, not the absolute target
+                        V_t_2 = R_target_2 + sigma_pair_3d_ov * eps_2
+                    else:
+                        V_gen_2 = None
+                        V_base_2 = None
+                        R_target_2 = None
+                        V_target_2_aligned = V_target_2  # For Fix #2: use original if not residual mode
+                        # Add noise to view2 target (original behavior)
+                        V_t_2 = V_target_2 + sigma_pair_3d_ov * eps_2
+
+                    V_t_2 = V_t_2 * mask_2.unsqueeze(-1).float()
+
+                    with torch.autocast(device_type='cuda', dtype=amp_dtype):
  
-                        # Forward pass for view2
+                        # Forward pass for view2 - use sigma_edm for correct preconditioning
                         x0_pred_2_result = score_net.forward_edm(
-                            V_t_2, sigma_pair_ov, H_2, mask_2, sigma_data,  # Use sliced sigma_pair_ov
+                            V_t_2, sigma_pair_ov, H_2, mask_2, sigma_edm,
                             self_cond=None, return_debug=False
                         )
 
@@ -8818,7 +9714,9 @@ def train_stageC_diffusion_generator(
                         # ============================================================
 
                         # Compute per-node MSE (same as view1: mean over dims)
-                        err2_node_2 = (x0_pred_2 - V_target_2).pow(2).mean(dim=-1)  # (B_keep, N2)
+                        # In residual mode, use R_target_2; otherwise use V_target_2
+                        target_2_for_score = R_target_2 if use_resid else V_target_2
+                        err2_node_2 = (x0_pred_2 - target_2_for_score).pow(2).mean(dim=-1)  # (B_keep, N2)
 
                         # Per-sample normalization (same as view1)
                         mask_2_f = mask_2.float()  # (B_keep, N2)
@@ -8835,12 +9733,169 @@ def train_stageC_diffusion_generator(
                         L_total = L_total + WEIGHTS.get('score', 1.0) * L_score_2
                         L_score_2_batch = L_score_2  # Store for epoch tracking
 
+                        # ============================================================
+                        # ROBUST FIX #1: Generator-level overlap consistency loss
+                        # ============================================================
+                        # This enforces that the generator produces consistent geometry
+                        # for overlap cells regardless of context (exclusive nodes).
+                        # Shrinks "context variance" at the base level, making residual
+                        # diffusion's job well-posed.
+                        #
+                        # For overlap set I, we compute:
+                        # - Shape loss: (1/n_I^2) * ||G1_norm - G2_norm||_F^2
+                        # - Scale loss: (log(tr(G1)) - log(tr(G2)))^2
+                        # ============================================================
+                        L_gen_ov_shape = torch.tensor(0.0, device=device)
+                        L_gen_ov_scale = torch.tensor(0.0, device=device)
+                        gen_ov_valid_count = 0
+
+                        if use_resid and V_gen_2 is not None:
+                            # Compute V_gen_1 WITH gradients (slice H and run generator)
+                            H_ov = H[idx_keep]  # Slice context encoding for view1
+                            V_gen_1 = generator(H_ov, mask_ov)  # WITH gradients
+
+                            # Compute generator overlap consistency loss on overlap indices
+                            B_ov = V_gen_1.shape[0]
+                            for b in range(B_ov):
+                                I_valid_b = I_mask[b]  # (max_I,)
+                                n_I_b = I_valid_b.sum().item()
+                                if n_I_b < 5:  # Need enough points for meaningful loss
+                                    continue
+
+                                # Get overlap indices for this sample
+                                idx1_b = idx1_I[b, I_valid_b]  # Positions in view1
+                                idx2_b = idx2_I[b, I_valid_b]  # Positions in view2
+
+                                # Extract generator outputs on overlap
+                                V_g1_I = V_gen_1[b, idx1_b]  # (n_I, D)
+                                V_g2_I = V_gen_2[b, idx2_b]  # (n_I, D)
+
+                                # Center (remove mean)
+                                V_g1_I_c = V_g1_I - V_g1_I.mean(dim=0, keepdim=True)
+                                V_g2_I_c = V_g2_I - V_g2_I.mean(dim=0, keepdim=True)
+
+                                # Compute Gram matrices
+                                G1 = V_g1_I_c @ V_g1_I_c.T  # (n_I, n_I)
+                                G2 = V_g2_I_c @ V_g2_I_c.T  # (n_I, n_I)
+
+                                eps = 1e-8
+                                tr_G1 = G1.trace() + eps
+                                tr_G2 = G2.trace() + eps
+
+                                # Shape loss: normalized Gram Frobenius (scale-free)
+                                G1_norm = G1 / tr_G1
+                                G2_norm = G2 / tr_G2
+                                shape_loss_b = (G1_norm - G2_norm).pow(2).mean()  # Normalized by n_I^2
+                                L_gen_ov_shape = L_gen_ov_shape + shape_loss_b
+
+                                # Scale loss: log-trace difference
+                                scale_loss_b = (torch.log(tr_G1) - torch.log(tr_G2)).pow(2)
+                                L_gen_ov_scale = L_gen_ov_scale + scale_loss_b
+
+                                gen_ov_valid_count += 1
+
+                            # Normalize by valid count
+                            if gen_ov_valid_count > 0:
+                                L_gen_ov_shape = L_gen_ov_shape / gen_ov_valid_count
+                                L_gen_ov_scale = L_gen_ov_scale / gen_ov_valid_count
+
+                                # Add to total loss with generator weights
+                                # Use gen_gram weight for shape, gen_scale weight for scale
+                                w_gen_ov_shape = WEIGHTS.get('gen_gram', 10.0) * 0.5  # Half weight for overlap
+                                w_gen_ov_scale = WEIGHTS.get('gen_scale', 10.0) * 0.5
+                                L_total = L_total + w_gen_ov_shape * L_gen_ov_shape
+                                L_total = L_total + w_gen_ov_scale * L_gen_ov_scale
+
+                        # ============================================================
+                        # ROBUST FIX #2: Symmetrize view2 supervision
+                        # ============================================================
+                        # Apply Gram shape and scale losses to view2 against its own
+                        # aligned target. This prevents view2 from drifting into
+                        # "match overlap but be globally weird" behavior.
+                        # ============================================================
+                        L_gram_2 = torch.tensor(0.0, device=device)
+                        L_gram_scale_2 = torch.tensor(0.0, device=device)
+
+                        if WEIGHTS.get('gram', 0) > 0 or WEIGHTS.get('gram_scale', 0) > 0:
+                            with torch.autocast(device_type='cuda', enabled=False):
+                                # Use V_hat_2 (absolute prediction) and V_target_2_aligned (target)
+                                # First, compose absolute prediction for view2
+                                if use_resid:
+                                    V_pred_2_abs = V_base_2 + x0_pred_2  # Absolute prediction
+                                    V_tgt_2_abs = V_target_2_aligned  # Aligned target
+                                else:
+                                    V_pred_2_abs = x0_pred_2
+                                    V_tgt_2_abs = V_target_2
+
+                                # Center both (mask-aware)
+                                m2_f = mask_2.unsqueeze(-1).float()  # (B, N, 1)
+                                m2_sum = m2_f.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1, 1)
+
+                                V_pred_2_c = V_pred_2_abs - (V_pred_2_abs * m2_f).sum(dim=1, keepdim=True) / m2_sum
+                                V_pred_2_c = V_pred_2_c * m2_f
+                                V_tgt_2_c = V_tgt_2_abs - (V_tgt_2_abs * m2_f).sum(dim=1, keepdim=True) / m2_sum
+                                V_tgt_2_c = V_tgt_2_c * m2_f
+
+                                # Compute Gram matrices
+                                Gp_2 = V_pred_2_c @ V_pred_2_c.transpose(1, 2)  # (B, N, N)
+                                Gt_2 = V_tgt_2_c @ V_tgt_2_c.transpose(1, 2)  # (B, N, N)
+
+                                # Valid pair mask
+                                m2_bool = mask_2.bool()
+                                MM_2 = (m2_bool.unsqueeze(-1) & m2_bool.unsqueeze(-2)).float()
+                                N2 = mask_2.shape[1]
+                                eye_2 = torch.eye(N2, dtype=torch.bool, device=device).unsqueeze(0)
+                                P_off_2 = (MM_2.bool() & (~eye_2)).float()
+
+                                # Gram shape loss (scale-normalized)
+                                if WEIGHTS.get('gram', 0) > 0:
+                                    # Normalize by trace for scale-invariant comparison
+                                    tr_p_2 = (Gp_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-8)
+                                    tr_t_2 = (Gt_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-8)
+                                    Gp_2_norm = Gp_2 / tr_p_2
+                                    Gt_2_norm = Gt_2 / tr_t_2
+
+                                    diff_2 = (Gp_2_norm - Gt_2_norm) * P_off_2
+                                    pair_cnt_2 = P_off_2.sum(dim=(1, 2)).clamp(min=1.0)
+                                    L_gram_2 = (diff_2.pow(2).sum(dim=(1, 2)) / pair_cnt_2).mean()
+
+                                    # Add to total (half weight for view2)
+                                    L_total = L_total + WEIGHTS.get('gram', 2.0) * 0.5 * L_gram_2
+
+                                # Gram scale loss (trace matching)
+                                if WEIGHTS.get('gram_scale', 0) > 0:
+                                    tr_p_2_flat = (Gp_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1)  # (B,)
+                                    tr_t_2_flat = (Gt_2.diagonal(dim1=1, dim2=2) * m2_bool.float()).sum(dim=1)  # (B,)
+                                    log_ratio_2 = torch.log(tr_p_2_flat + 1e-8) - torch.log(tr_t_2_flat + 1e-8)
+                                    L_gram_scale_2 = (log_ratio_2 ** 2).mean()
+
+                                    # Add to total (half weight for view2)
+                                    L_total = L_total + WEIGHTS.get('gram_scale', 2.0) * 0.5 * L_gram_scale_2
+
                         # Compute overlap losses
                         # Slice V_target to match the filtered batch
                         V_target_1_ov = V_target[idx_keep]
-                        
+
+                        # ========== RESIDUAL DIFFUSION: Compose absolute coords for overlap ==========
+                        # In residual mode, x0_pred is R_hat (residual). For overlap consistency,
+                        # we need absolute coordinates: V_hat = V_base + R_hat
+                        if use_resid:
+                            V_base_1 = V_base[idx_keep]  # Slice V_base from main batch
+                            V_hat_1_ov = V_base_1 + x0_pred_1  # Compose absolute coords
+                            V_hat_2_ov = V_base_2 + x0_pred_2  # V_base_2 computed earlier
+                        else:
+                            V_hat_1_ov = x0_pred_1  # Already absolute
+                            V_hat_2_ov = x0_pred_2
+
+                        # FIX #3: Dynamic sigma_0_hi threshold (70% of curriculum cap)
+                        # This ensures the high-σ scale anchor actually activates within training range
+                        curr_stage_for_hi = curriculum_state['current_stage']
+                        curr_mult_for_hi = curriculum_state['sigma_cap_mults'][curr_stage_for_hi]
+                        sigma_cap_for_hi = curr_mult_for_hi * sigma_data
+                        sigma_0_hi_dynamic = 0.7 * sigma_cap_for_hi  # 70% of current cap
+
                         ov_loss_dict = compute_overlap_losses(
-                            x0_pred_1, x0_pred_2,
+                            V_hat_1_ov, V_hat_2_ov,  # Use composed coords in residual mode
                             idx1_I, idx2_I, I_mask,
                             mask_ov, mask_2,  # Use sliced mask_ov for view1
                             kl_tau=overlap_kl_tau,
@@ -8848,7 +9903,7 @@ def train_stageC_diffusion_generator(
                             sigma_t=sigma_pair_3d_ov,
                             V_target_1=V_target_1_ov,
                             V_target_2=V_target_2,
-                            sigma_0_hi=0.5,  # threshold for high-σ anchor
+                            sigma_0_hi=sigma_0_hi_dynamic,  # FIX #3: dynamic threshold (70% of sigma_cap)
                             # [TRY 2] Per-sample SNR gating for KL
                             sigma_data=sigma_data,
                             kl_gate_power=2.0,  # c_skip^2 gating
@@ -8895,8 +9950,8 @@ def train_stageC_diffusion_generator(
                             # Only for samples where σ > σ_switch
                             # ============================================================
                             if n_hi > 0:
-                                # Compute EDM preconditioning for ALL samples (needed for indexing)
-                                c_skip_ov, c_out_ov, c_in_ov, _ = uet.edm_precond(sigma_pair_ov, sigma_data)
+                                # Compute EDM preconditioning for ALL samples - use sigma_edm
+                                c_skip_ov, c_out_ov, c_in_ov, _ = uet.edm_precond(sigma_pair_ov, sigma_edm)
                                 # c_skip_ov: (B,) -> expand to (B, 1, 1)
                                 c_skip_ov_3d = c_skip_ov.view(-1, 1, 1)
                                 c_out_ov_3d = c_out_ov.view(-1, 1, 1)
@@ -9055,36 +10110,47 @@ def train_stageC_diffusion_generator(
                                 ov_jaccard_k10.extend(ov_loss_dict['debug_info']['jaccard_k10'])
 
                             # ============ [OVLP-VS-GLOBAL] Overlap vs Global health ============
+                            # FIX #1: In residual mode, use absolute predictions (V_hat) and aligned targets
                             if global_step % overlap_debug_every == 0:
                                 with torch.no_grad():
                                     # Get overlap Jaccard from the debug info
                                     ov_jacc = ov_loss_dict['debug_info'].get('jaccard_k10', [])
                                     ov_jacc_mean = np.mean(ov_jacc) if ov_jacc else 0.0
-                                    
+
                                     # Get overlap scale ratio from loss dict
                                     ov_scale_r = ov_loss_dict.get('debug_scale_ratio', 1.0)
-                                    
+
+                                    # FIX #1: Use absolute predictions and aligned targets
+                                    # In residual mode: V_hat = V_base + R_hat (already computed as V_hat_1_ov)
+                                    # Target should be V_target_aligned (in same frame as V_base)
+                                    if use_resid:
+                                        pred_for_diag = V_hat_1_ov  # Absolute prediction
+                                        tgt_for_diag = V_target_aligned[idx_keep]  # Aligned target
+                                    else:
+                                        pred_for_diag = x0_pred_1  # Already absolute
+                                        tgt_for_diag = V_target[idx_keep]
+
                                     # Compute GLOBAL Jaccard@10 on view1 (full set, not just overlap)
                                     global_jacc_sum = 0.0
                                     global_jacc_cnt = 0
-                                    for b in range(min(4, x0_pred_1.shape[0])):
+                                    for b in range(min(4, pred_for_diag.shape[0])):
                                         m_b = mask_ov[b].bool()
                                         n_valid = int(m_b.sum().item())
                                         if n_valid < 15:
                                             continue
-                                        
-                                        pred_b = x0_pred_1[b, m_b]
-                                        tgt_b = V_target[idx_keep][b, m_b]
-                                        
+
+                                        pred_b = pred_for_diag[b, m_b]
+                                        tgt_b = tgt_for_diag[b, m_b]
+
                                         D_pred = torch.cdist(pred_b, pred_b)
                                         D_tgt = torch.cdist(tgt_b, tgt_b)
-                                        
+
                                         k_j = min(10, n_valid - 1)
                                         _, knn_pred = D_pred.topk(k_j + 1, largest=False)
                                         _, knn_tgt = D_tgt.topk(k_j + 1, largest=False)
                                         knn_pred = knn_pred[:, 1:]
                                         knn_tgt = knn_tgt[:, 1:]
-                                        
+
                                         for i in range(n_valid):
                                             set_pred = set(knn_pred[i].tolist())
                                             set_tgt = set(knn_tgt[i].tolist())
@@ -9093,18 +10159,19 @@ def train_stageC_diffusion_generator(
                                             if union > 0:
                                                 global_jacc_sum += inter / union
                                                 global_jacc_cnt += 1
-                                    
+
                                     global_jacc_mean = global_jacc_sum / max(global_jacc_cnt, 1)
-                                    
-                                    # Global scale ratio
+
+                                    # Global scale ratio (using absolute predictions and aligned targets)
                                     m1_f = mask_ov.unsqueeze(-1).float()
-                                    rms_pred_g = (x0_pred_1.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                    rms_pred_g = (pred_for_diag.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                     rms_pred_g = rms_pred_g.sqrt().item()
-                                    rms_tgt_g = (V_target[idx_keep].pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                    rms_tgt_g = (tgt_for_diag.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                     rms_tgt_g = rms_tgt_g.sqrt().item()
                                     global_scale_r = rms_pred_g / max(rms_tgt_g, 1e-8)
-                                    
-                                    print(f"\n[OVLP-VS-GLOBAL] step={global_step}")
+
+                                    mode_str = "RESID(V_hat vs V_aligned)" if use_resid else "STD"
+                                    print(f"\n[OVLP-VS-GLOBAL] step={global_step} mode={mode_str}")
                                     print(f"  Overlap:  Jacc@10={ov_jacc_mean:.4f}")
                                     print(f"  Global:   Jacc@10={global_jacc_mean:.4f} scale_r={global_scale_r:.4f}")
                                     print(f"  Delta:    ov-global Jacc={ov_jacc_mean - global_jacc_mean:.4f}")
@@ -9117,9 +10184,9 @@ def train_stageC_diffusion_generator(
                         if global_step % overlap_debug_every == 0:
                             rank = dist.get_rank() if dist.is_initialized() else 0
                             print(f"  [rank={rank}] valid_batch_count={ov_loss_dict['valid_batch_count']}")
-                            print(f"  [rank={rank}] hi_scale_count={ov_loss_dict['hi_scale_count']}")  # NEW
+                            print(f"  [rank={rank}] hi_scale_count={ov_loss_dict['hi_scale_count']} (σ > {sigma_0_hi_dynamic:.4f})")  # FIX #3: show dynamic threshold
                             print(f"  [rank={rank}] L_score_2={L_score_2.item():.6f} (view2 scale anchor)")
-                            print(f"  [rank={rank}] L_hi_scale={ov_loss_dict['L_hi_scale'].item():.6f} (high-σ scale anchor)")  # NEW
+                            print(f"  [rank={rank}] L_hi_scale={ov_loss_dict['L_hi_scale'].item():.6f} (high-σ scale anchor, threshold={sigma_0_hi_dynamic:.4f})")  # FIX #3
                             if ov_loss_dict['debug_info']['hi_scale_ratio']:  # NEW
                                 print(f"  [rank={rank}] hi_scale_ratio: mean={np.mean(ov_loss_dict['debug_info']['hi_scale_ratio']):.4f}")
                             if ov_loss_dict['debug_info']['I_sizes']:
@@ -9127,25 +10194,39 @@ def train_stageC_diffusion_generator(
                                     f"mean={np.mean(ov_loss_dict['debug_info']['I_sizes']):.1f}")
 
                             # ============ [PAIR-SCALE] View1 vs View2 scale comparison ============
+                            # FIX #1: In residual mode, use absolute predictions and aligned targets
                             with torch.no_grad():
                                 m1_f = mask_ov.unsqueeze(-1).float()
                                 m2_f = mask_2.unsqueeze(-1).float()
-                                
-                                rms_pred_1 = (x0_pred_1.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+
+                                # FIX #1: Use absolute predictions and aligned targets
+                                if use_resid:
+                                    pred_1_scale = V_hat_1_ov  # Absolute prediction
+                                    tgt_1_scale = V_target_aligned[idx_keep]  # Aligned target
+                                    pred_2_scale = V_hat_2_ov  # Absolute prediction
+                                    tgt_2_scale = V_target_2_aligned  # Aligned target
+                                else:
+                                    pred_1_scale = x0_pred_1
+                                    tgt_1_scale = V_target[idx_keep]
+                                    pred_2_scale = x0_pred_2
+                                    tgt_2_scale = V_target_2
+
+                                rms_pred_1 = (pred_1_scale.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                 rms_pred_1 = rms_pred_1.sqrt().item()
-                                rms_tgt_1 = (V_target[idx_keep].pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
+                                rms_tgt_1 = (tgt_1_scale.pow(2) * m1_f).sum() / m1_f.sum().clamp(min=1)
                                 rms_tgt_1 = rms_tgt_1.sqrt().item()
                                 scale_r_1 = rms_pred_1 / max(rms_tgt_1, 1e-8)
-                                
-                                rms_pred_2 = (x0_pred_2.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
+
+                                rms_pred_2 = (pred_2_scale.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
                                 rms_pred_2 = rms_pred_2.sqrt().item()
-                                rms_tgt_2 = (V_target_2.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
+                                rms_tgt_2 = (tgt_2_scale.pow(2) * m2_f).sum() / m2_f.sum().clamp(min=1)
                                 rms_tgt_2 = rms_tgt_2.sqrt().item()
                                 scale_r_2 = rms_pred_2 / max(rms_tgt_2, 1e-8)
-                                
+
                                 scale_gap = abs(np.log(scale_r_1 + 1e-8) - np.log(scale_r_2 + 1e-8))
-                                
-                                print(f"\n[PAIR-SCALE] step={global_step}")
+
+                                mode_str = "RESID(V_hat vs V_aligned)" if use_resid else "STD"
+                                print(f"\n[PAIR-SCALE] step={global_step} mode={mode_str}")
                                 print(f"  View1: rms_pred={rms_pred_1:.4f} rms_tgt={rms_tgt_1:.4f} scale_r={scale_r_1:.4f}")
                                 print(f"  View2: rms_pred={rms_pred_2:.4f} rms_tgt={rms_tgt_2:.4f} scale_r={scale_r_2:.4f}")
                                 print(f"  scale_gap (|log diff|)={scale_gap:.4f} (want < 0.1)")
@@ -9153,18 +10234,36 @@ def train_stageC_diffusion_generator(
                             # ============ [PAIR-LOSS] Loss component breakdown ============
                             L_score_1_val = L_score.item() if isinstance(L_score, torch.Tensor) else 0.0
                             L_score_2_val = L_score_2.item()
-                            L_ov_total = L_ov_shape_batch.item() + L_ov_scale_batch.item() + L_ov_kl_batch.item()
+                            # FIX: Use GATED KL (what training uses) not ungated for ratio calc
+                            # Ungated L_ov_kl_batch includes high-σ samples; gated is suppressed at high σ
+                            L_ov_kl_gated_val = L_ov_kl_gated.item() if torch.is_tensor(L_ov_kl_gated) else L_ov_kl_gated
+                            L_ov_total_gated = L_ov_shape_batch.item() + L_ov_scale_batch.item() + L_ov_kl_gated_val
                             w_score = WEIGHTS.get('score', 1.0)
                             w_ov = overlap_loss_weight_shape + overlap_loss_weight_scale + overlap_loss_weight_kl
-                            
+
                             score_contrib = w_score * (L_score_1_val + L_score_2_val)
-                            ov_contrib = w_ov * L_ov_total if L_ov_total > 0 else 0.0
+                            ov_contrib = w_ov * L_ov_total_gated if L_ov_total_gated > 0 else 0.0
                             ratio_ov_score = ov_contrib / max(score_contrib, 1e-8)
-                            
+
                             print(f"\n[PAIR-LOSS] step={global_step}")
                             print(f"  L_score_1={L_score_1_val:.6f} L_score_2={L_score_2_val:.6f}")
-                            print(f"  L_ov: shape={L_ov_shape_batch.item():.6f} scale={L_ov_scale_batch.item():.6f} kl={L_ov_kl_batch.item():.6f}")
-                            print(f"  weighted_ratio (ov/score)={ratio_ov_score:.4f} (watch if >> 1 early)")
+                            print(f"  L_ov: shape={L_ov_shape_batch.item():.6f} scale={L_ov_scale_batch.item():.6f} kl_gated={L_ov_kl_gated_val:.6f} (kl_raw={L_ov_kl_batch.item():.6f})")
+                            print(f"  weighted_ratio (ov/score)={ratio_ov_score:.4f} [uses gated KL]")
+
+                            # FIX #4: Log difficulty distribution
+                            if 'difficulty_counts' in pair_batch_full:
+                                dc = pair_batch_full['difficulty_counts']
+                                alphas = pair_batch_full.get('effective_alphas', [])
+                                mean_alpha = np.mean(alphas) if alphas else 0.5
+                                print(f"  [FIX4-DIFFICULTY] easy={dc['easy']} medium={dc['medium']} hard={dc['hard']} mean_alpha={mean_alpha:.3f}")
+
+                            # ROBUST FIX #1 & #2: Log new losses
+                            L_gen_ov_shape_val = L_gen_ov_shape.item() if torch.is_tensor(L_gen_ov_shape) else L_gen_ov_shape
+                            L_gen_ov_scale_val = L_gen_ov_scale.item() if torch.is_tensor(L_gen_ov_scale) else L_gen_ov_scale
+                            L_gram_2_val = L_gram_2.item() if torch.is_tensor(L_gram_2) else L_gram_2
+                            L_gram_scale_2_val = L_gram_scale_2.item() if torch.is_tensor(L_gram_scale_2) else L_gram_scale_2
+                            print(f"  [FIX-ROBUST] L_gen_ov: shape={L_gen_ov_shape_val:.6f} scale={L_gen_ov_scale_val:.6f} (gen context inv)")
+                            print(f"  [FIX-ROBUST] L_view2: gram={L_gram_2_val:.6f} gram_scale={L_gram_scale_2_val:.6f} (view2 geo)")
 
                             # ============ [BLOB-CHECK] Collapse detection ============
                             with torch.no_grad():
@@ -9591,13 +10690,14 @@ def train_stageC_diffusion_generator(
 
                     # [GEN-GRAD] Phase 1.2: Log generator loss contribution vs total
                     gen_align_contrib = WEIGHTS['gen_align'] * L_gen_align.item() if not is_sc else 0.0
+                    gen_gram_contrib = WEIGHTS.get('gen_gram', 0) * L_gen_gram.item() if not is_sc else 0.0
                     gen_scale_contrib = WEIGHTS.get('gen_scale', 0) * L_gen_scale.item() if not is_sc else 0.0
                     score_contrib = WEIGHTS.get('score', 1.0) * L_score.item()
-                    gen_total_contrib = gen_align_contrib + gen_scale_contrib
+                    gen_total_contrib = gen_align_contrib + gen_gram_contrib + gen_scale_contrib
                     total_loss_approx = L_total.item() if L_total is not None else 1.0
                     gen_pct = 100.0 * gen_total_contrib / max(total_loss_approx, 1e-8)
 
-                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
+                    print(f"  [GEN-GRAD] gen_align_contrib={gen_align_contrib:.4e} gen_gram_contrib={gen_gram_contrib:.4e} gen_scale_contrib={gen_scale_contrib:.4e}")
                     print(f"  [GEN-GRAD] score_contrib={score_contrib:.4e} gen_total_contrib={gen_total_contrib:.4e} ({gen_pct:.1f}%)")
 
                     if gen_pct < 1.0 and not is_sc:
@@ -9710,6 +10810,7 @@ def train_stageC_diffusion_generator(
             epoch_losses['ordinal_sc'] += L_ordinal_sc.item()
             epoch_losses['edm_tail'] += L_edm_tail.item()
             epoch_losses['gen_align'] += L_gen_align.item()
+            epoch_losses['gen_gram'] += L_gen_gram.item()
             epoch_losses['dim'] += L_dim.item()
             epoch_losses['triangle'] += L_triangle.item()
             epoch_losses['radial'] += L_radial.item()
@@ -9741,10 +10842,66 @@ def train_stageC_diffusion_generator(
                 global_step_tensor = torch.tensor([global_step], device=device, dtype=torch.long)
                 dist.broadcast(global_step_tensor, src=0)
                 global_step = int(global_step_tensor.item())
-        
+
+            # =====================================================================
+            # OPTION A: Recompute sigma_data_resid once generator is trained
+            # Triggered at sigma_resid_recompute_step (default 3000)
+            # =====================================================================
+            if (use_residual_diffusion and
+                not curriculum_state.get('sigma_resid_recomputed', False) and
+                global_step == curriculum_state.get('sigma_resid_recompute_step', 3000)):
+
+                if fabric is None or fabric.is_global_zero:
+                    print(f"\n[RESID-DIFF] RECOMPUTING sigma_data_resid at step {global_step}...")
+                    computed_resid = compute_sigma_data_resid_aligned(st_loader, context_encoder, generator, device)
+                    if computed_resid is not None:
+                        old_resid = curriculum_state.get('sigma_data_resid', sigma_data)
+                        curriculum_state['sigma_data_resid'] = computed_resid
+                        curriculum_state['sigma_data_resid_locked'] = computed_resid
+                        curriculum_state['sigma_resid_valid'] = True
+                        curriculum_state['sigma_resid_recomputed'] = True
+                        print(f"[RESID-DIFF] sigma_data_resid: {old_resid:.4f} → {computed_resid:.4f} [NOW VALID]")
+                        print(f"[RESID-DIFF] Curriculum will now use residual-based sigma scaling")
+                    else:
+                        print(f"[RESID-DIFF] Recomputation failed, keeping sigma_data={sigma_data:.4f}")
+                        curriculum_state['sigma_resid_recomputed'] = True  # Don't retry
+
+                # Sync the new values across ranks
+                if dist.is_initialized():
+                    resid_tensor = torch.tensor([curriculum_state.get('sigma_data_resid', sigma_data)], device=device)
+                    valid_tensor = torch.tensor([1.0 if curriculum_state.get('sigma_resid_valid', False) else 0.0], device=device)
+                    dist.broadcast(resid_tensor, src=0)
+                    dist.broadcast(valid_tensor, src=0)
+                    curriculum_state['sigma_data_resid'] = float(resid_tensor.item())
+                    curriculum_state['sigma_resid_valid'] = valid_tensor.item() > 0.5
+                    if curriculum_state['sigma_resid_valid']:
+                        curriculum_state['sigma_data_resid_locked'] = curriculum_state['sigma_data_resid']
+                    curriculum_state['sigma_resid_recomputed'] = True
+
             # (optional) metrics logging
             if fabric is None or fabric.is_global_zero:
                 pass  # print / tqdm here if you want
+
+            # =====================================================================
+            # [SIGMA-RANGE] Debug: Show sigma configuration every 200 steps
+            # Also print at step 1 (first completed step) to show initial config
+            # =====================================================================
+            if (global_step == 1 or global_step % 200 == 0) and (fabric is None or fabric.is_global_zero):
+                # Get current sigma cap info
+                _cap_eff, _cap_target, _ramp_active, _ramp_prog, _dbg = get_sigma_cap_eff(
+                    curriculum_state, global_step, sigma_data, do_log=False)
+
+                _stage = curriculum_state['current_stage']
+                _resid_valid = curriculum_state.get('sigma_resid_valid', False)
+                _sigma0 = _dbg.get('sigma0', sigma_data)
+                _resid_val = curriculum_state.get('sigma_data_resid', sigma_data)
+                _resid_locked = curriculum_state.get('sigma_data_resid_locked')
+
+                print(f"\n[SIGMA-RANGE] step={global_step} stage=S{_stage}")
+                print(f"[SIGMA-RANGE]   sigma_data={sigma_data:.4f}, sigma_data_resid={_resid_val:.4f} (valid={_resid_valid}, locked={_resid_locked})")
+                print(f"[SIGMA-RANGE]   sigma0_for_curriculum={_sigma0:.4f} ({'resid' if _resid_valid else 'data'})")
+                print(f"[SIGMA-RANGE]   sigma_min={sigma_min:.4f}, sigma_cap_eff={_cap_eff:.4f} (target={_cap_target:.4f})")
+                print(f"[SIGMA-RANGE]   training_range=[{sigma_min:.4f}, {_cap_eff:.4f}], ramp_active={_ramp_active}")
 
             # DEBUG: Per-batch logging
             if DEBUG and (global_step % LOG_EVERY == 0):
@@ -9762,9 +10919,19 @@ def train_stageC_diffusion_generator(
         # =====================================================================
         # FIXED-BATCH EVALUATION AT FIXED SIGMAS (once per epoch)
         # =====================================================================
-        # Run fixed-batch eval at epochs 1,3,5,10 for early detection, then every 5 epochs
-        early_eval_epochs = {0, 2, 4, 9}  # 0-indexed: epochs 1,3,5,10
-        run_fixed_eval = (epoch % 5 == 0) or (epoch in early_eval_epochs)
+        # Run every epoch so curriculum promotion is responsive
+        # (5 consecutive passes = 5 epochs per stage, not 25)
+        run_fixed_eval = True
+
+        # Compute sigma_edm for evaluation (same logic as training loop)
+        use_resid_eval = curriculum_state.get('use_residual_diffusion', False)
+        sigma_resid_valid_eval = curriculum_state.get('sigma_resid_valid', False)
+        if use_resid_eval and sigma_resid_valid_eval:
+            sigma_edm_eval = curriculum_state.get('sigma_data_resid_locked',
+                             curriculum_state.get('sigma_data_resid', sigma_data))
+        else:
+            sigma_edm_eval = sigma_data
+
         if (fabric is None or fabric.is_global_zero) and use_st and run_fixed_eval:
             fixed_eval_sigmas = [0.05, 0.15, 0.40, 0.70, 1.20, 2.40]
 
@@ -9784,11 +10951,26 @@ def train_stageC_diffusion_generator(
                 
                 with torch.no_grad():
                     Z_fixed = fixed_batch_data['Z_set'].to(device)
-                    Z_fixed = apply_z_ln(Z_fixed, context_encoder)
+                    if use_z_ln:
+                        Z_fixed = apply_z_ln(Z_fixed, context_encoder)
                     mask_fixed = fixed_batch_data['mask'].to(device)
                     V_target_fixed = fixed_batch_data['V_target'].to(device)
                     G_target_fixed = fixed_batch_data['G_target'].to(device)
-                    
+
+                    # Residual mode: load V_base and R_target for correct noising/comparison
+                    if use_resid_eval and 'V_base' in fixed_batch_data:
+                        V_base_fb = fixed_batch_data['V_base'].to(device)
+                        R_target_fb = fixed_batch_data['R_target'].to(device)
+                        V_target_aligned_fb = fixed_batch_data['V_target_aligned'].to(device)
+                        noise_target_fb = R_target_fb  # Noise the residual
+                        compare_target_fb = V_target_aligned_fb  # Compare to aligned target
+                    else:
+                        V_base_fb = None
+                        R_target_fb = None
+                        V_target_aligned_fb = None
+                        noise_target_fb = V_target_fixed  # Noise full coords
+                        compare_target_fb = V_target_fixed  # Compare to original target
+
                     B_fixed = Z_fixed.shape[0]
                     D_lat = score_net.D_latent if hasattr(score_net, 'D_latent') else \
                             score_net.module.D_latent if hasattr(score_net, 'module') else 16
@@ -9884,49 +11066,56 @@ def train_stageC_diffusion_generator(
                         sigma_fixed = torch.full((B_fixed,), sigma_val, device=device)
                         sigma_fixed_3d = sigma_fixed.view(-1, 1, 1)
                         
-                        eps_fixed = torch.randn_like(V_target_fixed)
-                        V_t_fixed = V_target_fixed + sigma_fixed_3d * eps_fixed
+                        # In residual mode, noise R_target; otherwise noise V_target
+                        eps_fixed = torch.randn_like(noise_target_fb)
+                        V_t_fixed = noise_target_fb + sigma_fixed_3d * eps_fixed
                         V_t_fixed = V_t_fixed * mask_fixed.unsqueeze(-1).float()
-                        
+
                         for sc_mode in ['no_sc', 'with_sc']:
                             if sc_mode == 'with_sc' and score_net.self_conditioning:
                                 x0_pred_0_eval = score_net.forward_edm(
-                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
-                                    sigma_data, self_cond=None
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed,
+                                    sigma_edm_eval, self_cond=None
                                 )
                                 if isinstance(x0_pred_0_eval, tuple):
                                     x0_pred_0_eval = x0_pred_0_eval[0]
-                                
+
                                 x0_pred_eval = score_net.forward_edm(
-                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
-                                    sigma_data, self_cond=x0_pred_0_eval
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed,
+                                    sigma_edm_eval, self_cond=x0_pred_0_eval
                                 )
                             else:
                                 x0_pred_eval = score_net.forward_edm(
-                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed, 
-                                    sigma_data, self_cond=None
+                                    V_t_fixed, sigma_fixed, H_fixed, mask_fixed,
+                                    sigma_edm_eval, self_cond=None
                                 )
-                            
+
                             if isinstance(x0_pred_eval, tuple):
                                 x0_pred_eval = x0_pred_eval[0]
+
+                            # In residual mode, compose V_base + R_pred for full coordinates
+                            if V_base_fb is not None:
+                                V_pred_full = V_base_fb + x0_pred_eval
+                            else:
+                                V_pred_full = x0_pred_eval
                             
                             mask_f_eval = mask_fixed.unsqueeze(-1).float()
                             valid_count_eval = mask_f_eval.sum()
                             
-                            # Scale ratio (centered)
-                            V_pred_c, _ = uet.center_only(x0_pred_eval, mask_fixed)
-                            V_tgt_c, _ = uet.center_only(V_target_fixed, mask_fixed)
+                            # Scale ratio (centered) - use full coords for comparison
+                            V_pred_c, _ = uet.center_only(V_pred_full, mask_fixed)
+                            V_tgt_c, _ = uet.center_only(compare_target_fb, mask_fixed)
                             rms_pred = (V_pred_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt()
                             rms_tgt = (V_tgt_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt()
                             scale_ratio = (rms_pred / rms_tgt.clamp(min=1e-8)).item()
-                            
+
                             # Trace ratio
                             G_pred = V_pred_c @ V_pred_c.transpose(1, 2)
                             trace_pred = torch.diagonal(G_pred, dim1=-2, dim2=-1).sum(dim=-1)
                             trace_tgt = torch.diagonal(G_target_fixed, dim1=-2, dim2=-1).sum(dim=-1)
                             trace_ratio = (trace_pred / trace_tgt.clamp(min=1e-8)).mean().item()
-                            
-                            # Jaccard@10 (pure torch, no numpy)
+
+                            # Jaccard@10 (pure torch, no numpy) - use full coords
                             jaccard_sum = 0.0
                             jaccard_count = 0
                             for b in range(min(4, B_fixed)):
@@ -9934,9 +11123,9 @@ def train_stageC_diffusion_generator(
                                 n_valid = int(m_b.sum().item())
                                 if n_valid < 15:
                                     continue
-                                
-                                pred_b = x0_pred_eval[b, m_b]
-                                tgt_b = V_target_fixed[b, m_b]
+
+                                pred_b = V_pred_full[b, m_b]
+                                tgt_b = compare_target_fb[b, m_b]
                                 
                                 D_pred_b = torch.cdist(pred_b, pred_b)
                                 D_tgt_b = torch.cdist(tgt_b, tgt_b)
@@ -9961,9 +11150,8 @@ def train_stageC_diffusion_generator(
 
 
                             # Compute out/tgt (learned branch scale ratio)
-                            # Compute out/tgt (learned branch scale ratio)
                             # Recompute EDM preconditioning for this sigma value
-                            c_skip_fb, c_out_fb, _, _ = uet.edm_precond(sigma_fixed, sigma_data)
+                            c_skip_fb, c_out_fb, _, _ = uet.edm_precond(sigma_fixed, sigma_edm_eval)
                             # c_skip_fb: (B, 1, 1)
 
                             # V_c (centered noisy input) - same as forward_edm does
@@ -9995,25 +11183,33 @@ def train_stageC_diffusion_generator(
                         torch.manual_seed(42 + int(sigma_probe * 1000))
                         sigma_p = torch.full((B_fixed,), sigma_probe, device=device)
                         sigma_p_3d = sigma_p.view(-1, 1, 1)
-                        
-                        eps_p = torch.randn_like(V_target_fixed)
-                        V_t_p = V_target_fixed + sigma_p_3d * eps_p
+
+                        # In residual mode, noise R_target; otherwise noise V_target
+                        eps_p = torch.randn_like(noise_target_fb)
+                        V_t_p = noise_target_fb + sigma_p_3d * eps_p
                         V_t_p = V_t_p * mask_fixed.unsqueeze(-1).float()
-                        
-                        x0_p = score_net.forward_edm(V_t_p, sigma_p, H_fixed, mask_fixed, sigma_data, self_cond=None)
+
+                        x0_p = score_net.forward_edm(V_t_p, sigma_p, H_fixed, mask_fixed, sigma_edm_eval, self_cond=None)
                         if isinstance(x0_p, tuple):
                             x0_p = x0_p[0]
-                        
-                        # Scale ratio
-                        V_p_c, _ = uet.center_only(x0_p, mask_fixed)
+
+                        # In residual mode, compose V_base + R_pred for scale comparison
+                        if V_base_fb is not None:
+                            V_pred_p = V_base_fb + x0_p
+                        else:
+                            V_pred_p = x0_p
+
+                        # Scale ratio - use full coords vs aligned target
+                        V_p_c, _ = uet.center_only(V_pred_p, mask_fixed)
+                        V_tgt_p_c, _ = uet.center_only(compare_target_fb, mask_fixed)
                         rms_p = (V_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
-                        rms_t = (V_tgt_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
+                        rms_t = (V_tgt_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
                         scale_r_p = rms_p / max(rms_t, 1e-8)
-                        
+
                         # Compare to noisy input scale
                         V_t_p_c, _ = uet.center_only(V_t_p, mask_fixed)
                         rms_noisy = (V_t_p_c.pow(2) * mask_f_eval).sum().div(valid_count_eval).sqrt().item()
-                        
+
                         print(f"\n[HI-SIGMA-PROBE] σ={sigma_probe}: scale_r={scale_r_p:.3f} (want ~1.0), "
                               f"rms_pred={rms_p:.4f}, rms_tgt={rms_t:.4f}, rms_noisy={rms_noisy:.4f}")
                 
@@ -10028,45 +11224,75 @@ def train_stageC_diffusion_generator(
                 # [CURRICULUM] Phase 3: Promotion logic based on fixed-batch eval
                 # =====================================================================
                 curr_stage = curriculum_state['current_stage']
-                curr_mult = curriculum_state['sigma_cap_mults'][curr_stage]
-                sigma_cap_curr = curr_mult * sigma_data
 
-                # Find the closest sigma in fixed_eval_sigmas to current sigma_cap
-                # Evaluate at sigma_cap (or closest available)
-                closest_sigma = min(fixed_eval_sigmas, key=lambda x: abs(x - sigma_cap_curr))
+                # Use EFFECTIVE sigma_cap (accounts for ramp) for eval
+                # Enable logging here (once per eval) to verify data-dependent cap
+                do_log_cap = (fabric is None or fabric.is_global_zero)
+                sigma_cap_eff, sigma_cap_target, ramp_active, ramp_progress, _ = get_sigma_cap_eff(
+                    curriculum_state, global_step, sigma_data, do_log=do_log_cap)
 
-                # [FIX 1] Save RNG state before promotion eval to avoid contaminating training
-                promo_rng_state = torch.get_rng_state()
-                if torch.cuda.is_available():
-                    promo_cuda_rng_state = torch.cuda.get_rng_state()
+                # Update sigma cap tracking (for checkpoint and inference)
+                curriculum_state['sigma_cap_eff_last'] = sigma_cap_eff
+                curriculum_state['max_sigma_cap_eff_seen'] = max(
+                    curriculum_state.get('max_sigma_cap_eff_seen', 0.0), sigma_cap_eff)
 
-                # Re-evaluate at closest_sigma to get metrics for promotion check
-                torch.manual_seed(42 + int(closest_sigma * 1000))
+                # Select closest_sigma: max({s in fixed_eval_sigmas | s <= sigma_cap_eff})
+                # This ensures we don't eval at sigma we're not training on yet
+                candidates = [s for s in fixed_eval_sigmas if s <= sigma_cap_eff]
+                if candidates:
+                    closest_sigma = max(candidates)  # Largest sigma <= sigma_cap_eff
+                else:
+                    closest_sigma = min(fixed_eval_sigmas)  # Fallback to smallest
+
+                # Log what we're evaluating at
+                if fabric is None or fabric.is_global_zero:
+                    print(f"  [EVAL] σ_cap_eff={sigma_cap_eff:.4f} σ_cap_target={sigma_cap_target:.4f} "
+                          f"→ eval at σ={closest_sigma:.3f}"
+                          f"{' (ramp ' + f'{ramp_progress:.0%})' if ramp_active else ''}")
+
+                # Cache eps_promo ONCE per run (deterministic, no RNG contamination)
+                # Shape must match noise target (R_target in residual mode, V_target otherwise)
+                if 'eps_promo_cached' not in edm_debug_state:
+                    promo_gen = torch.Generator(device=device)
+                    promo_gen.manual_seed(42)
+                    edm_debug_state['eps_promo_cached'] = torch.randn(
+                        noise_target_fb.shape, generator=promo_gen, device=device, dtype=noise_target_fb.dtype
+                    )
+
                 sigma_promo = torch.full((B_fixed,), closest_sigma, device=device)
                 sigma_promo_3d = sigma_promo.view(-1, 1, 1)
-                eps_promo = torch.randn_like(V_target_fixed)
-                V_t_promo = V_target_fixed + sigma_promo_3d * eps_promo
+                eps_promo = edm_debug_state['eps_promo_cached']
+                # In residual mode, noise R_target; otherwise noise V_target
+                V_t_promo = noise_target_fb + sigma_promo_3d * eps_promo
                 V_t_promo = V_t_promo * mask_fixed.unsqueeze(-1).float()
 
                 with torch.no_grad():
-                    x0_promo = score_net.forward_edm(V_t_promo, sigma_promo, H_fixed, mask_fixed, sigma_data, self_cond=None)
+                    x0_promo = score_net.forward_edm(V_t_promo, sigma_promo, H_fixed, mask_fixed, sigma_edm_eval, self_cond=None)
                     if isinstance(x0_promo, tuple):
                         x0_promo = x0_promo[0]
 
-                    # Compute metrics at sigma_cap
-                    V_promo_c, _ = uet.center_only(x0_promo, mask_fixed)
+                    # In residual mode, compose V_base + R_pred for full coordinates
+                    if V_base_fb is not None:
+                        V_promo_full = V_base_fb + x0_promo
+                    else:
+                        V_promo_full = x0_promo
+
+                    # Compute metrics at sigma_cap - use full coords vs aligned target
+                    V_promo_c, _ = uet.center_only(V_promo_full, mask_fixed)
+                    V_tgt_promo_c, _ = uet.center_only(compare_target_fb, mask_fixed)
                     mask_f_promo = mask_fixed.unsqueeze(-1).float()
                     valid_cnt_promo = mask_f_promo.sum()
 
                     rms_promo = (V_promo_c.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
-                    rms_tgt_promo = (V_tgt_c_gen.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
+                    rms_tgt_promo = (V_tgt_promo_c.pow(2) * mask_f_promo).sum().div(valid_cnt_promo).sqrt()
                     scale_r_promo = (rms_promo / rms_tgt_promo.clamp(min=1e-8)).item()
 
                     G_promo = V_promo_c @ V_promo_c.transpose(1, 2)
                     trace_promo = torch.diagonal(G_promo, dim1=-2, dim2=-1).sum(dim=-1)
-                    trace_r_promo = (trace_promo / trace_tgt_gen.clamp(min=1e-8)).mean().item()
+                    trace_tgt_promo = torch.diagonal(V_tgt_promo_c @ V_tgt_promo_c.transpose(1, 2), dim1=-2, dim2=-1).sum(dim=-1)
+                    trace_r_promo = (trace_promo / trace_tgt_promo.clamp(min=1e-8)).mean().item()
 
-                    # Jacc@10 at sigma_cap
+                    # Jacc@10 at sigma_cap - use full coords vs aligned target
                     jacc_sum_promo = 0.0
                     jacc_cnt_promo = 0
                     for b in range(min(4, B_fixed)):
@@ -10074,8 +11300,8 @@ def train_stageC_diffusion_generator(
                         n_v = int(m_b.sum().item())
                         if n_v < 15:
                             continue
-                        pred_b = x0_promo[b, m_b]
-                        tgt_b = V_target_fixed[b, m_b]
+                        pred_b = V_promo_full[b, m_b]
+                        tgt_b = compare_target_fb[b, m_b]
                         D_pred_b = torch.cdist(pred_b, pred_b)
                         D_tgt_b = torch.cdist(tgt_b, tgt_b)
                         k_j = min(10, n_v - 1)
@@ -10093,10 +11319,25 @@ def train_stageC_diffusion_generator(
                                 jacc_cnt_promo += 1
                     jacc_promo = jacc_sum_promo / max(jacc_cnt_promo, 1)
 
-                # Get tiered Jacc threshold
-                jacc_min = curriculum_state['jacc_min_by_mult'].get(curr_mult, 0.07)
-                scale_r_min = curriculum_state['scale_r_min']
-                trace_r_min = curriculum_state['trace_r_min']
+                # Get tiered thresholds based on effective sigma (not target)
+                # Find which stage's thresholds to use based on closest_sigma
+                curr_mult_eff = sigma_cap_eff / sigma_data  # Effective multiplier
+                # Find closest mult in threshold dict
+                available_mults = list(curriculum_state['jacc_min_by_mult'].keys())
+                closest_mult = min(available_mults, key=lambda m: abs(m - curr_mult_eff))
+                jacc_min = curriculum_state['jacc_min_by_mult'].get(closest_mult, 0.07)
+                target_stage = curriculum_state.get('target_stage', len(curriculum_state['sigma_cap_mults']) - 1)
+
+                # At target stage: use FINAL (stricter) thresholds for "training succeeded"
+                # Before target stage: use relaxed PROMOTION thresholds based on effective mult
+                if curr_stage >= target_stage:
+                    scale_r_min = curriculum_state.get('scale_r_min_final', 0.80)
+                    trace_r_min = curriculum_state.get('trace_r_min_final', 0.60)
+                else:
+                    scale_r_min = curriculum_state['scale_r_min_by_mult'].get(
+                        closest_mult, curriculum_state['scale_r_min_default'])
+                    trace_r_min = curriculum_state['trace_r_min_by_mult'].get(
+                        closest_mult, curriculum_state['trace_r_min_default'])
 
                 # Check promotion criteria
                 scale_ok = scale_r_promo >= scale_r_min
@@ -10109,16 +11350,21 @@ def train_stageC_diffusion_generator(
                     prev_jacc = curriculum_state['eval_history'][-1].get('jacc', 0)
                 jacc_not_decreasing = (prev_jacc is None) or (jacc_promo >= prev_jacc - 0.01)
 
-                all_pass = scale_ok and trace_ok and jacc_ok and jacc_not_decreasing
+                # Structure pass = Jacc competence (model learned structure at this stage)
+                structure_pass = jacc_ok and jacc_not_decreasing
+                # Full pass = structure + scale/trace (ready for promotion)
+                all_pass = structure_pass and scale_ok and trace_ok
 
                 # Store in history
                 curriculum_state['eval_history'].append({
                     'epoch': epoch,
-                    'sigma_cap': sigma_cap_curr,
+                    'sigma_cap': sigma_cap_eff,  # Store effective cap (what we actually trained on)
+                    'sigma_cap_target': sigma_cap_target,  # Also store target for reference
                     'scale_r': scale_r_promo,
                     'trace_r': trace_r_promo,
                     'jacc': jacc_promo,
-                    'passed': all_pass
+                    'passed': all_pass,
+                    'structure_pass': structure_pass,  # Track structure competence separately
                 })
 
                 # Phase 2: Generator warm-start check
@@ -10134,24 +11380,106 @@ def train_stageC_diffusion_generator(
                         curriculum_state['generator_stable'] = True
                         print(f"\n[GEN-WARMUP] Generator is now STABLE after {epoch+1} epochs!")
 
-                # Promotion logic
-                if all_pass:
-                    curriculum_state['consecutive_passes'] += 1
-                    curriculum_state['stall_count'] = 0
-                else:
-                    curriculum_state['consecutive_passes'] = 0
-                    curriculum_state['stall_count'] += 1
+                # Promotion logic: windowed "5 of last 6" instead of strict consecutive
+                # This avoids one borderline epoch resetting all progress
+                window_size = 6
 
-                # Promote if enough consecutive passes
+                # Track full passes (for promotion)
+                if 'promo_pass_window' not in curriculum_state:
+                    curriculum_state['promo_pass_window'] = []
+                curriculum_state['promo_pass_window'].append(all_pass)
+                if len(curriculum_state['promo_pass_window']) > window_size:
+                    curriculum_state['promo_pass_window'] = curriculum_state['promo_pass_window'][-window_size:]
+
+                # Track structure passes (for stall behavior decision)
+                if 'structure_pass_window' not in curriculum_state:
+                    curriculum_state['structure_pass_window'] = []
+                curriculum_state['structure_pass_window'].append(structure_pass)
+                if len(curriculum_state['structure_pass_window']) > window_size:
+                    curriculum_state['structure_pass_window'] = curriculum_state['structure_pass_window'][-window_size:]
+
+                window = curriculum_state['promo_pass_window']
+                structure_window = curriculum_state['structure_pass_window']
+                passes_in_window = sum(window)
+                structure_passes_in_window = sum(structure_window)
+                required_passes = curriculum_state['promotion_threshold']  # 5
+
+                # Update stall_count based on WINDOW, not single-epoch events
+                # Only count stalls when:
+                # 1. Window is full (len >= window_size)
+                # 2. Minimum warmup steps met (avoid noisy early epochs)
+                # 3. Ramp is NOT active (during ramp, sigma is shifting so stall counter is meaningless)
+                steps_in_stage = curriculum_state.get('steps_in_stage', 0)
+                warmup_steps = 200  # Don't count stalls during first ~4 epochs of a stage
+                if len(window) >= window_size and steps_in_stage >= warmup_steps and not ramp_active:
+                    if passes_in_window >= 2:
+                        curriculum_state['stall_count'] = 0  # Window shows progress
+                    else:
+                        curriculum_state['stall_count'] += 1  # Window shows stall (<2/6)
+                # During ramp or warmup, don't touch stall_count - wait for stable evaluation
+
+                # Store structure passes count for stall decision
+                curriculum_state['structure_passes_in_window'] = structure_passes_in_window
+
+                # Safety floor: never promote if scale_r < 0.60 (real collapse)
+                scale_collapsed = scale_r_promo < 0.60
+                curriculum_state['scale_collapsed'] = scale_collapsed  # Store for use in stall handling
+
+                # ========== ChatGPT Must-fix #1: Structure-based promotion for pre-target ==========
+                # Problem: scale/trace can lag behind structure learning, causing infinite stalls.
+                # Fix: For stages < target, promote based on STRUCTURE (Jacc) only + collapse floor.
+                #      At target stage, use full scale+trace+Jacc requirements.
                 promoted = False
-                if curriculum_state['consecutive_passes'] >= curriculum_state['promotion_threshold']:
+                at_target = (curr_stage >= target_stage)
+
+                if at_target:
+                    # AT TARGET STAGE: require full passes (scale + trace + Jacc)
+                    should_promote = (passes_in_window >= required_passes and
+                                      len(window) >= required_passes and
+                                      not scale_collapsed)
+                    promo_reason = "full"
+                else:
+                    # PRE-TARGET: promote based on STRUCTURE only + collapse floor
+                    # This stops the "scale lags behind structure" infinite stall
+                    should_promote = (structure_passes_in_window >= required_passes and
+                                      len(structure_window) >= required_passes and
+                                      not scale_collapsed)
+                    promo_reason = "structure"
+
+                if should_promote:
                     if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                        old_stage = curr_stage
+                        old_mult = curriculum_state['sigma_cap_mults'][old_stage]
                         curriculum_state['current_stage'] += 1
-                        curriculum_state['consecutive_passes'] = 0
+                        curriculum_state['promo_pass_window'] = []  # Reset window
+                        curriculum_state['structure_pass_window'] = []  # Reset structure window
+                        curriculum_state['stall_count'] = 0  # Reset stall count on promotion
                         promoted = True
                         new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
-                        print(f"\n[CURRICULUM] 🎉 PROMOTED to stage {curriculum_state['current_stage']} "
-                              f"(σ_cap = {new_mult:.1f} × σ_data = {new_mult * sigma_data:.4f})")
+
+                        # Enable promotion ramp for smooth σ_cap transition
+                        # Store actual caps (not mults) for cleaner interpolation
+                        ramp_steps = curriculum_state.get('ramp_steps', 300)
+                        # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                        use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                        sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                        if use_resid_ramp and sigma_resid_valid_ramp:
+                            sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                          curriculum_state.get('sigma_data_resid', sigma_data))
+                        else:
+                            sigma0_ramp = sigma_data
+                        old_cap = old_mult * sigma0_ramp
+                        new_cap = new_mult * sigma0_ramp
+                        curriculum_state['ramp_start_step'] = global_step
+                        curriculum_state['ramp_prev_cap'] = old_cap
+                        curriculum_state['ramp_target_cap'] = new_cap
+
+                        promo_label = "STRUCTURE-PROMOTED" if promo_reason == "structure" else "PROMOTED"
+                        print(f"\n[CURRICULUM] {promo_label} to stage {curriculum_state['current_stage']} "
+                              f"(σ_cap_target = {new_cap:.4f})")
+                        print(f"  Basis: {promo_reason} ({structure_passes_in_window}/{len(structure_window)} struct, "
+                              f"{passes_in_window}/{len(window)} full)")
+                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
 
                         # [THREE-GATE] Reset stage-local tracking on promotion
                         curriculum_state['steps_in_stage'] = 0
@@ -10165,26 +11493,87 @@ def train_stageC_diffusion_generator(
 
                 # Print curriculum status
                 print(f"\n[CURRICULUM] Epoch {epoch+1} Status:")
-                print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1} "
-                      f"(σ_cap = {curr_mult:.1f} × {sigma_data:.4f} = {sigma_cap_curr:.4f})")
+                print(f"  Stage: {curr_stage}/{len(curriculum_state['sigma_cap_mults'])-1}")
+                print(f"  σ_cap: eff={sigma_cap_eff:.4f} target={sigma_cap_target:.4f}"
+                      f"{' (ramp ' + f'{ramp_progress:.0%})' if ramp_active else ''}")
+                # Show which promotion mode is active
+                if curr_stage >= target_stage:
+                    promo_mode = "AT TARGET: need full passes (scale+trace+Jacc)"
+                else:
+                    promo_mode = "PRE-TARGET: need structure passes only (Jacc) + collapse floor"
+                print(f"  Promo mode: {promo_mode}")
+                thresh_type = "FINAL" if curr_stage >= target_stage else "promo"
+                print(f"  Thresholds ({thresh_type}): scale_r≥{scale_r_min:.2f}, trace_r≥{trace_r_min:.2f}, Jacc≥{jacc_min:.2f}")
                 print(f"  Metrics at σ={closest_sigma:.3f}: scale_r={scale_r_promo:.3f} ({'✓' if scale_ok else '✗'}) "
                       f"trace_r={trace_r_promo:.3f} ({'✓' if trace_ok else '✗'}) "
-                      f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'}) (min={jacc_min:.2f})")
+                      f"Jacc@10={jacc_promo:.3f} ({'✓' if jacc_ok else '✗'})")
                 print(f"  Jacc trend: {'✓ stable/improving' if jacc_not_decreasing else '✗ decreasing'}")
-                print(f"  Consecutive passes: {curriculum_state['consecutive_passes']}/{curriculum_state['promotion_threshold']}")
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                struct_window = curriculum_state.get('structure_pass_window', [])
+                print(f"  Full passes: {sum(promo_window)}/{len(promo_window)} "
+                      f"(need {curriculum_state['promotion_threshold']}/6)"
+                      f" [{' '.join('✓' if p else '✗' for p in promo_window)}]")
+                print(f"  Structure passes: {sum(struct_window)}/{len(struct_window)} "
+                      f"(≥4=competent, <2=failing)"
+                      f" [{' '.join('✓' if p else '✗' for p in struct_window)}]")
                 print(f"  Generator stable: {curriculum_state['generator_stable']}")
                 if curriculum_state['stall_count'] > 0:
                     print(f"  ⚠️ Stall count: {curriculum_state['stall_count']}/{curriculum_state['stall_limit']}")
 
                 if curriculum_state['stall_count'] >= curriculum_state['stall_limit']:
-                    print(f"\n[CURRICULUM] ⚠️ STALLED at stage {curr_stage} for {curriculum_state['stall_limit']} evals!")
-                    print(f"  Consider: lowering thresholds, checking conditioning, or enabling residual diffusion")
+                    struct_passes = sum(struct_window)
+                    # DEMOTION LOGIC: For new 3-stage curriculum starting at S2
+                    # If struggling (struct_passes < 4) and not at S0, demote to lower stage
+                    if curr_stage > 0 and struct_passes < 4:
+                        old_stage = curr_stage
+                        old_mult = curriculum_state['sigma_cap_mults'][old_stage]
+                        curriculum_state['current_stage'] -= 1
+                        curriculum_state['promo_pass_window'] = []
+                        curriculum_state['structure_pass_window'] = []
+                        curriculum_state['stall_count'] = 0
+                        new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                        # Enable demotion ramp
+                        ramp_steps = curriculum_state.get('ramp_steps', 300)
+                        # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                        use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                        sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                        if use_resid_ramp and sigma_resid_valid_ramp:
+                            sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                          curriculum_state.get('sigma_data_resid', sigma_data))
+                        else:
+                            sigma0_ramp = sigma_data
+                        old_cap = old_mult * sigma0_ramp
+                        new_cap = new_mult * sigma0_ramp
+                        curriculum_state['ramp_start_step'] = global_step
+                        curriculum_state['ramp_prev_cap'] = old_cap
+                        curriculum_state['ramp_target_cap'] = new_cap
+
+                        print(f"\n[CURRICULUM] ⚠️ DEMOTED from S{old_stage} → S{curriculum_state['current_stage']}")
+                        print(f"  Reason: stall_count >= {curriculum_state['stall_limit']}, struct_passes={struct_passes}<4")
+                        print(f"  σ_cap: {old_cap:.4f} → {new_cap:.4f}")
+
+                        # Reset stage-local tracking
+                        curriculum_state['steps_in_stage'] = 0
+                        curriculum_state['cap_band_loss_sum'] = 0.0
+                        curriculum_state['cap_band_loss_count'] = 0
+                        curriculum_state['cap_band_loss_history'] = []
+                        curriculum_state['best_cap_band_loss'] = float('inf')
+                        curriculum_state['loss_no_improve_count'] = 0
+                        curriculum_state['metrics_pass_history'] = []
+                    elif curr_stage == 0:
+                        print(f"\n[CURRICULUM] ⚠️ STALLED at LOWEST stage S0!")
+                        print(f"  Cannot demote further. struct_passes={struct_passes}/6")
+                    else:
+                        # struct_passes >= 4 but scale stalled
+                        print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {curr_stage}")
+                        print(f"  Structure competent ({struct_passes}/6) but scale not passing")
 
                 # ============================================================
                 # [THREE-GATE] Track Gate B (metrics) and Gate C (cap-band loss)
                 # ============================================================
                 # Gate B: Record whether metrics passed this epoch
-                metrics_passed = all_pass
+                metrics_passed = all_pass  # From promotion check above
                 curriculum_state['metrics_pass_history'].append(metrics_passed)
                 # Keep only last K entries
                 K = curriculum_state['metrics_history_K']
@@ -10199,7 +11588,7 @@ def train_stageC_diffusion_generator(
                     # Check for plateau
                     loss_threshold = curriculum_state['loss_plateau_threshold']
                     best_loss = curriculum_state['best_cap_band_loss']
- 
+
                     if best_loss == float('inf'):
                         # First measurement: always set as best, reset counter
                         curriculum_state['best_cap_band_loss'] = avg_cap_band_loss
@@ -10224,27 +11613,25 @@ def train_stageC_diffusion_generator(
                 curriculum_state['cap_band_loss_sum'] = 0.0
                 curriculum_state['cap_band_loss_count'] = 0
 
-                # Gate B status
-                recent_passes = curriculum_state['metrics_pass_history']
-                gate_b_ok = len(recent_passes) >= K and all(recent_passes[-K:])
-                print(f"  [THREE-GATE] Gate B: {sum(recent_passes)}/{len(recent_passes)} recent passes "
-                      f"(need {K}/{K} for gate) {'✓' if gate_b_ok else '✗'}")
+                # Gate B status - use WINDOWED 5/6, matching actual implementation
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                passes_in_window = sum(promo_window) if promo_window else 0
+                gate_b_ok = (len(promo_window) >= 6 and passes_in_window >= 5)
+                print(f"  [THREE-GATE] Gate B: {passes_in_window}/{len(promo_window)} in window "
+                      f"(need 5/6 for gate) {'✓' if gate_b_ok else '✗'}")
 
                 # Steps in stage
                 print(f"  [THREE-GATE] Steps in stage: {curriculum_state['steps_in_stage']} "
                       f"(min={curriculum_state['min_steps_per_stage']})")
 
-                # [FIX 1] Restore RNG state after promotion eval to avoid contaminating training
-                torch.set_rng_state(promo_rng_state)
-                if torch.cuda.is_available():
-                    torch.cuda.set_rng_state(promo_cuda_rng_state)
+                # No need to restore RNG state - eps_promo is cached, no global RNG touched
 
                 print(f"{'='*70}\n")
 
                 # =====================================================================
                 # A/B TESTS (every 10 epochs to avoid too much output)
                 # =====================================================================
-                if (epoch % 5 == 0) or (epoch == 0):
+                if (epoch % 25 == 0) or (epoch == 0):
                     run_ab_tests_fixed_batch(
                         score_net=score_net,
                         context_encoder=context_encoder,
@@ -10253,6 +11640,7 @@ def train_stageC_diffusion_generator(
                         fixed_eval_sigmas=fixed_eval_sigmas,
                         device=device,
                         epoch=epoch,
+                        use_z_ln=use_z_ln,
                     )
         # =====================================================================
         # PROBE EVALUATION (ChatGPT Hypothesis 4 - Multi-Sigma Discriminative Metrics)
@@ -10273,6 +11661,7 @@ def train_stageC_diffusion_generator(
                 global_step=global_step,
                 epoch=epoch,
                 fabric=fabric,
+                use_z_ln=use_z_ln,
             )
             
             print_probe_results_multi_sigma(probe_results, global_step, epoch)
@@ -10318,6 +11707,7 @@ def train_stageC_diffusion_generator(
                 epoch=epoch,
                 trace_sigmas=PROBE_SAMPLE_TRACE_SIGMAS,
                 fabric=fabric,
+                use_z_ln=use_z_ln,
             )
             
             print_probe_sample_results(sample_results, global_step, epoch)
@@ -10376,48 +11766,73 @@ def train_stageC_diffusion_generator(
                 print(f"\n" + "="*70)
                 print(f"[PHASE 7] Learning Checks (Epoch {epoch+1})")
                 print("="*70)
-                
+
                 with torch.no_grad():
                     # Load fixed batch
                     fb = edm_debug_state['fixed_batch']
                     Z_fb = fb['Z_set'].to(device)
                     mask_fb = fb['mask'].to(device)
                     V_target_fb = fb['V_target'].to(device)
-                    
+
+                    # In residual mode, load V_base and R_target for correct noising/comparison
+                    use_resid_p7 = curriculum_state.get('use_residual_diffusion', False)
+                    if use_resid_p7 and 'V_base' in fb:
+                        V_base_p7 = fb['V_base'].to(device)
+                        R_target_p7 = fb['R_target'].to(device)
+                        V_target_aligned_p7 = fb['V_target_aligned'].to(device)
+                        noise_target_p7 = R_target_p7  # Noise the residual
+                        compare_target_p7 = V_target_aligned_p7  # Compare to aligned target
+                    else:
+                        V_base_p7 = None
+                        noise_target_p7 = V_target_fb  # Noise full coords
+                        compare_target_p7 = V_target_fb  # Compare to original target
+
                     H_fb = context_encoder(Z_fb, mask_fb)
-                    
+
                     # Test at 3 sigma levels (p20, p50, p80 of training distribution)
                     sigma_test_levels = [
                         sigma_refine_max * 0.2,  # Low noise
                         sigma_refine_max * 0.5,  # Medium
                         sigma_refine_max * 0.8,  # High
                     ]
-                    
+
                     print("\n[PHASE 7.1] One-step Denoise Improvement:")
-                    eps_seed = torch.randn_like(V_target_fb)
-                    
+                    # Noise correct target (R_target in residual mode, V_target otherwise)
+                    eps_seed = torch.randn_like(noise_target_p7)
+
                     for sigma_test in sigma_test_levels:
-                        V_t_test = V_target_fb + sigma_test * eps_seed
+                        V_t_test = noise_target_p7 + sigma_test * eps_seed
                         V_t_test = V_t_test * mask_fb.unsqueeze(-1).float()
-                        
+
                         sigma_batch = torch.full((V_t_test.shape[0],), sigma_test, device=device)
-                        x0_pred_test = score_net.forward_edm(V_t_test, sigma_batch, H_fb, mask_fb, sigma_data, self_cond=None)
+                        x0_pred_test = score_net.forward_edm(V_t_test, sigma_batch, H_fb, mask_fb, sigma_edm_eval, self_cond=None)
                         if isinstance(x0_pred_test, tuple):
                             x0_pred_test = x0_pred_test[0]
-                        
-                        # MSE: model vs baseline
-                        err_model = (x0_pred_test - V_target_fb).pow(2).sum(dim=-1)  # (B, N)
-                        err_baseline = (V_t_test - V_target_fb).pow(2).sum(dim=-1)
-                        
+
+                        # In residual mode, compose V_base + R_pred for full coordinates
+                        if V_base_p7 is not None:
+                            V_pred_test = V_base_p7 + x0_pred_test
+                        else:
+                            V_pred_test = x0_pred_test
+
+                        # MSE: model vs baseline - use full coords for comparison
+                        err_model = (V_pred_test - compare_target_p7).pow(2).sum(dim=-1)  # (B, N)
+                        if V_base_p7 is not None:
+                            # In residual mode, baseline is V_base + noisy_R = V_base + R_target + noise
+                            baseline_test = V_base_p7 + V_t_test  # V_base + noisy_residual
+                        else:
+                            baseline_test = V_t_test
+                        err_baseline = (baseline_test - compare_target_p7).pow(2).sum(dim=-1)
+
                         mask_f = mask_fb.float()
                         mse_model = (err_model * mask_f).sum() / mask_f.sum()
                         mse_baseline = (err_baseline * mask_f).sum() / mask_f.sum()
-                        
+
                         ratio = mse_model / (mse_baseline + 1e-8)
-                        
+
                         print(f"  sigma={sigma_test:.4f}: mse_model={mse_model:.6f} "
                               f"mse_baseline={mse_baseline:.6f} ratio={ratio:.4f}")
-                        
+
                         if ratio < 1.0:
                             print(f"    ✓ Model beats baseline")
                         else:
@@ -10553,8 +11968,10 @@ def train_stageC_diffusion_generator(
             # ============================================================
             curriculum_enabled = (curriculum_state is not None and
                                   len(curriculum_state.get('sigma_cap_mults', [])) > 0)
+            curriculum_stop_enabled = (curriculum_enabled and
+                                       curriculum_state.get('curriculum_early_stop', True))
 
-            if curriculum_enabled:
+            if curriculum_enabled and curriculum_stop_enabled:
                 final_stage_idx = len(curriculum_state['sigma_cap_mults']) - 1
                 curr_stage = curriculum_state['current_stage']
                 target_stage = curriculum_state.get('target_stage', final_stage_idx)
@@ -10565,10 +11982,11 @@ def train_stageC_diffusion_generator(
                 # Gate A: Stage target reached
                 gate_a = (curr_stage >= target_stage)
 
-                # Gate B: Metrics stable for K consecutive evals
-                K = curriculum_state.get('metrics_history_K', 5)
-                recent_passes = curriculum_state.get('metrics_pass_history', [])
-                gate_b = len(recent_passes) >= K and all(recent_passes[-K:])
+                # Gate B: Metrics stable - use WINDOWED 5/6, not 5 consecutive
+                # This is more forgiving of high-σ fluctuations at target stage
+                promo_window = curriculum_state.get('promo_pass_window', [])
+                passes_in_window = sum(promo_window) if promo_window else 0
+                gate_b = (len(promo_window) >= 6 and passes_in_window >= 5)  # 5/6 windowed
 
                 # Gate C: Cap-band loss plateau
                 loss_plateau_patience = curriculum_state.get('loss_plateau_patience', 6)
@@ -10583,24 +12001,19 @@ def train_stageC_diffusion_generator(
                 stall_count = curriculum_state.get('stall_count', 0)
                 stall_limit = curriculum_state.get('stall_limit', 6)
 
-                # === STOP CONDITION 1: Curriculum stall (failure) ===
-                # Only after min_steps to avoid premature stall
-                if stall_count >= stall_limit and min_steps_met:
-                    if fabric is None or fabric.is_global_zero:
-                        print(f"\n[THREE-GATE-STOP] Stall limit reached at stage {curr_stage}")
-                        print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
-                        print(f"  Stopping training (curriculum stall)")
-                    should_stop = True
-                    early_stopped = True
-                    early_stop_epoch = epoch + 1
+                # Structure competence info for stall handling
+                structure_passes = curriculum_state.get('structure_passes_in_window', 0)
+                structure_competent = structure_passes >= 4  # Model learned structure at this stage
+                structure_failing = structure_passes < 2     # Model genuinely failing
 
-                # === STOP CONDITION 2: Three-gate success ===
-                # All gates pass + prerequisites met
-                elif gate_a and gate_b and gate_c and min_epochs_met and min_steps_met:
+                # === STOP CONDITION 1: Three-gate SUCCESS (check FIRST!) ===
+                # At target stage, success stop takes priority over stall stop
+                # This prevents stopping for "stall" when actually converged
+                if gate_a and gate_b and gate_c and min_epochs_met and min_steps_met:
                     if fabric is None or fabric.is_global_zero:
                         print(f"\n[THREE-GATE-STOP] All gates passed! 🎉")
                         print(f"  Gate A (stage >= target): {curr_stage} >= {target_stage} ✓")
-                        print(f"  Gate B (metrics stable): {sum(recent_passes[-K:])}/{K} passes ✓")
+                        print(f"  Gate B (metrics 5/6 window): {passes_in_window}/6 passes ✓")
                         print(f"  Gate C (loss plateau): no_improve={loss_no_improve} >= {loss_plateau_patience} ✓")
                         print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
                         print(f"  Min steps: {steps_in_stage} >= {min_steps_per_stage} ✓")
@@ -10608,6 +12021,150 @@ def train_stageC_diffusion_generator(
                     should_stop = True
                     early_stopped = True
                     early_stop_epoch = epoch + 1
+
+                # === STOP CONDITION 2: Curriculum stall handling ===
+                # Only checked if success condition not met
+                elif stall_count >= stall_limit and min_steps_met:
+                    # Get scale_collapsed from curriculum state (computed during promotion check)
+                    scale_collapsed = curriculum_state.get('scale_collapsed', False)
+
+                    if curr_stage < target_stage:
+                        # NOT at target stage yet
+                        if structure_competent and not scale_collapsed:
+                            # Structure OK AND scale not collapsed → FORCE PROMOTE (scale-stall)
+                            # Note: we check scale_collapsed to avoid promoting truly collapsed models
+                            if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                                old_stage = curr_stage
+                                old_mult = curriculum_state['sigma_cap_mults'][old_stage]
+                                curriculum_state['current_stage'] += 1
+                                curriculum_state['stall_count'] = 0  # Reset stall count
+                                curriculum_state['promo_pass_window'] = []  # Reset window
+                                curriculum_state['structure_pass_window'] = []  # Reset structure window
+                                new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                                # Enable promotion ramp for smooth σ_cap transition
+                                ramp_steps = curriculum_state.get('ramp_steps', 300)
+                                # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                                use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                                sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                                if use_resid_ramp and sigma_resid_valid_ramp:
+                                    sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                                  curriculum_state.get('sigma_data_resid', sigma_data))
+                                else:
+                                    sigma0_ramp = sigma_data
+                                old_cap = old_mult * sigma0_ramp
+                                new_cap = new_mult * sigma0_ramp
+                                curriculum_state['ramp_start_step'] = global_step
+                                curriculum_state['ramp_prev_cap'] = old_cap
+                                curriculum_state['ramp_target_cap'] = new_cap
+
+                                # Reset stage-local tracking
+                                curriculum_state['steps_in_stage'] = 0
+                                curriculum_state['cap_band_loss_sum'] = 0.0
+                                curriculum_state['cap_band_loss_count'] = 0
+                                curriculum_state['cap_band_loss_history'] = []
+                                curriculum_state['best_cap_band_loss'] = float('inf')
+                                curriculum_state['loss_no_improve_count'] = 0
+                                curriculum_state['metrics_pass_history'] = []
+
+                                if fabric is None or fabric.is_global_zero:
+                                    print(f"\n[CURRICULUM] ⚠️ SCALE-STALL at stage {old_stage} → FORCE PROMOTING to stage {curriculum_state['current_stage']}")
+                                    print(f"  stall_count was {stall_count} >= stall_limit={stall_limit}")
+                                    print(f"  Structure competent: {structure_passes}/6 passes (≥4 required) ✓")
+                                    print(f"  Scale not collapsed: scale_r >= 0.60 ✓")
+                                    print(f"  New σ_cap_target = {new_cap:.4f}")
+                                    print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
+                                    print(f"  Model learned structure but scale lagging - promoting to learn at higher σ")
+
+                        elif structure_competent and scale_collapsed:
+                            # Structure OK but scale collapsed → don't force promote, continue training
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[CURRICULUM] ⚠️ STALL with collapsed scale at stage {curr_stage}")
+                                print(f"  Structure competent: {structure_passes}/6 passes ✓")
+                                print(f"  But scale_r < 0.60 (collapsed) - cannot force promote")
+                                print(f"  → Training continues to try recovering scale")
+
+                        elif structure_failing:
+                            # ChatGPT FIX: Structure failing pre-target → DO NOT STOP
+                            # Instead, check if max_steps_per_stage exceeded → force promote
+                            max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                            if steps_in_stage >= max_steps:
+                                # Hard escape: force promote even if structure failing
+                                if curr_stage < len(curriculum_state['sigma_cap_mults']) - 1:
+                                    old_stage = curr_stage
+                                    old_mult = curriculum_state['sigma_cap_mults'][old_stage]
+                                    curriculum_state['current_stage'] += 1
+                                    curriculum_state['stall_count'] = 0
+                                    curriculum_state['promo_pass_window'] = []
+                                    curriculum_state['structure_pass_window'] = []
+                                    new_mult = curriculum_state['sigma_cap_mults'][curriculum_state['current_stage']]
+
+                                    # Enable ramp for smooth transition
+                                    ramp_steps = curriculum_state.get('ramp_steps', 300)
+                                    # Compute sigma0 for ramp caps (same logic as get_sigma_cap_with_ramp)
+                                    use_resid_ramp = curriculum_state.get('use_residual_diffusion', False)
+                                    sigma_resid_valid_ramp = curriculum_state.get('sigma_resid_valid', False)
+                                    if use_resid_ramp and sigma_resid_valid_ramp:
+                                        sigma0_ramp = curriculum_state.get('sigma_data_resid_locked',
+                                                      curriculum_state.get('sigma_data_resid', sigma_data))
+                                    else:
+                                        sigma0_ramp = sigma_data
+                                    old_cap = old_mult * sigma0_ramp
+                                    new_cap = new_mult * sigma0_ramp
+                                    curriculum_state['ramp_start_step'] = global_step
+                                    curriculum_state['ramp_prev_cap'] = old_cap
+                                    curriculum_state['ramp_target_cap'] = new_cap
+
+                                    # Reset stage-local tracking
+                                    curriculum_state['steps_in_stage'] = 0
+                                    curriculum_state['cap_band_loss_sum'] = 0.0
+                                    curriculum_state['cap_band_loss_count'] = 0
+                                    curriculum_state['cap_band_loss_history'] = []
+                                    curriculum_state['best_cap_band_loss'] = float('inf')
+                                    curriculum_state['loss_no_improve_count'] = 0
+                                    curriculum_state['metrics_pass_history'] = []
+
+                                    if fabric is None or fabric.is_global_zero:
+                                        print(f"\n[CURRICULUM] ⚠️ MAX_STEPS ESCAPE at stage {old_stage}")
+                                        print(f"  steps_in_stage={steps_in_stage} >= max_steps={max_steps}")
+                                        print(f"  Structure failing ({structure_passes}/6) but FORCE PROMOTING anyway")
+                                        print(f"  → PROMOTED to stage {curriculum_state['current_stage']} (σ_cap_target = {new_cap:.4f})")
+                                        print(f"  [RAMP] Enabled: {old_cap:.4f} → {new_cap:.4f} over {ramp_steps} steps")
+                            else:
+                                # Not yet at max_steps, just warn and continue
+                                if fabric is None or fabric.is_global_zero:
+                                    print(f"\n[CURRICULUM] ⚠️ Structure struggling at stage {curr_stage}")
+                                    print(f"  Structure passes: {structure_passes}/6 (<2 = failing)")
+                                    print(f"  steps_in_stage: {steps_in_stage}/{max_steps}")
+                                    print(f"  → Will FORCE PROMOTE when max_steps reached (no pre-target stop)")
+
+                        # else: structure borderline (2-3 passes), continue training
+
+                    else:
+                        # AT target stage - check minimum dwell before allowing stall stop
+                        min_steps_at_target = curriculum_state.get('min_steps_at_target', 2000)
+                        target_dwell_met = steps_in_stage >= min_steps_at_target
+
+                        if min_epochs_met and target_dwell_met:
+                            # AT target stage AND min_epochs met AND minimum dwell at target met
+                            # → can stop due to stall (only reached if success condition above wasn't met)
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[THREE-GATE-STOP] Stall limit reached at TARGET stage {curr_stage}")
+                                print(f"  stall_count={stall_count} >= stall_limit={stall_limit}")
+                                print(f"  Gate A satisfied: stage {curr_stage} >= target {target_stage}")
+                                print(f"  Gate B (5/6 window): {passes_in_window}/6 (need 5) ✗")
+                                print(f"  Min epochs: {epoch+1} >= {min_epochs_curriculum} ✓")
+                                print(f"  Min steps at target: {steps_in_stage} >= {min_steps_at_target} ✓")
+                                print(f"  Stopping training (stall at target stage)")
+                            should_stop = True
+                            early_stopped = True
+                            early_stop_epoch = epoch + 1
+                        elif not target_dwell_met:
+                            # Stalled at target but haven't dwelled long enough
+                            if fabric is None or fabric.is_global_zero:
+                                print(f"\n[CURRICULUM] ⚠️ STALL at target stage {curr_stage} but minimum dwell not met")
+                                print(f"  Steps at target: {steps_in_stage}/{min_steps_at_target}")
+                                print(f"  → Training continues to give target stage a fair chance")
 
                 # === NO STOP: Log gate status ===
                 else:
@@ -10619,14 +12176,30 @@ def train_stageC_diffusion_generator(
                     if (fabric is None or fabric.is_global_zero) and (epoch + 1) % 5 == 0:
                         print(f"\n[THREE-GATE] Epoch {epoch+1} Gate Status:")
                         print(f"  Gate A (stage >= {target_stage}): {curr_stage} {'✓' if gate_a else '✗'}")
-                        print(f"  Gate B (metrics K={K}): {sum(recent_passes[-K:]) if recent_passes else 0}/{K} {'✓' if gate_b else '✗'}")
+                        print(f"  Gate B (5/6 window): {passes_in_window}/6 {'✓' if gate_b else '✗'}")
                         print(f"  Gate C (loss plateau): {loss_no_improve}/{loss_plateau_patience} {'✓' if gate_c else '✗'}")
                         print(f"  Min epochs: {epoch+1}/{min_epochs_curriculum} {'✓' if min_epochs_met else '✗'}")
                         print(f"  Min steps: {steps_in_stage}/{min_steps_per_stage} {'✓' if min_steps_met else '✗'}")
+
+                        # Enhanced curriculum budget tracking
+                        max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                        steps_until_escape = max(0, max_steps - steps_in_stage)
+                        print(f"  [BUDGET] stage {curr_stage}: {steps_in_stage}/{max_steps} steps "
+                              f"({steps_until_escape} until force-promote)")
+
+                        if ramp_active:
+                            ramp_start = curriculum_state.get('ramp_start_step', 0)
+                            ramp_steps_val = curriculum_state.get('ramp_steps', 300)
+                            steps_into_ramp = global_step - ramp_start
+                            prev_cap = curriculum_state.get('ramp_prev_cap', 0)
+                            targ_cap = curriculum_state.get('ramp_target_cap', 0)
+                            print(f"  [RAMP] Active: {steps_into_ramp}/{ramp_steps_val} "
+                                  f"({prev_cap:.4f}→{targ_cap:.4f})")
+
                         if not gate_a:
                             print(f"  → Training continues: need to reach target stage {target_stage}")
                         elif not gate_b:
-                            print(f"  → Training continues: need {K} consecutive metric passes")
+                            print(f"  → Training continues: need 5/6 passes in window")
                         elif not gate_c:
                             print(f"  → Training continues: loss still improving")
                         elif not min_epochs_met:
@@ -10634,7 +12207,24 @@ def train_stageC_diffusion_generator(
                         elif not min_steps_met:
                             print(f"  → Training continues: min steps per stage not met")
 
-            else:
+                        # Log stall status with structure competence info
+                        if stall_count >= stall_limit:
+                            if curr_stage < target_stage:
+                                if structure_competent:
+                                    print(f"  ⚠️ SCALE-STALL ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Will FORCE PROMOTE to stage {curr_stage+1} when min_steps met")
+                                elif structure_failing:
+                                    max_steps = curriculum_state.get('max_steps_per_stage', 1500)
+                                    print(f"  Structure struggling ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Will force-promote at max_steps ({steps_in_stage}/{max_steps})")
+                                else:
+                                    print(f"  ⚠️ BORDERLINE ({stall_count}>={stall_limit}, structure={structure_passes}/6)")
+                                    print(f"  → Training continues until structure is competent (≥4) or failing (<2)")
+                            elif not min_epochs_met:
+                                print(f"  ⚠️ Stall at target stage ({stall_count}>={stall_limit}) but min_epochs={min_epochs_curriculum} not met")
+                                print(f"  → Training continues until epoch {min_epochs_curriculum}")
+
+            elif not curriculum_enabled:
                 # No curriculum: use legacy loss-based early stop
                 if enable_early_stop and (epoch + 1) >= early_stop_min_epochs:
                     # Use total weighted loss as validation metric
@@ -10742,7 +12332,7 @@ def train_stageC_diffusion_generator(
         
         # Determine denominator per loss type
         def _denom_for(key):
-            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale', 'ctx_edge'):
+            if key in ('gram', 'gram_scale', 'heat', 'sw_st', 'cone', 'edm_tail', 'gen_align', 'gen_gram', 'dim', 'triangle', 'radial', 'st_dist', 'edge', 'topo', 'shape_spec', 'subspace', 'gen_scale', 'ctx_edge'):
                 return cnt_st
             if key in ('sw_sc', 'ordinal_sc'):
                 return cnt_sc
@@ -10760,6 +12350,9 @@ def train_stageC_diffusion_generator(
         # store + history
         epoch_losses = epoch_means
         for k, v in epoch_losses.items():
+            # Backward compat: add missing keys to history
+            if k not in history['epoch_avg']:
+                history['epoch_avg'][k] = []
             history['epoch_avg'][k].append(v)
         history['epoch'].append(epoch + 1)
 
@@ -10777,6 +12370,7 @@ def train_stageC_diffusion_generator(
             WEIGHTS['st_dist']  * epoch_losses['st_dist']  +   
             WEIGHTS['edm_tail'] * epoch_losses['edm_tail'] +
             WEIGHTS['gen_align']* epoch_losses['gen_align']+
+            WEIGHTS.get('gen_gram', 0) * epoch_losses.get('gen_gram', 0) +
             WEIGHTS['dim']      * epoch_losses['dim']      +
             WEIGHTS['triangle'] * epoch_losses['triangle'] +
             WEIGHTS['radial']   * epoch_losses['radial']   +
@@ -10898,32 +12492,40 @@ def train_stageC_diffusion_generator(
 
 
         # --- save checkpoints only on rank-0 ---
-        # --- save checkpoints only on rank-0 ---
-        if (epoch + 1) % 100 == 0:
-            if fabric is None or fabric.is_global_zero:
-                ckpt = {
-                    'epoch': epoch,
-                    'context_encoder': context_encoder.state_dict(),
-                    'score_net': score_net.state_dict(),
-                    'generator': generator.state_dict(),
-                    'context_encoder_ema': context_encoder_ema.state_dict(),
-                    'score_net_ema': score_net_ema.state_dict(),
-                    'ema_decay': ema_decay,
-                    'optimizer': optimizer.state_dict(),
-                    'history': history,
-                    'sigma_data': sigma_data,
-                    'sigma_min': sigma_min,
-                    'sigma_max': sigma_max,
-                }
-                if encoder is not None:
-                    encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
-                    ckpt['encoder'] = encoder_to_save.state_dict()
+        if fabric is None or fabric.is_global_zero:
+            ckpt = {
+                'epoch': epoch,
+                'global_step': global_step,  # NEW: save for correct resume
+                'context_encoder': context_encoder.state_dict(),
+                'score_net': score_net.state_dict(),
+                'generator': generator.state_dict(),
+                'context_encoder_ema': context_encoder_ema.state_dict(),
+                'score_net_ema': score_net_ema.state_dict(),
+                'ema_decay': ema_decay,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'history': history,
+                'sigma_data': sigma_data,
+                'sigma_min': sigma_min,
+                'sigma_max': sigma_max,
+                'curriculum_state': curriculum_state,
+            }
+            if encoder is not None:
+                encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
+                ckpt['encoder'] = encoder_to_save.state_dict()
+
+            # Rolling latest checkpoint — overwritten every epoch
+            torch.save(ckpt, os.path.join(outf, 'ckpt_latest.pt'))
+
+            # Periodic milestone checkpoint every 50 epochs
+            if (epoch + 1) % 50 == 0:
                 torch.save(ckpt, os.path.join(outf, f'ckpt_epoch_{epoch+1}.pt'))
     
     # Save final checkpoint after training loop
     if fabric is None or fabric.is_global_zero:
         ckpt_final = {
             'epoch': epoch,
+            'global_step': global_step,  # NEW: save for correct resume
             'context_encoder': context_encoder.state_dict(),
             'score_net': score_net.state_dict(),
             'generator': generator.state_dict(),
@@ -10931,10 +12533,12 @@ def train_stageC_diffusion_generator(
             'score_net_ema': score_net_ema.state_dict(),
             'ema_decay': ema_decay,
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'history': history,
             'sigma_data': sigma_data,
             'sigma_min': sigma_min,
             'sigma_max': sigma_max,
+            'curriculum_state': curriculum_state,
         }
         if encoder is not None:
             encoder_to_save = encoder.module if hasattr(encoder, 'module') else encoder
@@ -12639,6 +14243,1877 @@ def train_stageC_diffusion_generator(
 #     return result
 
 
+# =============================================================================
+# DISTANCE-FIRST STITCHING PIPELINE HELPERS (v2 redesign)
+# =============================================================================
+# These functions implement the mathematically consistent inference pipeline:
+# - Step 0: Build locality graph (mutual-kNN + Jaccard + self-tuned weights)
+# - Step 1: Sample overlapping patches via random walk
+# - Step 2: Residual diffusion per patch
+# - Step 3: Extract distance measurements
+# - Step 4: Aggregate into global distance graph
+# - Step 5: Global 2D solve via distance geometry
+# - Step 6: Output EDM + diagnostics
+# =============================================================================
+
+def build_locality_graph_v2(
+    Z: torch.Tensor,
+    k_Z: int = 40,
+    k_sigma: int = 10,
+    tau_jaccard: float = 0.10,
+    min_shared: int = 5,
+    device: str = 'cuda',
+    DEBUG_FLAG: bool = True,
+) -> Dict[str, Any]:
+    """
+    Step 0: Build a locality graph on SC cells using Z-space embeddings.
+
+    Unlike raw kNN, this filters for mutual neighbors and shared-neighborhood
+    to suppress "teleport" edges (same cell type but spatially far).
+
+    Returns:
+        dict with:
+            'adj_list': Dict[int, List[int]] - adjacency list
+            'edge_weights': Dict[Tuple[int,int], float] - edge weights
+            'local_scales': Tensor (N,) - sigma_i for each node
+            'diagnostics': dict - mutuality rate, etc.
+    """
+    import numpy as np
+
+    N, h = Z.shape
+    Z_np = Z.cpu().numpy() if Z.is_cuda else Z.numpy()
+
+    if DEBUG_FLAG:
+        print(f"\n[LOCALITY-GRAPH] Building locality graph: N={N}, k_Z={k_Z}")
+
+    # 0.1: Base directed kNN graph in Z-space
+    from sklearn.neighbors import NearestNeighbors
+    nbrs = NearestNeighbors(n_neighbors=min(k_Z + 1, N), algorithm='auto').fit(Z_np)
+    distances, indices = nbrs.kneighbors(Z_np)
+
+    # indices[:, 0] is self, so neighbors are indices[:, 1:]
+    knn_sets = [set(indices[i, 1:k_Z+1].tolist()) for i in range(N)]
+
+    # 0.2: Symmetrize to mutual-kNN
+    mutual_edges = set()
+    for i in range(N):
+        for j in knn_sets[i]:
+            if i in knn_sets[j]:  # Mutual
+                edge = (min(i, j), max(i, j))
+                mutual_edges.add(edge)
+
+    mutuality_rate = len(mutual_edges) / (N * k_Z / 2 + 1e-8)
+    if DEBUG_FLAG:
+        print(f"[LOCALITY-GRAPH] Mutual-kNN edges: {len(mutual_edges)} (mutuality rate: {mutuality_rate:.3f})")
+
+    # 0.3: Shared-neighborhood / Jaccard filter
+    filtered_edges = []
+    jaccard_scores = []
+    shared_counts = []
+
+    for (i, j) in mutual_edges:
+        intersection = len(knn_sets[i] & knn_sets[j])
+        union = len(knn_sets[i] | knn_sets[j])
+        jaccard = intersection / (union + 1e-8)
+
+        # Keep edge if Jaccard >= threshold OR shared neighbors >= min
+        if jaccard >= tau_jaccard or intersection >= min_shared:
+            filtered_edges.append((i, j))
+            jaccard_scores.append(jaccard)
+            shared_counts.append(intersection)
+
+    if DEBUG_FLAG:
+        print(f"[LOCALITY-GRAPH] After Jaccard filter (τ={tau_jaccard}, min_shared={min_shared}): {len(filtered_edges)} edges")
+        if jaccard_scores:
+            print(f"[LOCALITY-GRAPH] Jaccard stats: min={min(jaccard_scores):.3f}, median={np.median(jaccard_scores):.3f}, max={max(jaccard_scores):.3f}")
+
+    # 0.4: Self-tuned edge weights
+    # Local scale: distance to k_sigma-th neighbor
+    local_scales = torch.tensor(distances[:, min(k_sigma, distances.shape[1]-1)],
+                                 dtype=torch.float32, device=device)
+    local_scales = local_scales.clamp(min=1e-8)
+
+    # Build adjacency list and edge weights
+    adj_list = {i: [] for i in range(N)}
+    edge_weights = {}
+
+    Z_t = Z.to(device)
+    for (i, j) in filtered_edges:
+        adj_list[i].append(j)
+        adj_list[j].append(i)
+
+        # Weight: exp(-d^2 / (sigma_i * sigma_j))
+        d_ij = (Z_t[i] - Z_t[j]).norm().item()
+        sigma_i = local_scales[i].item()
+        sigma_j = local_scales[j].item()
+        w_ij = np.exp(-d_ij**2 / (sigma_i * sigma_j + 1e-8))
+
+        edge_weights[(i, j)] = w_ij
+        edge_weights[(j, i)] = w_ij
+
+    # Compute degree distribution for diagnostics
+    degrees = [len(adj_list[i]) for i in range(N)]
+    isolated_nodes = sum(1 for d in degrees if d == 0)
+
+    if DEBUG_FLAG:
+        print(f"[LOCALITY-GRAPH] Degree stats: min={min(degrees)}, median={np.median(degrees):.1f}, max={max(degrees)}")
+        print(f"[LOCALITY-GRAPH] Isolated nodes: {isolated_nodes} ({100*isolated_nodes/N:.1f}%)")
+
+    diagnostics = {
+        'mutuality_rate': mutuality_rate,
+        'n_edges_mutual': len(mutual_edges),
+        'n_edges_filtered': len(filtered_edges),
+        'jaccard_median': float(np.median(jaccard_scores)) if jaccard_scores else 0.0,
+        'degree_median': float(np.median(degrees)),
+        'isolated_nodes': isolated_nodes,
+    }
+
+    return {
+        'adj_list': adj_list,
+        'edge_weights': edge_weights,
+        'local_scales': local_scales,
+        'knn_sets': knn_sets,
+        'filtered_edges': filtered_edges,
+        'diagnostics': diagnostics,
+    }
+
+
+def sample_patches_random_walk_v2(
+    graph: Dict[str, Any],
+    N: int,
+    patch_size: int = 256,
+    overlap_frac: float = 0.5,
+    coverage_per_cell: float = 4.0,
+    min_overlap: int = 30,
+    max_patches: int = 500,
+    device: str = 'cuda',
+    DEBUG_FLAG: bool = True,
+) -> Dict[str, Any]:
+    """
+    Step 1: Sample overlapping patches as connected subgraphs via random walk.
+
+    Uses sliding window on random walk to guarantee structural overlap.
+
+    Returns:
+        dict with:
+            'patch_indices': List[Tensor] - cell indices per patch
+            'patch_overlaps': Dict[(k1,k2), Set[int]] - overlap sets
+            'coverage_counts': Tensor (N,) - how many patches each cell appears in
+            'diagnostics': dict
+    """
+    import numpy as np
+    import random
+
+    adj_list = graph['adj_list']
+    edge_weights = graph['edge_weights']
+
+    stride = int(patch_size * (1 - overlap_frac))
+    target_patches = int(np.ceil(N * coverage_per_cell / patch_size))
+    target_patches = min(target_patches, max_patches)
+
+    if DEBUG_FLAG:
+        print(f"\n[PATCH-SAMPLE] Sampling patches: size={patch_size}, overlap={overlap_frac:.0%}, stride={stride}")
+        print(f"[PATCH-SAMPLE] Target patches: {target_patches} (coverage={coverage_per_cell})")
+
+    # Find nodes with edges (non-isolated)
+    active_nodes = [i for i in range(N) if len(adj_list[i]) > 0]
+    if len(active_nodes) < patch_size:
+        print(f"[PATCH-SAMPLE] WARNING: Only {len(active_nodes)} active nodes, need {patch_size}")
+        patch_size = max(32, len(active_nodes) // 2)
+
+    # Random walk with weighted transitions
+    def weighted_random_walk(start_node: int, length: int) -> List[int]:
+        walk = [start_node]
+        current = start_node
+        for _ in range(length - 1):
+            neighbors = adj_list[current]
+            if not neighbors:
+                # Stuck at isolated node - jump to random active node
+                current = random.choice(active_nodes)
+            else:
+                # Weighted choice
+                weights = [edge_weights.get((current, n), 0.01) for n in neighbors]
+                total = sum(weights)
+                weights = [w/total for w in weights]
+                current = random.choices(neighbors, weights=weights, k=1)[0]
+            walk.append(current)
+        return walk
+
+    # Generate long random walk
+    walk_length = stride * (target_patches + 5) + patch_size
+    start_node = random.choice(active_nodes)
+    walk = weighted_random_walk(start_node, walk_length)
+
+    if DEBUG_FLAG:
+        unique_in_walk = len(set(walk))
+        print(f"[PATCH-SAMPLE] Random walk length: {len(walk)}, unique nodes visited: {unique_in_walk}")
+
+    # Extract patches via sliding window (with deduplication)
+    patch_indices_list = []
+    coverage_counts = torch.zeros(N, dtype=torch.long, device=device)
+
+    pos = 0
+    while pos + patch_size <= len(walk) and len(patch_indices_list) < target_patches:
+        window = walk[pos:pos + patch_size]
+        unique_nodes = list(dict.fromkeys(window))  # Preserve order, remove dups
+
+        # If too few unique nodes, extend by BFS
+        if len(unique_nodes) < patch_size * 0.8:
+            unique_nodes = _extend_patch_bfs(unique_nodes, adj_list, patch_size, N)
+
+        # Truncate to patch_size
+        unique_nodes = unique_nodes[:patch_size]
+
+        patch_tensor = torch.tensor(unique_nodes, dtype=torch.long, device=device)
+        patch_indices_list.append(patch_tensor)
+
+        for idx in unique_nodes:
+            coverage_counts[idx] += 1
+
+        pos += stride
+
+    # If not enough patches or coverage, sample more starting from under-covered nodes
+    under_covered = (coverage_counts < coverage_per_cell * 0.5).nonzero(as_tuple=True)[0]
+    attempts = 0
+    while len(patch_indices_list) < target_patches and len(under_covered) > 0 and attempts < 100:
+        start_idx = under_covered[random.randint(0, len(under_covered)-1)].item()
+        if start_idx in active_nodes or len(adj_list[start_idx]) > 0:
+            walk = weighted_random_walk(start_idx, patch_size * 2)
+            unique_nodes = list(dict.fromkeys(walk))[:patch_size]
+
+            if len(unique_nodes) >= patch_size * 0.7:
+                unique_nodes = _extend_patch_bfs(unique_nodes, adj_list, patch_size, N)
+                unique_nodes = unique_nodes[:patch_size]
+
+                patch_tensor = torch.tensor(unique_nodes, dtype=torch.long, device=device)
+                patch_indices_list.append(patch_tensor)
+
+                for idx in unique_nodes:
+                    coverage_counts[idx] += 1
+
+        under_covered = (coverage_counts < coverage_per_cell * 0.5).nonzero(as_tuple=True)[0]
+        attempts += 1
+
+    K = len(patch_indices_list)
+
+    # Compute patch overlaps
+    patch_sets = [set(p.cpu().tolist()) for p in patch_indices_list]
+    patch_overlaps = {}
+    overlap_sizes = []
+
+    for k1 in range(K):
+        for k2 in range(k1 + 1, K):
+            overlap = patch_sets[k1] & patch_sets[k2]
+            if len(overlap) >= min_overlap:
+                patch_overlaps[(k1, k2)] = overlap
+                overlap_sizes.append(len(overlap))
+
+    # Check patch graph connectivity
+    patch_adj = {k: set() for k in range(K)}
+    for (k1, k2) in patch_overlaps:
+        patch_adj[k1].add(k2)
+        patch_adj[k2].add(k1)
+
+    # BFS to find connected components
+    visited = set()
+    components = []
+    for start in range(K):
+        if start not in visited:
+            component = []
+            queue = [start]
+            while queue:
+                node = queue.pop(0)
+                if node not in visited:
+                    visited.add(node)
+                    component.append(node)
+                    queue.extend(patch_adj[node] - visited)
+            components.append(component)
+
+    is_connected = len(components) == 1
+
+    # =========================================================================
+    # FM1 FIX: Ensure 100% coverage - add uncovered cells to nearest patches
+    # =========================================================================
+    uncovered_cells = (coverage_counts == 0).nonzero(as_tuple=True)[0].cpu().tolist()
+    if len(uncovered_cells) > 0:
+        if DEBUG_FLAG:
+            print(f"[PATCH-SAMPLE] FM1 FIX: {len(uncovered_cells)} uncovered cells, adding to nearest patches...")
+
+        # For each uncovered cell, find the patch that shares the most neighbors
+        for cell_idx in uncovered_cells:
+            cell_neighbors = set(adj_list[cell_idx])
+
+            if len(cell_neighbors) > 0:
+                # Find patch with most overlap with cell's neighbors
+                best_patch_idx = 0
+                best_overlap = 0
+                for k, patch_set in enumerate(patch_sets):
+                    overlap = len(cell_neighbors & patch_set)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_patch_idx = k
+
+                # Add cell to the best patch
+                patch_sets[best_patch_idx].add(cell_idx)
+                patch_indices_list[best_patch_idx] = torch.tensor(
+                    list(patch_sets[best_patch_idx]), dtype=torch.long, device=device
+                )
+                coverage_counts[cell_idx] = 1
+            else:
+                # Isolated cell (no neighbors) - add to largest patch
+                largest_patch_idx = max(range(K), key=lambda k: len(patch_sets[k]))
+                patch_sets[largest_patch_idx].add(cell_idx)
+                patch_indices_list[largest_patch_idx] = torch.tensor(
+                    list(patch_sets[largest_patch_idx]), dtype=torch.long, device=device
+                )
+                coverage_counts[cell_idx] = 1
+
+        if DEBUG_FLAG:
+            print(f"[PATCH-SAMPLE] FM1 FIX: All cells now covered!")
+
+        # Recompute overlaps after adding cells
+        patch_overlaps = {}
+        overlap_sizes = []
+        for k1 in range(K):
+            for k2 in range(k1 + 1, K):
+                overlap = patch_sets[k1] & patch_sets[k2]
+                if len(overlap) >= min_overlap:
+                    patch_overlaps[(k1, k2)] = overlap
+                    overlap_sizes.append(len(overlap))
+
+    if DEBUG_FLAG:
+        print(f"[PATCH-SAMPLE] Generated {K} patches")
+        print(f"[PATCH-SAMPLE] Coverage: min={coverage_counts.min().item()}, median={coverage_counts.float().median().item():.1f}, max={coverage_counts.max().item()}")
+        uncovered = (coverage_counts == 0).sum().item()
+        print(f"[PATCH-SAMPLE] Uncovered cells: {uncovered} ({100*uncovered/N:.1f}%)")
+        print(f"[PATCH-SAMPLE] Overlapping patch pairs: {len(patch_overlaps)}")
+        if overlap_sizes:
+            print(f"[PATCH-SAMPLE] Overlap sizes: min={min(overlap_sizes)}, median={np.median(overlap_sizes):.0f}, max={max(overlap_sizes)}")
+        print(f"[PATCH-SAMPLE] Patch graph connected: {is_connected} ({len(components)} components)")
+
+    diagnostics = {
+        'n_patches': K,
+        'coverage_min': coverage_counts.min().item(),
+        'coverage_median': coverage_counts.float().median().item(),
+        'uncovered_cells': (coverage_counts == 0).sum().item(),
+        'n_overlap_pairs': len(patch_overlaps),
+        'overlap_median': float(np.median(overlap_sizes)) if overlap_sizes else 0,
+        'is_connected': is_connected,
+        'n_components': len(components),
+    }
+
+    return {
+        'patch_indices': patch_indices_list,
+        'patch_sets': patch_sets,
+        'patch_overlaps': patch_overlaps,
+        'coverage_counts': coverage_counts,
+        'components': components,
+        'diagnostics': diagnostics,
+    }
+
+
+def _extend_patch_bfs(nodes: List[int], adj_list: Dict[int, List[int]], target_size: int, N: int) -> List[int]:
+    """Extend a patch by BFS until reaching target size."""
+    node_set = set(nodes)
+    frontier = list(nodes)
+    random.shuffle(frontier)
+
+    while len(node_set) < target_size and frontier:
+        current = frontier.pop(0)
+        for neighbor in adj_list[current]:
+            if neighbor not in node_set:
+                node_set.add(neighbor)
+                frontier.append(neighbor)
+                if len(node_set) >= target_size:
+                    break
+
+    return list(node_set)
+
+
+def sample_patch_residual_diffusion_v2(
+    Z_patch: torch.Tensor,        # (1, m, h) or (m, h)
+    mask_patch: torch.Tensor,     # (1, m) or (m,)
+    context_encoder: nn.Module,
+    generator: nn.Module,
+    score_net: nn.Module,
+    sigma_data: float,
+    sigma_start: float,
+    sigma_min: float = 0.01,
+    n_steps: int = 50,
+    guidance_scale: float = 1.0,
+    seed: Optional[int] = None,
+    device: str = 'cuda',
+    DEBUG_FLAG: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Step 2: Per-patch conditional sampling with residual diffusion.
+
+    Key difference from non-residual: we diffuse R (residual), not V (absolute).
+    - Initialize R_start = sigma_start * epsilon
+    - Denoise in R-space
+    - Compose: V = V_base + R_0
+
+    Returns:
+        dict with V_final, V_base, R_final, and diagnostics
+    """
+    import utils_et as uet
+
+    # Ensure batch dimension
+    if Z_patch.dim() == 2:
+        Z_patch = Z_patch.unsqueeze(0)
+    if mask_patch.dim() == 1:
+        mask_patch = mask_patch.unsqueeze(0)
+
+    B, m, h = Z_patch.shape
+
+    # Set seed for deterministic sampling if provided
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    with torch.no_grad():
+        # 2.1 Conditioning
+        H = context_encoder(Z_patch, mask_patch)  # (1, m, c)
+
+        # 2.2 Generator proposal
+        V_base = generator(H, mask_patch)  # (1, m, D)
+
+        # 2.3 Initialize residual at sigma_start
+        epsilon = torch.randn_like(V_base)
+        R_t = sigma_start * epsilon  # Start from pure noise in R-space
+
+        # EDM sigma schedule (Karras et al.)
+        sigmas = uet.edm_sigma_schedule(n_steps, sigma_min, sigma_start, rho=7.0, device=device)
+
+        # Debug: Show diffusion setup
+        if DEBUG_FLAG:
+            rms_V_base_init = V_base.pow(2).mean().sqrt().item()
+            rms_R_init = R_t.pow(2).mean().sqrt().item()
+            print(f"\n[DIFFUSION] Residual diffusion sampling:")
+            print(f"[DIFFUSION]   n_steps={n_steps}, sigma_start={sigma_start:.4f}, sigma_min={sigma_min:.4f}")
+            print(f"[DIFFUSION]   sigma_data (for score_net)={sigma_data:.4f}")
+            print(f"[DIFFUSION]   V_base RMS={rms_V_base_init:.4f}")
+            print(f"[DIFFUSION]   Initial noise R_t RMS={rms_R_init:.4f} (should be ~sigma_start)")
+            print(f"[DIFFUSION]   Sigma schedule: [{sigmas[0].item():.4f}, ..., {sigmas[len(sigmas)//2].item():.4f}, ..., {sigmas[-1].item():.4f}]")
+
+        # Denoising loop in residual space
+        for i in range(len(sigmas) - 1):
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+            sigma_batch = sigma.view(1)
+
+            # Score net predicts clean R_0 (in residual space)
+            # Note: The score net was trained on R, so input is R_t
+            R_0_pred = _forward_edm_x0_pred(score_net, R_t, sigma_batch, H, mask_patch, sigma_data)
+
+            # Optional CFG (usually guidance_scale=1.0 for residual mode)
+            if guidance_scale != 1.0:
+                H_null = torch.zeros_like(H)
+                R_0_uncond = _forward_edm_x0_pred(score_net, R_t, sigma_batch, H_null, mask_patch, sigma_data)
+                R_0_pred = R_0_uncond + guidance_scale * (R_0_pred - R_0_uncond)
+
+            # Euler step
+            d = (R_t - R_0_pred) / sigma.clamp(min=1e-8)
+            R_euler = R_t + (sigma_next - sigma) * d
+
+            # Heun corrector (skip if sigma_next == 0)
+            if sigma_next > 1e-8:
+                R_0_next = _forward_edm_x0_pred(score_net, R_euler, sigma_next.view(1), H, mask_patch, sigma_data)
+                if guidance_scale != 1.0:
+                    R_0_next_uncond = _forward_edm_x0_pred(score_net, R_euler, sigma_next.view(1), H_null, mask_patch, sigma_data)
+                    R_0_next = R_0_next_uncond + guidance_scale * (R_0_next - R_0_next_uncond)
+
+                d_next = (R_euler - R_0_next) / sigma_next.clamp(min=1e-8)
+                R_t = R_t + 0.5 * (sigma_next - sigma) * (d + d_next)
+            else:
+                R_t = R_euler
+
+        R_final = R_t
+
+        # Compose: V = V_base + R
+        V_final = V_base + R_final
+
+        # Apply mask
+        mask_f = mask_patch.unsqueeze(-1).float()
+        V_final = V_final * mask_f
+        V_base = V_base * mask_f
+        R_final = R_final * mask_f
+
+        # Debug: Show final state
+        if DEBUG_FLAG:
+            rms_R_final = R_final.pow(2).mean().sqrt().item()
+            rms_V_final = V_final.pow(2).mean().sqrt().item()
+            print(f"[DIFFUSION]   Final R_t RMS={rms_R_final:.4f} (denoised residual)")
+            print(f"[DIFFUSION]   Final V RMS={rms_V_final:.4f} (V_base + R)")
+            print(f"[DIFFUSION]   Residual/Base ratio={rms_R_final/(rms_V_base_init+1e-8):.3f}")
+
+    # Diagnostics
+    rms_V_base = V_base.pow(2).sum() / (mask_f.sum() * V_base.shape[-1] + 1e-8)
+    rms_V_base = rms_V_base.sqrt().item()
+    rms_R = R_final.pow(2).sum() / (mask_f.sum() * R_final.shape[-1] + 1e-8)
+    rms_R = rms_R.sqrt().item()
+    residual_ratio = rms_R / (rms_V_base + 1e-8)
+
+    return {
+        'V_final': V_final.squeeze(0),  # (m, D)
+        'V_base': V_base.squeeze(0),
+        'R_final': R_final.squeeze(0),
+        'rms_V_base': rms_V_base,
+        'rms_R': rms_R,
+        'residual_ratio': residual_ratio,
+    }
+
+
+def _forward_edm_x0_pred(score_net, x_t, sigma, H, mask, sigma_data, use_self_cond=True):
+    """Forward pass through score net to get x0 prediction with self-conditioning."""
+    # Use the score_net's forward_edm method which handles preconditioning properly
+    if use_self_cond:
+        # Two-pass self-conditioning
+        x0_pred_0 = score_net.forward_edm(
+            x_t, sigma, H, mask, sigma_data,
+            self_cond=None,
+            center_mask=None,
+        )
+        x0_pred = score_net.forward_edm(
+            x_t, sigma, H, mask, sigma_data,
+            self_cond=x0_pred_0.detach(),
+            center_mask=None,
+        )
+    else:
+        x0_pred = score_net.forward_edm(
+            x_t, sigma, H, mask, sigma_data,
+            self_cond=None,
+            center_mask=None,
+        )
+    return x0_pred
+
+
+def extract_patch_distances_v2(
+    V_patch: torch.Tensor,  # (m, D)
+    mask_patch: torch.Tensor,  # (m,)
+    k_edge: int = 20,
+    centrality_weight: bool = True,
+    random_edge_frac: float = 0.1,  # FM6 mitigation: add random longer-range edges
+    device: str = 'cuda',
+) -> Dict[str, Any]:
+    """
+    Step 3: Convert patch output to sparse distance measurements.
+
+    Extracts:
+    1. kNN edges for local structure
+    2. Random non-kNN edges for global connectivity (FM6 mitigation)
+
+    Returns:
+        dict with edges (List of (u,v)), distances, weights, and diagnostics
+    """
+    m, D = V_patch.shape
+    valid_mask = mask_patch.bool()
+    n_valid = valid_mask.sum().item()
+
+    if n_valid < 3:
+        return {'edges': [], 'distances': [], 'weights': [], 'diagnostics': {}}
+
+    # Get valid coordinates
+    V_valid = V_patch[valid_mask]  # (n_valid, D)
+    valid_indices = valid_mask.nonzero(as_tuple=True)[0]  # Map back to original indices
+
+    # Compute full distance matrix for valid points
+    D_mat = torch.cdist(V_valid, V_valid)  # (n_valid, n_valid)
+
+    # Get kNN edges (directed)
+    k_actual = min(k_edge, n_valid - 1)
+    _, knn_indices = D_mat.topk(k_actual + 1, dim=1, largest=False)  # +1 for self
+    knn_indices = knn_indices[:, 1:]  # Remove self
+
+    # Track which edges are kNN (for avoiding duplicates with random edges)
+    knn_edge_set = set()
+
+    # Convert to edge list with distances
+    edges = []
+    distances = []
+    weights = []
+
+    # Compute centrality weights (downweight boundary points)
+    if centrality_weight and n_valid > k_actual:
+        # Mean distance to k nearest neighbors as centrality proxy
+        mean_knn_dist = D_mat.topk(k_actual + 1, dim=1, largest=False)[0][:, 1:].mean(dim=1)
+        median_dist = mean_knn_dist.median()
+        centrality = torch.exp(-mean_knn_dist / (2 * median_dist + 1e-8))
+    else:
+        centrality = torch.ones(n_valid, device=device)
+
+    # Add kNN edges
+    for i in range(n_valid):
+        for j_idx in range(k_actual):
+            j = knn_indices[i, j_idx].item()
+            if i < j:  # Avoid duplicates
+                u = valid_indices[i].item()
+                v = valid_indices[j].item()
+                d = D_mat[i, j].item()
+                w = (centrality[i] * centrality[j]).sqrt().item()
+
+                edges.append((u, v))
+                distances.append(d)
+                weights.append(w)
+                knn_edge_set.add((min(i, j), max(i, j)))
+
+    # FM6 MITIGATION: Add random longer-range edges for better connectivity
+    n_knn_edges = len(edges)
+    n_random_target = max(1, int(n_knn_edges * random_edge_frac))
+
+    # Generate random pairs that aren't already kNN edges
+    random_edges_added = 0
+    max_attempts = n_random_target * 10
+    attempts = 0
+
+    while random_edges_added < n_random_target and attempts < max_attempts:
+        i = random.randint(0, n_valid - 1)
+        j = random.randint(0, n_valid - 1)
+        if i != j:
+            edge_key = (min(i, j), max(i, j))
+            if edge_key not in knn_edge_set:
+                u = valid_indices[i].item()
+                v = valid_indices[j].item()
+                d = D_mat[i, j].item()
+                # Lower weight for random edges (less trusted)
+                w = 0.5 * (centrality[i] * centrality[j]).sqrt().item()
+
+                edges.append((u, v))
+                distances.append(d)
+                weights.append(w)
+                knn_edge_set.add(edge_key)
+                random_edges_added += 1
+        attempts += 1
+
+    # Compute planarity diagnostic (rank-2 energy)
+    # B = -0.5 * J @ D^2 @ J where J is centering matrix
+    D_sq = D_mat ** 2
+    J = torch.eye(n_valid, device=device) - torch.ones(n_valid, n_valid, device=device) / n_valid
+    B = -0.5 * J @ D_sq @ J
+
+    # Eigendecomposition
+    eigvals = torch.linalg.eigvalsh(B)
+    pos_eigvals = eigvals[eigvals > 1e-8]
+    if len(pos_eigvals) >= 2:
+        rank2_energy = (pos_eigvals[-1] + pos_eigvals[-2]) / (pos_eigvals.sum() + 1e-8)
+    else:
+        rank2_energy = 0.0
+
+    diagnostics = {
+        'n_edges': len(edges),
+        'n_valid': n_valid,
+        'rank2_energy': rank2_energy.item() if isinstance(rank2_energy, torch.Tensor) else rank2_energy,
+        'dist_median': float(np.median(distances)) if distances else 0.0,
+        'dist_max': max(distances) if distances else 0.0,
+    }
+
+    return {
+        'edges': edges,
+        'distances': distances,
+        'weights': weights,
+        'valid_indices': valid_indices.cpu().tolist(),
+        'diagnostics': diagnostics,
+    }
+
+
+def aggregate_distance_measurements_v2(
+    patch_measurements: List[Dict],
+    patch_indices: List[torch.Tensor],
+    N: int,
+    M_min: int = 2,
+    tau_spread: float = 0.30,
+    spread_alpha: float = 10.0,
+    patch_consistency: Optional[Dict[int, float]] = None,  # FM3 mitigation: per-patch consistency scores
+    device: str = 'cuda',
+    DEBUG_FLAG: bool = True,
+) -> Dict[str, Any]:
+    """
+    Step 4: Aggregate patch distance constraints into global distance graph.
+
+    For each global edge (i,j), collect all patch measurements and compute:
+    - Consensus distance via weighted median
+    - Spread (disagreement measure)
+    - Filter by count and spread
+
+    Args:
+        patch_consistency: Optional dict mapping patch_id -> consistency score (0 to 1).
+                          Measurements from higher-consistency patches are weighted more.
+
+    Returns:
+        dict with global edges, consensus distances, weights, and diagnostics
+    """
+    from collections import defaultdict
+    import numpy as np
+
+    if DEBUG_FLAG:
+        print(f"\n[AGGREGATE] Aggregating measurements from {len(patch_measurements)} patches")
+        if patch_consistency:
+            print(f"[AGGREGATE] Using patch consistency weighting (FM3 mitigation)")
+
+    # Collect measurements per global edge
+    edge_measurements = defaultdict(list)  # (i,j) -> [(distance, weight), ...]
+
+    for k, (patch_meas, patch_idx) in enumerate(zip(patch_measurements, patch_indices)):
+        patch_idx_list = patch_idx.cpu().tolist()
+
+        # Get patch consistency weight (default 1.0 if not provided)
+        patch_weight = patch_consistency.get(k, 1.0) if patch_consistency else 1.0
+
+        for (u, v), d, w in zip(patch_meas['edges'], patch_meas['distances'], patch_meas['weights']):
+            # Map local indices to global
+            i_global = patch_idx_list[u]
+            j_global = patch_idx_list[v]
+
+            # Canonical ordering
+            edge = (min(i_global, j_global), max(i_global, j_global))
+            # Apply patch consistency weight to the edge weight
+            w_adjusted = w * patch_weight
+            edge_measurements[edge].append((d, w_adjusted, k))  # (distance, weight, patch_id)
+
+    if DEBUG_FLAG:
+        print(f"[AGGREGATE] Total unique edges: {len(edge_measurements)}")
+
+    # Compute consensus for each edge
+    global_edges = []
+    consensus_distances = []
+    consensus_weights = []
+    edge_spreads = []
+    edge_counts = []
+
+    for (i, j), measurements in edge_measurements.items():
+        count = len(measurements)
+
+        # Filter by minimum count
+        if count < M_min:
+            continue
+
+        distances = [m[0] for m in measurements]
+        weights = [m[1] for m in measurements]
+
+        # Weighted median
+        sorted_pairs = sorted(zip(distances, weights))
+        cumsum = 0
+        total_weight = sum(weights)
+        d_median = sorted_pairs[-1][0]  # Default to last
+        for d, w in sorted_pairs:
+            cumsum += w
+            if cumsum >= total_weight / 2:
+                d_median = d
+                break
+
+        # Compute spread (relative IQR)
+        if len(distances) >= 4:
+            q10 = np.percentile(distances, 10)
+            q90 = np.percentile(distances, 90)
+            spread = (q90 - q10) / (d_median + 1e-8)
+        else:
+            spread = np.std(distances) / (d_median + 1e-8) if d_median > 0 else 0
+
+        # Filter by spread
+        if spread > tau_spread:
+            continue
+
+        # Trust weight: count * exp(-alpha * spread^2)
+        trust_weight = count * np.exp(-spread_alpha * spread**2)
+
+        global_edges.append((i, j))
+        consensus_distances.append(d_median)
+        consensus_weights.append(trust_weight)
+        edge_spreads.append(spread)
+        edge_counts.append(count)
+
+    if DEBUG_FLAG:
+        print(f"[AGGREGATE] Edges after filtering (M_min={M_min}, tau_spread={tau_spread}): {len(global_edges)}")
+        if consensus_distances:
+            print(f"[AGGREGATE] Consensus distances: min={min(consensus_distances):.4f}, median={np.median(consensus_distances):.4f}, max={max(consensus_distances):.4f}")
+            print(f"[AGGREGATE] Spreads: min={min(edge_spreads):.3f}, median={np.median(edge_spreads):.3f}, max={max(edge_spreads):.3f}")
+            print(f"[AGGREGATE] Counts: min={min(edge_counts)}, median={np.median(edge_counts):.1f}, max={max(edge_counts)}")
+
+    # =========================================================================
+    # FM6 FIX: Connect isolated nodes using single measurements
+    # =========================================================================
+    # Find nodes with no edges
+    connected_nodes = set()
+    for (i, j) in global_edges:
+        connected_nodes.add(i)
+        connected_nodes.add(j)
+
+    isolated_nodes = [i for i in range(N) if i not in connected_nodes]
+
+    if len(isolated_nodes) > 0:
+        if DEBUG_FLAG:
+            print(f"[AGGREGATE] FM6 FIX: {len(isolated_nodes)} isolated nodes, adding rescue edges...")
+
+        # For isolated nodes, use single-measurement edges (M_min=1) with relaxed spread
+        rescue_edges_added = 0
+        for node in isolated_nodes:
+            # Find all edges involving this node from unfiltered measurements
+            node_edges = []
+            for (i, j), measurements in edge_measurements.items():
+                if i == node or j == node:
+                    # Take median distance even from single measurement
+                    distances_ij = [m[0] for m in measurements]
+                    d_median = np.median(distances_ij)
+                    # Use count as weight (penalize single measurements)
+                    w = len(measurements) * 0.5  # Reduced weight for rescue edges
+                    node_edges.append(((i, j), d_median, w))
+
+            # Sort by weight (prefer edges with more measurements)
+            node_edges.sort(key=lambda x: -x[2])
+
+            # Add top-k edges for this node (at least connect it)
+            k_rescue = min(5, len(node_edges))
+            for idx in range(k_rescue):
+                edge, d, w = node_edges[idx]
+                if edge not in global_edges:
+                    global_edges.append(edge)
+                    consensus_distances.append(d)
+                    consensus_weights.append(w)
+                    edge_spreads.append(0.5)  # Mark as uncertain
+                    edge_counts.append(1)
+                    rescue_edges_added += 1
+
+        if DEBUG_FLAG:
+            print(f"[AGGREGATE] FM6 FIX: Added {rescue_edges_added} rescue edges")
+            # Recount isolated nodes
+            connected_nodes = set()
+            for (i, j) in global_edges:
+                connected_nodes.add(i)
+                connected_nodes.add(j)
+            still_isolated = [i for i in range(N) if i not in connected_nodes]
+            print(f"[AGGREGATE] FM6 FIX: {len(still_isolated)} nodes still isolated after fix")
+
+    diagnostics = {
+        'n_global_edges': len(global_edges),
+        'n_total_measurements': sum(len(m) for m in edge_measurements.values()),
+        'edges_filtered_by_count': sum(1 for m in edge_measurements.values() if len(m) < M_min),
+        'edges_filtered_by_spread': sum(1 for (i,j), m in edge_measurements.items()
+                                        if len(m) >= M_min and
+                                        (np.percentile([x[0] for x in m], 90) - np.percentile([x[0] for x in m], 10)) /
+                                        (np.median([x[0] for x in m]) + 1e-8) > tau_spread),
+        'spread_median': float(np.median(edge_spreads)) if edge_spreads else 0,
+        'count_median': float(np.median(edge_counts)) if edge_counts else 0,
+    }
+
+    return {
+        'edges': global_edges,
+        'distances': consensus_distances,
+        'weights': consensus_weights,
+        'spreads': edge_spreads,
+        'counts': edge_counts,
+        'diagnostics': diagnostics,
+    }
+
+
+def landmark_isomap_init_v2(
+    edges: List[Tuple[int, int]],
+    distances: List[float],
+    N: int,
+    n_landmarks: int = 256,
+    device: str = 'cuda',
+    DEBUG_FLAG: bool = True,
+) -> torch.Tensor:
+    """
+    Step 5a: Initialize 2D coordinates via Landmark Isomap.
+
+    1. Build graph with edge distances
+    2. Compute geodesic distances from landmarks (Dijkstra)
+    3. Embed landmarks via classical MDS
+    4. Place non-landmarks by trilateration
+
+    Returns:
+        X_init: (N, 2) initial coordinates
+    """
+    import numpy as np
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+    from scipy.spatial.distance import squareform
+    from sklearn.manifold import MDS
+
+    if DEBUG_FLAG:
+        print(f"\n[ISOMAP-INIT] Landmark Isomap initialization: N={N}, landmarks={n_landmarks}")
+
+    # Build sparse adjacency matrix
+    row, col, data = [], [], []
+    for (i, j), d in zip(edges, distances):
+        row.extend([i, j])
+        col.extend([j, i])
+        data.extend([d, d])
+
+    adj_sparse = csr_matrix((data, (row, col)), shape=(N, N))
+
+    # Select landmarks (high-degree nodes + random)
+    degrees = np.array(adj_sparse.getnnz(axis=1))
+    n_landmarks = min(n_landmarks, N)
+
+    # Top degree nodes as landmarks
+    n_degree = n_landmarks // 2
+    high_degree_nodes = np.argsort(degrees)[-n_degree:]
+
+    # Random nodes for coverage
+    remaining = set(range(N)) - set(high_degree_nodes)
+    n_random = n_landmarks - n_degree
+    random_nodes = np.random.choice(list(remaining), size=min(n_random, len(remaining)), replace=False)
+
+    landmarks = np.concatenate([high_degree_nodes, random_nodes])
+    landmarks = np.unique(landmarks)
+    L = len(landmarks)
+
+    if DEBUG_FLAG:
+        print(f"[ISOMAP-INIT] Selected {L} landmarks ({n_degree} high-degree, {len(random_nodes)} random)")
+
+    # Compute geodesic distances from landmarks
+    D_geo_landmarks = dijkstra(adj_sparse, indices=landmarks, directed=False)
+
+    # Handle disconnected nodes
+    inf_mask = np.isinf(D_geo_landmarks)
+    if inf_mask.any():
+        n_disconnected = inf_mask.any(axis=0).sum()
+        if DEBUG_FLAG:
+            print(f"[ISOMAP-INIT] WARNING: {n_disconnected} nodes disconnected, using fallback distance")
+        max_finite = np.nanmax(D_geo_landmarks[~inf_mask])
+        D_geo_landmarks[inf_mask] = max_finite * 2
+
+    # Classical MDS on landmarks
+    D_landmarks = D_geo_landmarks[:, landmarks]  # (L, L) landmark-to-landmark
+
+    # Double centering
+    n = D_landmarks.shape[0]
+    H = np.eye(n) - np.ones((n, n)) / n
+    B = -0.5 * H @ (D_landmarks ** 2) @ H
+
+    # Eigendecomposition
+    eigvals, eigvecs = np.linalg.eigh(B)
+    idx = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+
+    # Take top 2 positive eigenvalues
+    pos_mask = eigvals > 1e-8
+    if pos_mask.sum() < 2:
+        if DEBUG_FLAG:
+            print("[ISOMAP-INIT] WARNING: Less than 2 positive eigenvalues, using fallback")
+        X_landmarks = np.random.randn(L, 2) * 0.1
+    else:
+        eigvals_pos = eigvals[pos_mask][:2]
+        eigvecs_pos = eigvecs[:, pos_mask][:, :2]
+        X_landmarks = eigvecs_pos @ np.diag(np.sqrt(eigvals_pos))
+
+    if DEBUG_FLAG:
+        print(f"[ISOMAP-INIT] Landmark embedding range: [{X_landmarks.min():.3f}, {X_landmarks.max():.3f}]")
+
+    # Place non-landmarks by trilateration (least squares to landmarks)
+    X_all = np.zeros((N, 2))
+    X_all[landmarks] = X_landmarks
+
+    non_landmarks = np.setdiff1d(np.arange(N), landmarks)
+
+    for i in non_landmarks:
+        # Get distances to landmarks
+        d_to_landmarks = D_geo_landmarks[:, i]  # (L,)
+
+        # Weighted least squares (weight by 1/d^2)
+        weights = 1.0 / (d_to_landmarks ** 2 + 1e-8)
+        weights = weights / weights.sum()
+
+        # Initial guess: weighted average of landmark positions
+        X_all[i] = (weights[:, None] * X_landmarks).sum(axis=0)
+
+    # Refine non-landmarks with a few optimization steps
+    # (Simple gradient descent on distance errors)
+    X_all = _refine_trilateration(X_all, landmarks, D_geo_landmarks, n_iters=50)
+
+    # Center and scale
+    X_all = X_all - X_all.mean(axis=0)
+    scale = np.sqrt((X_all ** 2).mean())
+    if scale > 1e-8:
+        X_all = X_all / scale
+
+    if DEBUG_FLAG:
+        print(f"[ISOMAP-INIT] Final init range: [{X_all.min():.3f}, {X_all.max():.3f}]")
+
+    return torch.tensor(X_all, dtype=torch.float32, device=device)
+
+
+def _refine_trilateration(X, landmarks, D_geo_landmarks, n_iters=50, lr=0.1):
+    """Refine non-landmark positions via gradient descent on distance errors."""
+    import numpy as np
+
+    N = X.shape[0]
+    L = len(landmarks)
+    non_landmarks = np.setdiff1d(np.arange(N), landmarks)
+
+    X = X.copy()
+
+    for _ in range(n_iters):
+        for i in non_landmarks:
+            # Compute gradient of squared distance errors to landmarks
+            diff = X[i:i+1] - X[landmarks]  # (L, 2)
+            d_current = np.linalg.norm(diff, axis=1)  # (L,)
+            d_target = D_geo_landmarks[:, i]  # (L,)
+
+            # Gradient: 2 * (d_current - d_target) * (x_i - x_l) / d_current
+            errors = d_current - d_target
+            grad = 2 * (errors[:, None] * diff / (d_current[:, None] + 1e-8)).mean(axis=0)
+
+            X[i] -= lr * grad
+
+    return X
+
+
+def global_distance_geometry_solve_v2(
+    edges: List[Tuple[int, int]],
+    distances: List[float],
+    weights: List[float],
+    N: int,
+    X_init: torch.Tensor,
+    n_iters: int = 1000,
+    lr: float = 0.01,
+    huber_delta: float = 0.1,
+    anchor_lambda: float = 0.1,
+    anchor_decay: float = 0.995,
+    log_every: int = 100,
+    device: str = 'cuda',
+    DEBUG_FLAG: bool = True,
+) -> Dict[str, Any]:
+    """
+    Step 5b: Global 2D solve via distance geometry optimization.
+
+    Minimizes:
+        sum_ij w_ij * huber(|X_i - X_j| - d_ij) + lambda * |X - X_init|^2
+
+    Returns:
+        dict with X_final, stress history, and diagnostics
+    """
+    if DEBUG_FLAG:
+        print(f"\n[GLOBAL-SOLVE] Distance geometry optimization: N={N}, edges={len(edges)}, iters={n_iters}")
+
+    # Convert to tensors
+    edge_i = torch.tensor([e[0] for e in edges], dtype=torch.long, device=device)
+    edge_j = torch.tensor([e[1] for e in edges], dtype=torch.long, device=device)
+    d_target = torch.tensor(distances, dtype=torch.float32, device=device)
+    w = torch.tensor(weights, dtype=torch.float32, device=device)
+    w = w / (w.sum() + 1e-8)  # Normalize
+
+    # Initialize - need to enable grad even if called inside no_grad context
+    X_anchor = X_init.clone().detach()
+    stress_history = []
+
+    # Use enable_grad to allow optimization even when called from no_grad context
+    with torch.enable_grad():
+        X = X_init.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([X], lr=lr)
+        current_anchor_lambda = anchor_lambda
+
+        for it in range(n_iters):
+            optimizer.zero_grad()
+
+            # Compute pairwise distances for edges
+            diff = X[edge_i] - X[edge_j]  # (E, 2)
+            d_pred = diff.norm(dim=1)  # (E,)
+
+            # Huber loss
+            residuals = d_pred - d_target
+            abs_res = residuals.abs()
+            huber = torch.where(
+                abs_res <= huber_delta,
+                0.5 * residuals ** 2,
+                huber_delta * (abs_res - 0.5 * huber_delta)
+            )
+
+            # Weighted stress
+            stress = (w * huber).sum()
+
+            # Anchor regularization (decays over time)
+            anchor_loss = current_anchor_lambda * ((X - X_anchor) ** 2).mean()
+
+            loss = stress + anchor_loss
+            loss.backward()
+            optimizer.step()
+
+            # Decay anchor weight
+            current_anchor_lambda *= anchor_decay
+
+            stress_val = stress.item()
+            stress_history.append(stress_val)
+
+            if DEBUG_FLAG and (it % log_every == 0 or it == n_iters - 1):
+                mean_residual = residuals.abs().mean().item()
+                max_residual = residuals.abs().max().item()
+                print(f"[GLOBAL-SOLVE] iter={it:4d} stress={stress_val:.6f} anchor={anchor_loss.item():.6f} "
+                      f"mean_res={mean_residual:.4f} max_res={max_residual:.4f}")
+
+    X_final = X.detach()
+
+    # Center and compute final statistics
+    X_final = X_final - X_final.mean(dim=0)
+
+    # Final residuals
+    with torch.no_grad():
+        diff = X_final[edge_i] - X_final[edge_j]
+        d_final = diff.norm(dim=1)
+        residuals = (d_final - d_target).abs()
+
+    diagnostics = {
+        'final_stress': stress_history[-1],
+        'initial_stress': stress_history[0],
+        'mean_residual': residuals.mean().item(),
+        'max_residual': residuals.max().item(),
+        'median_residual': residuals.median().item(),
+    }
+
+    if DEBUG_FLAG:
+        print(f"[GLOBAL-SOLVE] Final: stress={diagnostics['final_stress']:.6f}, "
+              f"mean_res={diagnostics['mean_residual']:.4f}, max_res={diagnostics['max_residual']:.4f}")
+
+    return {
+        'X_final': X_final,
+        'stress_history': stress_history,
+        'diagnostics': diagnostics,
+    }
+
+
+def compute_overlap_consistency_v2(
+    patch_V: List[torch.Tensor],
+    patch_indices: List[torch.Tensor],
+    patch_overlaps: Dict[Tuple[int, int], set],
+    device: str = 'cuda',
+    DEBUG_FLAG: bool = True,
+) -> Dict[str, Any]:
+    """
+    Step 3b: Compute overlap consistency diagnostics (gauge-invariant).
+
+    For each overlapping patch pair, compare distances on overlap.
+    High disagreement indicates teleport patches or context variance.
+
+    Returns:
+        dict with per-pair disagreements and aggregate statistics
+    """
+    pair_disagreements = {}
+    disagreement_values = []
+
+    for (k1, k2), overlap_global in patch_overlaps.items():
+        if len(overlap_global) < 5:
+            continue
+
+        # Map global indices to local indices in each patch
+        idx1_list = patch_indices[k1].cpu().tolist()
+        idx2_list = patch_indices[k2].cpu().tolist()
+
+        local1 = [idx1_list.index(g) for g in overlap_global if g in idx1_list]
+        local2 = [idx2_list.index(g) for g in overlap_global if g in idx2_list]
+
+        if len(local1) < 5 or len(local2) < 5:
+            continue
+
+        # Get coordinates for overlap in each patch
+        V1_overlap = patch_V[k1][local1]  # (n_overlap, D)
+        V2_overlap = patch_V[k2][local2]  # (n_overlap, D)
+
+        # Compute distance matrices on overlap
+        D1 = torch.cdist(V1_overlap, V1_overlap)
+        D2 = torch.cdist(V2_overlap, V2_overlap)
+
+        # Distance disagreement (Frobenius norm of log-distance difference)
+        # Use log for scale stability
+        D1_log = (D1 + 1e-8).log()
+        D2_log = (D2 + 1e-8).log()
+
+        disagreement = (D1_log - D2_log).abs().mean().item()
+
+        pair_disagreements[(k1, k2)] = disagreement
+        disagreement_values.append(disagreement)
+
+    if DEBUG_FLAG and disagreement_values:
+        print(f"\n[OVERLAP-CONSIST] Checked {len(disagreement_values)} patch pairs")
+        print(f"[OVERLAP-CONSIST] Disagreement: min={min(disagreement_values):.4f}, "
+              f"median={np.median(disagreement_values):.4f}, max={max(disagreement_values):.4f}")
+
+    diagnostics = {
+        'n_pairs_checked': len(disagreement_values),
+        'disagreement_min': min(disagreement_values) if disagreement_values else 0,
+        'disagreement_median': float(np.median(disagreement_values)) if disagreement_values else 0,
+        'disagreement_max': max(disagreement_values) if disagreement_values else 0,
+    }
+
+    # =========================================================================
+    # Compute per-patch consistency scores (FM3 mitigation)
+    # Patches that agree with neighbors get higher scores
+    # =========================================================================
+    K = len(patch_V)
+    patch_disagreements = {k: [] for k in range(K)}
+
+    for (k1, k2), disagreement in pair_disagreements.items():
+        patch_disagreements[k1].append(disagreement)
+        patch_disagreements[k2].append(disagreement)
+
+    # Compute mean disagreement per patch
+    patch_mean_disagreement = {}
+    for k in range(K):
+        if patch_disagreements[k]:
+            patch_mean_disagreement[k] = np.mean(patch_disagreements[k])
+        else:
+            # Patch has no overlaps - assign median disagreement
+            patch_mean_disagreement[k] = diagnostics['disagreement_median']
+
+    # Convert to consistency score: lower disagreement = higher consistency
+    # consistency = exp(-disagreement / scale)
+    # where scale = median disagreement (so median patch gets consistency ~0.37)
+    scale = diagnostics['disagreement_median'] + 1e-8
+    patch_consistency = {}
+    for k in range(K):
+        patch_consistency[k] = np.exp(-patch_mean_disagreement[k] / scale)
+
+    if DEBUG_FLAG:
+        consistency_values = list(patch_consistency.values())
+        print(f"[OVERLAP-CONSIST] Per-patch consistency scores:")
+        print(f"[OVERLAP-CONSIST]   min={min(consistency_values):.3f}, "
+              f"median={np.median(consistency_values):.3f}, max={max(consistency_values):.3f}")
+
+    return {
+        'pair_disagreements': pair_disagreements,
+        'patch_consistency': patch_consistency,  # NEW: per-patch consistency scores
+        'diagnostics': diagnostics,
+    }
+
+
+def _sample_sc_edm_patchwise_v2(
+    sc_gene_expr: torch.Tensor,
+    encoder: nn.Module,
+    context_encoder: nn.Module,
+    score_net: nn.Module,
+    generator: nn.Module,
+    sigma_data: float,
+    sigma_min: float,
+    sigma_max: float,
+    guidance_scale: float,
+    device: str,
+    patch_size: int,
+    coverage_per_cell: float,
+    return_coords: bool,
+    DEBUG_FLAG: bool,
+    gt_coords: Optional[torch.Tensor],
+    debug_knn: bool,
+    debug_k_list: Tuple[int, int],
+    # V2-specific params
+    use_residual_diffusion: bool,
+    sigma_data_resid: Optional[float],
+    k_Z: int,
+    k_sigma: int,
+    tau_jaccard: float,
+    min_shared: int,
+    overlap_frac: float,
+    min_overlap: int,
+    n_diffusion_steps: int,
+    M_min: int,
+    tau_spread: float,
+    spread_alpha: float,
+    n_landmarks: int,
+    global_iters: int,
+    global_lr: float,
+    huber_delta: float,
+    anchor_lambda: float,
+    k_edge: int,
+    # Z layer normalization
+    use_z_ln: bool = False,
+    generator_only: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    V2 Distance-First Stitching Pipeline.
+
+    This implements the mathematically consistent inference:
+    1. Build locality graph (mutual-kNN + Jaccard filter)
+    2. Sample overlapping patches via random walk
+    3. Run residual diffusion per patch (if enabled)
+    4. Extract distance measurements from patches
+    5. Aggregate into global distance graph
+    6. Solve global 2D embedding via distance geometry
+    7. Output EDM and coordinates
+
+    All stitching is done on distances (gauge-invariant), not coordinates.
+    """
+    import numpy as np
+    from tqdm import tqdm
+    import utils_et as uet
+
+    N = sc_gene_expr.shape[0]
+
+    # V2 pipeline requires a trained generator for both residual and standard modes
+    if generator is None:
+        raise ValueError(
+            "[V2-PIPELINE] Generator is required for V2 pipeline. "
+            "The V2 pipeline uses the generator for initialization in both "
+            "residual and standard diffusion modes. Please ensure your checkpoint "
+            "contains a trained generator, or use the legacy pipeline instead."
+        )
+
+    if DEBUG_FLAG:
+        print("\n" + "="*70)
+        print("[V2-PIPELINE] Distance-First Stitching Pipeline")
+        print("="*70)
+        print(f"[V2-PIPELINE] N={N}, patch_size={patch_size}, coverage={coverage_per_cell}")
+        print(f"[V2-PIPELINE] use_residual_diffusion={use_residual_diffusion}")
+        print(f"[V2-PIPELINE] generator_only={generator_only}")
+        print(f"[V2-PIPELINE] sigma_data={sigma_data:.4f}, sigma_max={sigma_max:.4f}")
+        if use_residual_diffusion and sigma_data_resid:
+            print(f"[V2-PIPELINE] sigma_data_resid={sigma_data_resid:.4f}")
+
+    # Determine sigma_start for diffusion
+    if generator_only:
+        sigma_start = 0.0
+        sigma_data_effective = sigma_data_resid if (use_residual_diffusion and sigma_data_resid is not None) else sigma_data
+    elif use_residual_diffusion and sigma_data_resid is not None:
+        sigma_start = min(3.0 * sigma_data_resid, sigma_max)
+        # Use sigma_data_resid for preconditioning to match training
+        # Training now uses sigma_data_resid for forward_edm in residual mode,
+        # so inference must use the same to get consistent c_skip/c_out coefficients
+        sigma_data_effective = sigma_data_resid
+    else:
+        sigma_start = min(sigma_max, 3.0 * sigma_data)
+        sigma_data_effective = sigma_data
+
+    if DEBUG_FLAG:
+        print(f"[V2-PIPELINE] sigma_start={sigma_start:.4f}, sigma_data_effective={sigma_data_effective:.4f}")
+
+    # =========================================================================
+    # STEP 0: Encode all SC cells
+    # =========================================================================
+    if DEBUG_FLAG:
+        print(f"\n[V2-STEP0] Encoding {N} cells...")
+
+    with torch.no_grad():
+        encoder.eval()
+        Z_all = encoder(sc_gene_expr.to(device))  # (N, h)
+
+    if DEBUG_FLAG:
+        print(f"[V2-STEP0] Z_all shape: {Z_all.shape}, rms={Z_all.pow(2).mean().sqrt().item():.4f}")
+
+    # =========================================================================
+    # STEP 1: Build locality graph
+    # =========================================================================
+    locality_graph = build_locality_graph_v2(
+        Z=Z_all,
+        k_Z=k_Z,
+        k_sigma=k_sigma,
+        tau_jaccard=tau_jaccard,
+        min_shared=min_shared,
+        device=device,
+        DEBUG_FLAG=DEBUG_FLAG,
+    )
+
+    # Check for failure mode FM1: too many isolated nodes
+    diag = locality_graph['diagnostics']
+    if diag['isolated_nodes'] > N * 0.1:
+        print(f"[V2-WARNING] FM1: {diag['isolated_nodes']} isolated nodes ({100*diag['isolated_nodes']/N:.1f}%)")
+
+    # =========================================================================
+    # STEP 2: Sample overlapping patches
+    # =========================================================================
+    patch_result = sample_patches_random_walk_v2(
+        graph=locality_graph,
+        N=N,
+        patch_size=patch_size,
+        overlap_frac=overlap_frac,
+        coverage_per_cell=coverage_per_cell,
+        min_overlap=min_overlap,
+        device=device,
+        DEBUG_FLAG=DEBUG_FLAG,
+    )
+
+    patch_indices = patch_result['patch_indices']
+    patch_overlaps = patch_result['patch_overlaps']
+    K = len(patch_indices)
+
+    # Check for failure mode FM1: patch graph disconnected
+    if not patch_result['diagnostics']['is_connected']:
+        print(f"[V2-WARNING] FM1: Patch graph disconnected ({patch_result['diagnostics']['n_components']} components)")
+
+    # =========================================================================
+    # STEP 3: Per-patch diffusion sampling
+    # =========================================================================
+    if DEBUG_FLAG:
+        print(f"\n[V2-STEP3] Sampling {K} patches with {'residual' if use_residual_diffusion else 'standard'} diffusion...")
+
+    # Check if context_encoder expects anchor channel
+    expected_in_ctx = getattr(context_encoder, "input_dim", None)
+    if expected_in_ctx is None and hasattr(context_encoder, 'input_proj'):
+        expected_in_ctx = context_encoder.input_proj.in_features
+
+    patch_V = []  # Composed V = V_base + R for residual mode, or just V for standard
+    patch_V_base = []
+    patch_R = []
+    residual_ratios = []
+    rank2_energies = []
+
+    context_encoder.eval()
+    score_net.eval()
+    generator.eval()
+
+    for k in tqdm(range(K), desc="[V2] Sampling patches", disable=not DEBUG_FLAG):
+        S_k = patch_indices[k]
+        m_k = S_k.numel()
+
+        Z_k = Z_all[S_k].unsqueeze(0)  # (1, m, h)
+        mask_k = torch.ones(1, m_k, dtype=torch.bool, device=device)
+
+        # Append anchor channel if needed
+        if expected_in_ctx is not None and expected_in_ctx == Z_k.shape[-1] + 1:
+            zeros_anchor = torch.zeros(1, m_k, 1, device=device, dtype=Z_k.dtype)
+            Z_k = torch.cat([Z_k, zeros_anchor], dim=-1)
+
+        # Apply Z layer normalization
+        if use_z_ln:
+            Z_k = apply_z_ln(Z_k, context_encoder)
+
+        # Deterministic seed based on patch cell IDs
+        seed = hash(tuple(sorted(S_k.cpu().tolist()))) % (2**31)
+
+        if generator_only:
+            with torch.no_grad():
+                H_k = context_encoder(Z_k, mask_k)
+                V_base_k = generator(H_k, mask_k).squeeze(0)
+                V_k = V_base_k
+                R_k = torch.zeros_like(V_base_k)
+                residual_ratios.append(0.0)
+        elif use_residual_diffusion:
+            result = sample_patch_residual_diffusion_v2(
+                Z_patch=Z_k,
+                mask_patch=mask_k,
+                context_encoder=context_encoder,
+                generator=generator,
+                score_net=score_net,
+                sigma_data=sigma_data_effective,
+                sigma_start=sigma_start,
+                sigma_min=sigma_min,
+                n_steps=n_diffusion_steps,
+                guidance_scale=guidance_scale,
+                seed=seed,
+                device=device,
+                DEBUG_FLAG=(DEBUG_FLAG and k == 0),
+            )
+            V_k = result['V_final']
+            V_base_k = result['V_base']
+            R_k = result['R_final']
+            residual_ratios.append(result['residual_ratio'])
+        else:
+            # Standard (non-residual) diffusion
+            with torch.no_grad():
+                H_k = context_encoder(Z_k, mask_k)
+                V_base_k = generator(H_k, mask_k).squeeze(0)
+
+                # Start from generator + noise
+                torch.manual_seed(seed)
+                noise = torch.randn_like(V_base_k.unsqueeze(0)) * sigma_start
+                V_t = V_base_k.unsqueeze(0) + noise
+
+                # EDM sampling (simplified for non-residual)
+                sigmas = uet.edm_sigma_schedule(n_diffusion_steps, sigma_min, sigma_start, rho=7.0, device=device)
+
+                for i in range(len(sigmas) - 1):
+                    sigma = sigmas[i]
+                    sigma_next = sigmas[i + 1]
+                    x0 = _forward_edm_x0_pred(score_net, V_t, sigma.view(1), H_k, mask_k, sigma_data)
+
+                    d = (V_t - x0) / sigma.clamp(min=1e-8)
+                    V_t = V_t + (sigma_next - sigma) * d
+
+                V_k = V_t.squeeze(0)
+                R_k = V_k - V_base_k
+                residual_ratios.append(R_k.pow(2).mean().sqrt().item() / (V_base_k.pow(2).mean().sqrt().item() + 1e-8))
+
+        patch_V.append(V_k)
+        patch_V_base.append(V_base_k)
+        patch_R.append(R_k)
+
+    if DEBUG_FLAG:
+        print(f"[V2-STEP3] Residual ratios: min={min(residual_ratios):.3f}, median={np.median(residual_ratios):.3f}, max={max(residual_ratios):.3f}")
+        # Check FM5: scale collapse
+        if np.median(residual_ratios) > 1.0:
+            print(f"[V2-WARNING] FM5: Large residual ratios suggest generator proposal may be poor")
+
+    # =========================================================================
+    # CRITICAL DIAGNOSTIC: Per-patch distance correlation with GT
+    # Compare both V_base (generator) and V_final (after diffusion) to GT
+    # =========================================================================
+    if DEBUG_FLAG and gt_coords is not None:
+        print(f"\n[V2-PATCH-DIAG] Checking per-patch quality against GT coords...")
+        print(f"[V2-PATCH-DIAG] Comparing: V_base (generator) vs V_final (after diffusion)")
+
+        base_knn_accs = []
+        base_dist_corrs = []
+        final_knn_accs = []
+        final_dist_corrs = []
+
+        for k in range(min(K, 5)):  # Check first 5 patches
+            S_k = patch_indices[k]
+            V_base_k = patch_V_base[k]
+            V_final_k = patch_V[k]
+            gt_k = gt_coords[S_k]  # (m, 2)
+            m = V_base_k.shape[0]
+
+            # Compute distance matrices
+            D_base = torch.cdist(V_base_k.unsqueeze(0), V_base_k.unsqueeze(0)).squeeze(0)
+            D_final = torch.cdist(V_final_k.unsqueeze(0), V_final_k.unsqueeze(0)).squeeze(0)
+            D_gt = torch.cdist(gt_k.unsqueeze(0).to(device), gt_k.unsqueeze(0).to(device)).squeeze(0)
+
+            # Distance correlation (upper triangle only)
+            triu_idx = torch.triu_indices(m, m, offset=1)
+            d_base_flat = D_base[triu_idx[0], triu_idx[1]].cpu().numpy()
+            d_final_flat = D_final[triu_idx[0], triu_idx[1]].cpu().numpy()
+            d_gt_flat = D_gt[triu_idx[0], triu_idx[1]].cpu().numpy()
+
+            if len(d_gt_flat) > 10:
+                corr_base = np.corrcoef(d_base_flat, d_gt_flat)[0, 1]
+                corr_final = np.corrcoef(d_final_flat, d_gt_flat)[0, 1]
+                base_dist_corrs.append(corr_base)
+                final_dist_corrs.append(corr_final)
+
+            # kNN accuracy within patch
+            k_nn = min(10, m - 1)
+
+            # V_base kNN
+            _, idx_base = D_base.topk(k_nn + 1, dim=1, largest=False)
+            idx_base = idx_base[:, 1:].cpu()
+            # V_final kNN
+            _, idx_final = D_final.topk(k_nn + 1, dim=1, largest=False)
+            idx_final = idx_final[:, 1:].cpu()
+            # GT kNN
+            _, idx_gt = D_gt.topk(k_nn + 1, dim=1, largest=False)
+            idx_gt = idx_gt[:, 1:].cpu()
+
+            overlaps_base = []
+            overlaps_final = []
+            for i in range(m):
+                overlap_base = len(set(idx_base[i].tolist()) & set(idx_gt[i].tolist())) / k_nn
+                overlap_final = len(set(idx_final[i].tolist()) & set(idx_gt[i].tolist())) / k_nn
+                overlaps_base.append(overlap_base)
+                overlaps_final.append(overlap_final)
+            base_knn_accs.append(np.mean(overlaps_base))
+            final_knn_accs.append(np.mean(overlaps_final))
+
+        print(f"[V2-PATCH-DIAG] Per-patch k=10 kNN accuracy:")
+        print(f"[V2-PATCH-DIAG]   {'Patch':<8} {'V_base kNN':<12} {'V_final kNN':<12} {'Base corr':<12} {'Final corr':<12}")
+        for k in range(len(final_knn_accs)):
+            b_acc = base_knn_accs[k]
+            f_acc = final_knn_accs[k]
+            b_corr = base_dist_corrs[k] if k < len(base_dist_corrs) else 0
+            f_corr = final_dist_corrs[k] if k < len(final_dist_corrs) else 0
+            print(f"[V2-PATCH-DIAG]   {k:<8} {b_acc:<12.3f} {f_acc:<12.3f} {b_corr:<12.3f} {f_corr:<12.3f}")
+
+        if final_knn_accs:
+            avg_base_acc = np.mean(base_knn_accs)
+            avg_final_acc = np.mean(final_knn_accs)
+            avg_base_corr = np.mean(base_dist_corrs) if base_dist_corrs else 0
+            avg_final_corr = np.mean(final_dist_corrs) if final_dist_corrs else 0
+            print(f"[V2-PATCH-DIAG] Average: V_base kNN={avg_base_acc:.3f}, V_final kNN={avg_final_acc:.3f}")
+            print(f"[V2-PATCH-DIAG] Average: V_base corr={avg_base_corr:.3f}, V_final corr={avg_final_corr:.3f}")
+
+            # Interpretation
+            if avg_base_acc < 0.3:
+                print(f"[V2-WARNING] Generator (V_base) is producing poor spatial structure!")
+                print(f"[V2-WARNING] This suggests the generator itself is not well-trained.")
+            elif avg_final_acc < avg_base_acc - 0.1:
+                print(f"[V2-WARNING] Diffusion is DEGRADING quality (final < base)!")
+                print(f"[V2-WARNING] This suggests the score_net or diffusion process has issues.")
+            elif avg_final_acc < 0.3:
+                print(f"[V2-WARNING] Final V has low kNN accuracy despite reasonable generator.")
+                print(f"[V2-WARNING] Check diffusion parameters: sigma_data_resid, sigma_start, n_steps.")
+            else:
+                print(f"[V2-OK] Per-patch V quality looks reasonable (kNN > 0.3).")
+                if avg_final_acc > avg_base_acc + 0.05:
+                    print(f"[V2-OK] Diffusion is IMPROVING quality over generator baseline!")
+
+        # Also check scale: are V distances in similar scale to GT distances?
+        print(f"\n[V2-PATCH-DIAG] Scale check (V-space distance vs GT-space distance):")
+        for k in range(min(K, 3)):
+            S_k = patch_indices[k]
+            V_final_k = patch_V[k]
+            gt_k = gt_coords[S_k]
+            D_final = torch.cdist(V_final_k.unsqueeze(0), V_final_k.unsqueeze(0)).squeeze(0)
+            D_gt = torch.cdist(gt_k.unsqueeze(0).to(device), gt_k.unsqueeze(0).to(device)).squeeze(0)
+            scale_ratio = D_final.mean().item() / (D_gt.mean().item() + 1e-8)
+            print(f"[V2-PATCH-DIAG]   Patch {k}: V_final mean_dist={D_final.mean().item():.4f}, GT mean_dist={D_gt.mean().item():.4f}, ratio={scale_ratio:.2f}")
+
+    # =========================================================================
+    # STEP 4: Extract distance measurements from patches
+    # =========================================================================
+    if DEBUG_FLAG:
+        print(f"\n[V2-STEP4] Extracting distance measurements...")
+
+    patch_measurements = []
+    for k in range(K):
+        meas = extract_patch_distances_v2(
+            V_patch=patch_V[k],
+            mask_patch=torch.ones(patch_V[k].shape[0], dtype=torch.bool, device=device),
+            k_edge=k_edge,
+            device=device,
+        )
+        patch_measurements.append(meas)
+        rank2_energies.append(meas['diagnostics'].get('rank2_energy', 0))
+
+    if DEBUG_FLAG:
+        print(f"[V2-STEP4] Rank-2 energy: min={min(rank2_energies):.3f}, median={np.median(rank2_energies):.3f}, max={max(rank2_energies):.3f}")
+        # Check FM4: not planar
+        if np.median(rank2_energies) < 0.8:
+            print(f"[V2-WARNING] FM4: Low rank-2 energy suggests geometry is not planar")
+
+    # =========================================================================
+    # STEP 5: Compute overlap consistency (FM2/FM3 detection)
+    # =========================================================================
+    overlap_result = compute_overlap_consistency_v2(
+        patch_V=patch_V,
+        patch_indices=patch_indices,
+        patch_overlaps=patch_overlaps,
+        device=device,
+        DEBUG_FLAG=DEBUG_FLAG,
+    )
+
+    # Check FM2/FM3
+    if overlap_result['diagnostics']['disagreement_median'] > 0.5:
+        print(f"[V2-WARNING] FM2/FM3: High overlap disagreement suggests teleport patches or context variance")
+
+    # =========================================================================
+    # STEP 6: Aggregate distance measurements (with FM3 mitigation)
+    # =========================================================================
+    # Get patch consistency scores from overlap analysis
+    patch_consistency = overlap_result.get('patch_consistency', None)
+
+    agg_result = aggregate_distance_measurements_v2(
+        patch_measurements=patch_measurements,
+        patch_indices=patch_indices,
+        N=N,
+        M_min=M_min,
+        tau_spread=tau_spread,
+        spread_alpha=spread_alpha,
+        patch_consistency=patch_consistency,  # FM3 mitigation
+        device=device,
+        DEBUG_FLAG=DEBUG_FLAG,
+    )
+
+    global_edges = agg_result['edges']
+    global_distances = agg_result['distances']
+    global_weights = agg_result['weights']
+
+    # =========================================================================
+    # FM6 CHECK: Connectivity analysis of distance graph
+    # =========================================================================
+    if DEBUG_FLAG:
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        # Build adjacency for connectivity check
+        if len(global_edges) > 0:
+            row = [e[0] for e in global_edges] + [e[1] for e in global_edges]
+            col = [e[1] for e in global_edges] + [e[0] for e in global_edges]
+            data = [1] * len(row)
+            adj = csr_matrix((data, (row, col)), shape=(N, N))
+
+            n_components, labels = connected_components(adj, directed=False)
+            component_sizes = np.bincount(labels)
+
+            # Count isolated nodes (nodes with no edges)
+            node_degrees = np.array(adj.sum(axis=1)).flatten()
+            isolated_nodes = (node_degrees == 0).sum()
+
+            print(f"\n[FM6-CHECK] Distance graph connectivity:")
+            print(f"[FM6-CHECK]   Total edges: {len(global_edges)}")
+            print(f"[FM6-CHECK]   Connected components: {n_components}")
+            print(f"[FM6-CHECK]   Largest component: {component_sizes.max()} nodes ({100*component_sizes.max()/N:.1f}%)")
+            print(f"[FM6-CHECK]   Isolated nodes (degree=0): {isolated_nodes}")
+
+            if n_components > 1:
+                print(f"[V2-WARNING] FM6: Graph has {n_components} components! Stitching will fail.")
+                print(f"[V2-WARNING] Component sizes: {sorted(component_sizes, reverse=True)[:10]}")
+
+            if isolated_nodes > 0:
+                print(f"[V2-WARNING] FM6: {isolated_nodes} nodes have no distance constraints!")
+        else:
+            print(f"[V2-WARNING] FM6: No edges in distance graph!")
+
+    if len(global_edges) < N:
+        print(f"[V2-WARNING] FM6: Only {len(global_edges)} global edges for {N} nodes - may have connectivity issues")
+
+    # =========================================================================
+    # STEP 7: Initialize global coordinates via Landmark Isomap
+    # =========================================================================
+    X_init = landmark_isomap_init_v2(
+        edges=global_edges,
+        distances=global_distances,
+        N=N,
+        n_landmarks=n_landmarks,
+        device=device,
+        DEBUG_FLAG=DEBUG_FLAG,
+    )
+
+    # =========================================================================
+    # STEP 8: Optimize global coordinates
+    # =========================================================================
+    solve_result = global_distance_geometry_solve_v2(
+        edges=global_edges,
+        distances=global_distances,
+        weights=global_weights,
+        N=N,
+        X_init=X_init,
+        n_iters=global_iters,
+        lr=global_lr,
+        huber_delta=huber_delta,
+        anchor_lambda=anchor_lambda,
+        log_every=global_iters // 10,
+        device=device,
+        DEBUG_FLAG=DEBUG_FLAG,
+    )
+
+    X_final = solve_result['X_final']  # (N, 2)
+
+    # =========================================================================
+    # STEP 9: Compute final EDM and canonicalize
+    # =========================================================================
+    if DEBUG_FLAG:
+        print(f"\n[V2-STEP9] Computing final EDM...")
+
+    D_edm = torch.cdist(X_final, X_final)  # (N, N)
+
+    # Canonicalize: center, isotropic scale
+    X_canon = X_final - X_final.mean(dim=0)
+    rms = X_canon.pow(2).mean().sqrt()
+    if rms > 1e-8:
+        X_canon = X_canon / rms
+
+    if DEBUG_FLAG:
+        print(f"[V2-STEP9] X_canon RMS: {X_canon.pow(2).mean().sqrt().item():.4f}")
+        print(f"[V2-STEP9] D_edm range: [{D_edm.min().item():.4f}, {D_edm.max().item():.4f}]")
+
+    # =========================================================================
+    # DEBUG: kNN accuracy if GT available
+    # =========================================================================
+    if debug_knn and gt_coords is not None:
+        # Also check kNN using raw aggregated distances (before distance geometry)
+        if DEBUG_FLAG and len(global_edges) > 0:
+            print(f"\n[V2-DIAG] Comparing aggregated distances vs GT (before distance geometry)...")
+
+            # Build sparse distance matrix from aggregated edges
+            D_agg = torch.full((N, N), float('inf'), device=device)
+            for (i, j), d in zip(global_edges, global_distances):
+                D_agg[i, j] = d
+                D_agg[j, i] = d
+            D_agg.fill_diagonal_(float('inf'))
+
+            # GT distances
+            D_gt = torch.cdist(gt_coords.to(device), gt_coords.to(device))
+            D_gt.fill_diagonal_(float('inf'))
+
+            # Check kNN using aggregated distances (only where we have edges)
+            k_test = 10
+            _, knn_agg = D_agg.topk(k_test, largest=False, dim=1)
+            _, knn_gt = D_gt.topk(k_test, largest=False, dim=1)
+
+            # Separate connected vs isolated nodes
+            node_degrees = torch.zeros(N, device=device)
+            for (i, j) in global_edges:
+                node_degrees[i] += 1
+                node_degrees[j] += 1
+
+            connected_mask = node_degrees > 0
+            isolated_mask = node_degrees == 0
+            n_connected = connected_mask.sum().item()
+            n_isolated = isolated_mask.sum().item()
+
+            # kNN accuracy for connected nodes (using aggregated distances)
+            overlaps_connected = []
+            for i in range(N):
+                if connected_mask[i]:
+                    pred_set = set(knn_agg[i].cpu().tolist())
+                    gt_set = set(knn_gt[i].cpu().tolist())
+                    # Filter out 'inf' neighbors
+                    pred_set = {x for x in pred_set if D_agg[i, x] < float('inf')}
+                    if len(pred_set) > 0:
+                        overlap = len(pred_set & gt_set) / max(len(pred_set), 1)
+                        overlaps_connected.append(overlap)
+
+            if overlaps_connected:
+                print(f"[V2-DIAG] Aggregated distances kNN (k={k_test}):")
+                print(f"[V2-DIAG]   Connected nodes ({n_connected}): mean_overlap={np.mean(overlaps_connected):.3f}")
+                print(f"[V2-DIAG]   Isolated nodes ({n_isolated}): NO distance constraints")
+
+            # Now check final 2D coordinates kNN for connected vs isolated
+            D_2d = torch.cdist(X_canon, X_canon)
+            D_2d.fill_diagonal_(float('inf'))
+            _, knn_2d = D_2d.topk(k_test, largest=False, dim=1)
+
+            overlaps_2d_connected = []
+            overlaps_2d_isolated = []
+            for i in range(N):
+                pred_set = set(knn_2d[i].cpu().tolist())
+                gt_set = set(knn_gt[i].cpu().tolist())
+                overlap = len(pred_set & gt_set) / k_test
+                if connected_mask[i]:
+                    overlaps_2d_connected.append(overlap)
+                else:
+                    overlaps_2d_isolated.append(overlap)
+
+            print(f"[V2-DIAG] Final 2D coordinates kNN (k={k_test}):")
+            if overlaps_2d_connected:
+                print(f"[V2-DIAG]   Connected nodes ({n_connected}): mean_overlap={np.mean(overlaps_2d_connected):.3f}")
+            if overlaps_2d_isolated:
+                print(f"[V2-DIAG]   Isolated nodes ({n_isolated}): mean_overlap={np.mean(overlaps_2d_isolated):.3f}")
+            print(f"[V2-DIAG]   Overall: mean_overlap={(np.mean(overlaps_2d_connected + overlaps_2d_isolated)):.3f}")
+
+        _compute_knn_accuracy_v2(X_canon, gt_coords, debug_k_list, DEBUG_FLAG)
+
+    # =========================================================================
+    # STEP 10: Build result dictionary
+    # =========================================================================
+    result = {
+        'D_edm': D_edm,
+        'coords_canon': X_canon if return_coords else None,
+    }
+
+    # Add diagnostics
+    result['v2_diagnostics'] = {
+        'locality_graph': locality_graph['diagnostics'],
+        'patch_sampling': patch_result['diagnostics'],
+        'overlap_consistency': overlap_result['diagnostics'],
+        'aggregation': agg_result['diagnostics'],
+        'global_solve': solve_result['diagnostics'],
+        'residual_ratio_median': float(np.median(residual_ratios)),
+        'rank2_energy_median': float(np.median(rank2_energies)),
+    }
+
+    if DEBUG_FLAG:
+        print("\n" + "="*70)
+        print("[V2-PIPELINE] Complete!")
+        print("="*70)
+
+    return result
+
+
+def _compute_knn_accuracy_v2(X_pred, X_gt, k_list, DEBUG_FLAG):
+    """Compute kNN overlap accuracy for V2 pipeline."""
+    if DEBUG_FLAG:
+        print(f"\n[V2-KNN] Computing kNN accuracy...")
+
+    for k in k_list:
+        # Pred kNN
+        D_pred = torch.cdist(X_pred, X_pred)
+        D_pred.fill_diagonal_(float('inf'))
+        _, knn_pred = D_pred.topk(k, largest=False, dim=1)
+
+        # GT kNN
+        D_gt = torch.cdist(X_gt, X_gt)
+        D_gt.fill_diagonal_(float('inf'))
+        _, knn_gt = D_gt.topk(k, largest=False, dim=1)
+
+        # Compute overlap
+        overlaps = []
+        for i in range(X_pred.shape[0]):
+            pred_set = set(knn_pred[i].cpu().tolist())
+            gt_set = set(knn_gt[i].cpu().tolist())
+            overlap = len(pred_set & gt_set) / k
+            overlaps.append(overlap)
+
+        mean_overlap = np.mean(overlaps)
+        if DEBUG_FLAG:
+            print(f"[V2-KNN] k={k}: mean_overlap={mean_overlap:.3f}")
+
 
 def sample_sc_edm_patchwise(
     sc_gene_expr: torch.Tensor,
@@ -12723,6 +16198,34 @@ def sample_sc_edm_patchwise(
     debug_gen_vs_noise: bool = False,
     ablate_use_generator_init: bool = False,
     ablate_use_pure_noise_init: bool = False,
+    # =========================================================================
+    # V2 DISTANCE-FIRST STITCHING PIPELINE (new math-consistent pipeline)
+    # =========================================================================
+    use_v2_pipeline: bool = False,
+    use_residual_diffusion: bool = False,
+    sigma_data_resid: Optional[float] = None,  # From checkpoint curriculum_state
+    # V2 locality graph params
+    v2_k_Z: int = 40,
+    v2_k_sigma: int = 10,
+    v2_tau_jaccard: float = 0.10,
+    v2_min_shared: int = 5,
+    # V2 patch sampling params
+    v2_overlap_frac: float = 0.5,
+    v2_min_overlap: int = 30,
+    # V2 residual diffusion params
+    v2_n_diffusion_steps: int = 200,
+    v2_generator_only: bool = False,
+    # V2 distance aggregation params
+    v2_M_min: int = 2,
+    v2_tau_spread: float = 0.30,
+    v2_spread_alpha: float = 10.0,
+    # V2 global solve params
+    v2_n_landmarks: int = 256,
+    v2_global_iters: int = 1000,
+    v2_global_lr: float = 0.01,
+    v2_huber_delta: float = 0.1,
+    v2_anchor_lambda: float = 0.1,
+    use_z_ln: bool = False
 
 ) -> Dict[str, torch.Tensor]:
 
@@ -12751,6 +16254,55 @@ def sample_sc_edm_patchwise(
 
 
     import random
+
+    # =========================================================================
+    # V2 DISTANCE-FIRST PIPELINE DISPATCH
+    # =========================================================================
+    if use_v2_pipeline:
+        return _sample_sc_edm_patchwise_v2(
+            sc_gene_expr=sc_gene_expr,
+            encoder=encoder,
+            context_encoder=context_encoder,
+            score_net=score_net,
+            generator=generator,
+            sigma_data=sigma_data,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            guidance_scale=guidance_scale,
+            device=device,
+            patch_size=patch_size,
+            coverage_per_cell=coverage_per_cell,
+            return_coords=return_coords,
+            DEBUG_FLAG=DEBUG_FLAG,
+            gt_coords=gt_coords,
+            debug_knn=debug_knn,
+            debug_k_list=debug_k_list,
+            # V2-specific params
+            use_residual_diffusion=use_residual_diffusion,
+            sigma_data_resid=sigma_data_resid,
+            k_Z=v2_k_Z,
+            k_sigma=v2_k_sigma,
+            tau_jaccard=v2_tau_jaccard,
+            min_shared=v2_min_shared,
+            overlap_frac=v2_overlap_frac,
+            min_overlap=v2_min_overlap,
+            n_diffusion_steps=v2_n_diffusion_steps,
+            generator_only=v2_generator_only,
+            M_min=v2_M_min,
+            tau_spread=v2_tau_spread,
+            spread_alpha=v2_spread_alpha,
+            n_landmarks=v2_n_landmarks,
+            global_iters=v2_global_iters,
+            global_lr=v2_global_lr,
+            huber_delta=v2_huber_delta,
+            anchor_lambda=v2_anchor_lambda,
+            k_edge=dgso_k_edge,
+            use_z_ln=use_z_ln
+        )
+
+    # ===================================================================
+    # LEGACY PIPELINE (original code below)
+    # ===================================================================
 
     # ===================================================================
     # DEBUG KNN HELPERS (only used if debug_knn=True and gt_coords provided)

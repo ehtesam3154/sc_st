@@ -1036,7 +1036,7 @@ def log_adversary_diagnostics(
             for j in range(n_classes):
                 stats[f'{prefix}cm_{i}_{j}'] = cm[i, j].item()
         
-        if verbose and epoch % 50 == 0:
+        if verbose and epoch % 100 == 0:
             print(f"  [{prefix}] Acc={acc:.3f}, Ent={ent_mean:.3f}/{max_entropy:.3f} "
                   f"(ratio={ent_ratio:.3f})")
             print(f"  [{prefix}] Per-class acc: {per_class_acc}")
@@ -1044,76 +1044,6 @@ def log_adversary_diagnostics(
         
         return stats
 
-
-
-# ==============================================================================
-# LOCAL ALIGNMENT LOSS (Run 4 - GPT 5.2 Pro)
-# ==============================================================================
-
-# def compute_local_alignment_loss(
-#     z_sc: torch.Tensor,
-#     z_st: torch.Tensor, 
-#     x_sc: torch.Tensor,
-#     x_st: torch.Tensor,
-#     tau_x: float = 0.1,
-#     tau_z: float = 0.1,
-#     bidirectional: bool = True
-# ) -> torch.Tensor:
-#     """
-#     Local alignment loss: Match neighborhood distributions between expression and embedding space.
-    
-#     For each SC cell, compute soft neighbors in ST based on:
-#       - Teacher: expression similarity (ground truth)
-#       - Student: embedding similarity (learned)
-#     Then minimize KL(teacher || student).
-    
-#     Args:
-#         z_sc: (n_sc, D) SC embeddings from encoder
-#         z_st: (n_st, D) ST embeddings from encoder
-#         x_sc: (n_sc, G) SC expression (raw, not encoded)
-#         x_st: (n_st, G) ST expression (raw, not encoded)
-#         tau_x: temperature for expression similarities (teacher)
-#         tau_z: temperature for embedding similarities (student)
-#         bidirectional: if True, also compute ST->SC alignment
-        
-#     Returns:
-#         loss: scalar local alignment loss
-#     """
-#     # Normalize for cosine similarity
-#     x_sc_norm = F.normalize(x_sc, dim=1)  # (n_sc, G)
-#     x_st_norm = F.normalize(x_st, dim=1)  # (n_st, G)
-#     z_sc_norm = F.normalize(z_sc, dim=1)  # (n_sc, D)
-#     z_st_norm = F.normalize(z_st, dim=1)  # (n_st, D)
-    
-#     # ========== SC -> ST direction ==========
-#     # Teacher: expression-based soft neighbors (SC queries ST)
-#     sim_x_sc2st = (x_sc_norm @ x_st_norm.T) / tau_x  # (n_sc, n_st)
-#     q_sc2st = F.softmax(sim_x_sc2st, dim=1)  # Teacher distribution
-    
-#     # Student: embedding-based soft neighbors
-#     sim_z_sc2st = (z_sc_norm @ z_st_norm.T) / tau_z  # (n_sc, n_st)
-#     log_p_sc2st = F.log_softmax(sim_z_sc2st, dim=1)  # Student log-distribution
-    
-#     # KL divergence: KL(q || p) = sum_j q_j * (log q_j - log p_j)
-#     # Using F.kl_div which expects log_p and q
-#     loss_sc2st = F.kl_div(log_p_sc2st, q_sc2st, reduction='batchmean')
-    
-#     if not bidirectional:
-#         return loss_sc2st
-    
-#     # ========== ST -> SC direction ==========
-#     # Teacher: expression-based soft neighbors (ST queries SC)
-#     sim_x_st2sc = (x_st_norm @ x_sc_norm.T) / tau_x  # (n_st, n_sc)
-#     q_st2sc = F.softmax(sim_x_st2sc, dim=1)
-    
-#     # Student: embedding-based soft neighbors
-#     sim_z_st2sc = (z_st_norm @ z_sc_norm.T) / tau_z  # (n_st, n_sc)
-#     log_p_st2sc = F.log_softmax(sim_z_st2sc, dim=1)
-    
-#     loss_st2sc = F.kl_div(log_p_st2sc, q_st2sc, reduction='batchmean')
-    
-#     # Average both directions
-#     return 0.5 * (loss_sc2st + loss_st2sc)
 
 def compute_local_alignment_loss(
     z_sc: torch.Tensor,
@@ -1216,3 +1146,188 @@ def mmd_rbf_loss(
     mmd = mmd / len(sigmas)
     return (mmd, base_sigma) if return_sigma else mmd
 
+
+# ==============================================================================
+# SPATIAL InfoNCE LOSS (coordinate-supervised neighborhood)
+# ==============================================================================
+
+@torch.no_grad()
+def precompute_spatial_nce_structures(
+    st_coords: torch.Tensor,
+    st_gene_expr: torch.Tensor,
+    slide_ids: torch.Tensor,
+    k_phys: int = 20,
+    far_mult: float = 4.0,
+    n_hard: int = 20,
+    device: str = 'cuda',
+) -> dict:
+    """
+    Precompute physical neighbors, far sets, and hard negatives per ST spot.
+
+    Returns dict with:
+        pos_idx:  (n_st, k_phys) physical neighbor indices
+        far_mask: (n_st, n_st)   bool mask for physically far spots (per-slide)
+        hard_neg: (n_st, n_hard) expression-similar but physically far indices
+        r_pos:    per-slide median k-th neighbor distance (for logging)
+    """
+    n_st = st_coords.shape[0]
+    unique_slides = torch.unique(slide_ids)
+
+    # Per-slide physical kNN
+    pos_idx = torch.full((n_st, k_phys), -1, dtype=torch.long, device=device)
+    far_mask = torch.zeros(n_st, n_st, dtype=torch.bool, device=device)
+    hard_neg = torch.full((n_st, n_hard), -1, dtype=torch.long, device=device)
+    r_pos_list = []
+
+    X_norm = F.normalize(st_gene_expr, dim=1)
+
+    for sid in unique_slides:
+        mask = (slide_ids == sid)
+        idx_global = torch.where(mask)[0]
+        coords_s = st_coords[idx_global]
+        n_s = coords_s.shape[0]
+
+        D_phys = torch.cdist(coords_s, coords_s)
+
+        # Physical kNN (exclude self)
+        k_eff = min(k_phys, n_s - 1)
+        _, topk = D_phys.topk(k_eff + 1, dim=1, largest=False)
+        topk = topk[:, 1:]  # drop self
+        # pos_idx[idx_global[:, None].expand(-1, k_eff), :k_eff] = idx_global[topk]
+        pos_idx[idx_global, :k_eff] = idx_global[topk]
+
+        # r_pos = median distance to k-th physical neighbor
+        kth_dists = D_phys.gather(1, topk)
+        r_pos = kth_dists[:, -1].median().item()
+        r_pos_list.append(r_pos)
+        r_far = far_mult * r_pos
+
+        # Far mask (within same slide only)
+        far_slide = D_phys >= r_far
+        far_slide.fill_diagonal_(False)
+        for i_local in range(n_s):
+            i_g = idx_global[i_local]
+            far_globals = idx_global[far_slide[i_local]]
+            far_mask[i_g, far_globals] = True
+
+        # Hard negatives: expression-similar but physically far
+        X_s = X_norm[idx_global]
+        sim_expr = X_s @ X_s.T  # (n_s, n_s)
+
+        for i_local in range(n_s):
+            i_g = idx_global[i_local]
+            far_local = far_slide[i_local]
+            if far_local.sum() == 0:
+                continue
+            # Among far spots, pick top-m by expression similarity
+            sim_far = sim_expr[i_local].clone()
+            sim_far[~far_local] = -float('inf')
+            m_eff = min(n_hard, far_local.sum().item())
+            _, hard_local = sim_far.topk(m_eff)
+            hard_neg[i_g, :m_eff] = idx_global[hard_local]
+
+    print(f"[SpatialNCE] Precomputed: k_phys={k_phys}, r_far={far_mult}x, "
+          f"n_hard={n_hard}, r_pos per slide={[f'{r:.2f}' for r in r_pos_list]}")
+
+    return {
+        'pos_idx': pos_idx,
+        'far_mask': far_mask,
+        'hard_neg': hard_neg,
+        'r_pos': r_pos_list,
+    }
+
+
+def compute_spatial_infonce_loss(
+    z: torch.Tensor,
+    batch_idx: torch.Tensor,
+    pos_idx: torch.Tensor,
+    far_mask: torch.Tensor,
+    hard_neg: torch.Tensor,
+    tau: float = 0.1,
+    n_rand_neg: int = 128,
+    is_st_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Spatial InfoNCE: positives = physical neighbors, negatives = far + hard.
+
+    Args:
+        z:          (B, D) embeddings for entire batch
+        batch_idx:  (B,) global indices into ST arrays
+        pos_idx:    (n_st, k) precomputed physical neighbor global indices
+        far_mask:   (n_st, n_st) bool far mask
+        hard_neg:   (n_st, n_hard) hard negative global indices
+        tau:        temperature
+        n_rand_neg: number of random far negatives per anchor
+        is_st_mask: (B,) bool mask for ST samples in batch (only ST has coords)
+
+    Returns:
+        scalar loss
+    """
+    if is_st_mask is not None:
+        st_idx_in_batch = torch.where(is_st_mask)[0]
+    else:
+        st_idx_in_batch = torch.arange(z.shape[0], device=z.device)
+
+    if st_idx_in_batch.numel() < 4:
+        return torch.tensor(0.0, device=z.device)
+
+    z_norm = F.normalize(z, dim=1)
+    losses = []
+
+    for local_i in st_idx_in_batch:
+        g_i = batch_idx[local_i].item()
+        z_anchor = z_norm[local_i]  # (D,)
+
+        # Positives: physical neighbors that are also in this batch
+        pos_globals = pos_idx[g_i]
+        pos_globals = pos_globals[pos_globals >= 0]
+        if pos_globals.numel() == 0:
+            continue
+
+        # Map global → batch-local
+        global_to_local = torch.full(
+            (max(batch_idx.max().item() + 1, pos_globals.max().item() + 1),),
+            -1, dtype=torch.long, device=z.device
+        )
+        global_to_local[batch_idx] = torch.arange(z.shape[0], device=z.device)
+
+        pos_local = global_to_local[pos_globals]
+        pos_local = pos_local[pos_local >= 0]
+        if pos_local.numel() == 0:
+            continue
+
+        # Hard negatives in batch
+        hard_globals = hard_neg[g_i]
+        hard_globals = hard_globals[hard_globals >= 0]
+        hard_local = global_to_local[hard_globals.clamp(max=global_to_local.shape[0] - 1)]
+        hard_local = hard_local[hard_local >= 0]
+
+        # Random far negatives in batch
+        far_in_batch = far_mask[g_i][batch_idx]
+        far_in_batch[local_i] = False
+        far_candidates = torch.where(far_in_batch)[0]
+        if far_candidates.numel() > n_rand_neg:
+            perm = torch.randperm(far_candidates.numel(), device=z.device)[:n_rand_neg]
+            rand_neg = far_candidates[perm]
+        else:
+            rand_neg = far_candidates
+
+        # Combine negatives (deduplicate)
+        all_neg = torch.cat([hard_local, rand_neg]).unique()
+        if all_neg.numel() == 0:
+            continue
+
+        # InfoNCE
+        sim_pos = (z_anchor @ z_norm[pos_local].T) / tau  # (n_pos,)
+        sim_neg = (z_anchor @ z_norm[all_neg].T) / tau    # (n_neg,)
+
+        # log-sum-exp denominator
+        logits = torch.cat([sim_pos, sim_neg])  # (n_pos + n_neg,)
+        log_denom = torch.logsumexp(logits, dim=0)
+        loss_i = -(sim_pos.mean() - log_denom)
+        losses.append(loss_i)
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=z.device)
+
+    return torch.stack(losses).mean()

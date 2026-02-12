@@ -193,7 +193,14 @@ def train_encoder(
     # ========== Best checkpoint ==========
     use_best_checkpoint: bool = True,  # Return best model (by alignment) instead of final
     centroid_weight: float = 0.0,
-    knn_weight: float = 10.0
+    knn_weight: float = 10.0,
+    # ========== Spatial InfoNCE (coordinate-supervised neighborhoods) ==========
+    spatial_nce_weight: float = 0.0,
+    spatial_nce_k_phys: int = 20,
+    spatial_nce_far_mult: float = 4.0,
+    spatial_nce_n_hard: int = 20,
+    spatial_nce_tau: float = 0.1,
+    spatial_nce_n_rand_neg: int = 128,
 ):
 
     """
@@ -528,7 +535,7 @@ def train_encoder(
             'loss_source_coral': [],  # Pairwise source CORAL for all-source alignment
             'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
-            'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': []
+            'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': [], 'loss_spatial_nce': []
         }
 
 
@@ -654,6 +661,20 @@ def train_encoder(
             
         print(f"[KNN] Precomputed neighbors for {n_total} cells")
 
+    # ========== PRECOMPUTE SPATIAL NCE STRUCTURES ==========
+    spatial_nce_data = None
+    if spatial_nce_weight > 0 and stageA_obj == 'vicreg_adv':
+        from ssl_utils import precompute_spatial_nce_structures
+        spatial_nce_data = precompute_spatial_nce_structures(
+            st_coords=st_coords_norm,
+            st_gene_expr=st_gene_expr,
+            slide_ids=slide_ids,
+            k_phys=spatial_nce_k_phys,
+            far_mult=spatial_nce_far_mult,
+            n_hard=spatial_nce_n_hard,
+            device=device,
+        )
+        print(f"[SpatialNCE] weight={spatial_nce_weight}, tau={spatial_nce_tau}")
 
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
@@ -737,7 +758,24 @@ def train_encoder(
                 loss_knn = knn_consistency_loss_global(idx, z_clean, global_X_knn, Z_cache, k=15)
             else:
                 loss_knn = torch.tensor(0.0, device=device)
-            
+
+            # ========== SPATIAL InfoNCE LOSS (ST only) ==========
+            loss_spatial_nce = torch.tensor(0.0, device=device)
+            if spatial_nce_weight > 0 and spatial_nce_data is not None:
+                from ssl_utils import compute_spatial_infonce_loss
+                is_st = (s_batch == ST_LABEL)
+                if is_st.sum() >= 4:
+                    loss_spatial_nce = compute_spatial_infonce_loss(
+                        z=z_clean,
+                        batch_idx=idx,
+                        pos_idx=spatial_nce_data['pos_idx'],
+                        far_mask=spatial_nce_data['far_mask'],
+                        hard_neg=spatial_nce_data['hard_neg'],
+                        tau=spatial_nce_tau,
+                        n_rand_neg=spatial_nce_n_rand_neg,
+                        is_st_mask=is_st,
+                    )   
+
             if adv_use_layernorm:
                 z_cond = F.layer_norm(z_clean, (z_clean.shape[1],))
             else:
@@ -951,7 +989,8 @@ def train_encoder(
             mmd_w = (coral_w * mmd_weight) if mmd_ramp else mmd_weight
             loss_total = (loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral +
                          local_w * loss_local + patient_coral_w * loss_patient_coral +
-                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + centroid_weight * loss_centroid + knn_weight * loss_knn)
+                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + centroid_weight * loss_centroid + knn_weight * loss_knn +
+                         spatial_nce_weight * loss_spatial_nce)
 
             # Optionally log encoder gradient norms before step
             # Backprop for encoder (MISSING BEFORE!)
@@ -1074,10 +1113,11 @@ def train_encoder(
             history_vicreg['disc_acc'].append(disc_acc_det)
             history_vicreg['disc_acc_clean'].append(disc_acc_clean)  # NEW: track clean accuracy
             history_vicreg['grl_alpha'].append(alpha)
+            history_vicreg['loss_spatial_nce'].append(loss_spatial_nce.item())
 
             # ========== BEST CHECKPOINT SAVING ==========
             # Only check after warmup, and evaluate every 50 epochs on FULL dataset for stability
-            if epoch >= adv_warmup_epochs + adv_ramp_epochs and epoch % 50 == 0:
+            if epoch >= adv_warmup_epochs + adv_ramp_epochs and epoch % 100 == 0:
                 # Evaluate on full dataset (or subsample) for stable alignment metric
                 with torch.no_grad():
                     # Use up to 2000 samples per domain for speed
