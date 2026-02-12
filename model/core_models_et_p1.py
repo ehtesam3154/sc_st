@@ -543,9 +543,10 @@ def train_encoder(
 
 
         # ========== BEST CHECKPOINT TRACKING ==========
-        # Track best alignment based on combined CORAL losses
-        # Lower = better alignment between domains and patients
-        best_alignment_score = float('inf')
+        # Track best overlap@20 (higher = better spatial locality)
+        # Falls back to alignment score if spatial NCE is disabled
+        best_overlap_at_k = -1.0  # higher = better
+        best_alignment_score = float('inf')  # kept as secondary metric for logging
         best_epoch = 0
         best_encoder_state = None
         best_projector_state = None
@@ -1231,25 +1232,35 @@ def train_encoder(
                     avg_spread = (z_st_eval.std(dim=0).mean() + z_sc_eval.std(dim=0).mean()).item() / 2
                     overlap_ratio = centroid_dist / max(avg_spread, 1e-6)
                     
-                    # Combined score (lower = better)
-                    # Only consider if representation isn't collapsed (std_min > 0.1)
+                    # Combined alignment score (lower = better) — kept for logging
                     if std_min > 0.1:
                         alignment_score = disc_confusion + 0.1 * overlap_ratio
                     else:
                         alignment_score = 999.0  # Reject collapsed representations
 
-                if alignment_score < best_alignment_score:
-                    best_alignment_score = alignment_score
+                # ---- Model selection: overlap@20 (higher = better) ----
+                # Use the overlap computed after Step M as the selection criterion
+                current_overlap = _loc_after_M['overlap_mean']
+
+                # Only accept if representation isn't collapsed
+                if std_min <= 0.1:
+                    current_overlap = -1.0  # Reject collapsed representations
+
+                if current_overlap > best_overlap_at_k:
+                    best_overlap_at_k = current_overlap
+                    best_alignment_score = alignment_score  # track for logging
                     best_epoch = epoch
                     best_encoder_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                     if projector is not None:
                         best_projector_state = {k: v.cpu().clone() for k, v in projector.state_dict().items()}
                     best_discriminator_state = {k: v.cpu().clone() for k, v in discriminator.state_dict().items()}
-                    print(f"  [BEST] New best at epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
-                          f"score={alignment_score:.4f}, std_min={std_min:.3f}, ratio={overlap_ratio:.2f}")
+                    print(f"  [BEST] New best at epoch {epoch}: overlap@20={current_overlap:.4f}, "
+                          f"acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
+                          f"align={alignment_score:.4f}, std_min={std_min:.3f}")
                 elif epoch % 100 == 0:
-                    print(f"  [EVAL] Epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
-                          f"score={alignment_score:.4f}, std_min={std_min:.3f}, ratio={overlap_ratio:.2f} (best={best_alignment_score:.4f})")
+                    print(f"  [EVAL] Epoch {epoch}: overlap@20={current_overlap:.4f} (best={best_overlap_at_k:.4f} @e{best_epoch}), "
+                          f"acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
+                          f"align={alignment_score:.4f}, std_min={std_min:.3f}")
 
             continue  # Skip geometry code, go to next epoch
 
@@ -1722,7 +1733,7 @@ def train_encoder(
         # ========== RESTORE BEST CHECKPOINT IF AVAILABLE ==========
         if use_best_checkpoint and best_encoder_state is not None:
             print(f"\n[BEST CHECKPOINT] Restoring best model from epoch {best_epoch}")
-            print(f"  Best alignment score: {best_alignment_score:.6f}")
+            print(f"  Best overlap@20: {best_overlap_at_k:.4f}, alignment score: {best_alignment_score:.6f}")
             model.load_state_dict(best_encoder_state)
             if projector is not None and best_projector_state is not None:
                 projector.load_state_dict(best_projector_state)
@@ -1743,7 +1754,7 @@ def train_encoder(
         print("="*70)
         if use_best_checkpoint and best_encoder_state is not None:
             print(f"Using BEST checkpoint from epoch {best_epoch}")
-            print(f"Best alignment score: {best_alignment_score:.6f}")
+            print(f"Best overlap@20: {best_overlap_at_k:.4f}, alignment score: {best_alignment_score:.6f}")
         else:
             print(f"Using FINAL model from epoch {n_epochs-1}")
         print(f"Final Loss: {history_vicreg['loss_total'][-1]:.4f}")
