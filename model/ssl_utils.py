@@ -2303,3 +2303,140 @@ def compute_knn_locality_metrics(
         'overlap_mean': float(np.mean(all_overlaps)) if all_overlaps else 0.0,
         'emb_phys_dist_median': float(np.median(all_phys_dists)) if all_phys_dists else 0.0,
     }
+
+
+@torch.no_grad()
+def identifiability_probe(
+    st_gene_expr: torch.Tensor,
+    st_coords: torch.Tensor,
+    slide_ids: torch.Tensor,
+    pos_idx: torch.Tensor,
+    far_mask: torch.Tensor,
+    model: Optional['nn.Module'] = None,
+    n_anchors: int = 500,
+    n_neg_per_anchor: int = 20,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """
+    Supervised identifiability probe: can a linear classifier distinguish
+    physical neighbors from far spots, given expression or embedding features?
+
+    For each anchor, constructs:
+      - positive pairs: (anchor, physical_kNN_neighbor)
+      - negative pairs: (anchor, random_far_spot)
+    Feature per pair: |x_a - x_b| (absolute difference)
+    Classifier: logistic regression (sklearn)
+
+    Tests on both:
+      1. Raw expression (X)  — data ceiling
+      2. Trained embedding (Z) — what the model captures
+
+    Args:
+        st_gene_expr: (n_st, n_genes)
+        st_coords:    (n_st, 2)
+        slide_ids:    (n_st,)
+        pos_idx:      (n_st, k_phys) physical neighbor indices
+        far_mask:     (n_st, n_st) bool
+        model:        trained encoder (optional, for embedding probe)
+        n_anchors:    number of anchors to sample
+        n_neg_per_anchor: negative pairs per anchor
+        seed:         random seed
+
+    Returns:
+        dict with 'auc_expression', 'auc_embedding' (if model provided),
+        'acc_expression', 'acc_embedding'
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import roc_auc_score, accuracy_score
+
+    device = st_gene_expr.device
+    n_st = st_gene_expr.shape[0]
+    rng = np.random.RandomState(seed)
+
+    # Sample anchors across all slides
+    anchor_idx = rng.choice(n_st, min(n_anchors, n_st), replace=False)
+
+    # Build pair features and labels
+    X_expr = st_gene_expr.cpu().numpy()
+
+    # Get embeddings if model provided
+    Z = None
+    if model is not None:
+        was_training = model.training
+        model.eval()
+        z_parts = []
+        for i in range(0, n_st, 512):
+            z_parts.append(model(st_gene_expr[i:i+512]).cpu())
+        Z = torch.cat(z_parts, dim=0).numpy()
+        if was_training:
+            model.train()
+
+    feat_expr_list = []
+    feat_emb_list = []
+    labels = []
+
+    for a in anchor_idx:
+        # Positive pairs from physical kNN
+        p = pos_idx[a]
+        p = p[p >= 0].cpu().numpy()
+        if len(p) == 0:
+            continue
+
+        for j in p:
+            feat_expr_list.append(np.abs(X_expr[a] - X_expr[j]))
+            if Z is not None:
+                feat_emb_list.append(np.abs(Z[a] - Z[j]))
+            labels.append(1)
+
+        # Negative pairs from far spots
+        far_of_a = torch.where(far_mask[a])[0].cpu().numpy()
+        if len(far_of_a) == 0:
+            continue
+        neg_pick = rng.choice(far_of_a, min(n_neg_per_anchor, len(far_of_a)), replace=False)
+        for j in neg_pick:
+            feat_expr_list.append(np.abs(X_expr[a] - X_expr[j]))
+            if Z is not None:
+                feat_emb_list.append(np.abs(Z[a] - Z[j]))
+            labels.append(0)
+
+    feat_expr = np.array(feat_expr_list)
+    labels = np.array(labels)
+
+    results = {}
+
+    # Logistic regression with 3-fold CV
+    def _cv_auc(X_feat, y, name):
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
+        aucs, accs = [], []
+        for train_i, test_i in skf.split(X_feat, y):
+            clf = LogisticRegression(max_iter=500, solver='lbfgs', C=1.0, class_weight='balanced')
+            clf.fit(X_feat[train_i], y[train_i])
+            prob = clf.predict_proba(X_feat[test_i])[:, 1]
+            pred = clf.predict(X_feat[test_i])
+            aucs.append(roc_auc_score(y[test_i], prob))
+            accs.append(accuracy_score(y[test_i], pred))
+        return np.mean(aucs), np.mean(accs)
+
+    auc_e, acc_e = _cv_auc(feat_expr, labels, 'expression')
+    results['auc_expression'] = auc_e
+    results['acc_expression'] = acc_e
+
+    if Z is not None:
+        feat_emb = np.array(feat_emb_list)
+        auc_z, acc_z = _cv_auc(feat_emb, labels, 'embedding')
+        results['auc_embedding'] = auc_z
+        results['acc_embedding'] = acc_z
+
+    # Also test: L2 distance as single feature (simplest possible probe)
+    l2_expr = np.linalg.norm(feat_expr, axis=1, keepdims=True)
+    auc_l2, acc_l2 = _cv_auc(l2_expr, labels, 'l2_expr')
+    results['auc_expr_l2_only'] = auc_l2
+    results['acc_expr_l2_only'] = acc_l2
+
+    # Class balance info
+    results['n_positive_pairs'] = int(labels.sum())
+    results['n_negative_pairs'] = int((1 - labels).sum())
+    results['n_total_pairs'] = len(labels)
+
+    return results
