@@ -536,7 +536,8 @@ def train_encoder(
             'loss_source_coral': [],  # Pairwise source CORAL for all-source alignment
             'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
-            'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': [], 'loss_spatial_nce': []
+            'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': [], 'loss_spatial_nce': [],
+            'locality_overlap_after_S': [], 'locality_overlap_after_M': [],
         }
 
 
@@ -678,11 +679,16 @@ def train_encoder(
         print(f"[SpatialNCE] weight={spatial_nce_weight}, tau={spatial_nce_tau}")
 
     # Round-robin slide list for Step S (spatial NCE)
+    _nce_phys_knn = None
     if spatial_nce_weight > 0 and spatial_nce_data is not None:
         _nce_unique_slides = torch.unique(slide_ids).cpu().tolist()
         _nce_slide_cursor = 0
         print(f"[SpatialNCE] Separate Step S: round-robin over {len(_nce_unique_slides)} slides, "
               f"n_anchors={spatial_nce_n_anchors}")
+
+        # Precompute physical kNN for locality diagnostic (pos_idx is already (n_st, k_phys))
+        _nce_phys_knn = spatial_nce_data['pos_idx']  # (n_st, k_phys)
+        print(f"[SpatialNCE] Locality diagnostic: will log kNN overlap every 100 epochs")
 
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
@@ -696,6 +702,8 @@ def train_encoder(
 
             # ========== STEP S: Separate Spatial InfoNCE update (ST only) ==========
             loss_spatial_nce = torch.tensor(0.0, device=device)
+            _loc_after_S = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0}
+            _loc_after_M = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0}
             if spatial_nce_weight > 0 and spatial_nce_data is not None:
                 from ssl_utils import compute_spatial_infonce_supportset
                 # Round-robin slide selection
@@ -718,6 +726,15 @@ def train_encoder(
                 opt_enc.zero_grad(set_to_none=True)
                 (spatial_nce_weight * loss_spatial_nce).backward()
                 opt_enc.step()
+
+                # --- Locality diagnostic: after Step S ---
+                if _nce_phys_knn is not None and epoch % 100 == 0:
+                    from ssl_utils import compute_knn_locality_metrics
+                    _loc_after_S = compute_knn_locality_metrics(
+                        model=model, st_gene_expr=st_gene_expr,
+                        st_coords=st_coords, slide_ids=slide_ids,
+                        phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                    )
 
             # ========== STEP M: Mixed ST+SC representation + alignment ==========
             # ========== Balanced domain sampling ==========
@@ -1029,6 +1046,21 @@ def train_encoder(
             opt_enc.step()
             scheduler.step()
 
+            # --- Locality diagnostic: after Step M ---
+            if _nce_phys_knn is not None and epoch % 100 == 0:
+                from ssl_utils import compute_knn_locality_metrics
+                _loc_after_M = compute_knn_locality_metrics(
+                    model=model, st_gene_expr=st_gene_expr,
+                    st_coords=st_coords, slide_ids=slide_ids,
+                    phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                )
+                print(f"  [LOCALITY e{epoch}] "
+                      f"after StepS: overlap={_loc_after_S['overlap_mean']:.4f}, "
+                      f"emb_phys_dist={_loc_after_S['emb_phys_dist_median']:.1f} | "
+                      f"after StepM: overlap={_loc_after_M['overlap_mean']:.4f}, "
+                      f"emb_phys_dist={_loc_after_M['emb_phys_dist_median']:.1f} | "
+                      f"delta_overlap={_loc_after_M['overlap_mean'] - _loc_after_S['overlap_mean']:+.4f}")
+
             # Update Z_cache periodically
             if knn_weight > 0 and Z_cache is not None and epoch % cache_update_freq == 0:
                 with torch.no_grad():
@@ -1132,6 +1164,8 @@ def train_encoder(
             history_vicreg['disc_acc_clean'].append(disc_acc_clean)  # NEW: track clean accuracy
             history_vicreg['grl_alpha'].append(alpha)
             history_vicreg['loss_spatial_nce'].append(loss_spatial_nce.item())
+            history_vicreg['locality_overlap_after_S'].append(_loc_after_S['overlap_mean'])
+            history_vicreg['locality_overlap_after_M'].append(_loc_after_M['overlap_mean'])
 
             # ========== BEST CHECKPOINT SAVING ==========
             # Only check after warmup, and evaluate every 50 epochs on FULL dataset for stability

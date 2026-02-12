@@ -2175,3 +2175,108 @@ def _total_grad_norm(model: nn.Module) -> float:
         if p.grad is not None:
             total += p.grad.detach().norm(2).item() ** 2
     return total ** 0.5
+
+
+@torch.no_grad()
+def compute_knn_locality_metrics(
+    model: nn.Module,
+    st_gene_expr: torch.Tensor,
+    st_coords: torch.Tensor,
+    slide_ids: torch.Tensor,
+    phys_knn_idx: torch.Tensor,
+    k: int = 20,
+    n_sample: int = 300,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """
+    Lightweight kNN overlap + median physical distance diagnostic.
+
+    Computes per-slide:
+      - overlap@k: |kNN_emb(i) ∩ kNN_phys(i)| / k, averaged
+      - median physical distance of embedding kNN
+
+    Args:
+        model:        encoder (will be set to eval temporarily)
+        st_gene_expr: (n_st, n_genes) on device
+        st_coords:    (n_st, 2) on device
+        slide_ids:    (n_st,) on device
+        phys_knn_idx: (n_st, k) precomputed physical kNN indices
+        k:            number of neighbors
+        n_sample:     spots to sample per slide for speed
+        seed:         random seed
+
+    Returns:
+        dict with 'overlap_mean', 'emb_phys_dist_median' (averaged over slides)
+    """
+    was_training = model.training
+    model.eval()
+
+    device = st_gene_expr.device
+    n_st = st_gene_expr.shape[0]
+
+    # Forward all ST spots in chunks
+    z_all = []
+    chunk = 512
+    for i in range(0, n_st, chunk):
+        z_all.append(model(st_gene_expr[i:i+chunk]))
+    z_all = torch.cat(z_all, dim=0)  # (n_st, d)
+
+    unique_slides = torch.unique(slide_ids)
+    all_overlaps = []
+    all_phys_dists = []
+
+    rng = np.random.RandomState(seed)
+
+    for s in unique_slides:
+        s_mask = (slide_ids == s)
+        s_idx = torch.where(s_mask)[0]
+        n_s = s_idx.shape[0]
+        if n_s <= k:
+            continue
+
+        # Subsample for speed
+        n_pick = min(n_sample, n_s)
+        pick = rng.choice(n_s, n_pick, replace=False)
+        anchors = s_idx[pick]
+
+        # Embedding kNN within this slide
+        z_slide = z_all[s_idx]
+        z_anchors = z_all[anchors]
+
+        # Pairwise distances (anchor vs all in slide)
+        dists_emb = torch.cdist(z_anchors, z_slide)  # (n_pick, n_s)
+        # Set self-distance to inf
+        for i_a, a_global in enumerate(anchors):
+            local_self = (s_idx == a_global).nonzero(as_tuple=True)[0]
+            if local_self.numel() > 0:
+                dists_emb[i_a, local_self[0]] = float('inf')
+
+        _, emb_knn_local = torch.topk(dists_emb, k=k, dim=1, largest=False)
+        emb_knn_global = s_idx[emb_knn_local]  # (n_pick, k)
+
+        # Physical kNN (precomputed)
+        phys_knn = phys_knn_idx[anchors]  # (n_pick, k)
+
+        # Overlap
+        for i_a in range(n_pick):
+            emb_set = set(emb_knn_global[i_a].cpu().tolist())
+            phys_set = set(phys_knn[i_a].cpu().tolist())
+            phys_set.discard(-1)  # remove padding
+            if len(phys_set) == 0:
+                continue
+            overlap = len(emb_set & phys_set) / len(phys_set)
+            all_overlaps.append(overlap)
+
+            # Physical distance of embedding kNN
+            coords_anchor = st_coords[anchors[i_a]]
+            coords_neighbors = st_coords[emb_knn_global[i_a]]
+            pdist = torch.norm(coords_neighbors - coords_anchor, dim=1)
+            all_phys_dists.append(pdist.median().item())
+
+    if was_training:
+        model.train()
+
+    return {
+        'overlap_mean': float(np.mean(all_overlaps)) if all_overlaps else 0.0,
+        'emb_phys_dist_median': float(np.median(all_phys_dists)) if all_phys_dists else 0.0,
+    }
