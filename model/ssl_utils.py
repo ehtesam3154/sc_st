@@ -1702,6 +1702,122 @@ def diagnose_spatial_infonce(
         print(f"    {k}: {v}")
 
     # ================================================================
+    # CHECK C: Index set sanity (physical distances + overlap)
+    # ================================================================
+    print("\n" + "=" * 70)
+    print("CHECK C: Index set sanity — pos/neg distances & overlap")
+    print("=" * 70)
+
+    pos_idx_t = spatial_nce_data['pos_idx']   # (n_st, k_phys)
+    far_mask_t = spatial_nce_data['far_mask']  # (n_st, n_st)
+    hard_neg_t = spatial_nce_data['hard_neg']  # (n_st, n_hard)
+    st_coords_dev = st_coords.to(device)
+
+    n_sample_c = min(500, n_st)
+    rng_c = np.random.RandomState(seed)
+    sample_idx = rng_c.choice(n_st, n_sample_c, replace=False)
+
+    pos_phys_dists_all = []   # physical distance to each positive
+    hard_phys_dists_all = []  # physical distance to each hard neg
+    far_counts = []           # how many far spots each anchor has
+    pos_counts = []           # how many valid positives each anchor has
+    hard_counts = []          # how many valid hard negs each anchor has
+    overlap_counts = []       # |pos_set ∩ hard_set| per anchor
+    overlap_any_neg = []      # |pos_set ∩ all_neg_set| per anchor
+
+    for i in sample_idx:
+        coord_i = st_coords_dev[i]
+
+        # Positives
+        p_globals = pos_idx_t[i]
+        p_globals = p_globals[p_globals >= 0]
+        pos_counts.append(p_globals.numel())
+        if p_globals.numel() > 0:
+            d_pos = torch.norm(st_coords_dev[p_globals] - coord_i, dim=1)
+            pos_phys_dists_all.extend(d_pos.cpu().tolist())
+        pos_set = set(p_globals.cpu().tolist())
+
+        # Hard negatives
+        h_globals = hard_neg_t[i]
+        h_globals = h_globals[h_globals >= 0]
+        hard_counts.append(h_globals.numel())
+        if h_globals.numel() > 0:
+            d_hard = torch.norm(st_coords_dev[h_globals] - coord_i, dim=1)
+            hard_phys_dists_all.extend(d_hard.cpu().tolist())
+        hard_set = set(h_globals.cpu().tolist())
+
+        # Far mask count
+        far_count = far_mask_t[i].sum().item()
+        far_counts.append(far_count)
+
+        # Overlap: positives that are also hard negatives
+        overlap = pos_set & hard_set
+        overlap_counts.append(len(overlap))
+
+        # Overlap: positives that appear in hard_neg OR far_mask
+        far_globals = set(torch.where(far_mask_t[i])[0].cpu().tolist())
+        all_neg_set = hard_set | far_globals
+        overlap_any = pos_set & all_neg_set
+        overlap_any_neg.append(len(overlap_any))
+
+    pos_phys_dists_all = np.array(pos_phys_dists_all)
+    hard_phys_dists_all = np.array(hard_phys_dists_all)
+    r_pos_values = spatial_nce_data['r_pos']
+    r_far_threshold = spatial_nce_far_mult * np.mean(r_pos_values)
+
+    print(f"\n  Sampled {n_sample_c} random anchors:")
+    print(f"  r_pos per slide: {[f'{r:.4f}' for r in r_pos_values]}")
+    print(f"  r_far threshold: {r_far_threshold:.4f} ({spatial_nce_far_mult}x mean r_pos)")
+    print()
+    print(f"  Positives (physical neighbors):")
+    print(f"    Count per anchor: mean={np.mean(pos_counts):.1f}, min={np.min(pos_counts)}, max={np.max(pos_counts)}")
+    if len(pos_phys_dists_all) > 0:
+        print(f"    Physical dist: mean={pos_phys_dists_all.mean():.4f}, "
+              f"median={np.median(pos_phys_dists_all):.4f}, "
+              f"max={pos_phys_dists_all.max():.4f}")
+        pct_pos_below_rfar = (pos_phys_dists_all < r_far_threshold).mean() * 100
+        print(f"    % pos below r_far: {pct_pos_below_rfar:.1f}% (should be ~100%)")
+    print()
+    print(f"  Hard negatives (expr-similar but far):")
+    print(f"    Count per anchor: mean={np.mean(hard_counts):.1f}, min={np.min(hard_counts)}, max={np.max(hard_counts)}")
+    if len(hard_phys_dists_all) > 0:
+        print(f"    Physical dist: mean={hard_phys_dists_all.mean():.4f}, "
+              f"median={np.median(hard_phys_dists_all):.4f}, "
+              f"min={hard_phys_dists_all.min():.4f}")
+        pct_hard_above_rfar = (hard_phys_dists_all >= r_far_threshold).mean() * 100
+        print(f"    % hard_neg above r_far: {pct_hard_above_rfar:.1f}% (should be ~100%)")
+    print()
+    print(f"  Far mask:")
+    print(f"    Far spots per anchor: mean={np.mean(far_counts):.1f}, "
+          f"min={np.min(far_counts)}, max={np.max(far_counts)}")
+    print()
+    print(f"  INDEX OVERLAP (must be zero!):")
+    print(f"    |pos ∩ hard_neg|: mean={np.mean(overlap_counts):.2f}, "
+          f"max={np.max(overlap_counts)}, nonzero={sum(1 for x in overlap_counts if x > 0)}/{n_sample_c}")
+    print(f"    |pos ∩ (hard ∪ far)|: mean={np.mean(overlap_any_neg):.2f}, "
+          f"max={np.max(overlap_any_neg)}, nonzero={sum(1 for x in overlap_any_neg if x > 0)}/{n_sample_c}")
+
+    if np.max(overlap_counts) > 0:
+        print("    ** LEAKAGE DETECTED: some positives are also hard negatives! **")
+        print("    ** InfoNCE is contradictory — same spot is pushed close AND far **")
+    elif np.max(overlap_any_neg) > 0:
+        print("    ** LEAKAGE DETECTED: some positives are in the far set! **")
+        print("    ** The loss may be pulling and pushing the same pairs **")
+    else:
+        print("    ** CLEAN: zero overlap between pos and neg index sets **")
+
+    check_c_results = {
+        'pos_phys_dists': pos_phys_dists_all,
+        'hard_phys_dists': hard_phys_dists_all,
+        'r_far_threshold': r_far_threshold,
+        'pos_counts': np.array(pos_counts),
+        'hard_counts': np.array(hard_counts),
+        'far_counts': np.array(far_counts),
+        'overlap_pos_hard': np.array(overlap_counts),
+        'overlap_pos_any_neg': np.array(overlap_any_neg),
+    }
+
+    # ================================================================
     # CHECK B: Loss scale & logit gap over first N steps
     # ================================================================
     print("\n" + "=" * 70)
@@ -1830,6 +1946,7 @@ def diagnose_spatial_infonce(
         'nce_single_batch_stats': nce_stats,
         'step_logs': step_logs,
         'spatial_nce_data_r_pos': spatial_nce_data['r_pos'],
+        'check_c': check_c_results,
     }
 
 
