@@ -201,6 +201,7 @@ def train_encoder(
     spatial_nce_n_hard: int = 20,
     spatial_nce_tau: float = 0.1,
     spatial_nce_n_rand_neg: int = 128,
+    spatial_nce_n_anchors: int = 64,
 ):
 
     """
@@ -759,22 +760,21 @@ def train_encoder(
             else:
                 loss_knn = torch.tensor(0.0, device=device)
 
-            # ========== SPATIAL InfoNCE LOSS (ST only) ==========
+            # ========== SPATIAL InfoNCE LOSS (support-set, ST only) ==========
             loss_spatial_nce = torch.tensor(0.0, device=device)
             if spatial_nce_weight > 0 and spatial_nce_data is not None:
-                from ssl_utils import compute_spatial_infonce_loss
-                is_st = (s_batch == ST_LABEL)
-                if is_st.sum() >= 4:
-                    loss_spatial_nce = compute_spatial_infonce_loss(
-                        z=z_clean,
-                        batch_idx=idx,
-                        pos_idx=spatial_nce_data['pos_idx'],
-                        far_mask=spatial_nce_data['far_mask'],
-                        hard_neg=spatial_nce_data['hard_neg'],
-                        tau=spatial_nce_tau,
-                        n_rand_neg=spatial_nce_n_rand_neg,
-                        is_st_mask=is_st,
-                    )   
+                from ssl_utils import compute_spatial_infonce_supportset
+                loss_spatial_nce = compute_spatial_infonce_supportset(
+                    model=model,
+                    st_gene_expr=st_gene_expr,
+                    pos_idx=spatial_nce_data['pos_idx'],
+                    far_mask=spatial_nce_data['far_mask'],
+                    hard_neg=spatial_nce_data['hard_neg'],
+                    slide_ids=slide_ids,
+                    tau=spatial_nce_tau,
+                    n_rand_neg=spatial_nce_n_rand_neg,
+                    n_anchors_per_step=spatial_nce_n_anchors,
+                )   
 
             if adv_use_layernorm:
                 z_cond = F.layer_norm(z_clean, (z_clean.shape[1],))

@@ -1342,6 +1342,209 @@ def compute_spatial_infonce_loss(
 
 
 # ==============================================================================
+# SUPPORT-SET Spatial InfoNCE (full pos/hard/rand per anchor)
+# ==============================================================================
+
+def compute_spatial_infonce_supportset(
+    model: 'nn.Module',
+    st_gene_expr: torch.Tensor,
+    pos_idx: torch.Tensor,
+    far_mask: torch.Tensor,
+    hard_neg: torch.Tensor,
+    slide_ids: torch.Tensor,
+    tau: float = 0.1,
+    n_rand_neg: int = 128,
+    n_anchors_per_step: int = 64,
+    return_diagnostics: bool = False,
+):
+    """
+    Support-set Spatial InfoNCE: explicitly forward-pass all positives,
+    hard negatives, and random far negatives for each anchor.
+
+    Unlike the in-batch version, this guarantees every anchor sees its
+    full positive set (~k_phys) and full hard-negative set (~n_hard),
+    regardless of what was randomly sampled into the VICReg batch.
+
+    Per step:
+      1. Pick one random slide, sample n_anchors_per_step anchors from it
+      2. Gather all pos_idx, hard_neg, and random far indices for those anchors
+      3. Forward-pass the union through the encoder
+      4. Compute InfoNCE per anchor using full sets
+
+    Args:
+        model:       encoder (must be in train mode, gradients will flow)
+        st_gene_expr: (n_st, n_genes) full ST expression, already on device
+        pos_idx:     (n_st, k_phys) precomputed physical neighbor indices
+        far_mask:    (n_st, n_st) bool mask for physically far spots
+        hard_neg:    (n_st, n_hard) expression-similar but physically far indices
+        slide_ids:   (n_st,) per-spot slide IDs
+        tau:         temperature
+        n_rand_neg:  random far negatives per anchor
+        n_anchors_per_step: anchors to sample per slide per step
+        return_diagnostics: if True, returns (loss, stats_dict)
+
+    Returns:
+        loss (or (loss, stats) if return_diagnostics=True)
+    """
+    device = st_gene_expr.device
+    n_st = st_gene_expr.shape[0]
+
+    # 1. Pick a random slide, sample anchors from it
+    unique_slides = torch.unique(slide_ids)
+    slide_pick = unique_slides[torch.randint(len(unique_slides), (1,)).item()]
+    slide_indices = torch.where(slide_ids == slide_pick)[0]
+
+    n_avail = slide_indices.shape[0]
+    n_anc = min(n_anchors_per_step, n_avail)
+    perm = torch.randperm(n_avail, device=device)[:n_anc]
+    anchor_globals = slide_indices[perm]
+
+    # 2. Collect all indices needed for the support set
+    all_needed = set()
+    anchor_list = anchor_globals.cpu().tolist()
+    all_needed.update(anchor_list)
+
+    per_anchor_pos = []
+    per_anchor_hard = []
+    per_anchor_far = []
+
+    for a in anchor_list:
+        p = pos_idx[a]
+        p = p[p >= 0].cpu().tolist()
+        per_anchor_pos.append(p)
+        all_needed.update(p)
+
+        h = hard_neg[a]
+        h = h[h >= 0].cpu().tolist()
+        per_anchor_hard.append(h)
+        all_needed.update(h)
+
+        far_of_a = torch.where(far_mask[a])[0]
+        if far_of_a.numel() > n_rand_neg:
+            rperm = torch.randperm(far_of_a.numel(), device=device)[:n_rand_neg]
+            far_of_a = far_of_a[rperm]
+        f = far_of_a.cpu().tolist()
+        per_anchor_far.append(f)
+        all_needed.update(f)
+
+    # 3. Forward-pass all unique spots
+    all_needed_sorted = sorted(all_needed)
+    all_needed_t = torch.tensor(all_needed_sorted, dtype=torch.long, device=device)
+
+    z_support = model(st_gene_expr[all_needed_t])
+    z_support_norm = F.normalize(z_support, dim=1)
+
+    # Global -> support-local index mapping
+    g2l = torch.full((n_st,), -1, dtype=torch.long, device=device)
+    g2l[all_needed_t] = torch.arange(len(all_needed_sorted), device=device)
+
+    # 4. Compute InfoNCE per anchor
+    losses = []
+    diag_sim_pos = []
+    diag_sim_hard = []
+    diag_sim_rand = []
+    diag_n_pos = []
+    diag_n_hard = []
+    diag_n_rand = []
+
+    for i, a in enumerate(anchor_list):
+        a_local = g2l[a].item()
+        z_a = z_support_norm[a_local]
+
+        # Positives
+        pos_g = per_anchor_pos[i]
+        if len(pos_g) == 0:
+            continue
+        pos_locals = g2l[torch.tensor(pos_g, dtype=torch.long, device=device)]
+        pos_locals = pos_locals[pos_locals >= 0]
+        if pos_locals.numel() == 0:
+            continue
+
+        # Hard negatives
+        hard_g = per_anchor_hard[i]
+        if hard_g:
+            hard_locals = g2l[torch.tensor(hard_g, dtype=torch.long, device=device)]
+            hard_locals = hard_locals[hard_locals >= 0]
+        else:
+            hard_locals = torch.tensor([], dtype=torch.long, device=device)
+
+        # Far negatives
+        far_g = per_anchor_far[i]
+        if far_g:
+            far_locals = g2l[torch.tensor(far_g, dtype=torch.long, device=device)]
+            far_locals = far_locals[far_locals >= 0]
+        else:
+            far_locals = torch.tensor([], dtype=torch.long, device=device)
+
+        # Combine negatives, remove self and any positive overlap
+        neg_parts = [t for t in [hard_locals, far_locals] if t.numel() > 0]
+        if len(neg_parts) == 0:
+            continue
+        all_neg_locals = torch.cat(neg_parts).unique()
+        pos_set = set(pos_locals.cpu().tolist())
+        keep = torch.tensor(
+            [v.item() not in pos_set and v.item() != a_local for v in all_neg_locals],
+            dtype=torch.bool, device=device,
+        )
+        all_neg_locals = all_neg_locals[keep]
+        if all_neg_locals.numel() == 0:
+            continue
+
+        # Cosine similarities
+        sim_pos_raw = z_a @ z_support_norm[pos_locals].T
+        sim_neg_raw = z_a @ z_support_norm[all_neg_locals].T
+
+        if return_diagnostics:
+            diag_sim_pos.append(sim_pos_raw.detach())
+            if hard_locals.numel() > 0:
+                diag_sim_hard.append((z_a @ z_support_norm[hard_locals].T).detach())
+            if far_locals.numel() > 0:
+                diag_sim_rand.append((z_a @ z_support_norm[far_locals].T).detach())
+            diag_n_pos.append(pos_locals.numel())
+            diag_n_hard.append(hard_locals.numel())
+            diag_n_rand.append(far_locals.numel())
+
+        # InfoNCE
+        sim_pos_t = sim_pos_raw / tau
+        sim_neg_t = sim_neg_raw / tau
+        logits = torch.cat([sim_pos_t, sim_neg_t])
+        log_denom = torch.logsumexp(logits, dim=0)
+        loss_i = -(sim_pos_t.mean() - log_denom)
+        losses.append(loss_i)
+
+    if len(losses) == 0:
+        loss = torch.tensor(0.0, device=device, requires_grad=True)
+    else:
+        loss = torch.stack(losses).mean()
+
+    if not return_diagnostics:
+        return loss
+
+    sim_pos_cat = torch.cat(diag_sim_pos) if diag_sim_pos else torch.tensor([0.0])
+    sim_hard_cat = torch.cat(diag_sim_hard) if diag_sim_hard else torch.tensor([0.0])
+    sim_rand_cat = torch.cat(diag_sim_rand) if diag_sim_rand else torch.tensor([0.0])
+
+    stats = {
+        'n_anchors': n_anc,
+        'n_active': len(losses),
+        'slide_picked': slide_pick.item(),
+        'support_set_size': all_needed_t.shape[0],
+        'sim_pos_mean': sim_pos_cat.mean().item(),
+        'sim_pos_std': sim_pos_cat.std().item() if sim_pos_cat.numel() > 1 else 0.0,
+        'sim_hard_mean': sim_hard_cat.mean().item(),
+        'sim_hard_std': sim_hard_cat.std().item() if sim_hard_cat.numel() > 1 else 0.0,
+        'sim_rand_mean': sim_rand_cat.mean().item(),
+        'sim_rand_std': sim_rand_cat.std().item() if sim_rand_cat.numel() > 1 else 0.0,
+        'n_pos_per_anchor': np.mean(diag_n_pos) if diag_n_pos else 0.0,
+        'n_hard_per_anchor': np.mean(diag_n_hard) if diag_n_hard else 0.0,
+        'n_rand_per_anchor': np.mean(diag_n_rand) if diag_n_rand else 0.0,
+        'loss': loss.item(),
+    }
+
+    return loss, stats
+
+
+# ==============================================================================
 # SPATIAL InfoNCE DIAGNOSTICS
 # ==============================================================================
 
@@ -1519,6 +1722,7 @@ def diagnose_spatial_infonce(
     spatial_nce_n_hard: int = 20,
     spatial_nce_tau: float = 0.1,
     spatial_nce_n_rand_neg: int = 128,
+    spatial_nce_n_anchors: int = 64,
     vicreg_lambda_inv: float = 25.0,
     vicreg_lambda_var: float = 50.0,
     vicreg_lambda_cov: float = 1.0,
@@ -1591,10 +1795,10 @@ def diagnose_spatial_infonce(
     # CHECK A: Gradient norms from each loss component (single batch)
     # ================================================================
     print("=" * 70)
-    print("CHECK A: Per-component gradient norms (single batch)")
+    print("CHECK A: Per-component gradient norms (support-set NCE)")
     print("=" * 70)
 
-    # Sample one balanced batch
+    # Sample one balanced batch (for VICReg / local align)
     idx = sample_balanced_domain_and_slide_indices(
         domain_ids, slide_ids.to(device),
         sc_slide_ids.to(device) if sc_slide_ids is not None else None,
@@ -1603,27 +1807,27 @@ def diagnose_spatial_infonce(
     X_batch = X_ssl[idx]
     s_batch = domain_ids[idx]
 
-    # Forward
+    # Augmented views for VICReg
     X1 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
     X2 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
-    z1 = model_diag(X1)
-    z2 = model_diag(X2)
-    z_clean = model_diag(X_batch)
 
-    is_st = (s_batch == 0)
+    st_expr_dev = st_gene_expr.to(device)
 
     grad_norms = {}
 
-    # A1: Spatial InfoNCE only
+    # A1: Spatial InfoNCE only (support-set — own forward pass)
     opt.zero_grad(set_to_none=True)
-    loss_nce, nce_stats = compute_spatial_infonce_loss_with_diagnostics(
-        z=z_clean, batch_idx=idx,
+    loss_nce, nce_stats = compute_spatial_infonce_supportset(
+        model=model_diag,
+        st_gene_expr=st_expr_dev,
         pos_idx=spatial_nce_data['pos_idx'],
         far_mask=spatial_nce_data['far_mask'],
         hard_neg=spatial_nce_data['hard_neg'],
+        slide_ids=slide_ids.to(device),
         tau=spatial_nce_tau,
         n_rand_neg=spatial_nce_n_rand_neg,
-        is_st_mask=is_st,
+        n_anchors_per_step=spatial_nce_n_anchors,
+        return_diagnostics=True,
     )
     if loss_nce.requires_grad and loss_nce.item() != 0.0:
         (spatial_nce_weight * loss_nce).backward(retain_graph=True)
@@ -1632,7 +1836,7 @@ def diagnose_spatial_infonce(
         gnorm_nce = 0.0
     grad_norms['L_spatialNCE'] = gnorm_nce
 
-    # A2: VICReg only (need fresh forward since backward consumed graph)
+    # A2: VICReg only
     opt.zero_grad(set_to_none=True)
     z1_ = model_diag(X1)
     z2_ = model_diag(X2)
@@ -1660,21 +1864,21 @@ def diagnose_spatial_infonce(
         loss_local = torch.tensor(0.0)
     grad_norms['L_local_align'] = gnorm_local
 
-    # A4: Full loss
+    # A4: Full loss (VICReg + support-set NCE)
     opt.zero_grad(set_to_none=True)
     z1_f = model_diag(X1)
     z2_f = model_diag(X2)
-    z_clean_f = model_diag(X_batch)
     loss_vic_f, _ = vicreg_loss_fn(z1_f, z2_f)
-    is_st_f = (s_batch == 0)
-    loss_nce_f, _ = compute_spatial_infonce_loss_with_diagnostics(
-        z=z_clean_f, batch_idx=idx,
+    loss_nce_f = compute_spatial_infonce_supportset(
+        model=model_diag,
+        st_gene_expr=st_expr_dev,
         pos_idx=spatial_nce_data['pos_idx'],
         far_mask=spatial_nce_data['far_mask'],
         hard_neg=spatial_nce_data['hard_neg'],
+        slide_ids=slide_ids.to(device),
         tau=spatial_nce_tau,
         n_rand_neg=spatial_nce_n_rand_neg,
-        is_st_mask=is_st_f,
+        n_anchors_per_step=spatial_nce_n_anchors,
     )
     loss_full = loss_vic_f + spatial_nce_weight * loss_nce_f
     loss_full.backward()
@@ -1697,7 +1901,7 @@ def diagnose_spatial_infonce(
         else:
             print("    ** Spatial NCE gradient is non-trivial -- loss IS live **")
 
-    print(f"\n  Spatial NCE batch stats (single batch):")
+    print(f"\n  Spatial NCE support-set stats:")
     for k, v in nce_stats.items():
         print(f"    {k}: {v}")
 
@@ -1818,15 +2022,17 @@ def diagnose_spatial_infonce(
     }
 
     # ================================================================
-    # CHECK B: Loss scale & logit gap over first N steps
+    # CHECK B: Loss scale & logit gap over first N steps (support-set)
     # ================================================================
     print("\n" + "=" * 70)
-    print(f"CHECK B: Loss scale & logit gap (first {n_diagnostic_steps} steps)")
+    print(f"CHECK B: Loss scale & logit gap (first {n_diagnostic_steps} steps, support-set)")
     print("=" * 70)
 
     # Fresh model copy for the training run
     model_train = copy.deepcopy(model).to(device).train()
     opt_train = torch.optim.Adam(model_train.parameters(), lr=lr)
+
+    st_expr_dev = st_gene_expr.to(device)
 
     step_logs = {
         'step': [], 'loss_nce': [], 'loss_vicreg': [],
@@ -1837,33 +2043,34 @@ def diagnose_spatial_infonce(
     }
 
     for step in range(n_diagnostic_steps):
-        # Sample batch
+        # Sample batch for VICReg
         idx_s = sample_balanced_domain_and_slide_indices(
             domain_ids, slide_ids.to(device),
             sc_slide_ids.to(device) if sc_slide_ids is not None else None,
             batch_size, device,
         )
         X_b = X_ssl[idx_s]
-        s_b = domain_ids[idx_s]
 
         X1_s = augment_expression(X_b, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
         X2_s = augment_expression(X_b, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
 
         z1_s = model_train(X1_s)
         z2_s = model_train(X2_s)
-        z_clean_s = model_train(X_b)
 
         loss_vic_s, _ = vicreg_loss_fn(z1_s, z2_s)
 
-        is_st_s = (s_b == 0)
-        loss_nce_s, nce_diag_s = compute_spatial_infonce_loss_with_diagnostics(
-            z=z_clean_s, batch_idx=idx_s,
+        # Support-set spatial InfoNCE (does its own forward pass)
+        loss_nce_s, nce_diag_s = compute_spatial_infonce_supportset(
+            model=model_train,
+            st_gene_expr=st_expr_dev,
             pos_idx=spatial_nce_data['pos_idx'],
             far_mask=spatial_nce_data['far_mask'],
             hard_neg=spatial_nce_data['hard_neg'],
+            slide_ids=slide_ids.to(device),
             tau=spatial_nce_tau,
             n_rand_neg=spatial_nce_n_rand_neg,
-            is_st_mask=is_st_s,
+            n_anchors_per_step=spatial_nce_n_anchors,
+            return_diagnostics=True,
         )
 
         loss_total_s = loss_vic_s + spatial_nce_weight * loss_nce_s
@@ -1891,7 +2098,8 @@ def diagnose_spatial_infonce(
             print(f"  step {step:4d} | NCE={loss_nce_s.item():.4f} VIC={loss_vic_s.item():.4f} | "
                   f"sim(pos)={nce_diag_s['sim_pos_mean']:.4f} sim(hard)={nce_diag_s['sim_hard_mean']:.4f} "
                   f"sim(rand)={nce_diag_s['sim_rand_mean']:.4f} | "
-                  f"active={nce_diag_s['n_active']}/{nce_diag_s['n_anchors']}")
+                  f"active={nce_diag_s['n_active']}/{nce_diag_s['n_anchors']} | "
+                  f"support={nce_diag_s['support_set_size']}")
 
     # Summary
     print("\n" + "-" * 70)
@@ -1928,8 +2136,8 @@ def diagnose_spatial_infonce(
 
     # Interpretation
     if mean_active < 2:
-        print("  ** CRITICAL: Almost no anchors have both pos AND neg in batch! **")
-        print("     -> The loss is effectively zero. Increase batch_size or check pos_idx.")
+        print("  ** CRITICAL: Almost no anchors have both pos AND neg! **")
+        print("     -> Check pos_idx / hard_neg precomputation.")
     elif mean_nce < 0.01:
         print("  ** WARNING: NCE loss is near zero -- already saturated or disconnected. **")
     elif mean_pos > mean_hard + 0.1:
