@@ -426,6 +426,10 @@ def train_encoder(
 
 
 
+        # After subsampling, st_coords_norm must match st_coords
+        # (otherwise precomputed spatial structures use wrong coordinates)
+        st_coords_norm = st_coords
+
         X_ssl = torch.cat([st_gene_expr, sc_gene_expr], dim=0)
 
         # ========== NEW: N-class Source Adversary ==========
@@ -673,7 +677,7 @@ def train_encoder(
     if spatial_nce_weight > 0 and stageA_obj == 'vicreg_adv':
         from ssl_utils import precompute_spatial_nce_structures
         spatial_nce_data = precompute_spatial_nce_structures(
-            st_coords=st_coords_norm,
+            st_coords=st_coords,  # Must use subsampled coords, NOT st_coords_norm (which is pre-subsample)
             st_gene_expr=st_gene_expr,
             slide_ids=slide_ids,
             k_phys=spatial_nce_k_phys,
