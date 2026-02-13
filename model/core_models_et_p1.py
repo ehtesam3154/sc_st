@@ -71,6 +71,47 @@ class SharedEncoder(nn.Module):
         return self.encoder(X)
 
 
+@torch.no_grad()
+def normalize_embeddings_per_slide(
+    z: torch.Tensor,
+    slide_ids: torch.Tensor,
+    target_rms: float = 1.0,
+    center: bool = True,
+) -> torch.Tensor:
+    """
+    Per-slide normalization of embeddings: mean-center + RMS rescale.
+
+    Fixes norm asymmetry across slides (e.g., ST3 norm=10.2 vs ST1/ST2 norm=6.6).
+    Can be applied as a post-processing step after the encoder or during training.
+
+    Args:
+        z:          (n, d) embeddings
+        slide_ids:  (n,) integer slide identifiers
+        target_rms: target root-mean-square norm per slide (default 1.0)
+        center:     if True, subtract per-slide mean before rescaling
+
+    Returns:
+        z_norm: (n, d) normalized embeddings
+    """
+    z_norm = z.clone()
+    unique_slides = torch.unique(slide_ids)
+
+    for s in unique_slides:
+        mask = (slide_ids == s)
+        z_s = z_norm[mask]
+
+        if center:
+            z_s = z_s - z_s.mean(dim=0, keepdim=True)
+
+        # Current RMS norm: sqrt(mean(||z_i||^2))
+        rms = (z_s.norm(dim=1) ** 2).mean().sqrt().clamp(min=1e-8)
+        z_s = z_s * (target_rms / rms)
+
+        z_norm[mask] = z_s
+
+    return z_norm
+
+
 def build_vicreg_projector(
     input_dim: int,
     project_dim: int = 256,
@@ -206,6 +247,12 @@ def train_encoder(
     two_phase_training: bool = False,  # Phase 1: VICReg+NCE only, Phase 2: add alignment
     phase1_epochs: int = 1000,         # Duration of Phase 1
     phase2_lr_factor: float = 0.1,     # Reduce encoder LR by this factor in Phase 2
+    # ========== VICReg invariance weight schedule ==========
+    vicreg_inv_warmup_frac: float = 0.0,  # Fraction of Phase 1 to ramp lambda_inv (0=disabled)
+    vicreg_inv_start: float = 5.0,        # Starting lambda_inv during warmup (ramps to vicreg_lambda_inv)
+    # ========== Per-slide normalization ==========
+    per_slide_norm: bool = False,     # Apply per-slide normalization during eval diagnostics
+    per_slide_norm_target: float = 1.0,  # Target RMS norm per slide
 ):
 
     """
@@ -523,6 +570,12 @@ def train_encoder(
             vicreg_gamma, vicreg_eps, vicreg_ddp_gather, vicreg_float32_stats
         )
         print(f"  VICReg: λ_inv={vicreg_lambda_inv}, λ_var={vicreg_lambda_var}, λ_cov={vicreg_lambda_cov}")
+        if vicreg_inv_warmup_frac > 0:
+            _warmup_end = int(vicreg_inv_warmup_frac * (phase1_epochs if two_phase_training else n_epochs))
+            print(f"  VICReg λ_inv schedule: {vicreg_inv_start} → {vicreg_lambda_inv} over first {_warmup_end} epochs "
+                  f"({vicreg_inv_warmup_frac*100:.0f}% warmup)")
+        if per_slide_norm:
+            print(f"  Per-slide normalization: enabled (target_rms={per_slide_norm_target})")
 
         # Optimizers
         enc_params = list(model.parameters())
@@ -555,6 +608,10 @@ def train_encoder(
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
             'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': [], 'loss_spatial_nce': [],
             'locality_overlap_after_S': [], 'locality_overlap_after_M': [],
+            # Per-epoch diagnostics (populated every 100 epochs, 0.0 otherwise)
+            'hit_within_radius_after_S': [], 'hit_within_radius_after_M': [],
+            'slide_norms': [],  # list of dicts {slide_id: norm_mean}
+            'vicreg_lambda_inv_effective': [],  # tracks scheduled lambda_inv
         }
 
 
@@ -747,8 +804,8 @@ def train_encoder(
 
             # ========== STEP S: Separate Spatial InfoNCE update (ST only) ==========
             loss_spatial_nce = torch.tensor(0.0, device=device)
-            _loc_after_S = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0}
-            _loc_after_M = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0}
+            _loc_after_S = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0, 'hit_within_radius_mean': 0.0, 'slide_norms': {}}
+            _loc_after_M = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0, 'hit_within_radius_mean': 0.0, 'slide_norms': {}}
             if spatial_nce_weight > 0 and spatial_nce_data is not None:
                 from ssl_utils import compute_spatial_infonce_supportset
                 # Round-robin slide selection
@@ -845,6 +902,18 @@ def train_encoder(
             else:
                 y1 = z1
                 y2 = z2
+
+            # ========== VICReg invariance weight schedule ==========
+            if vicreg_inv_warmup_frac > 0:
+                # Ramp lambda_inv from vicreg_inv_start to vicreg_lambda_inv
+                # over the first vicreg_inv_warmup_frac of Phase 1 (or total epochs)
+                warmup_end = int(vicreg_inv_warmup_frac * (phase1_epochs if two_phase_training else n_epochs))
+                if epoch < warmup_end:
+                    frac = epoch / max(1, warmup_end)
+                    effective_lambda_inv = vicreg_inv_start + frac * (vicreg_lambda_inv - vicreg_inv_start)
+                else:
+                    effective_lambda_inv = vicreg_lambda_inv
+                vicreg_loss_fn.lambda_inv = effective_lambda_inv
 
             loss_vicreg, vicreg_stats = vicreg_loss_fn(y1, y2)
 
@@ -1134,12 +1203,23 @@ def train_encoder(
                     st_coords=st_coords, slide_ids=slide_ids,
                     phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
                 )
+                _hit_S = _loc_after_S.get('hit_within_radius_mean', 0.0)
+                _hit_M = _loc_after_M.get('hit_within_radius_mean', 0.0)
                 print(f"  [LOCALITY e{epoch}] "
                       f"after StepS: overlap={_loc_after_S['overlap_mean']:.4f}, "
+                      f"hit@20={_hit_S:.4f}, "
                       f"emb_phys_dist={_loc_after_S['emb_phys_dist_median']:.1f} | "
                       f"after StepM: overlap={_loc_after_M['overlap_mean']:.4f}, "
+                      f"hit@20={_hit_M:.4f}, "
                       f"emb_phys_dist={_loc_after_M['emb_phys_dist_median']:.1f} | "
                       f"delta_overlap={_loc_after_M['overlap_mean'] - _loc_after_S['overlap_mean']:+.4f}")
+                # Per-slide norm logging
+                _snorms = _loc_after_M.get('slide_norms', {})
+                if _snorms:
+                    _norm_str = ", ".join([f"s{k}={v:.2f}" for k, v in sorted(_snorms.items())])
+                    print(f"  [NORMS e{epoch}] {_norm_str}")
+                if vicreg_inv_warmup_frac > 0:
+                    print(f"  [VICREG e{epoch}] lambda_inv={vicreg_loss_fn.lambda_inv:.2f}")
 
             # Update Z_cache periodically
             if knn_weight > 0 and Z_cache is not None and epoch % cache_update_freq == 0:
@@ -1247,6 +1327,12 @@ def train_encoder(
             history_vicreg['loss_spatial_nce'].append(loss_spatial_nce.item())
             history_vicreg['locality_overlap_after_S'].append(_loc_after_S['overlap_mean'])
             history_vicreg['locality_overlap_after_M'].append(_loc_after_M['overlap_mean'])
+            history_vicreg['hit_within_radius_after_S'].append(_loc_after_S.get('hit_within_radius_mean', 0.0))
+            history_vicreg['hit_within_radius_after_M'].append(_loc_after_M.get('hit_within_radius_mean', 0.0))
+            history_vicreg['slide_norms'].append(_loc_after_M.get('slide_norms', {}))
+            history_vicreg['vicreg_lambda_inv_effective'].append(
+                vicreg_loss_fn.lambda_inv if vicreg_inv_warmup_frac > 0 else vicreg_lambda_inv
+            )
 
             # ========== BEST CHECKPOINT SAVING ==========
             # In two-phase mode: checkpoint from epoch 100 (first overlap measurement)

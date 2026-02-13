@@ -2247,6 +2247,8 @@ def compute_knn_locality_metrics(
     unique_slides = torch.unique(slide_ids)
     all_overlaps = []
     all_phys_dists = []
+    all_hit_within_radius = []
+    slide_norms = {}  # {slide_id: mean_norm}
 
     rng = np.random.RandomState(seed)
 
@@ -2266,6 +2268,23 @@ def compute_knn_locality_metrics(
         z_slide = z_all[s_idx]
         z_anchors = z_all[anchors]
 
+        # Per-slide embedding norm stats
+        slide_norm_mean = z_slide.norm(dim=1).mean().item()
+        slide_norms[int(s.item())] = slide_norm_mean
+
+        # Physical distances within this slide (for hit_within_radius)
+        coords_slide = st_coords[s_idx]
+        coords_anchors = st_coords[anchors]
+
+        # Physical kNN distance: d_k(i) for each anchor
+        D_phys_anchor = torch.cdist(coords_anchors, coords_slide)  # (n_pick, n_s)
+        for i_a, a_global in enumerate(anchors):
+            local_self = (s_idx == a_global).nonzero(as_tuple=True)[0]
+            if local_self.numel() > 0:
+                D_phys_anchor[i_a, local_self[0]] = float('inf')
+        D_phys_sorted, _ = D_phys_anchor.sort(dim=1)
+        d_k_anchors = D_phys_sorted[:, k - 1]  # (n_pick,) k-th neighbor distance
+
         # Pairwise distances (anchor vs all in slide)
         dists_emb = torch.cdist(z_anchors, z_slide)  # (n_pick, n_s)
         # Set self-distance to inf
@@ -2280,7 +2299,8 @@ def compute_knn_locality_metrics(
         # Physical kNN (precomputed)
         phys_knn = phys_knn_idx[anchors]  # (n_pick, k)
 
-        # Overlap
+        # Overlap + hit_within_radius
+        eps = 1e-6
         for i_a in range(n_pick):
             emb_set = set(emb_knn_global[i_a].cpu().tolist())
             phys_set = set(phys_knn[i_a].cpu().tolist())
@@ -2296,12 +2316,18 @@ def compute_knn_locality_metrics(
             pdist = torch.norm(coords_neighbors - coords_anchor, dim=1)
             all_phys_dists.append(pdist.median().item())
 
+            # hit_within_radius: fraction of emb-kNN within d_k(i)
+            hits = (pdist <= d_k_anchors[i_a] + eps).sum().item()
+            all_hit_within_radius.append(hits / k)
+
     if was_training:
         model.train()
 
     return {
         'overlap_mean': float(np.mean(all_overlaps)) if all_overlaps else 0.0,
         'emb_phys_dist_median': float(np.median(all_phys_dists)) if all_phys_dists else 0.0,
+        'hit_within_radius_mean': float(np.mean(all_hit_within_radius)) if all_hit_within_radius else 0.0,
+        'slide_norms': slide_norms,
     }
 
 
