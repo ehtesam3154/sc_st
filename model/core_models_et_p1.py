@@ -253,6 +253,8 @@ def train_encoder(
     # ========== Per-slide normalization ==========
     per_slide_norm: bool = False,     # Apply per-slide normalization during eval diagnostics
     per_slide_norm_target: float = 1.0,  # Target RMS norm per slide
+    # ========== Slide-scale regularizer ==========
+    slide_scale_weight: float = 0.0,  # Soft penalty to equalize per-slide RMS norms (0=disabled)
 ):
 
     """
@@ -576,6 +578,10 @@ def train_encoder(
                   f"({vicreg_inv_warmup_frac*100:.0f}% warmup)")
         if per_slide_norm:
             print(f"  Per-slide normalization: enabled (target_rms={per_slide_norm_target})")
+        if slide_scale_weight > 0:
+            print(f"  Slide-scale regularizer: weight={slide_scale_weight} (equalizes per-slide RMS norms)")
+        if adv_slide_weight == 0.0:
+            print(f"  Discriminator training: SKIPPED (adv_slide_weight=0, saving compute)")
 
         # Optimizers
         enc_params = list(model.parameters())
@@ -612,6 +618,7 @@ def train_encoder(
             'hit_within_radius_after_S': [], 'hit_within_radius_after_M': [],
             'slide_norms': [],  # list of dicts {slide_id: norm_mean}
             'vicreg_lambda_inv_effective': [],  # tracks scheduled lambda_inv
+            'loss_slide_scale': [],  # slide-scale regularizer
         }
 
 
@@ -951,7 +958,9 @@ def train_encoder(
             disc_loss_val = 0.0
             disc_acc_val = 0.0
 
-            _skip_disc = in_phase1 and epoch < (phase1_epochs - 50)
+            # Skip disc training entirely when adv_slide_weight=0 (save compute)
+            # Otherwise, in Phase 1, skip until last 50 epochs (warmup)
+            _skip_disc = (adv_slide_weight == 0.0) or (in_phase1 and epoch < (phase1_epochs - 50))
             disc_grad_norms = {}
             for _ in range(disc_steps if not _skip_disc else 0):
                 logits_d = discriminator(z_det)
@@ -1170,10 +1179,32 @@ def train_encoder(
                 _adv_w = adv_slide_weight
                 _centroid_w = centroid_weight
 
+            # ========== Slide-scale regularizer ==========
+            # Soft penalty: keep per-slide RMS norms close to global mean
+            # L_ss = Σ_s (log RMS(z_s) - log RMS(z_all))^2
+            loss_slide_scale = torch.tensor(0.0, device=device)
+            if slide_scale_weight > 0 and slide_ids is not None:
+                z_st_clean = z_clean[~is_sc]  # ST portion only
+                slide_ids_batch = slide_ids[idx[~is_sc]]
+                # Global RMS across all ST spots in batch
+                global_rms = z_st_clean.norm(dim=1).pow(2).mean().sqrt().clamp(min=1e-6)
+                log_global = torch.log(global_rms)
+                unique_batch_slides = torch.unique(slide_ids_batch)
+                slide_penalties = []
+                for sid in unique_batch_slides:
+                    s_mask = (slide_ids_batch == sid)
+                    if s_mask.sum() < 4:
+                        continue
+                    slide_rms = z_st_clean[s_mask].norm(dim=1).pow(2).mean().sqrt().clamp(min=1e-6)
+                    slide_penalties.append((torch.log(slide_rms) - log_global).pow(2))
+                if slide_penalties:
+                    loss_slide_scale = torch.stack(slide_penalties).mean()
+
             # NOTE: spatial_nce is handled in separate Step S above (not in this loss)
             loss_total = (loss_vicreg + _adv_w * loss_adv_enc + coral_w * loss_coral +
                          local_w * loss_local + patient_coral_w * loss_patient_coral +
-                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + _centroid_w * loss_centroid + knn_weight * loss_knn)
+                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + _centroid_w * loss_centroid + knn_weight * loss_knn +
+                         slide_scale_weight * loss_slide_scale)
 
             # Optionally log encoder gradient norms before step
             # Backprop for encoder (MISSING BEFORE!)
@@ -1235,42 +1266,48 @@ def train_encoder(
                 p.requires_grad_(True)
 
             # Logging accuracy (chance=0.5 is what you want to approach)
-            with torch.no_grad():
-                logits_det = discriminator(z_det)
-                disc_acc_det = (logits_det.argmax(dim=1) == s_batch).float().mean().item()
+            # Skip disc logging when adversary is off (save compute)
+            disc_acc_det = 0.5
+            disc_acc_post = 0.5
+            disc_acc_clean = 0.5
+            disc_acc_aug = 0.5
+            clean_diag = {}
+            loss_adv = loss_adv_enc.detach()
 
-                # Post-update: use CLEAN representation (matches training now)
-                z_clean_post = model(X_batch)
-                if adv_use_layernorm:
-                    z_post = F.layer_norm(z_clean_post, (z_clean_post.shape[1],))
-                else:
-                    z_post = z_clean_post
-                    
-                logits_post = discriminator(z_post)
-                disc_acc_post = (logits_post.argmax(dim=1) == s_batch).float().mean().item()
-                
-                # Now disc_post and disc_CLEAN should be identical (same representation)
-                disc_acc_clean = disc_acc_post  # They're the same now!
-                
-                # DIAGNOSTIC: Also check augmented for comparison
-                z_aug_check = model(X1)
-                logits_aug = discriminator(z_aug_check)
-                disc_acc_aug = (logits_aug.argmax(dim=1) == s_batch).float().mean().item()
+            if adv_slide_weight > 0.0 or not _skip_disc:
+                with torch.no_grad():
+                    logits_det = discriminator(z_det)
+                    disc_acc_det = (logits_det.argmax(dim=1) == s_batch).float().mean().item()
 
-                
-                # Post-update diagnostics on clean representation
-                clean_diag = {}
-                if adv_log_diagnostics:
-                    clean_diag = log_adversary_diagnostics(
-                        logits=logits_post,
-                        targets=s_batch,
-                        n_classes=n_domains,
-                        prefix="clean_",
-                        epoch=epoch,
-                        verbose=(epoch % 100 == 0)
-                    )
+                    # Post-update: use CLEAN representation (matches training now)
+                    z_clean_post = model(X_batch)
+                    if adv_use_layernorm:
+                        z_post = F.layer_norm(z_clean_post, (z_clean_post.shape[1],))
+                    else:
+                        z_post = z_clean_post
 
-                loss_adv = loss_adv_enc.detach()
+                    logits_post = discriminator(z_post)
+                    disc_acc_post = (logits_post.argmax(dim=1) == s_batch).float().mean().item()
+
+                    # Now disc_post and disc_CLEAN should be identical (same representation)
+                    disc_acc_clean = disc_acc_post  # They're the same now!
+
+                    # DIAGNOSTIC: Also check augmented for comparison
+                    z_aug_check = model(X1)
+                    logits_aug = discriminator(z_aug_check)
+                    disc_acc_aug = (logits_aug.argmax(dim=1) == s_batch).float().mean().item()
+
+
+                    # Post-update diagnostics on clean representation
+                    if adv_log_diagnostics:
+                        clean_diag = log_adversary_diagnostics(
+                            logits=logits_post,
+                            targets=s_batch,
+                            n_classes=n_domains,
+                            prefix="clean_",
+                            epoch=epoch,
+                            verbose=(epoch % 100 == 0)
+                        )
 
 
             # Logging
@@ -1280,13 +1317,14 @@ def train_encoder(
                 source_coral_str = f", SrcCORAL={loss_source_coral.item():.6f}" if (st_source_ids is not None and sc_source_ids is not None) else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
                 nce_str = f", NCE_S={loss_spatial_nce.item():.4f}" if spatial_nce_weight > 0 else ""
+                ss_str = f", SlideScale={loss_slide_scale.item():.6f}" if slide_scale_weight > 0 else ""
                 phase_str = f"[P1] " if in_phase1 else (f"[P2] " if two_phase_training else "")
                 print(f"{phase_str}Epoch {epoch}/{n_epochs} | "
                     f"StepM={loss_total.item():.4f} "
                     f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, "
                     f"CORAL={loss_coral.item():.6f}, MMD={loss_mmd.item():.6f}, "
                     f"MMDw={mmd_w:.2f}, σ={mmd_sigma:.3f}"
-                    f"{patient_coral_str}{source_coral_str}{local_str}{nce_str}) | "
+                    f"{patient_coral_str}{source_coral_str}{local_str}{nce_str}{ss_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
                     f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}"
@@ -1333,6 +1371,7 @@ def train_encoder(
             history_vicreg['vicreg_lambda_inv_effective'].append(
                 vicreg_loss_fn.lambda_inv if vicreg_inv_warmup_frac > 0 else vicreg_lambda_inv
             )
+            history_vicreg['loss_slide_scale'].append(loss_slide_scale.item())
 
             # ========== BEST CHECKPOINT SAVING ==========
             # In two-phase mode: checkpoint from epoch 100 (first overlap measurement)
