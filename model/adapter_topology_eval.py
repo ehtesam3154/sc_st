@@ -411,6 +411,7 @@ def _encode_all(encoder, expr, device='cuda', chunk=512):
     return torch.cat(parts, dim=0)
 
 
+@torch.no_grad()
 def compare_all_adapters(
     encoder: nn.Module,
     st_gene_exprs: Dict[str, torch.Tensor],
