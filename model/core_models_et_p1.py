@@ -1311,6 +1311,32 @@ def train_encoder(
                     print(f"  [BEST] New best at epoch {epoch}: overlap@20={current_overlap:.4f}, "
                           f"acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
                           f"align={alignment_score:.4f}, std_min={std_min:.3f}")
+
+                    # ===== CHECKPOINT VERIFICATION (diagnose overlap@20 bug) =====
+                    # Load the just-saved checkpoint into a fresh model and re-compute overlap
+                    if _nce_phys_knn is not None:
+                        _verify_model = SharedEncoder(
+                            n_genes=model.n_genes,
+                            n_embedding=model.n_embedding,
+                            dropout=0.1
+                        ).to(device)
+                        _verify_model.load_state_dict(best_encoder_state)
+                        from ssl_utils import compute_knn_locality_metrics as _ckpt_verify_fn
+                        _verify_overlap = _ckpt_verify_fn(
+                            model=_verify_model, st_gene_expr=st_gene_expr,
+                            st_coords=st_coords, slide_ids=slide_ids,
+                            phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                        )
+                        _vo = _verify_overlap['overlap_mean']
+                        _delta = abs(_vo - current_overlap)
+                        if _delta > 0.01:
+                            print(f"  [CHECKPOINT BUG] Verification FAILED! "
+                                  f"Live model overlap={current_overlap:.4f}, "
+                                  f"checkpoint reload overlap={_vo:.4f}, delta={_delta:.4f}")
+                        else:
+                            print(f"  [CHECKPOINT OK] Verified: reload overlap={_vo:.4f} "
+                                  f"(delta={_delta:.4f})")
+                        del _verify_model
                 elif epoch % 100 == 0:
                     print(f"  [EVAL] Epoch {epoch}: overlap@20={current_overlap:.4f} (best={best_overlap_at_k:.4f} @e{best_epoch}), "
                           f"acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
@@ -1793,6 +1819,34 @@ def train_encoder(
                 projector.load_state_dict(best_projector_state)
             if best_discriminator_state is not None:
                 discriminator.load_state_dict(best_discriminator_state)
+
+            # ===== POST-RESTORE VERIFICATION (diagnose overlap@20 bug) =====
+            if _nce_phys_knn is not None:
+                from ssl_utils import compute_knn_locality_metrics as _post_verify_fn
+                _post_overlap = _post_verify_fn(
+                    model=model, st_gene_expr=st_gene_expr,
+                    st_coords=st_coords, slide_ids=slide_ids,
+                    phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                )
+                _pov = _post_overlap['overlap_mean']
+                print(f"  [POST-RESTORE VERIFY] overlap@20 = {_pov:.4f} "
+                      f"(expected {best_overlap_at_k:.4f}, "
+                      f"delta={abs(_pov - best_overlap_at_k):.4f})")
+                if abs(_pov - best_overlap_at_k) > 0.01:
+                    print(f"  [POST-RESTORE BUG] MISMATCH DETECTED!")
+
+                    # Detailed comparison of live vs checkpoint weights
+                    _live_sd = model.state_dict()
+                    _diff_keys = []
+                    for _k in _live_sd:
+                        _d = (_live_sd[_k].cpu().float() - best_encoder_state[_k].float()).abs().max().item()
+                        if _d > 1e-6:
+                            _diff_keys.append((_k, _d))
+                    if _diff_keys:
+                        print(f"  [POST-RESTORE BUG] Weight diffs: {_diff_keys[:5]}")
+                    else:
+                        print(f"  [POST-RESTORE BUG] Weights MATCH but overlap differs!")
+                        print(f"  This suggests the metric is non-deterministic or data-dependent.")
         elif use_best_checkpoint:
             print("\n[BEST CHECKPOINT] No checkpoint saved (training too short or warmup not reached)")
             print("  Using final model instead")
@@ -1818,7 +1872,30 @@ def train_encoder(
         print("="*70 + "\n")
         print(f"History saved: {history_path}")
     
-    torch.save(model.state_dict(), os.path.join(outf, 'encoder_final_new.pt'))
+    _save_path = os.path.join(outf, 'encoder_final_new.pt')
+    torch.save(model.state_dict(), _save_path)
+
+    # ===== DISK SAVE VERIFICATION (diagnose overlap@20 bug) =====
+    if stageA_obj == 'vicreg_adv' and _nce_phys_knn is not None:
+        _disk_model = SharedEncoder(
+            n_genes=model.n_genes,
+            n_embedding=model.n_embedding,
+            dropout=0.1
+        ).to(device)
+        _disk_model.load_state_dict(torch.load(_save_path, map_location=device))
+        from ssl_utils import compute_knn_locality_metrics as _disk_verify_fn
+        _disk_overlap = _disk_verify_fn(
+            model=_disk_model, st_gene_expr=st_gene_expr,
+            st_coords=st_coords, slide_ids=slide_ids,
+            phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+        )
+        _dov = _disk_overlap['overlap_mean']
+        print(f"\n[DISK VERIFY] Loaded encoder_final_new.pt → overlap@20 = {_dov:.4f}")
+        if best_encoder_state is not None:
+            print(f"  Expected: {best_overlap_at_k:.4f}, delta={abs(_dov - best_overlap_at_k):.4f}")
+            if abs(_dov - best_overlap_at_k) > 0.01:
+                print(f"  [DISK BUG] MISMATCH between training metric and disk reload!")
+        del _disk_model
 
     if stageA_obj == 'vicreg_adv':
         aux_path = os.path.join(outf, 'stageA_vicreg_aux.pt')
