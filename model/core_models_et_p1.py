@@ -414,15 +414,24 @@ def train_encoder(
                     sc_source_ids = sc_source_ids[subsample_idx]
                 n_sc = n_st
             elif n_st > n_sc:
-                print(f"[VICReg] Balancing ST: {n_st} → {n_sc} (to match SC)")
-                subsample_idx = torch.randperm(n_st, device=device)[:n_sc]
-                st_gene_expr = st_gene_expr[subsample_idx]
-                st_coords = st_coords[subsample_idx]
-                if slide_ids is not None:
-                    slide_ids = slide_ids[subsample_idx]
-                if st_source_ids is not None:
-                    st_source_ids = st_source_ids[subsample_idx]
-                n_st = n_sc
+                # Do NOT subsample ST when spatial NCE is active:
+                # Subsampling destroys spatial resolution (r_pos doubles),
+                # causing NCE to learn coarse structure that doesn't transfer
+                # to full-density evaluation. Balanced batch sampling (line ~800)
+                # already handles domain imbalance at the mini-batch level.
+                if spatial_nce_weight > 0:
+                    print(f"[VICReg] SKIP ST subsampling: keeping all {n_st} ST spots "
+                          f"(SC={n_sc}). Balanced batch sampling handles imbalance.")
+                else:
+                    print(f"[VICReg] Balancing ST: {n_st} → {n_sc} (to match SC)")
+                    subsample_idx = torch.randperm(n_st, device=device)[:n_sc]
+                    st_gene_expr = st_gene_expr[subsample_idx]
+                    st_coords = st_coords[subsample_idx]
+                    if slide_ids is not None:
+                        slide_ids = slide_ids[subsample_idx]
+                    if st_source_ids is not None:
+                        st_source_ids = st_source_ids[subsample_idx]
+                    n_st = n_sc
 
 
 
