@@ -95,6 +95,7 @@ def train_sc_adapter(
     # Loss weights
     coral_weight: float = 10.0,
     mmd_weight: float = 10.0,
+    identity_weight: float = 0.0,
     # Diagnostics
     log_every: int = 50,
     device: str = 'cuda',
@@ -146,7 +147,7 @@ def train_sc_adapter(
     print(f"  Adapter: {adapter_mode} ({embed_dim} -> {embed_dim})")
     print(f"  ST: {n_st} spots, SC: {n_sc} cells")
     print(f"  Epochs: {n_epochs}, LR: {lr}, Batch: {batch_size}")
-    print(f"  CORAL weight: {coral_weight}, MMD weight: {mmd_weight}")
+    print(f"  CORAL weight: {coral_weight}, MMD weight: {mmd_weight}, Identity weight: {identity_weight}")
     print(f"  Output: {outf}")
 
     # === Freeze encoder ===
@@ -187,6 +188,7 @@ def train_sc_adapter(
     # === Training history ===
     history = {
         'epoch': [], 'loss_total': [], 'loss_coral': [], 'loss_mmd': [],
+        'loss_identity': [],
         'st_overlap_at_20': [], 'domain_centroid_dist': [],
         'lr': [],
     }
@@ -226,6 +228,14 @@ def train_sc_adapter(
         else:
             l_mmd = torch.tensor(0.0)
 
+        # Identity regularizer: g(z_st) ≈ z_st (prevents topology warping)
+        if identity_weight > 0:
+            z_st_through = adapter(z_st_batch)
+            l_id = F.mse_loss(z_st_through, z_st_batch)
+            loss = loss + identity_weight * l_id
+        else:
+            l_id = torch.tensor(0.0)
+
         # Backward
         optimizer.zero_grad()
         loss.backward()
@@ -263,13 +273,15 @@ def train_sc_adapter(
                     st_ov = ov_metrics['overlap_mean']
 
             current_lr = scheduler.get_last_lr()[0]
-            print(f"  e{epoch:4d} | loss={loss.item():.4f} coral={l_coral.item():.4f} mmd={l_mmd.item():.4f} | "
+            id_str = f" L_id={l_id.item():.6f}" if identity_weight > 0 else ""
+            print(f"  e{epoch:4d} | loss={loss.item():.4f} coral={l_coral.item():.4f} mmd={l_mmd.item():.4f}{id_str} | "
                   f"centroid_dist={centroid_dist:.4f} | st_overlap@20={st_ov:.4f} | lr={current_lr:.2e}")
 
             history['epoch'].append(epoch)
             history['loss_total'].append(loss.item())
             history['loss_coral'].append(full_coral)
             history['loss_mmd'].append(full_mmd)
+            history['loss_identity'].append(l_id.item() if identity_weight > 0 else 0.0)
             history['st_overlap_at_20'].append(st_ov)
             history['domain_centroid_dist'].append(centroid_dist)
             history['lr'].append(current_lr)
