@@ -45,6 +45,7 @@ class SCAdapter(nn.Module):
     Options:
       - 'linear': single linear layer (128 -> 128)
       - 'mlp':    2-layer MLP with LayerNorm+ReLU (128 -> 128 -> 128)
+      - 'affine': per-dimension scale + shift: z' = a * z + b  (cannot scramble neighborhoods)
     """
     def __init__(self, embed_dim: int = 128, mode: str = 'mlp', dropout: float = 0.1):
         super().__init__()
@@ -61,11 +62,15 @@ class SCAdapter(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(embed_dim, embed_dim),
             )
+        elif mode == 'affine':
+            self.scale = nn.Parameter(torch.ones(embed_dim))
+            self.shift = nn.Parameter(torch.zeros(embed_dim))
         else:
             raise ValueError(f"Unknown adapter mode: {mode}")
 
-        # Initialize close to identity
-        self._init_near_identity()
+        # Initialize close to identity (linear/mlp only; affine is already identity)
+        if mode in ('linear', 'mlp'):
+            self._init_near_identity()
 
     def _init_near_identity(self):
         """Initialize weights so adapter starts close to identity mapping."""
@@ -75,6 +80,8 @@ class SCAdapter(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if self.mode == 'affine':
+            return z * self.scale + self.shift
         return self.adapter(z)
 
 
