@@ -124,9 +124,10 @@ def train_sc_adapter(
         slide_ids:     (n_st,) slide IDs
         adapter_mode:  'linear', 'mlp', or 'affine'
         adapter_dropout: dropout for MLP adapter
-        init_closed_form: if True and mode='affine', initialize with per-dim
-                          mean/variance matching (a_d = σ_ST_d/σ_SC_d, b_d = μ_ST_d - a_d*μ_SC_d)
-                          instead of identity. Prevents variance collapse.
+        init_closed_form: if True, initialize adapter analytically:
+                          - affine: per-dim mean/var matching (diagonal only)
+                          - linear: whitening+coloring (full covariance matching)
+                            This is the optimal transport map between Gaussians.
         n_epochs:      training epochs
         batch_size:    mini-batch size
         lr:            learning rate for adapter
@@ -165,6 +166,8 @@ def train_sc_adapter(
     print(f"  Variance match weight: {variance_match_weight}")
     if init_closed_form and adapter_mode == 'affine':
         print(f"  Init: CLOSED-FORM (per-dim mean/var matching)")
+    if init_closed_form and adapter_mode == 'linear':
+        print(f"  Init: CLOSED-FORM (whitening+coloring, full covariance matching)")
     print(f"  Output: {outf}")
 
     # === Freeze encoder ===
@@ -194,7 +197,7 @@ def train_sc_adapter(
     n_params = sum(p.numel() for p in adapter.parameters())
     print(f"  Adapter parameters: {n_params}")
 
-    # === Closed-form init for affine adapter ===
+    # === Closed-form init ===
     if init_closed_form and adapter_mode == 'affine':
         with torch.no_grad():
             mu_sc = z_sc_frozen.mean(dim=0)
@@ -207,6 +210,48 @@ def train_sc_adapter(
             adapter.shift.copy_(b)
         print(f"  Closed-form init: scale mean={a.mean():.4f}, shift mean={b.mean():.4f}")
         print(f"  Closed-form init: scale range=[{a.min():.4f}, {a.max():.4f}]")
+
+    if init_closed_form and adapter_mode == 'linear':
+        # Whitening+coloring: the optimal transport map between two Gaussians.
+        # z' = C_ST^{1/2} @ C_SC^{-1/2} @ (z - mu_SC) + mu_ST
+        # This matches the FULL covariance matrix (not just per-dim variance),
+        # rotating SC's isotropic variance into ST's anisotropic PCA directions.
+        with torch.no_grad():
+            mu_sc = z_sc_frozen.mean(dim=0)  # (128,)
+            mu_st = z_st_frozen.mean(dim=0)  # (128,)
+
+            C_sc = torch.cov(z_sc_frozen.T)  # (128, 128)
+            C_st = torch.cov(z_st_frozen.T)  # (128, 128)
+
+            # Eigendecomposition for matrix square roots
+            # C_SC^{-1/2} = U_SC @ diag(1/sqrt(S_SC)) @ U_SC^T
+            S_sc, U_sc = torch.linalg.eigh(C_sc)
+            S_st, U_st = torch.linalg.eigh(C_st)
+
+            # Clamp small eigenvalues for numerical stability
+            eps = 1e-6
+            S_sc = S_sc.clamp(min=eps)
+            S_st = S_st.clamp(min=eps)
+
+            # C_SC^{-1/2}
+            whiten = U_sc @ torch.diag(1.0 / S_sc.sqrt()) @ U_sc.T
+            # C_ST^{1/2}
+            color = U_st @ torch.diag(S_st.sqrt()) @ U_st.T
+
+            # W = color @ whiten, b = mu_ST - W @ mu_SC
+            W = color @ whiten   # (128, 128)
+            b = mu_st - W @ mu_sc  # (128,)
+
+            adapter.adapter.weight.copy_(W)
+            adapter.adapter.bias.copy_(b)
+
+            # Diagnostics: condition number tells us if transform is well-behaved
+            cond = (S_sc.max() / S_sc.min()).item()
+            print(f"  Closed-form init (whitening+coloring):")
+            print(f"    SC eigenvalues: min={S_sc.min():.6f}, max={S_sc.max():.4f}")
+            print(f"    ST eigenvalues: min={S_st.min():.6f}, max={S_st.max():.4f}")
+            print(f"    SC covariance condition number: {cond:.1f}")
+            print(f"    W matrix: norm={W.norm():.4f}, diag_mean={W.diag().mean():.4f}")
 
     # === Optimizer ===
     optimizer = torch.optim.Adam(adapter.parameters(), lr=lr, weight_decay=weight_decay)
