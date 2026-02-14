@@ -94,6 +94,7 @@ def train_sc_adapter(
     # Adapter config
     adapter_mode: str = 'mlp',
     adapter_dropout: float = 0.1,
+    init_closed_form: bool = False,
     # Training config
     n_epochs: int = 500,
     batch_size: int = 256,
@@ -103,6 +104,7 @@ def train_sc_adapter(
     coral_weight: float = 10.0,
     mmd_weight: float = 10.0,
     identity_weight: float = 0.0,
+    variance_match_weight: float = 0.0,
     # Diagnostics
     log_every: int = 50,
     device: str = 'cuda',
@@ -120,14 +122,19 @@ def train_sc_adapter(
         sc_gene_expr:  (n_sc, n_genes) SC expression
         st_coords:     (n_st, 2) ST spatial coordinates
         slide_ids:     (n_st,) slide IDs
-        adapter_mode:  'linear' or 'mlp'
+        adapter_mode:  'linear', 'mlp', or 'affine'
         adapter_dropout: dropout for MLP adapter
+        init_closed_form: if True and mode='affine', initialize with per-dim
+                          mean/variance matching (a_d = σ_ST_d/σ_SC_d, b_d = μ_ST_d - a_d*μ_SC_d)
+                          instead of identity. Prevents variance collapse.
         n_epochs:      training epochs
         batch_size:    mini-batch size
         lr:            learning rate for adapter
         weight_decay:  L2 regularization
         coral_weight:  weight for CORAL loss
         mmd_weight:    weight for MMD loss
+        variance_match_weight: weight for per-dim variance matching regularizer
+                       L_var = Σ_d (log σ_adapted_d - log σ_target_d)^2
         log_every:     log metrics every N epochs
         device:        cuda/cpu
         seed:          random seed
@@ -155,6 +162,9 @@ def train_sc_adapter(
     print(f"  ST: {n_st} spots, SC: {n_sc} cells")
     print(f"  Epochs: {n_epochs}, LR: {lr}, Batch: {batch_size}")
     print(f"  CORAL weight: {coral_weight}, MMD weight: {mmd_weight}, Identity weight: {identity_weight}")
+    print(f"  Variance match weight: {variance_match_weight}")
+    if init_closed_form and adapter_mode == 'affine':
+        print(f"  Init: CLOSED-FORM (per-dim mean/var matching)")
     print(f"  Output: {outf}")
 
     # === Freeze encoder ===
@@ -184,6 +194,20 @@ def train_sc_adapter(
     n_params = sum(p.numel() for p in adapter.parameters())
     print(f"  Adapter parameters: {n_params}")
 
+    # === Closed-form init for affine adapter ===
+    if init_closed_form and adapter_mode == 'affine':
+        with torch.no_grad():
+            mu_sc = z_sc_frozen.mean(dim=0)
+            mu_st = z_st_frozen.mean(dim=0)
+            std_sc = z_sc_frozen.std(dim=0).clamp(min=1e-8)
+            std_st = z_st_frozen.std(dim=0)
+            a = std_st / std_sc
+            b = mu_st - a * mu_sc
+            adapter.scale.copy_(a)
+            adapter.shift.copy_(b)
+        print(f"  Closed-form init: scale mean={a.mean():.4f}, shift mean={b.mean():.4f}")
+        print(f"  Closed-form init: scale range=[{a.min():.4f}, {a.max():.4f}]")
+
     # === Optimizer ===
     optimizer = torch.optim.Adam(adapter.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
@@ -195,7 +219,7 @@ def train_sc_adapter(
     # === Training history ===
     history = {
         'epoch': [], 'loss_total': [], 'loss_coral': [], 'loss_mmd': [],
-        'loss_identity': [],
+        'loss_identity': [], 'loss_variance': [],
         'st_overlap_at_20': [], 'domain_centroid_dist': [],
         'lr': [],
     }
@@ -243,6 +267,16 @@ def train_sc_adapter(
         else:
             l_id = torch.tensor(0.0)
 
+        # Variance matching: per-dim log-variance penalty
+        # L_var = mean_d (log σ_adapted_d - log σ_ST_d)^2
+        if variance_match_weight > 0:
+            sc_var = z_sc_adapted.var(dim=0).clamp(min=1e-8)
+            st_var = z_st_batch.var(dim=0).clamp(min=1e-8)
+            l_var = (torch.log(sc_var) - torch.log(st_var)).pow(2).mean()
+            loss = loss + variance_match_weight * l_var
+        else:
+            l_var = torch.tensor(0.0)
+
         # Backward
         optimizer.zero_grad()
         loss.backward()
@@ -281,14 +315,22 @@ def train_sc_adapter(
 
             current_lr = scheduler.get_last_lr()[0]
             id_str = f" L_id={l_id.item():.6f}" if identity_weight > 0 else ""
-            print(f"  e{epoch:4d} | loss={loss.item():.4f} coral={l_coral.item():.4f} mmd={l_mmd.item():.4f}{id_str} | "
-                  f"centroid_dist={centroid_dist:.4f} | st_overlap@20={st_ov:.4f} | lr={current_lr:.2e}")
+            var_str = f" L_var={l_var.item():.4f}" if variance_match_weight > 0 else ""
+
+            # Per-dim spread ratio: adapted SC std vs ST std
+            sc_ad_std = z_sc_all_adapted.std(dim=0).mean().item()
+            st_std = z_st_frozen.std(dim=0).mean().item()
+            spread_ratio = sc_ad_std / max(st_std, 1e-8)
+
+            print(f"  e{epoch:4d} | loss={loss.item():.4f} coral={l_coral.item():.4f} mmd={l_mmd.item():.4f}{id_str}{var_str} | "
+                  f"centroid_dist={centroid_dist:.4f} spread_ratio={spread_ratio:.3f} | st_overlap@20={st_ov:.4f} | lr={current_lr:.2e}")
 
             history['epoch'].append(epoch)
             history['loss_total'].append(loss.item())
             history['loss_coral'].append(full_coral)
             history['loss_mmd'].append(full_mmd)
             history['loss_identity'].append(l_id.item() if identity_weight > 0 else 0.0)
+            history['loss_variance'].append(l_var.item() if variance_match_weight > 0 else 0.0)
             history['st_overlap_at_20'].append(st_ov)
             history['domain_centroid_dist'].append(centroid_dist)
             history['lr'].append(current_lr)
