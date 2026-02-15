@@ -550,3 +550,31 @@ The full pipeline is:
 | `model/core_models_et_p1.py` | Added `mean_center_per_slide()` utility function |
 | `model/sc_adapter.py` | No changes (already had linear+OT mode) |
 | `model/liver_encoder_v2.ipynb` | Training cells for v5 encoder + adapter (user-run) |
+
+---
+
+## Post-Training Validation (8-Cell Analysis Suite)
+
+Comprehensive before-vs-after adapter analysis to validate the Design A pipeline.
+
+### Analysis Plan
+| Cell | Analysis | Key Question |
+|------|----------|-------------|
+| 0 | Load models + compute embeddings | Setup: z_st_raw, z_inf_raw, z_inf_adapted |
+| 1 | 4-class slide classification | Can a classifier separate ST1/ST2/ST3/ST4? |
+| 2 | Centroid distance matrix | Does ST4 move closer to ST1-3 after adapter? |
+| 3 | PCA visualization (3-panel) | Visual: raw / before / after adapter |
+| 4 | Collapse check | Are embeddings healthy (no dim collapse)? |
+| 5 | Domain alignment metrics | CORAL, MMD, domain acc (quantitative) |
+| 6 | Per-slide CORAL/MMD breakdown | Which ST slide is closest to ST4? |
+| 7 | Summary dashboard | Pass/fail verdict on 5 criteria |
+
+### Pass/Fail Criteria
+1. 4-class accuracy < 0.40 (chance = 0.25)
+2. Domain classifier accuracy < 0.60 (chance = 0.50)
+3. CORAL < 0.01
+4. No dimension collapse (min per-dim std > 0.001)
+5. Within-ST distances stable (>80% of original)
+
+### Results
+*(pending — user to run cells)*
