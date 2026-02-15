@@ -1303,9 +1303,17 @@ def compute_spatial_infonce_loss(
         hard_local = hard_local[hard_local >= 0]
 
         # Random far negatives in batch
-        far_in_batch = far_mask[g_i][batch_idx]
-        far_in_batch[local_i] = False
-        far_candidates = torch.where(far_in_batch)[0]
+        # FIX: far_mask is (n_st, n_st) -- only index with ST batch members
+        n_st_nce = far_mask.shape[0]
+        is_st_in_batch = (batch_idx < n_st_nce)
+        st_local_idx = torch.where(is_st_in_batch)[0]
+        if st_local_idx.numel() > 0:
+            st_globals = batch_idx[st_local_idx]
+            far_among_st = far_mask[g_i][st_globals]
+            far_among_st = far_among_st & (st_local_idx != local_i)
+            far_candidates = st_local_idx[far_among_st]
+        else:
+            far_candidates = torch.tensor([], dtype=torch.long, device=z.device)
         if far_candidates.numel() > n_rand_neg:
             perm = torch.randperm(far_candidates.numel(), device=z.device)[:n_rand_neg]
             rand_neg = far_candidates[perm]
@@ -1331,3 +1339,1130 @@ def compute_spatial_infonce_loss(
         return torch.tensor(0.0, device=z.device)
 
     return torch.stack(losses).mean()
+
+
+# ==============================================================================
+# SUPPORT-SET Spatial InfoNCE (full pos/hard/rand per anchor)
+# ==============================================================================
+
+def compute_spatial_infonce_supportset(
+    model: 'nn.Module',
+    st_gene_expr: torch.Tensor,
+    pos_idx: torch.Tensor,
+    far_mask: torch.Tensor,
+    hard_neg: torch.Tensor,
+    slide_ids: torch.Tensor,
+    tau: float = 0.1,
+    n_rand_neg: int = 128,
+    n_anchors_per_step: int = 64,
+    return_diagnostics: bool = False,
+    slide_override: Optional[int] = None,
+    z_cache: Optional[torch.Tensor] = None,
+    n_hard_mine: int = 20,
+):
+    """
+    Support-set Spatial InfoNCE: explicitly forward-pass all positives,
+    hard negatives, and random far negatives for each anchor.
+
+    Unlike the in-batch version, this guarantees every anchor sees its
+    full positive set (~k_phys) and full hard-negative set (~n_hard),
+    regardless of what was randomly sampled into the VICReg batch.
+
+    Per step:
+      1. Pick one random slide, sample n_anchors_per_step anchors from it
+      2. Gather all pos_idx, hard_neg, and random far indices for those anchors
+      3. Forward-pass the union through the encoder
+      4. Compute InfoNCE per anchor using full sets
+
+    Args:
+        model:       encoder (must be in train mode, gradients will flow)
+        st_gene_expr: (n_st, n_genes) full ST expression, already on device
+        pos_idx:     (n_st, k_phys) precomputed physical neighbor indices
+        far_mask:    (n_st, n_st) bool mask for physically far spots
+        hard_neg:    (n_st, n_hard) expression-similar but physically far indices
+        slide_ids:   (n_st,) per-spot slide IDs
+        tau:         temperature
+        n_rand_neg:  random far negatives per anchor
+        n_anchors_per_step: anchors to sample per slide per step
+        return_diagnostics: if True, returns (loss, stats_dict)
+        slide_override: if set, use this slide ID instead of random
+        z_cache:     (n_st, d) optional embedding cache for mining hard negatives
+                     in embedding space. When provided, hard negatives are mined
+                     as the top-n_hard_mine most similar far spots in z_cache
+                     instead of using precomputed expression-hard negatives.
+        n_hard_mine: number of hard negatives to mine from z_cache per anchor
+
+    Returns:
+        loss (or (loss, stats) if return_diagnostics=True)
+    """
+    device = st_gene_expr.device
+    n_st = st_gene_expr.shape[0]
+
+    # 1. Pick a slide (round-robin override or random), sample anchors from it
+    unique_slides = torch.unique(slide_ids)
+    if slide_override is not None:
+        slide_pick = torch.tensor(slide_override, device=device)
+    else:
+        slide_pick = unique_slides[torch.randint(len(unique_slides), (1,)).item()]
+    slide_indices = torch.where(slide_ids == slide_pick)[0]
+
+    n_avail = slide_indices.shape[0]
+    n_anc = min(n_anchors_per_step, n_avail)
+    perm = torch.randperm(n_avail, device=device)[:n_anc]
+    anchor_globals = slide_indices[perm]
+
+    # 2. Collect all indices needed for the support set
+    all_needed = set()
+    anchor_list = anchor_globals.cpu().tolist()
+    all_needed.update(anchor_list)
+
+    per_anchor_pos = []
+    per_anchor_hard = []
+    per_anchor_far = []
+
+    # If z_cache provided, mine hard negatives from embedding space
+    use_emb_mining = z_cache is not None
+    if use_emb_mining:
+        z_cache_norm = F.normalize(z_cache.detach(), dim=1)
+
+    for a in anchor_list:
+        p = pos_idx[a]
+        p = p[p >= 0].cpu().tolist()
+        per_anchor_pos.append(p)
+        all_needed.update(p)
+
+        if use_emb_mining:
+            # Mine hard negatives: top-n_hard_mine most similar far spots in embedding space
+            far_of_a_all = torch.where(far_mask[a])[0]
+            if far_of_a_all.numel() > 0:
+                sim_emb = z_cache_norm[a] @ z_cache_norm[far_of_a_all].T
+                m_eff = min(n_hard_mine, far_of_a_all.numel())
+                _, topk_idx = sim_emb.topk(m_eff)
+                h = far_of_a_all[topk_idx].cpu().tolist()
+            else:
+                h = []
+        else:
+            h_t = hard_neg[a]
+            h = h_t[h_t >= 0].cpu().tolist()
+        per_anchor_hard.append(h)
+        all_needed.update(h)
+
+        far_of_a = torch.where(far_mask[a])[0]
+        if far_of_a.numel() > n_rand_neg:
+            rperm = torch.randperm(far_of_a.numel(), device=device)[:n_rand_neg]
+            far_of_a = far_of_a[rperm]
+        f = far_of_a.cpu().tolist()
+        per_anchor_far.append(f)
+        all_needed.update(f)
+
+    # 3. Forward-pass all unique spots
+    all_needed_sorted = sorted(all_needed)
+    all_needed_t = torch.tensor(all_needed_sorted, dtype=torch.long, device=device)
+
+    z_support = model(st_gene_expr[all_needed_t])
+    z_support_norm = F.normalize(z_support, dim=1)
+
+    # Global -> support-local index mapping
+    g2l = torch.full((n_st,), -1, dtype=torch.long, device=device)
+    g2l[all_needed_t] = torch.arange(len(all_needed_sorted), device=device)
+
+    # 4. Compute InfoNCE per anchor
+    losses = []
+    diag_sim_pos = []
+    diag_sim_hard = []
+    diag_sim_rand = []
+    diag_n_pos = []
+    diag_n_hard = []
+    diag_n_rand = []
+
+    for i, a in enumerate(anchor_list):
+        a_local = g2l[a].item()
+        z_a = z_support_norm[a_local]
+
+        # Positives
+        pos_g = per_anchor_pos[i]
+        if len(pos_g) == 0:
+            continue
+        pos_locals = g2l[torch.tensor(pos_g, dtype=torch.long, device=device)]
+        pos_locals = pos_locals[pos_locals >= 0]
+        if pos_locals.numel() == 0:
+            continue
+
+        # Hard negatives
+        hard_g = per_anchor_hard[i]
+        if hard_g:
+            hard_locals = g2l[torch.tensor(hard_g, dtype=torch.long, device=device)]
+            hard_locals = hard_locals[hard_locals >= 0]
+        else:
+            hard_locals = torch.tensor([], dtype=torch.long, device=device)
+
+        # Far negatives
+        far_g = per_anchor_far[i]
+        if far_g:
+            far_locals = g2l[torch.tensor(far_g, dtype=torch.long, device=device)]
+            far_locals = far_locals[far_locals >= 0]
+        else:
+            far_locals = torch.tensor([], dtype=torch.long, device=device)
+
+        # Combine negatives, remove self and any positive overlap
+        neg_parts = [t for t in [hard_locals, far_locals] if t.numel() > 0]
+        if len(neg_parts) == 0:
+            continue
+        all_neg_locals = torch.cat(neg_parts).unique()
+        pos_set = set(pos_locals.cpu().tolist())
+        keep = torch.tensor(
+            [v.item() not in pos_set and v.item() != a_local for v in all_neg_locals],
+            dtype=torch.bool, device=device,
+        )
+        all_neg_locals = all_neg_locals[keep]
+        if all_neg_locals.numel() == 0:
+            continue
+
+        # Cosine similarities
+        sim_pos_raw = z_a @ z_support_norm[pos_locals].T
+        sim_neg_raw = z_a @ z_support_norm[all_neg_locals].T
+
+        if return_diagnostics:
+            diag_sim_pos.append(sim_pos_raw.detach())
+            if hard_locals.numel() > 0:
+                diag_sim_hard.append((z_a @ z_support_norm[hard_locals].T).detach())
+            if far_locals.numel() > 0:
+                diag_sim_rand.append((z_a @ z_support_norm[far_locals].T).detach())
+            diag_n_pos.append(pos_locals.numel())
+            diag_n_hard.append(hard_locals.numel())
+            diag_n_rand.append(far_locals.numel())
+
+        # InfoNCE
+        sim_pos_t = sim_pos_raw / tau
+        sim_neg_t = sim_neg_raw / tau
+        logits = torch.cat([sim_pos_t, sim_neg_t])
+        log_denom = torch.logsumexp(logits, dim=0)
+        loss_i = -(sim_pos_t.mean() - log_denom)
+        losses.append(loss_i)
+
+    if len(losses) == 0:
+        loss = torch.tensor(0.0, device=device, requires_grad=True)
+    else:
+        loss = torch.stack(losses).mean()
+
+    if not return_diagnostics:
+        return loss
+
+    sim_pos_cat = torch.cat(diag_sim_pos) if diag_sim_pos else torch.tensor([0.0])
+    sim_hard_cat = torch.cat(diag_sim_hard) if diag_sim_hard else torch.tensor([0.0])
+    sim_rand_cat = torch.cat(diag_sim_rand) if diag_sim_rand else torch.tensor([0.0])
+
+    stats = {
+        'n_anchors': n_anc,
+        'n_active': len(losses),
+        'slide_picked': slide_pick.item(),
+        'support_set_size': all_needed_t.shape[0],
+        'sim_pos_mean': sim_pos_cat.mean().item(),
+        'sim_pos_std': sim_pos_cat.std().item() if sim_pos_cat.numel() > 1 else 0.0,
+        'sim_hard_mean': sim_hard_cat.mean().item(),
+        'sim_hard_std': sim_hard_cat.std().item() if sim_hard_cat.numel() > 1 else 0.0,
+        'sim_rand_mean': sim_rand_cat.mean().item(),
+        'sim_rand_std': sim_rand_cat.std().item() if sim_rand_cat.numel() > 1 else 0.0,
+        'n_pos_per_anchor': np.mean(diag_n_pos) if diag_n_pos else 0.0,
+        'n_hard_per_anchor': np.mean(diag_n_hard) if diag_n_hard else 0.0,
+        'n_rand_per_anchor': np.mean(diag_n_rand) if diag_n_rand else 0.0,
+        'loss': loss.item(),
+    }
+
+    return loss, stats
+
+
+# ==============================================================================
+# SPATIAL InfoNCE DIAGNOSTICS
+# ==============================================================================
+
+def compute_spatial_infonce_loss_with_diagnostics(
+    z: torch.Tensor,
+    batch_idx: torch.Tensor,
+    pos_idx: torch.Tensor,
+    far_mask: torch.Tensor,
+    hard_neg: torch.Tensor,
+    tau: float = 0.1,
+    n_rand_neg: int = 128,
+    is_st_mask: torch.Tensor = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Same as compute_spatial_infonce_loss but returns detailed diagnostics.
+
+    Returns:
+        loss: scalar loss (differentiable)
+        stats: dict with similarity gap diagnostics
+    """
+    if is_st_mask is not None:
+        st_idx_in_batch = torch.where(is_st_mask)[0]
+    else:
+        st_idx_in_batch = torch.arange(z.shape[0], device=z.device)
+
+    if st_idx_in_batch.numel() < 4:
+        return torch.tensor(0.0, device=z.device, requires_grad=True), {
+            'n_anchors': 0, 'n_active': 0,
+            'sim_pos_mean': 0.0, 'sim_hard_mean': 0.0, 'sim_rand_mean': 0.0,
+            'n_pos_per_anchor': 0.0, 'n_hard_per_anchor': 0.0, 'n_rand_per_anchor': 0.0,
+            'loss': 0.0,
+        }
+
+    z_norm = F.normalize(z, dim=1)
+    losses = []
+
+    # Accumulators for diagnostics (raw cosine sim, NOT divided by tau)
+    all_sim_pos = []
+    all_sim_hard = []
+    all_sim_rand = []
+    n_pos_counts = []
+    n_hard_counts = []
+    n_rand_counts = []
+    n_skipped_no_pos_global = 0
+    n_skipped_no_pos_batch = 0
+    n_skipped_no_neg = 0
+
+    for local_i in st_idx_in_batch:
+        g_i = batch_idx[local_i].item()
+        z_anchor = z_norm[local_i]
+
+        # Positives: physical neighbors
+        pos_globals = pos_idx[g_i]
+        pos_globals = pos_globals[pos_globals >= 0]
+        if pos_globals.numel() == 0:
+            n_skipped_no_pos_global += 1
+            continue
+
+        # Map global -> batch-local
+        global_to_local = torch.full(
+            (max(batch_idx.max().item() + 1, pos_globals.max().item() + 1),),
+            -1, dtype=torch.long, device=z.device
+        )
+        global_to_local[batch_idx] = torch.arange(z.shape[0], device=z.device)
+
+        pos_local = global_to_local[pos_globals]
+        pos_local = pos_local[pos_local >= 0]
+        if pos_local.numel() == 0:
+            n_skipped_no_pos_batch += 1
+            continue
+
+        # Hard negatives in batch
+        hard_globals = hard_neg[g_i]
+        hard_globals = hard_globals[hard_globals >= 0]
+        hard_local = global_to_local[hard_globals.clamp(max=global_to_local.shape[0] - 1)]
+        hard_local = hard_local[hard_local >= 0]
+
+        # Random far negatives in batch
+        # FIX: far_mask is (n_st, n_st) -- only index with ST batch members
+        n_st_nce = far_mask.shape[0]
+        is_st_in_batch = (batch_idx < n_st_nce)
+        st_local_idx = torch.where(is_st_in_batch)[0]
+        if st_local_idx.numel() > 0:
+            st_globals = batch_idx[st_local_idx]
+            far_among_st = far_mask[g_i][st_globals]
+            far_among_st = far_among_st & (st_local_idx != local_i)
+            far_candidates = st_local_idx[far_among_st]
+        else:
+            far_candidates = torch.tensor([], dtype=torch.long, device=z.device)
+        if far_candidates.numel() > n_rand_neg:
+            perm = torch.randperm(far_candidates.numel(), device=z.device)[:n_rand_neg]
+            rand_neg = far_candidates[perm]
+        else:
+            rand_neg = far_candidates
+
+        # Combine negatives
+        all_neg = torch.cat([hard_local, rand_neg]).unique()
+        if all_neg.numel() == 0:
+            n_skipped_no_neg += 1
+            continue
+
+        # Raw cosine similarities (for diagnostics, without tau)
+        raw_sim_pos = (z_anchor @ z_norm[pos_local].T)
+        raw_sim_hard = (z_anchor @ z_norm[hard_local].T) if hard_local.numel() > 0 else torch.tensor([], device=z.device)
+        raw_sim_rand = (z_anchor @ z_norm[rand_neg].T) if rand_neg.numel() > 0 else torch.tensor([], device=z.device)
+
+        all_sim_pos.append(raw_sim_pos.detach())
+        if raw_sim_hard.numel() > 0:
+            all_sim_hard.append(raw_sim_hard.detach())
+        if raw_sim_rand.numel() > 0:
+            all_sim_rand.append(raw_sim_rand.detach())
+
+        n_pos_counts.append(pos_local.numel())
+        n_hard_counts.append(hard_local.numel())
+        n_rand_counts.append(rand_neg.numel())
+
+        # InfoNCE (same as original)
+        sim_pos = raw_sim_pos / tau
+        sim_neg = (z_anchor @ z_norm[all_neg].T) / tau
+        logits = torch.cat([sim_pos, sim_neg])
+        log_denom = torch.logsumexp(logits, dim=0)
+        loss_i = -(sim_pos.mean() - log_denom)
+        losses.append(loss_i)
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=z.device, requires_grad=True), {
+            'n_anchors': st_idx_in_batch.numel(),
+            'n_active': 0,
+            'n_skipped_no_pos_global': n_skipped_no_pos_global,
+            'n_skipped_no_pos_batch': n_skipped_no_pos_batch,
+            'n_skipped_no_neg': n_skipped_no_neg,
+            'sim_pos_mean': 0.0, 'sim_hard_mean': 0.0, 'sim_rand_mean': 0.0,
+            'n_pos_per_anchor': 0.0, 'n_hard_per_anchor': 0.0, 'n_rand_per_anchor': 0.0,
+            'loss': 0.0,
+        }
+
+    loss = torch.stack(losses).mean()
+
+    # Aggregate similarity stats
+    sim_pos_cat = torch.cat(all_sim_pos) if all_sim_pos else torch.tensor([0.0])
+    sim_hard_cat = torch.cat(all_sim_hard) if all_sim_hard else torch.tensor([0.0])
+    sim_rand_cat = torch.cat(all_sim_rand) if all_sim_rand else torch.tensor([0.0])
+
+    stats = {
+        'n_anchors': st_idx_in_batch.numel(),
+        'n_active': len(losses),
+        'n_skipped_no_pos_global': n_skipped_no_pos_global,
+        'n_skipped_no_pos_batch': n_skipped_no_pos_batch,
+        'n_skipped_no_neg': n_skipped_no_neg,
+        'sim_pos_mean': sim_pos_cat.mean().item(),
+        'sim_pos_std': sim_pos_cat.std().item() if sim_pos_cat.numel() > 1 else 0.0,
+        'sim_hard_mean': sim_hard_cat.mean().item(),
+        'sim_hard_std': sim_hard_cat.std().item() if sim_hard_cat.numel() > 1 else 0.0,
+        'sim_rand_mean': sim_rand_cat.mean().item(),
+        'sim_rand_std': sim_rand_cat.std().item() if sim_rand_cat.numel() > 1 else 0.0,
+        'n_pos_per_anchor': np.mean(n_pos_counts) if n_pos_counts else 0.0,
+        'n_hard_per_anchor': np.mean(n_hard_counts) if n_hard_counts else 0.0,
+        'n_rand_per_anchor': np.mean(n_rand_counts) if n_rand_counts else 0.0,
+        'loss': loss.item(),
+    }
+
+    return loss, stats
+
+
+def diagnose_spatial_infonce(
+    model: nn.Module,
+    st_gene_expr: torch.Tensor,
+    st_coords: torch.Tensor,
+    sc_gene_expr: torch.Tensor,
+    slide_ids: torch.Tensor,
+    sc_slide_ids: Optional[torch.Tensor] = None,
+    spatial_nce_weight: float = 3.0,
+    spatial_nce_k_phys: int = 20,
+    spatial_nce_far_mult: float = 4.0,
+    spatial_nce_n_hard: int = 20,
+    spatial_nce_tau: float = 0.1,
+    spatial_nce_n_rand_neg: int = 128,
+    spatial_nce_n_anchors: int = 64,
+    vicreg_lambda_inv: float = 25.0,
+    vicreg_lambda_var: float = 50.0,
+    vicreg_lambda_cov: float = 1.0,
+    vicreg_gamma: float = 1.0,
+    vicreg_eps: float = 1e-4,
+    aug_gene_dropout: float = 0.25,
+    aug_gauss_std: float = 0.01,
+    aug_scale_jitter: float = 0.1,
+    local_align_weight: float = 0.0,
+    local_align_tau_z: float = 0.07,
+    local_align_bidirectional: bool = True,
+    batch_size: int = 256,
+    n_diagnostic_steps: int = 200,
+    lr: float = 1e-4,
+    device: str = 'cuda',
+    seed: int = 42,
+):
+    """
+    Run two diagnostic checks on spatial InfoNCE:
+
+    A) Gradient check (single batch):
+       - Backprop only L_spatialNCE -> record ||grad_theta||
+       - Backprop only L_VICReg     -> record ||grad_theta||
+       - Backprop only L_local_align -> record ||grad_theta||
+       - Backprop full loss          -> record ||grad_theta||
+
+    B) Loss scale check (first n_diagnostic_steps steps):
+       - Mean L_spatialNCE per step
+       - Logit gap: sim(z_i, pos) vs sim(z_i, hardneg) vs sim(z_i, randneg)
+
+    Returns:
+        results: dict with all diagnostics
+    """
+    import copy
+
+    set_seed(seed)
+
+    # --- Setup (mirrors train_encoder) ---
+    model_diag = copy.deepcopy(model).to(device).train()
+
+    n_st = st_gene_expr.shape[0]
+    n_sc = sc_gene_expr.shape[0]
+    X_ssl = torch.cat([st_gene_expr, sc_gene_expr], dim=0).to(device)
+
+    domain_ids = torch.cat([
+        torch.zeros(n_st, device=device, dtype=torch.long),
+        torch.ones(n_sc, device=device, dtype=torch.long),
+    ])
+
+    # Precompute spatial NCE structures
+    spatial_nce_data = precompute_spatial_nce_structures(
+        st_coords=st_coords.to(device),
+        st_gene_expr=st_gene_expr.to(device),
+        slide_ids=slide_ids.to(device),
+        k_phys=spatial_nce_k_phys,
+        far_mult=spatial_nce_far_mult,
+        n_hard=spatial_nce_n_hard,
+        device=device,
+    )
+
+    vicreg_loss_fn = VICRegLoss(
+        vicreg_lambda_inv, vicreg_lambda_var, vicreg_lambda_cov,
+        vicreg_gamma, vicreg_eps, use_ddp_gather=False,
+        compute_stats_fp32=True,
+    )
+
+    opt = torch.optim.Adam(model_diag.parameters(), lr=lr)
+
+    # ================================================================
+    # CHECK A: Gradient norms from each loss component (single batch)
+    # ================================================================
+    print("=" * 70)
+    print("CHECK A: Per-component gradient norms (support-set NCE)")
+    print("=" * 70)
+
+    # Sample one balanced batch (for VICReg / local align)
+    idx = sample_balanced_domain_and_slide_indices(
+        domain_ids, slide_ids.to(device),
+        sc_slide_ids.to(device) if sc_slide_ids is not None else None,
+        batch_size, device,
+    )
+    X_batch = X_ssl[idx]
+    s_batch = domain_ids[idx]
+
+    # Augmented views for VICReg
+    X1 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+    X2 = augment_expression(X_batch, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+
+    st_expr_dev = st_gene_expr.to(device)
+
+    grad_norms = {}
+
+    # A1: Spatial InfoNCE only (support-set — own forward pass)
+    opt.zero_grad(set_to_none=True)
+    loss_nce, nce_stats = compute_spatial_infonce_supportset(
+        model=model_diag,
+        st_gene_expr=st_expr_dev,
+        pos_idx=spatial_nce_data['pos_idx'],
+        far_mask=spatial_nce_data['far_mask'],
+        hard_neg=spatial_nce_data['hard_neg'],
+        slide_ids=slide_ids.to(device),
+        tau=spatial_nce_tau,
+        n_rand_neg=spatial_nce_n_rand_neg,
+        n_anchors_per_step=spatial_nce_n_anchors,
+        return_diagnostics=True,
+    )
+    if loss_nce.requires_grad and loss_nce.item() != 0.0:
+        (spatial_nce_weight * loss_nce).backward(retain_graph=True)
+        gnorm_nce = _total_grad_norm(model_diag)
+    else:
+        gnorm_nce = 0.0
+    grad_norms['L_spatialNCE'] = gnorm_nce
+
+    # A2: VICReg only
+    opt.zero_grad(set_to_none=True)
+    z1_ = model_diag(X1)
+    z2_ = model_diag(X2)
+    loss_vic, _ = vicreg_loss_fn(z1_, z2_)
+    loss_vic.backward(retain_graph=True)
+    gnorm_vic = _total_grad_norm(model_diag)
+    grad_norms['L_VICReg'] = gnorm_vic
+
+    # A3: Local alignment only
+    opt.zero_grad(set_to_none=True)
+    z_clean2 = model_diag(X_batch)
+    is_sc = (idx >= n_st)
+    z_st_b = z_clean2[~is_sc]
+    z_sc_b = z_clean2[is_sc]
+    if local_align_weight > 0 and z_st_b.shape[0] > 8 and z_sc_b.shape[0] > 8:
+        loss_local = compute_local_alignment_loss(
+            z_sc=z_sc_b, z_st=z_st_b,
+            tau_z=local_align_tau_z,
+            bidirectional=local_align_bidirectional,
+        )
+        (local_align_weight * loss_local).backward(retain_graph=True)
+        gnorm_local = _total_grad_norm(model_diag)
+    else:
+        gnorm_local = 0.0
+        loss_local = torch.tensor(0.0)
+    grad_norms['L_local_align'] = gnorm_local
+
+    # A4: Full loss (VICReg + support-set NCE)
+    opt.zero_grad(set_to_none=True)
+    z1_f = model_diag(X1)
+    z2_f = model_diag(X2)
+    loss_vic_f, _ = vicreg_loss_fn(z1_f, z2_f)
+    loss_nce_f = compute_spatial_infonce_supportset(
+        model=model_diag,
+        st_gene_expr=st_expr_dev,
+        pos_idx=spatial_nce_data['pos_idx'],
+        far_mask=spatial_nce_data['far_mask'],
+        hard_neg=spatial_nce_data['hard_neg'],
+        slide_ids=slide_ids.to(device),
+        tau=spatial_nce_tau,
+        n_rand_neg=spatial_nce_n_rand_neg,
+        n_anchors_per_step=spatial_nce_n_anchors,
+    )
+    loss_full = loss_vic_f + spatial_nce_weight * loss_nce_f
+    loss_full.backward()
+    gnorm_full = _total_grad_norm(model_diag)
+    grad_norms['L_full'] = gnorm_full
+
+    print(f"\n  Gradient norms (||grad_theta||):")
+    print(f"    L_spatialNCE (w={spatial_nce_weight}): {gnorm_nce:.6f}")
+    print(f"    L_VICReg:                              {gnorm_vic:.6f}")
+    print(f"    L_local_align (w={local_align_weight}): {gnorm_local:.6f}")
+    print(f"    L_full:                                {gnorm_full:.6f}")
+
+    if gnorm_vic > 0:
+        ratio = gnorm_nce / gnorm_vic
+        print(f"\n    Ratio NCE/VICReg: {ratio:.6f}")
+        if ratio < 1e-4:
+            print("    ** SPATIAL NCE IS EFFECTIVELY A NO-OP (gradient ~0) **")
+        elif ratio < 0.01:
+            print("    ** WARNING: Spatial NCE gradient is very small relative to VICReg **")
+        else:
+            print("    ** Spatial NCE gradient is non-trivial -- loss IS live **")
+
+    print(f"\n  Spatial NCE support-set stats:")
+    for k, v in nce_stats.items():
+        print(f"    {k}: {v}")
+
+    # ================================================================
+    # CHECK C: Index set sanity (physical distances + overlap)
+    # ================================================================
+    print("\n" + "=" * 70)
+    print("CHECK C: Index set sanity — pos/neg distances & overlap")
+    print("=" * 70)
+
+    pos_idx_t = spatial_nce_data['pos_idx']   # (n_st, k_phys)
+    far_mask_t = spatial_nce_data['far_mask']  # (n_st, n_st)
+    hard_neg_t = spatial_nce_data['hard_neg']  # (n_st, n_hard)
+    st_coords_dev = st_coords.to(device)
+
+    n_sample_c = min(500, n_st)
+    rng_c = np.random.RandomState(seed)
+    sample_idx = rng_c.choice(n_st, n_sample_c, replace=False)
+
+    pos_phys_dists_all = []   # physical distance to each positive
+    hard_phys_dists_all = []  # physical distance to each hard neg
+    far_counts = []           # how many far spots each anchor has
+    pos_counts = []           # how many valid positives each anchor has
+    hard_counts = []          # how many valid hard negs each anchor has
+    overlap_counts = []       # |pos_set ∩ hard_set| per anchor
+    overlap_any_neg = []      # |pos_set ∩ all_neg_set| per anchor
+
+    for i in sample_idx:
+        coord_i = st_coords_dev[i]
+
+        # Positives
+        p_globals = pos_idx_t[i]
+        p_globals = p_globals[p_globals >= 0]
+        pos_counts.append(p_globals.numel())
+        if p_globals.numel() > 0:
+            d_pos = torch.norm(st_coords_dev[p_globals] - coord_i, dim=1)
+            pos_phys_dists_all.extend(d_pos.cpu().tolist())
+        pos_set = set(p_globals.cpu().tolist())
+
+        # Hard negatives
+        h_globals = hard_neg_t[i]
+        h_globals = h_globals[h_globals >= 0]
+        hard_counts.append(h_globals.numel())
+        if h_globals.numel() > 0:
+            d_hard = torch.norm(st_coords_dev[h_globals] - coord_i, dim=1)
+            hard_phys_dists_all.extend(d_hard.cpu().tolist())
+        hard_set = set(h_globals.cpu().tolist())
+
+        # Far mask count
+        far_count = far_mask_t[i].sum().item()
+        far_counts.append(far_count)
+
+        # Overlap: positives that are also hard negatives
+        overlap = pos_set & hard_set
+        overlap_counts.append(len(overlap))
+
+        # Overlap: positives that appear in hard_neg OR far_mask
+        far_globals = set(torch.where(far_mask_t[i])[0].cpu().tolist())
+        all_neg_set = hard_set | far_globals
+        overlap_any = pos_set & all_neg_set
+        overlap_any_neg.append(len(overlap_any))
+
+    pos_phys_dists_all = np.array(pos_phys_dists_all)
+    hard_phys_dists_all = np.array(hard_phys_dists_all)
+    r_pos_values = spatial_nce_data['r_pos']
+    r_far_threshold = spatial_nce_far_mult * np.mean(r_pos_values)
+
+    print(f"\n  Sampled {n_sample_c} random anchors:")
+    print(f"  r_pos per slide: {[f'{r:.4f}' for r in r_pos_values]}")
+    print(f"  r_far threshold: {r_far_threshold:.4f} ({spatial_nce_far_mult}x mean r_pos)")
+    print()
+    print(f"  Positives (physical neighbors):")
+    print(f"    Count per anchor: mean={np.mean(pos_counts):.1f}, min={np.min(pos_counts)}, max={np.max(pos_counts)}")
+    if len(pos_phys_dists_all) > 0:
+        print(f"    Physical dist: mean={pos_phys_dists_all.mean():.4f}, "
+              f"median={np.median(pos_phys_dists_all):.4f}, "
+              f"max={pos_phys_dists_all.max():.4f}")
+        pct_pos_below_rfar = (pos_phys_dists_all < r_far_threshold).mean() * 100
+        print(f"    % pos below r_far: {pct_pos_below_rfar:.1f}% (should be ~100%)")
+    print()
+    print(f"  Hard negatives (expr-similar but far):")
+    print(f"    Count per anchor: mean={np.mean(hard_counts):.1f}, min={np.min(hard_counts)}, max={np.max(hard_counts)}")
+    if len(hard_phys_dists_all) > 0:
+        print(f"    Physical dist: mean={hard_phys_dists_all.mean():.4f}, "
+              f"median={np.median(hard_phys_dists_all):.4f}, "
+              f"min={hard_phys_dists_all.min():.4f}")
+        pct_hard_above_rfar = (hard_phys_dists_all >= r_far_threshold).mean() * 100
+        print(f"    % hard_neg above r_far: {pct_hard_above_rfar:.1f}% (should be ~100%)")
+    print()
+    print(f"  Far mask:")
+    print(f"    Far spots per anchor: mean={np.mean(far_counts):.1f}, "
+          f"min={np.min(far_counts)}, max={np.max(far_counts)}")
+    print()
+    print(f"  INDEX OVERLAP (must be zero!):")
+    print(f"    |pos ∩ hard_neg|: mean={np.mean(overlap_counts):.2f}, "
+          f"max={np.max(overlap_counts)}, nonzero={sum(1 for x in overlap_counts if x > 0)}/{n_sample_c}")
+    print(f"    |pos ∩ (hard ∪ far)|: mean={np.mean(overlap_any_neg):.2f}, "
+          f"max={np.max(overlap_any_neg)}, nonzero={sum(1 for x in overlap_any_neg if x > 0)}/{n_sample_c}")
+
+    if np.max(overlap_counts) > 0:
+        print("    ** LEAKAGE DETECTED: some positives are also hard negatives! **")
+        print("    ** InfoNCE is contradictory — same spot is pushed close AND far **")
+    elif np.max(overlap_any_neg) > 0:
+        print("    ** LEAKAGE DETECTED: some positives are in the far set! **")
+        print("    ** The loss may be pulling and pushing the same pairs **")
+    else:
+        print("    ** CLEAN: zero overlap between pos and neg index sets **")
+
+    check_c_results = {
+        'pos_phys_dists': pos_phys_dists_all,
+        'hard_phys_dists': hard_phys_dists_all,
+        'r_far_threshold': r_far_threshold,
+        'pos_counts': np.array(pos_counts),
+        'hard_counts': np.array(hard_counts),
+        'far_counts': np.array(far_counts),
+        'overlap_pos_hard': np.array(overlap_counts),
+        'overlap_pos_any_neg': np.array(overlap_any_neg),
+    }
+
+    # ================================================================
+    # CHECK B: Loss scale & logit gap over first N steps (support-set)
+    # ================================================================
+    print("\n" + "=" * 70)
+    print(f"CHECK B: Loss scale & logit gap (first {n_diagnostic_steps} steps, support-set)")
+    print("=" * 70)
+
+    # Fresh model copy for the training run
+    model_train = copy.deepcopy(model).to(device).train()
+    opt_train = torch.optim.Adam(model_train.parameters(), lr=lr)
+
+    st_expr_dev = st_gene_expr.to(device)
+    unique_slide_list = torch.unique(slide_ids.to(device)).cpu().tolist()
+
+    step_logs = {
+        'step': [], 'loss_nce': [], 'loss_vicreg': [],
+        'sim_pos_mean': [], 'sim_hard_mean': [], 'sim_rand_mean': [],
+        'sim_pos_std': [], 'sim_hard_std': [], 'sim_rand_std': [],
+        'n_active_anchors': [], 'n_pos_per_anchor': [],
+        'n_hard_per_anchor': [], 'n_rand_per_anchor': [],
+    }
+
+    for step in range(n_diagnostic_steps):
+        # --- Step S: Separate spatial NCE update (round-robin slides) ---
+        slide_pick = unique_slide_list[step % len(unique_slide_list)]
+        loss_nce_s, nce_diag_s = compute_spatial_infonce_supportset(
+            model=model_train,
+            st_gene_expr=st_expr_dev,
+            pos_idx=spatial_nce_data['pos_idx'],
+            far_mask=spatial_nce_data['far_mask'],
+            hard_neg=spatial_nce_data['hard_neg'],
+            slide_ids=slide_ids.to(device),
+            tau=spatial_nce_tau,
+            n_rand_neg=spatial_nce_n_rand_neg,
+            n_anchors_per_step=spatial_nce_n_anchors,
+            return_diagnostics=True,
+            slide_override=slide_pick,
+        )
+
+        opt_train.zero_grad(set_to_none=True)
+        (spatial_nce_weight * loss_nce_s).backward()
+        opt_train.step()
+
+        # --- Step M: VICReg on mixed batch (separate step) ---
+        idx_s = sample_balanced_domain_and_slide_indices(
+            domain_ids, slide_ids.to(device),
+            sc_slide_ids.to(device) if sc_slide_ids is not None else None,
+            batch_size, device,
+        )
+        X_b = X_ssl[idx_s]
+
+        X1_s = augment_expression(X_b, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+        X2_s = augment_expression(X_b, aug_gene_dropout, aug_gauss_std, aug_scale_jitter)
+
+        z1_s = model_train(X1_s)
+        z2_s = model_train(X2_s)
+
+        loss_vic_s, _ = vicreg_loss_fn(z1_s, z2_s)
+
+        opt_train.zero_grad(set_to_none=True)
+        loss_vic_s.backward()
+        opt_train.step()
+
+        # Log
+        step_logs['step'].append(step)
+        step_logs['loss_nce'].append(loss_nce_s.item())
+        step_logs['loss_vicreg'].append(loss_vic_s.item())
+        step_logs['sim_pos_mean'].append(nce_diag_s['sim_pos_mean'])
+        step_logs['sim_hard_mean'].append(nce_diag_s['sim_hard_mean'])
+        step_logs['sim_rand_mean'].append(nce_diag_s['sim_rand_mean'])
+        step_logs['sim_pos_std'].append(nce_diag_s.get('sim_pos_std', 0.0))
+        step_logs['sim_hard_std'].append(nce_diag_s.get('sim_hard_std', 0.0))
+        step_logs['sim_rand_std'].append(nce_diag_s.get('sim_rand_std', 0.0))
+        step_logs['n_active_anchors'].append(nce_diag_s['n_active'])
+        step_logs['n_pos_per_anchor'].append(nce_diag_s['n_pos_per_anchor'])
+        step_logs['n_hard_per_anchor'].append(nce_diag_s['n_hard_per_anchor'])
+        step_logs['n_rand_per_anchor'].append(nce_diag_s['n_rand_per_anchor'])
+
+        if step % 50 == 0 or step < 5:
+            print(f"  step {step:4d} | NCE={loss_nce_s.item():.4f} VIC={loss_vic_s.item():.4f} | "
+                  f"sim(pos)={nce_diag_s['sim_pos_mean']:.4f} sim(hard)={nce_diag_s['sim_hard_mean']:.4f} "
+                  f"sim(rand)={nce_diag_s['sim_rand_mean']:.4f} | "
+                  f"active={nce_diag_s['n_active']}/{nce_diag_s['n_anchors']} | "
+                  f"slide={slide_pick} support={nce_diag_s['support_set_size']}")
+
+    # Summary
+    print("\n" + "-" * 70)
+    print("SUMMARY over all steps:")
+
+    arr = lambda k: np.array(step_logs[k])
+
+    mean_nce = arr('loss_nce').mean()
+    mean_vic = arr('loss_vicreg').mean()
+    mean_pos = arr('sim_pos_mean').mean()
+    mean_hard = arr('sim_hard_mean').mean()
+    mean_rand = arr('sim_rand_mean').mean()
+    mean_active = arr('n_active_anchors').mean()
+    mean_n_pos = arr('n_pos_per_anchor').mean()
+    mean_n_hard = arr('n_hard_per_anchor').mean()
+    mean_n_rand = arr('n_rand_per_anchor').mean()
+
+    print(f"  Mean L_spatialNCE:  {mean_nce:.4f}")
+    print(f"  Mean L_VICReg:      {mean_vic:.4f}")
+    print(f"  Weighted NCE loss:  {spatial_nce_weight * mean_nce:.4f}")
+    print(f"  NCE / total ratio:  {spatial_nce_weight * mean_nce / (mean_vic + spatial_nce_weight * mean_nce + 1e-10):.4f}")
+    print()
+    print(f"  Mean sim(anchor, pos):      {mean_pos:.4f}")
+    print(f"  Mean sim(anchor, hard_neg): {mean_hard:.4f}")
+    print(f"  Mean sim(anchor, rand_neg): {mean_rand:.4f}")
+    print(f"  Gap pos - hard:             {mean_pos - mean_hard:.4f}")
+    print(f"  Gap pos - rand:             {mean_pos - mean_rand:.4f}")
+    print()
+    print(f"  Mean active anchors/batch:  {mean_active:.1f}")
+    print(f"  Mean pos/anchor:            {mean_n_pos:.1f}")
+    print(f"  Mean hard_neg/anchor:       {mean_n_hard:.1f}")
+    print(f"  Mean rand_neg/anchor:       {mean_n_rand:.1f}")
+    print()
+
+    # Interpretation
+    if mean_active < 2:
+        print("  ** CRITICAL: Almost no anchors have both pos AND neg! **")
+        print("     -> Check pos_idx / hard_neg precomputation.")
+    elif mean_nce < 0.01:
+        print("  ** WARNING: NCE loss is near zero -- already saturated or disconnected. **")
+    elif mean_pos > mean_hard + 0.1:
+        print("  ** Positives already more similar than hard negatives -- loss is already solved. **")
+        print("     -> Spatial structure may already be captured, or positives are trivially similar.")
+    elif mean_pos < mean_hard:
+        print("  ** Positives LESS similar than hard negatives -- loss should be active. **")
+        print("     -> This is the expected hard case. Check gradient norm to confirm it's training.")
+    else:
+        print("  ** sim(pos) ~ sim(hard) -- loss should be pushing gradients. **")
+
+    return {
+        'grad_norms': grad_norms,
+        'nce_single_batch_stats': nce_stats,
+        'step_logs': step_logs,
+        'spatial_nce_data_r_pos': spatial_nce_data['r_pos'],
+        'check_c': check_c_results,
+    }
+
+
+def _total_grad_norm(model: nn.Module) -> float:
+    """Compute total L2 gradient norm across all parameters."""
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.detach().norm(2).item() ** 2
+    return total ** 0.5
+
+
+@torch.no_grad()
+def compute_knn_locality_metrics(
+    model: nn.Module,
+    st_gene_expr: torch.Tensor,
+    st_coords: torch.Tensor,
+    slide_ids: torch.Tensor,
+    phys_knn_idx: torch.Tensor,
+    k: int = 20,
+    n_sample: int = 300,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """
+    Lightweight kNN overlap + median physical distance diagnostic.
+
+    Computes per-slide:
+      - overlap@k: |kNN_emb(i) ∩ kNN_phys(i)| / k, averaged
+      - median physical distance of embedding kNN
+
+    Args:
+        model:        encoder (will be set to eval temporarily)
+        st_gene_expr: (n_st, n_genes) on device
+        st_coords:    (n_st, 2) on device
+        slide_ids:    (n_st,) on device
+        phys_knn_idx: (n_st, k) precomputed physical kNN indices
+        k:            number of neighbors
+        n_sample:     spots to sample per slide for speed
+        seed:         random seed
+
+    Returns:
+        dict with 'overlap_mean', 'emb_phys_dist_median' (averaged over slides)
+    """
+    was_training = model.training
+    model.eval()
+
+    device = st_gene_expr.device
+    n_st = st_gene_expr.shape[0]
+
+    # Forward all ST spots in chunks
+    z_all = []
+    chunk = 512
+    for i in range(0, n_st, chunk):
+        z_all.append(model(st_gene_expr[i:i+chunk]))
+    z_all = torch.cat(z_all, dim=0)  # (n_st, d)
+
+    unique_slides = torch.unique(slide_ids)
+    all_overlaps = []
+    all_phys_dists = []
+    all_hit_within_radius = []
+    slide_norms = {}  # {slide_id: mean_norm}
+
+    rng = np.random.RandomState(seed)
+
+    for s in unique_slides:
+        s_mask = (slide_ids == s)
+        s_idx = torch.where(s_mask)[0]
+        n_s = s_idx.shape[0]
+        if n_s <= k:
+            continue
+
+        # Subsample for speed
+        n_pick = min(n_sample, n_s)
+        pick = rng.choice(n_s, n_pick, replace=False)
+        anchors = s_idx[pick]
+
+        # Embedding kNN within this slide
+        z_slide = z_all[s_idx]
+        z_anchors = z_all[anchors]
+
+        # Per-slide embedding norm stats
+        slide_norm_mean = z_slide.norm(dim=1).mean().item()
+        slide_norms[int(s.item())] = slide_norm_mean
+
+        # Physical distances within this slide (for hit_within_radius)
+        coords_slide = st_coords[s_idx]
+        coords_anchors = st_coords[anchors]
+
+        # Physical kNN distance: d_k(i) for each anchor
+        D_phys_anchor = torch.cdist(coords_anchors, coords_slide)  # (n_pick, n_s)
+        for i_a, a_global in enumerate(anchors):
+            local_self = (s_idx == a_global).nonzero(as_tuple=True)[0]
+            if local_self.numel() > 0:
+                D_phys_anchor[i_a, local_self[0]] = float('inf')
+        D_phys_sorted, _ = D_phys_anchor.sort(dim=1)
+        d_k_anchors = D_phys_sorted[:, k - 1]  # (n_pick,) k-th neighbor distance
+
+        # Pairwise distances (anchor vs all in slide)
+        dists_emb = torch.cdist(z_anchors, z_slide)  # (n_pick, n_s)
+        # Set self-distance to inf
+        for i_a, a_global in enumerate(anchors):
+            local_self = (s_idx == a_global).nonzero(as_tuple=True)[0]
+            if local_self.numel() > 0:
+                dists_emb[i_a, local_self[0]] = float('inf')
+
+        _, emb_knn_local = torch.topk(dists_emb, k=k, dim=1, largest=False)
+        emb_knn_global = s_idx[emb_knn_local]  # (n_pick, k)
+
+        # Physical kNN (precomputed)
+        phys_knn = phys_knn_idx[anchors]  # (n_pick, k)
+
+        # Overlap + hit_within_radius
+        eps = 1e-6
+        for i_a in range(n_pick):
+            emb_set = set(emb_knn_global[i_a].cpu().tolist())
+            phys_set = set(phys_knn[i_a].cpu().tolist())
+            phys_set.discard(-1)  # remove padding
+            if len(phys_set) == 0:
+                continue
+            overlap = len(emb_set & phys_set) / len(phys_set)
+            all_overlaps.append(overlap)
+
+            # Physical distance of embedding kNN
+            coords_anchor = st_coords[anchors[i_a]]
+            coords_neighbors = st_coords[emb_knn_global[i_a]]
+            pdist = torch.norm(coords_neighbors - coords_anchor, dim=1)
+            all_phys_dists.append(pdist.median().item())
+
+            # hit_within_radius: fraction of emb-kNN within d_k(i)
+            hits = (pdist <= d_k_anchors[i_a] + eps).sum().item()
+            all_hit_within_radius.append(hits / k)
+
+    if was_training:
+        model.train()
+
+    return {
+        'overlap_mean': float(np.mean(all_overlaps)) if all_overlaps else 0.0,
+        'emb_phys_dist_median': float(np.median(all_phys_dists)) if all_phys_dists else 0.0,
+        'hit_within_radius_mean': float(np.mean(all_hit_within_radius)) if all_hit_within_radius else 0.0,
+        'slide_norms': slide_norms,
+    }
+
+
+@torch.no_grad()
+def identifiability_probe(
+    st_gene_expr: torch.Tensor,
+    st_coords: torch.Tensor,
+    slide_ids: torch.Tensor,
+    pos_idx: torch.Tensor,
+    far_mask: torch.Tensor,
+    model: Optional['nn.Module'] = None,
+    n_anchors: int = 500,
+    n_neg_per_anchor: int = 20,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """
+    Supervised identifiability probe: can a linear classifier distinguish
+    physical neighbors from far spots, given expression or embedding features?
+
+    For each anchor, constructs:
+      - positive pairs: (anchor, physical_kNN_neighbor)
+      - negative pairs: (anchor, random_far_spot)
+    Feature per pair: |x_a - x_b| (absolute difference)
+    Classifier: logistic regression (sklearn)
+
+    Tests on both:
+      1. Raw expression (X)  — data ceiling
+      2. Trained embedding (Z) — what the model captures
+
+    Args:
+        st_gene_expr: (n_st, n_genes)
+        st_coords:    (n_st, 2)
+        slide_ids:    (n_st,)
+        pos_idx:      (n_st, k_phys) physical neighbor indices
+        far_mask:     (n_st, n_st) bool
+        model:        trained encoder (optional, for embedding probe)
+        n_anchors:    number of anchors to sample
+        n_neg_per_anchor: negative pairs per anchor
+        seed:         random seed
+
+    Returns:
+        dict with 'auc_expression', 'auc_embedding' (if model provided),
+        'acc_expression', 'acc_embedding'
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import roc_auc_score, accuracy_score
+
+    device = st_gene_expr.device
+    n_st = st_gene_expr.shape[0]
+    rng = np.random.RandomState(seed)
+
+    # Sample anchors across all slides
+    anchor_idx = rng.choice(n_st, min(n_anchors, n_st), replace=False)
+
+    # Build pair features and labels
+    X_expr = st_gene_expr.cpu().numpy()
+
+    # Get embeddings if model provided
+    Z = None
+    if model is not None:
+        was_training = model.training
+        model.eval()
+        z_parts = []
+        for i in range(0, n_st, 512):
+            z_parts.append(model(st_gene_expr[i:i+512]).cpu())
+        Z = torch.cat(z_parts, dim=0).numpy()
+        if was_training:
+            model.train()
+
+    feat_expr_list = []
+    feat_emb_list = []
+    labels = []
+
+    for a in anchor_idx:
+        # Positive pairs from physical kNN
+        p = pos_idx[a]
+        p = p[p >= 0].cpu().numpy()
+        if len(p) == 0:
+            continue
+
+        for j in p:
+            feat_expr_list.append(np.abs(X_expr[a] - X_expr[j]))
+            if Z is not None:
+                feat_emb_list.append(np.abs(Z[a] - Z[j]))
+            labels.append(1)
+
+        # Negative pairs from far spots
+        far_of_a = torch.where(far_mask[a])[0].cpu().numpy()
+        if len(far_of_a) == 0:
+            continue
+        neg_pick = rng.choice(far_of_a, min(n_neg_per_anchor, len(far_of_a)), replace=False)
+        for j in neg_pick:
+            feat_expr_list.append(np.abs(X_expr[a] - X_expr[j]))
+            if Z is not None:
+                feat_emb_list.append(np.abs(Z[a] - Z[j]))
+            labels.append(0)
+
+    feat_expr = np.array(feat_expr_list)
+    labels = np.array(labels)
+
+    results = {}
+
+    # Logistic regression with 3-fold CV
+    def _cv_auc(X_feat, y, name):
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
+        aucs, accs = [], []
+        for train_i, test_i in skf.split(X_feat, y):
+            clf = LogisticRegression(max_iter=500, solver='lbfgs', C=1.0, class_weight='balanced')
+            clf.fit(X_feat[train_i], y[train_i])
+            prob = clf.predict_proba(X_feat[test_i])[:, 1]
+            pred = clf.predict(X_feat[test_i])
+            aucs.append(roc_auc_score(y[test_i], prob))
+            accs.append(accuracy_score(y[test_i], pred))
+        return np.mean(aucs), np.mean(accs)
+
+    auc_e, acc_e = _cv_auc(feat_expr, labels, 'expression')
+    results['auc_expression'] = auc_e
+    results['acc_expression'] = acc_e
+
+    if Z is not None:
+        feat_emb = np.array(feat_emb_list)
+        auc_z, acc_z = _cv_auc(feat_emb, labels, 'embedding')
+        results['auc_embedding'] = auc_z
+        results['acc_embedding'] = acc_z
+
+    # Also test: L2 distance as single feature (simplest possible probe)
+    l2_expr = np.linalg.norm(feat_expr, axis=1, keepdims=True)
+    auc_l2, acc_l2 = _cv_auc(l2_expr, labels, 'l2_expr')
+    results['auc_expr_l2_only'] = auc_l2
+    results['acc_expr_l2_only'] = acc_l2
+
+    # Class balance info
+    results['n_positive_pairs'] = int(labels.sum())
+    results['n_negative_pairs'] = int((1 - labels).sum())
+    results['n_total_pairs'] = len(labels)
+
+    return results

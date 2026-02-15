@@ -71,6 +71,47 @@ class SharedEncoder(nn.Module):
         return self.encoder(X)
 
 
+@torch.no_grad()
+def normalize_embeddings_per_slide(
+    z: torch.Tensor,
+    slide_ids: torch.Tensor,
+    target_rms: float = 1.0,
+    center: bool = True,
+) -> torch.Tensor:
+    """
+    Per-slide normalization of embeddings: mean-center + RMS rescale.
+
+    Fixes norm asymmetry across slides (e.g., ST3 norm=10.2 vs ST1/ST2 norm=6.6).
+    Can be applied as a post-processing step after the encoder or during training.
+
+    Args:
+        z:          (n, d) embeddings
+        slide_ids:  (n,) integer slide identifiers
+        target_rms: target root-mean-square norm per slide (default 1.0)
+        center:     if True, subtract per-slide mean before rescaling
+
+    Returns:
+        z_norm: (n, d) normalized embeddings
+    """
+    z_norm = z.clone()
+    unique_slides = torch.unique(slide_ids)
+
+    for s in unique_slides:
+        mask = (slide_ids == s)
+        z_s = z_norm[mask]
+
+        if center:
+            z_s = z_s - z_s.mean(dim=0, keepdim=True)
+
+        # Current RMS norm: sqrt(mean(||z_i||^2))
+        rms = (z_s.norm(dim=1) ** 2).mean().sqrt().clamp(min=1e-8)
+        z_s = z_s * (target_rms / rms)
+
+        z_norm[mask] = z_s
+
+    return z_norm
+
+
 def build_vicreg_projector(
     input_dim: int,
     project_dim: int = 256,
@@ -201,6 +242,19 @@ def train_encoder(
     spatial_nce_n_hard: int = 20,
     spatial_nce_tau: float = 0.1,
     spatial_nce_n_rand_neg: int = 128,
+    spatial_nce_n_anchors: int = 64,
+    # ========== Two-phase training (ChatGPT Step 2) ==========
+    two_phase_training: bool = False,  # Phase 1: VICReg+NCE only, Phase 2: add alignment
+    phase1_epochs: int = 1000,         # Duration of Phase 1
+    phase2_lr_factor: float = 0.1,     # Reduce encoder LR by this factor in Phase 2
+    # ========== VICReg invariance weight schedule ==========
+    vicreg_inv_warmup_frac: float = 0.0,  # Fraction of Phase 1 to ramp lambda_inv (0=disabled)
+    vicreg_inv_start: float = 5.0,        # Starting lambda_inv during warmup (ramps to vicreg_lambda_inv)
+    # ========== Per-slide normalization ==========
+    per_slide_norm: bool = False,     # Apply per-slide normalization during eval diagnostics
+    per_slide_norm_target: float = 1.0,  # Target RMS norm per slide
+    # ========== Slide-scale regularizer ==========
+    slide_scale_weight: float = 0.0,  # Soft penalty to equalize per-slide RMS norms (0=disabled)
 ):
 
     """
@@ -409,17 +463,30 @@ def train_encoder(
                     sc_source_ids = sc_source_ids[subsample_idx]
                 n_sc = n_st
             elif n_st > n_sc:
-                print(f"[VICReg] Balancing ST: {n_st} → {n_sc} (to match SC)")
-                subsample_idx = torch.randperm(n_st, device=device)[:n_sc]
-                st_gene_expr = st_gene_expr[subsample_idx]
-                st_coords = st_coords[subsample_idx]
-                if slide_ids is not None:
-                    slide_ids = slide_ids[subsample_idx]
-                if st_source_ids is not None:
-                    st_source_ids = st_source_ids[subsample_idx]
-                n_st = n_sc
+                # Do NOT subsample ST when spatial NCE is active:
+                # Subsampling destroys spatial resolution (r_pos doubles),
+                # causing NCE to learn coarse structure that doesn't transfer
+                # to full-density evaluation. Balanced batch sampling (line ~800)
+                # already handles domain imbalance at the mini-batch level.
+                if spatial_nce_weight > 0:
+                    print(f"[VICReg] SKIP ST subsampling: keeping all {n_st} ST spots "
+                          f"(SC={n_sc}). Balanced batch sampling handles imbalance.")
+                else:
+                    print(f"[VICReg] Balancing ST: {n_st} → {n_sc} (to match SC)")
+                    subsample_idx = torch.randperm(n_st, device=device)[:n_sc]
+                    st_gene_expr = st_gene_expr[subsample_idx]
+                    st_coords = st_coords[subsample_idx]
+                    if slide_ids is not None:
+                        slide_ids = slide_ids[subsample_idx]
+                    if st_source_ids is not None:
+                        st_source_ids = st_source_ids[subsample_idx]
+                    n_st = n_sc
 
 
+
+        # After subsampling, st_coords_norm must match st_coords
+        # (otherwise precomputed spatial structures use wrong coordinates)
+        st_coords_norm = st_coords
 
         X_ssl = torch.cat([st_gene_expr, sc_gene_expr], dim=0)
 
@@ -505,6 +572,16 @@ def train_encoder(
             vicreg_gamma, vicreg_eps, vicreg_ddp_gather, vicreg_float32_stats
         )
         print(f"  VICReg: λ_inv={vicreg_lambda_inv}, λ_var={vicreg_lambda_var}, λ_cov={vicreg_lambda_cov}")
+        if vicreg_inv_warmup_frac > 0:
+            _warmup_end = int(vicreg_inv_warmup_frac * (phase1_epochs if two_phase_training else n_epochs))
+            print(f"  VICReg λ_inv schedule: {vicreg_inv_start} → {vicreg_lambda_inv} over first {_warmup_end} epochs "
+                  f"({vicreg_inv_warmup_frac*100:.0f}% warmup)")
+        if per_slide_norm:
+            print(f"  Per-slide normalization: enabled (target_rms={per_slide_norm_target})")
+        if slide_scale_weight > 0:
+            print(f"  Slide-scale regularizer: weight={slide_scale_weight} (equalizes per-slide RMS norms)")
+        if adv_slide_weight == 0.0:
+            print(f"  Discriminator training: SKIPPED (adv_slide_weight=0, saving compute)")
 
         # Optimizers
         enc_params = list(model.parameters())
@@ -535,15 +612,22 @@ def train_encoder(
             'loss_source_coral': [],  # Pairwise source CORAL for all-source alignment
             'loss_local': [],  # NEW: Local alignment loss
             'vicreg_inv': [], 'vicreg_var': [], 'vicreg_cov': [],
-            'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': [], 'loss_spatial_nce': []
+            'std_mean': [], 'std_min': [], 'disc_acc': [], 'disc_acc_clean': [], 'grl_alpha': [], 'loss_spatial_nce': [],
+            'locality_overlap_after_S': [], 'locality_overlap_after_M': [],
+            # Per-epoch diagnostics (populated every 100 epochs, 0.0 otherwise)
+            'hit_within_radius_after_S': [], 'hit_within_radius_after_M': [],
+            'slide_norms': [],  # list of dicts {slide_id: norm_mean}
+            'vicreg_lambda_inv_effective': [],  # tracks scheduled lambda_inv
+            'loss_slide_scale': [],  # slide-scale regularizer
         }
 
 
 
         # ========== BEST CHECKPOINT TRACKING ==========
-        # Track best alignment based on combined CORAL losses
-        # Lower = better alignment between domains and patients
-        best_alignment_score = float('inf')
+        # Track best overlap@20 (higher = better spatial locality)
+        # Falls back to alignment score if spatial NCE is disabled
+        best_overlap_at_k = -1.0  # higher = better
+        best_alignment_score = float('inf')  # kept as secondary metric for logging
         best_epoch = 0
         best_encoder_state = None
         best_projector_state = None
@@ -666,7 +750,7 @@ def train_encoder(
     if spatial_nce_weight > 0 and stageA_obj == 'vicreg_adv':
         from ssl_utils import precompute_spatial_nce_structures
         spatial_nce_data = precompute_spatial_nce_structures(
-            st_coords=st_coords_norm,
+            st_coords=st_coords,  # Must use subsampled coords, NOT st_coords_norm (which is pre-subsample)
             st_gene_expr=st_gene_expr,
             slide_ids=slide_ids,
             k_phys=spatial_nce_k_phys,
@@ -676,16 +760,102 @@ def train_encoder(
         )
         print(f"[SpatialNCE] weight={spatial_nce_weight}, tau={spatial_nce_tau}")
 
+    # Round-robin slide list for Step S (spatial NCE)
+    _nce_phys_knn = None
+    if spatial_nce_weight > 0 and spatial_nce_data is not None:
+        _nce_unique_slides = torch.unique(slide_ids).cpu().tolist()
+        _nce_slide_cursor = 0
+        print(f"[SpatialNCE] Separate Step S: round-robin over {len(_nce_unique_slides)} slides, "
+              f"n_anchors={spatial_nce_n_anchors}")
+
+        # Precompute physical kNN for locality diagnostic (pos_idx is already (n_st, k_phys))
+        _nce_phys_knn = spatial_nce_data['pos_idx']  # (n_st, k_phys)
+        print(f"[SpatialNCE] Locality diagnostic: will log kNN overlap every 100 epochs")
+
+        # Initialize embedding cache for embedding-mined hard negatives (Step 2)
+        _nce_z_cache = None
+        _nce_z_cache_freq = 5  # update cache every N epochs
+        print(f"[SpatialNCE] Embedding-mined hard negatives: z_cache updated every {_nce_z_cache_freq} epochs")
+
+    # ========== TWO-PHASE TRAINING CONFIG ==========
+    if two_phase_training:
+        print(f"\n{'='*70}")
+        print(f"TWO-PHASE TRAINING ENABLED")
+        print(f"  Phase 1 (epochs 0-{phase1_epochs-1}): VICReg + SpatialNCE only (no adversary/alignment)")
+        print(f"  Phase 2 (epochs {phase1_epochs}-{n_epochs-1}): Add adversary + alignment, encoder LR *= {phase2_lr_factor}")
+        print(f"{'='*70}\n")
+    _phase2_started = False
+
     # Training loop
     print(f"Training encoder for {n_epochs} epochs...")
     for epoch in range(n_epochs):
+        # ========== TWO-PHASE: transition check ==========
+        in_phase1 = two_phase_training and epoch < phase1_epochs
+        if two_phase_training and epoch == phase1_epochs and not _phase2_started:
+            _phase2_started = True
+            # Reduce encoder LR for Phase 2
+            for pg in opt_enc.param_groups:
+                pg['lr'] = pg['lr'] * phase2_lr_factor
+            print(f"\n{'='*70}")
+            print(f"[TWO-PHASE] Entering Phase 2 at epoch {epoch}")
+            print(f"  Encoder LR reduced by {phase2_lr_factor}x → {opt_enc.param_groups[0]['lr']:.2e}")
+            print(f"  Adversary + CORAL + MMD now active")
+            print(f"{'='*70}\n")
+
         # ========== BRANCH 1: VICReg Mode ==========
         if stageA_obj == 'vicreg_adv':
             model.train()
             if projector is not None:
                 projector.train()
             discriminator.train()
-            
+
+            # ========== STEP S: Separate Spatial InfoNCE update (ST only) ==========
+            loss_spatial_nce = torch.tensor(0.0, device=device)
+            _loc_after_S = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0, 'hit_within_radius_mean': 0.0, 'slide_norms': {}}
+            _loc_after_M = {'overlap_mean': 0.0, 'emb_phys_dist_median': 0.0, 'hit_within_radius_mean': 0.0, 'slide_norms': {}}
+            if spatial_nce_weight > 0 and spatial_nce_data is not None:
+                from ssl_utils import compute_spatial_infonce_supportset
+                # Round-robin slide selection
+                _nce_slide_pick = _nce_unique_slides[_nce_slide_cursor % len(_nce_unique_slides)]
+                _nce_slide_cursor += 1
+
+                # Update embedding cache for hard negative mining
+                if _nce_z_cache is None or epoch % _nce_z_cache_freq == 0:
+                    with torch.no_grad():
+                        _z_parts = []
+                        for _ci in range(0, st_gene_expr.shape[0], 512):
+                            _z_parts.append(model(st_gene_expr[_ci:_ci+512]))
+                        _nce_z_cache = torch.cat(_z_parts, dim=0)
+
+                loss_spatial_nce = compute_spatial_infonce_supportset(
+                    model=model,
+                    st_gene_expr=st_gene_expr,
+                    pos_idx=spatial_nce_data['pos_idx'],
+                    far_mask=spatial_nce_data['far_mask'],
+                    hard_neg=spatial_nce_data['hard_neg'],
+                    slide_ids=slide_ids,
+                    tau=spatial_nce_tau,
+                    n_rand_neg=spatial_nce_n_rand_neg,
+                    n_anchors_per_step=spatial_nce_n_anchors,
+                    slide_override=_nce_slide_pick,
+                    z_cache=_nce_z_cache,
+                    n_hard_mine=20,
+                )
+
+                opt_enc.zero_grad(set_to_none=True)
+                (spatial_nce_weight * loss_spatial_nce).backward()
+                opt_enc.step()
+
+                # --- Locality diagnostic: after Step S ---
+                if _nce_phys_knn is not None and epoch % 100 == 0:
+                    from ssl_utils import compute_knn_locality_metrics
+                    _loc_after_S = compute_knn_locality_metrics(
+                        model=model, st_gene_expr=st_gene_expr,
+                        st_coords=st_coords, slide_ids=slide_ids,
+                        phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                    )
+
+            # ========== STEP M: Mixed ST+SC representation + alignment ==========
             # ========== Balanced domain sampling ==========
             # Sample from all domains (ST slides + SC)
             # ========== Balanced domain sampling ==========
@@ -740,9 +910,25 @@ def train_encoder(
                 y1 = z1
                 y2 = z2
 
+            # ========== VICReg invariance weight schedule ==========
+            if vicreg_inv_warmup_frac > 0:
+                # Ramp lambda_inv from vicreg_inv_start to vicreg_lambda_inv
+                # over the first vicreg_inv_warmup_frac of Phase 1 (or total epochs)
+                warmup_end = int(vicreg_inv_warmup_frac * (phase1_epochs if two_phase_training else n_epochs))
+                if epoch < warmup_end:
+                    frac = epoch / max(1, warmup_end)
+                    effective_lambda_inv = vicreg_inv_start + frac * (vicreg_lambda_inv - vicreg_inv_start)
+                else:
+                    effective_lambda_inv = vicreg_lambda_inv
+                vicreg_loss_fn.lambda_inv = effective_lambda_inv
+
             loss_vicreg, vicreg_stats = vicreg_loss_fn(y1, y2)
 
-            alpha = grl_alpha_schedule(epoch, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max)
+            # In two-phase training, alpha schedule resets at Phase 2 start
+            if two_phase_training:
+                alpha = grl_alpha_schedule(epoch - phase1_epochs, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max) if not in_phase1 else 0.0
+            else:
+                alpha = grl_alpha_schedule(epoch, adv_warmup_epochs, adv_ramp_epochs, grl_alpha_max)
 
             # ------------------------------------------------------------
             # FIX (Run 4.1): Compute conditioning representation from CLEAN input
@@ -759,38 +945,24 @@ def train_encoder(
             else:
                 loss_knn = torch.tensor(0.0, device=device)
 
-            # ========== SPATIAL InfoNCE LOSS (ST only) ==========
-            loss_spatial_nce = torch.tensor(0.0, device=device)
-            if spatial_nce_weight > 0 and spatial_nce_data is not None:
-                from ssl_utils import compute_spatial_infonce_loss
-                is_st = (s_batch == ST_LABEL)
-                if is_st.sum() >= 4:
-                    loss_spatial_nce = compute_spatial_infonce_loss(
-                        z=z_clean,
-                        batch_idx=idx,
-                        pos_idx=spatial_nce_data['pos_idx'],
-                        far_mask=spatial_nce_data['far_mask'],
-                        hard_neg=spatial_nce_data['hard_neg'],
-                        tau=spatial_nce_tau,
-                        n_rand_neg=spatial_nce_n_rand_neg,
-                        is_st_mask=is_st,
-                    )   
-
             if adv_use_layernorm:
                 z_cond = F.layer_norm(z_clean, (z_clean.shape[1],))
             else:
                 z_cond = z_clean  # Use raw clean embedding
 
             # (A) Train discriminator on DETACHED z_cond
+            # In Phase 1: start disc warmup in last 50 epochs so it's not cold at Phase 2
             with torch.no_grad():
                 z_det = z_cond.detach()
 
             disc_loss_val = 0.0
             disc_acc_val = 0.0
 
-            # Always train disc a bit (even during warmup) so it doesn't start from scratch later
+            # Skip disc training entirely when adv_slide_weight=0 (save compute)
+            # Otherwise, in Phase 1, skip until last 50 epochs (warmup)
+            _skip_disc = (adv_slide_weight == 0.0) or (in_phase1 and epoch < (phase1_epochs - 50))
             disc_grad_norms = {}
-            for _ in range(disc_steps):
+            for _ in range(disc_steps if not _skip_disc else 0):
                 logits_d = discriminator(z_det)
                 loss_disc = F.cross_entropy(logits_d, s_batch)
 
@@ -812,7 +984,7 @@ def train_encoder(
             
             # Comprehensive discriminator diagnostics (GPT 5.2 Pro recommendation)
             disc_diag = {}
-            if adv_log_diagnostics:
+            if adv_log_diagnostics and not _skip_disc:
                 disc_diag = log_adversary_diagnostics(
                     logits=logits_d,
                     targets=s_batch,
@@ -824,7 +996,7 @@ def train_encoder(
 
             # ========== DISCRIMINATOR HEALTH CHECK & REVIVAL ==========
             # If discriminator collapses (always predicts one class), revive it
-            if disc_diag:
+            if disc_diag and not _skip_disc:
                 acc_st = disc_diag.get('disc_acc_class0', 0.5)
                 acc_sc = disc_diag.get('disc_acc_class1', 0.5)
                 min_class_acc = min(acc_st, acc_sc)
@@ -981,16 +1153,58 @@ def train_encoder(
                 if len(source_corals) > 0:
                     loss_source_coral = torch.stack(source_corals).mean()
 
-            coral_w = float(np.clip((epoch - adv_warmup_epochs) / max(1, adv_ramp_epochs), 0.0, 1.0))
+            # In two-phase training, Phase 2 warmup/ramp is relative to phase1_epochs
+            _effective_epoch = (epoch - phase1_epochs) if two_phase_training else epoch
+            _effective_warmup = adv_warmup_epochs
+            _effective_ramp = adv_ramp_epochs
+
+            coral_w = float(np.clip((_effective_epoch - _effective_warmup) / max(1, _effective_ramp), 0.0, 1.0))
             # Patient CORAL uses same ramp as domain CORAL
             patient_coral_w = coral_w * patient_coral_weight if sc_patient_ids is not None else 0.0
             # Source CORAL uses same ramp
             source_coral_w = coral_w * source_coral_weight if (st_source_ids is not None and sc_source_ids is not None) else 0.0
             mmd_w = (coral_w * mmd_weight) if mmd_ramp else mmd_weight
-            loss_total = (loss_vicreg + adv_slide_weight * loss_adv_enc + coral_w * loss_coral +
+
+            # ---- Phase 1: zero out ALL alignment terms (VICReg only) ----
+            if in_phase1:
+                alpha = 0.0
+                _adv_w = 0.0
+                coral_w = 0.0
+                patient_coral_w = 0.0
+                source_coral_w = 0.0
+                mmd_w = 0.0
+                local_w = 0.0
+                _centroid_w = 0.0
+            else:
+                _adv_w = adv_slide_weight
+                _centroid_w = centroid_weight
+
+            # ========== Slide-scale regularizer ==========
+            # Soft penalty: keep per-slide RMS norms close to global mean
+            # L_ss = Σ_s (log RMS(z_s) - log RMS(z_all))^2
+            loss_slide_scale = torch.tensor(0.0, device=device)
+            if slide_scale_weight > 0 and slide_ids is not None:
+                z_st_clean = z_clean[~is_sc]  # ST portion only
+                slide_ids_batch = slide_ids[idx[~is_sc]]
+                # Global RMS across all ST spots in batch
+                global_rms = z_st_clean.norm(dim=1).pow(2).mean().sqrt().clamp(min=1e-6)
+                log_global = torch.log(global_rms)
+                unique_batch_slides = torch.unique(slide_ids_batch)
+                slide_penalties = []
+                for sid in unique_batch_slides:
+                    s_mask = (slide_ids_batch == sid)
+                    if s_mask.sum() < 4:
+                        continue
+                    slide_rms = z_st_clean[s_mask].norm(dim=1).pow(2).mean().sqrt().clamp(min=1e-6)
+                    slide_penalties.append((torch.log(slide_rms) - log_global).pow(2))
+                if slide_penalties:
+                    loss_slide_scale = torch.stack(slide_penalties).mean()
+
+            # NOTE: spatial_nce is handled in separate Step S above (not in this loss)
+            loss_total = (loss_vicreg + _adv_w * loss_adv_enc + coral_w * loss_coral +
                          local_w * loss_local + patient_coral_w * loss_patient_coral +
-                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + centroid_weight * loss_centroid + knn_weight * loss_knn +
-                         spatial_nce_weight * loss_spatial_nce)
+                         source_coral_w * loss_source_coral + mmd_w * loss_mmd + _centroid_w * loss_centroid + knn_weight * loss_knn +
+                         slide_scale_weight * loss_slide_scale)
 
             # Optionally log encoder gradient norms before step
             # Backprop for encoder (MISSING BEFORE!)
@@ -1012,6 +1226,32 @@ def train_encoder(
             opt_enc.step()
             scheduler.step()
 
+            # --- Locality diagnostic: after Step M ---
+            if _nce_phys_knn is not None and epoch % 100 == 0:
+                from ssl_utils import compute_knn_locality_metrics
+                _loc_after_M = compute_knn_locality_metrics(
+                    model=model, st_gene_expr=st_gene_expr,
+                    st_coords=st_coords, slide_ids=slide_ids,
+                    phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                )
+                _hit_S = _loc_after_S.get('hit_within_radius_mean', 0.0)
+                _hit_M = _loc_after_M.get('hit_within_radius_mean', 0.0)
+                print(f"  [LOCALITY e{epoch}] "
+                      f"after StepS: overlap={_loc_after_S['overlap_mean']:.4f}, "
+                      f"hit@20={_hit_S:.4f}, "
+                      f"emb_phys_dist={_loc_after_S['emb_phys_dist_median']:.1f} | "
+                      f"after StepM: overlap={_loc_after_M['overlap_mean']:.4f}, "
+                      f"hit@20={_hit_M:.4f}, "
+                      f"emb_phys_dist={_loc_after_M['emb_phys_dist_median']:.1f} | "
+                      f"delta_overlap={_loc_after_M['overlap_mean'] - _loc_after_S['overlap_mean']:+.4f}")
+                # Per-slide norm logging
+                _snorms = _loc_after_M.get('slide_norms', {})
+                if _snorms:
+                    _norm_str = ", ".join([f"s{k}={v:.2f}" for k, v in sorted(_snorms.items())])
+                    print(f"  [NORMS e{epoch}] {_norm_str}")
+                if vicreg_inv_warmup_frac > 0:
+                    print(f"  [VICREG e{epoch}] lambda_inv={vicreg_loss_fn.lambda_inv:.2f}")
+
             # Update Z_cache periodically
             if knn_weight > 0 and Z_cache is not None and epoch % cache_update_freq == 0:
                 with torch.no_grad():
@@ -1026,42 +1266,48 @@ def train_encoder(
                 p.requires_grad_(True)
 
             # Logging accuracy (chance=0.5 is what you want to approach)
-            with torch.no_grad():
-                logits_det = discriminator(z_det)
-                disc_acc_det = (logits_det.argmax(dim=1) == s_batch).float().mean().item()
+            # Skip disc logging when adversary is off (save compute)
+            disc_acc_det = 0.5
+            disc_acc_post = 0.5
+            disc_acc_clean = 0.5
+            disc_acc_aug = 0.5
+            clean_diag = {}
+            loss_adv = loss_adv_enc.detach()
 
-                # Post-update: use CLEAN representation (matches training now)
-                z_clean_post = model(X_batch)
-                if adv_use_layernorm:
-                    z_post = F.layer_norm(z_clean_post, (z_clean_post.shape[1],))
-                else:
-                    z_post = z_clean_post
-                    
-                logits_post = discriminator(z_post)
-                disc_acc_post = (logits_post.argmax(dim=1) == s_batch).float().mean().item()
-                
-                # Now disc_post and disc_CLEAN should be identical (same representation)
-                disc_acc_clean = disc_acc_post  # They're the same now!
-                
-                # DIAGNOSTIC: Also check augmented for comparison
-                z_aug_check = model(X1)
-                logits_aug = discriminator(z_aug_check)
-                disc_acc_aug = (logits_aug.argmax(dim=1) == s_batch).float().mean().item()
+            if adv_slide_weight > 0.0 or not _skip_disc:
+                with torch.no_grad():
+                    logits_det = discriminator(z_det)
+                    disc_acc_det = (logits_det.argmax(dim=1) == s_batch).float().mean().item()
 
-                
-                # Post-update diagnostics on clean representation
-                clean_diag = {}
-                if adv_log_diagnostics:
-                    clean_diag = log_adversary_diagnostics(
-                        logits=logits_post,
-                        targets=s_batch,
-                        n_classes=n_domains,
-                        prefix="clean_",
-                        epoch=epoch,
-                        verbose=(epoch % 100 == 0)
-                    )
+                    # Post-update: use CLEAN representation (matches training now)
+                    z_clean_post = model(X_batch)
+                    if adv_use_layernorm:
+                        z_post = F.layer_norm(z_clean_post, (z_clean_post.shape[1],))
+                    else:
+                        z_post = z_clean_post
 
-                loss_adv = loss_adv_enc.detach()
+                    logits_post = discriminator(z_post)
+                    disc_acc_post = (logits_post.argmax(dim=1) == s_batch).float().mean().item()
+
+                    # Now disc_post and disc_CLEAN should be identical (same representation)
+                    disc_acc_clean = disc_acc_post  # They're the same now!
+
+                    # DIAGNOSTIC: Also check augmented for comparison
+                    z_aug_check = model(X1)
+                    logits_aug = discriminator(z_aug_check)
+                    disc_acc_aug = (logits_aug.argmax(dim=1) == s_batch).float().mean().item()
+
+
+                    # Post-update diagnostics on clean representation
+                    if adv_log_diagnostics:
+                        clean_diag = log_adversary_diagnostics(
+                            logits=logits_post,
+                            targets=s_batch,
+                            n_classes=n_domains,
+                            prefix="clean_",
+                            epoch=epoch,
+                            verbose=(epoch % 100 == 0)
+                        )
 
 
             # Logging
@@ -1070,12 +1316,15 @@ def train_encoder(
                 patient_coral_str = f", PatCORAL={loss_patient_coral.item():.6f}" if sc_patient_ids is not None else ""
                 source_coral_str = f", SrcCORAL={loss_source_coral.item():.6f}" if (st_source_ids is not None and sc_source_ids is not None) else ""
                 aug_str = f", disc_AUG={disc_acc_aug:.3f}" if epoch % 100 == 0 else ""
-                print(f"Epoch {epoch}/{n_epochs} | "
-                    f"Loss={loss_total.item():.4f} "
+                nce_str = f", NCE_S={loss_spatial_nce.item():.4f}" if spatial_nce_weight > 0 else ""
+                ss_str = f", SlideScale={loss_slide_scale.item():.6f}" if slide_scale_weight > 0 else ""
+                phase_str = f"[P1] " if in_phase1 else (f"[P2] " if two_phase_training else "")
+                print(f"{phase_str}Epoch {epoch}/{n_epochs} | "
+                    f"StepM={loss_total.item():.4f} "
                     f"(VIC={loss_vicreg.item():.3f}, Adv={loss_adv.item():.3f}, "
                     f"CORAL={loss_coral.item():.6f}, MMD={loss_mmd.item():.6f}, "
                     f"MMDw={mmd_w:.2f}, σ={mmd_sigma:.3f}"
-                    f"{patient_coral_str}{source_coral_str}{local_str}) | "
+                    f"{patient_coral_str}{source_coral_str}{local_str}{nce_str}{ss_str}) | "
                     f"inv={vicreg_stats['inv']:.3f}, var={vicreg_stats['var']:.3f}, cov={vicreg_stats['cov']:.3f} | "
                     f"std: μ={vicreg_stats['std_mean']:.3f}, min={vicreg_stats['std_min']:.3f} | "
                     f"disc_det={disc_acc_det:.3f}, disc_post={disc_acc_post:.3f}{aug_str}, α={alpha:.3f}"
@@ -1114,10 +1363,21 @@ def train_encoder(
             history_vicreg['disc_acc_clean'].append(disc_acc_clean)  # NEW: track clean accuracy
             history_vicreg['grl_alpha'].append(alpha)
             history_vicreg['loss_spatial_nce'].append(loss_spatial_nce.item())
+            history_vicreg['locality_overlap_after_S'].append(_loc_after_S['overlap_mean'])
+            history_vicreg['locality_overlap_after_M'].append(_loc_after_M['overlap_mean'])
+            history_vicreg['hit_within_radius_after_S'].append(_loc_after_S.get('hit_within_radius_mean', 0.0))
+            history_vicreg['hit_within_radius_after_M'].append(_loc_after_M.get('hit_within_radius_mean', 0.0))
+            history_vicreg['slide_norms'].append(_loc_after_M.get('slide_norms', {}))
+            history_vicreg['vicreg_lambda_inv_effective'].append(
+                vicreg_loss_fn.lambda_inv if vicreg_inv_warmup_frac > 0 else vicreg_lambda_inv
+            )
+            history_vicreg['loss_slide_scale'].append(loss_slide_scale.item())
 
             # ========== BEST CHECKPOINT SAVING ==========
-            # Only check after warmup, and evaluate every 50 epochs on FULL dataset for stability
-            if epoch >= adv_warmup_epochs + adv_ramp_epochs and epoch % 100 == 0:
+            # In two-phase mode: checkpoint from epoch 100 (first overlap measurement)
+            # In normal mode: only after warmup+ramp
+            _ckpt_min_epoch = 100 if two_phase_training else (adv_warmup_epochs + adv_ramp_epochs)
+            if epoch >= _ckpt_min_epoch and epoch % 100 == 0:
                 # Evaluate on full dataset (or subsample) for stable alignment metric
                 with torch.no_grad():
                     # Use up to 2000 samples per domain for speed
@@ -1164,25 +1424,61 @@ def train_encoder(
                     avg_spread = (z_st_eval.std(dim=0).mean() + z_sc_eval.std(dim=0).mean()).item() / 2
                     overlap_ratio = centroid_dist / max(avg_spread, 1e-6)
                     
-                    # Combined score (lower = better)
-                    # Only consider if representation isn't collapsed (std_min > 0.1)
+                    # Combined alignment score (lower = better) — kept for logging
                     if std_min > 0.1:
                         alignment_score = disc_confusion + 0.1 * overlap_ratio
                     else:
                         alignment_score = 999.0  # Reject collapsed representations
 
-                if alignment_score < best_alignment_score:
-                    best_alignment_score = alignment_score
+                # ---- Model selection: overlap@20 (higher = better) ----
+                # Use the overlap computed after Step M as the selection criterion
+                current_overlap = _loc_after_M['overlap_mean']
+
+                # Only accept if representation isn't collapsed
+                if std_min <= 0.1:
+                    current_overlap = -1.0  # Reject collapsed representations
+
+                if current_overlap > best_overlap_at_k:
+                    best_overlap_at_k = current_overlap
+                    best_alignment_score = alignment_score  # track for logging
                     best_epoch = epoch
                     best_encoder_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                     if projector is not None:
                         best_projector_state = {k: v.cpu().clone() for k, v in projector.state_dict().items()}
                     best_discriminator_state = {k: v.cpu().clone() for k, v in discriminator.state_dict().items()}
-                    print(f"  [BEST] New best at epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
-                          f"score={alignment_score:.4f}, std_min={std_min:.3f}, ratio={overlap_ratio:.2f}")
+                    print(f"  [BEST] New best at epoch {epoch}: overlap@20={current_overlap:.4f}, "
+                          f"acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
+                          f"align={alignment_score:.4f}, std_min={std_min:.3f}")
+
+                    # ===== CHECKPOINT VERIFICATION (diagnose overlap@20 bug) =====
+                    # Load the just-saved checkpoint into a fresh model and re-compute overlap
+                    if _nce_phys_knn is not None:
+                        _verify_model = SharedEncoder(
+                            n_genes=model.n_genes,
+                            n_embedding=model.n_embedding,
+                            dropout=0.1
+                        ).to(device)
+                        _verify_model.load_state_dict(best_encoder_state)
+                        from ssl_utils import compute_knn_locality_metrics as _ckpt_verify_fn
+                        _verify_overlap = _ckpt_verify_fn(
+                            model=_verify_model, st_gene_expr=st_gene_expr,
+                            st_coords=st_coords, slide_ids=slide_ids,
+                            phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                        )
+                        _vo = _verify_overlap['overlap_mean']
+                        _delta = abs(_vo - current_overlap)
+                        if _delta > 0.01:
+                            print(f"  [CHECKPOINT BUG] Verification FAILED! "
+                                  f"Live model overlap={current_overlap:.4f}, "
+                                  f"checkpoint reload overlap={_vo:.4f}, delta={_delta:.4f}")
+                        else:
+                            print(f"  [CHECKPOINT OK] Verified: reload overlap={_vo:.4f} "
+                                  f"(delta={_delta:.4f})")
+                        del _verify_model
                 elif epoch % 100 == 0:
-                    print(f"  [EVAL] Epoch {epoch}: acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
-                          f"score={alignment_score:.4f}, std_min={std_min:.3f}, ratio={overlap_ratio:.2f} (best={best_alignment_score:.4f})")
+                    print(f"  [EVAL] Epoch {epoch}: overlap@20={current_overlap:.4f} (best={best_overlap_at_k:.4f} @e{best_epoch}), "
+                          f"acc_ST={acc_class0:.3f}, acc_SC={acc_class1:.3f}, "
+                          f"align={alignment_score:.4f}, std_min={std_min:.3f}")
 
             continue  # Skip geometry code, go to next epoch
 
@@ -1655,12 +1951,40 @@ def train_encoder(
         # ========== RESTORE BEST CHECKPOINT IF AVAILABLE ==========
         if use_best_checkpoint and best_encoder_state is not None:
             print(f"\n[BEST CHECKPOINT] Restoring best model from epoch {best_epoch}")
-            print(f"  Best alignment score: {best_alignment_score:.6f}")
+            print(f"  Best overlap@20: {best_overlap_at_k:.4f}, alignment score: {best_alignment_score:.6f}")
             model.load_state_dict(best_encoder_state)
             if projector is not None and best_projector_state is not None:
                 projector.load_state_dict(best_projector_state)
             if best_discriminator_state is not None:
                 discriminator.load_state_dict(best_discriminator_state)
+
+            # ===== POST-RESTORE VERIFICATION (diagnose overlap@20 bug) =====
+            if _nce_phys_knn is not None:
+                from ssl_utils import compute_knn_locality_metrics as _post_verify_fn
+                _post_overlap = _post_verify_fn(
+                    model=model, st_gene_expr=st_gene_expr,
+                    st_coords=st_coords, slide_ids=slide_ids,
+                    phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+                )
+                _pov = _post_overlap['overlap_mean']
+                print(f"  [POST-RESTORE VERIFY] overlap@20 = {_pov:.4f} "
+                      f"(expected {best_overlap_at_k:.4f}, "
+                      f"delta={abs(_pov - best_overlap_at_k):.4f})")
+                if abs(_pov - best_overlap_at_k) > 0.01:
+                    print(f"  [POST-RESTORE BUG] MISMATCH DETECTED!")
+
+                    # Detailed comparison of live vs checkpoint weights
+                    _live_sd = model.state_dict()
+                    _diff_keys = []
+                    for _k in _live_sd:
+                        _d = (_live_sd[_k].cpu().float() - best_encoder_state[_k].float()).abs().max().item()
+                        if _d > 1e-6:
+                            _diff_keys.append((_k, _d))
+                    if _diff_keys:
+                        print(f"  [POST-RESTORE BUG] Weight diffs: {_diff_keys[:5]}")
+                    else:
+                        print(f"  [POST-RESTORE BUG] Weights MATCH but overlap differs!")
+                        print(f"  This suggests the metric is non-deterministic or data-dependent.")
         elif use_best_checkpoint:
             print("\n[BEST CHECKPOINT] No checkpoint saved (training too short or warmup not reached)")
             print("  Using final model instead")
@@ -1676,7 +2000,7 @@ def train_encoder(
         print("="*70)
         if use_best_checkpoint and best_encoder_state is not None:
             print(f"Using BEST checkpoint from epoch {best_epoch}")
-            print(f"Best alignment score: {best_alignment_score:.6f}")
+            print(f"Best overlap@20: {best_overlap_at_k:.4f}, alignment score: {best_alignment_score:.6f}")
         else:
             print(f"Using FINAL model from epoch {n_epochs-1}")
         print(f"Final Loss: {history_vicreg['loss_total'][-1]:.4f}")
@@ -1686,7 +2010,30 @@ def train_encoder(
         print("="*70 + "\n")
         print(f"History saved: {history_path}")
     
-    torch.save(model.state_dict(), os.path.join(outf, 'encoder_final_new.pt'))
+    _save_path = os.path.join(outf, 'encoder_final_new.pt')
+    torch.save(model.state_dict(), _save_path)
+
+    # ===== DISK SAVE VERIFICATION (diagnose overlap@20 bug) =====
+    if stageA_obj == 'vicreg_adv' and _nce_phys_knn is not None:
+        _disk_model = SharedEncoder(
+            n_genes=model.n_genes,
+            n_embedding=model.n_embedding,
+            dropout=0.1
+        ).to(device)
+        _disk_model.load_state_dict(torch.load(_save_path, map_location=device))
+        from ssl_utils import compute_knn_locality_metrics as _disk_verify_fn
+        _disk_overlap = _disk_verify_fn(
+            model=_disk_model, st_gene_expr=st_gene_expr,
+            st_coords=st_coords, slide_ids=slide_ids,
+            phys_knn_idx=_nce_phys_knn, k=20, n_sample=300,
+        )
+        _dov = _disk_overlap['overlap_mean']
+        print(f"\n[DISK VERIFY] Loaded encoder_final_new.pt → overlap@20 = {_dov:.4f}")
+        if best_encoder_state is not None:
+            print(f"  Expected: {best_overlap_at_k:.4f}, delta={abs(_dov - best_overlap_at_k):.4f}")
+            if abs(_dov - best_overlap_at_k) > 0.01:
+                print(f"  [DISK BUG] MISMATCH between training metric and disk reload!")
+        del _disk_model
 
     if stageA_obj == 'vicreg_adv':
         aux_path = os.path.join(outf, 'stageA_vicreg_aux.pt')
