@@ -87,6 +87,55 @@ The encoder currently fights this batch effect using CORAL/MMD on global moments
 
 ---
 
+## Hypothesis H3: Slide Separability from Composition Differences
+
+**Claim**: Slides from different sections differ in proportions of zones/cell types (liver zonation, immune infiltration, edge effects). A slide classifier succeeds by learning "this gene program appears more in ST3."
+
+**Tests run**:
+1. **3a**: Clustered spots into K pseudo-types (K=10,20,30,50) on raw PCA, trained slide classifier WITHIN each cluster.
+2. **3b**: Compared cluster proportions per slide (chi-squared, Cramer's V, TVD).
+3. **3c**: Tested if cluster assignment alone (one-hot / soft) can predict slide identity.
+
+### Results
+
+**3a — Within-cluster slide classification**:
+| K | Valid clusters | Within-cluster acc (raw) | Within-cluster acc (mean-centered) |
+|---|---|---|---|
+| 10 | 6/10 | **0.942** (weighted) | 0.495 |
+| 20 | 13/20 | **0.939** (weighted) | 0.491 |
+| 30 | 18/30 | **0.922** (weighted) | 0.549 |
+| 50 | 28/50 | **0.891** (weighted) | 0.604 |
+
+Global baseline: raw=0.985, mean-centered=0.263
+
+**3b — Cluster proportions per slide**:
+- Cramer's V (cluster x slide): **0.617** (strong association)
+- Total Variation Distance: ST1-ST2=0.565, ST1-ST3=0.539, ST2-ST3=0.469
+- Several slide-dominated clusters: C1 (28.2% in ST2, ~0% others), C4 (34.3% in ST3, ~0% others), C14 (26.1% in ST1, ~0% others)
+
+**3c — Composition-only slide classification**:
+- Cluster one-hot (K=20): **0.636**
+- Soft assignment (K=20): **0.488**
+- Chance: 0.333
+
+### Analysis
+
+**H3 is PARTIALLY CONFIRMED — composition contributes but within-type batch dominates.**
+
+1. **Composition matters**: Cluster one-hot achieves 63.6% (well above 33.3% chance). Cramer's V = 0.617 is strong. Several clusters are nearly exclusive to one slide (C1→ST2, C4→ST3, C14→ST1). This means tissue sections genuinely sample different zones differently.
+
+2. **But within-type batch is the bigger story**: Even within the same pseudo-type (K=20), slide accuracy is **93.9%** — nearly as high as the global 98.5%. This means that even spots of the "same cell type" from different slides are trivially distinguishable. Composition alone can't explain this.
+
+3. **Mean centering fixes within-type too**: Within-cluster accuracy drops from 93.9% → 49.1% after mean centering (K=20). This confirms H2's finding: the per-gene mean shift is the dominant mechanism at every level — globally AND within cell types.
+
+4. **At higher K (50), mean-centered within-cluster rises to 60.4%**: This is expected — with many small clusters, residual variance after centering becomes more slide-structured (small sample effects + genuine zonation gradients that aren't captured by global centering).
+
+### Connection to H2
+
+H3 shows that H2's per-gene mean shift operates uniformly across all cell types, not just between them. This is consistent with a global capture-efficiency batch effect (every gene in every cell type shifts by a similar multiplicative factor per slide), rather than cell-type-specific biology.
+
+---
+
 ## Key Findings So Far
 
 | # | Finding | Result | Implication |
@@ -99,6 +148,9 @@ The encoder currently fights this batch effect using CORAL/MMD on global moments
 | 6 | **Per-gene mean centering drops slide acc from 98.5% → 26.3%** | H2c (KEY) | The batch effect is almost entirely a per-gene mean shift |
 | 7 | Variance normalization adds nothing beyond mean centering | H2c | Scale differences are not the issue — only location shifts matter |
 | 8 | Spatial structure preserved after batch gene removal | H2b sanity | Batch genes ≠ spatially variable genes |
+| 9 | Composition contributes to slide separability (Cramer's V=0.617, one-hot acc=0.636) | H3b/3c | Different sections sample different zones |
+| 10 | **Within same cell type, slides are still 93.9% separable** | H3a (KEY) | Per-gene mean shift operates uniformly across ALL cell types |
+| 11 | Mean centering fixes within-type batch too (93.9% → 49.1%) | H3a+H2 | Global mean centering sufficient, no per-type correction needed |
 
 ---
 
@@ -106,16 +158,18 @@ The encoder currently fights this batch effect using CORAL/MMD on global moments
 
 - [x] H1: QC covariate leakage — **CONFIRMED** (QC features ~94.6% predictive, Raw PCA 98.5%)
 - [x] H2: Per-gene mean/variance shifts — **STRONGLY CONFIRMED** (mean centering → 26.3%, batch is per-gene location shift)
-- [ ] H3: (next — to be defined)
-- [ ] H4: (to be defined)
+- [x] H3: Composition differences — **PARTIALLY CONFIRMED** (composition contributes 63.6%, but within-type batch at 93.9% dominates)
+- [ ] H4: Spatial InfoNCE induces slide-unique anisotropy (NEXT — requires training VICReg-only encoder)
 
 ---
 
 ## Design Decisions & Notes
 
-- All H1/H2 tests use **expression only** (no spatial coordinates) because the encoder input is expression-only
+- All H1/H2/H3 tests use **expression only** (no spatial coordinates) because the encoder input is expression-only
+- H4 will be the first hypothesis that requires training an encoder (VICReg-only vs VICReg+NCE comparison)
 - Kruskal-Wallis chosen over t-test for DE because it's non-parametric and handles >2 groups
 - Gene classification uses mouse naming conventions (mt- for mito, Rpl/Rps for ribo)
 - Ambient/hepatocyte gene list based on known highly-abundant liver markers that dominate ambient RNA
 - **IMPORTANT RULE**: Do NOT edit .ipynb files directly — provide code cells for user to copy-paste. Only edit .py files directly.
 - **Working notebook**: `model/liver_encoder_v2.ipynb` (NOT the older mouse_liver_encoder.ipynb)
+- v3 encoder (VICReg + spatial_nce=5.0, no CORAL/MMD/adversary) is the cleanest baseline for H4 comparison
