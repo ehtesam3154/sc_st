@@ -136,6 +136,84 @@ H3 shows that H2's per-gene mean shift operates uniformly across all cell types,
 
 ---
 
+## Hypothesis H4: Spatial InfoNCE Induces Slide-Unique Anisotropy
+
+**Claim**: Spatial InfoNCE is defined within-slide (physical kNN is per-slide). If each slide has a different spatially variable gene set / gradient orientation / tissue coverage, the learned embedding may develop slide-specific covariance structure ("geometry style"). The observed norm asymmetry across slides is one symptom.
+
+**Experimental design**: Train a VICReg-only encoder (identical to v3 but `spatial_nce_weight=0.0`) and compare to the existing v3 encoder (`spatial_nce_weight=5.0`). All other parameters identical: same VICReg weights, same augmentation, same `slide_scale_weight=5.0`, same `n_epochs=1200`, same seed.
+
+**Tests run**:
+1. **4a**: Slide separability linear probe (LogReg 5-fold CV) on encoder embeddings
+2. **4b**: Per-slide RMS embedding norms
+3. **4c**: Per-slide covariance eigen-spectra + principal angles between slide subspaces
+4. **4d**: Spatial locality — does NCE actually create spatially meaningful neighborhoods?
+
+### Results
+
+**4a — Slide separability**:
+| Encoder | Slide acc (balanced) |
+|---|---|
+| Raw PCA(50) input | **0.985** +/- 0.004 |
+| VICReg+NCE (v3) | **0.828** +/- 0.011 |
+| VICReg-only (H4) | **0.773** +/- 0.013 |
+| Chance | 0.333 |
+
+Delta (NCE - no-NCE) = **+0.056**
+
+**4b — Per-slide embedding norms**:
+| Slide | VICReg+NCE (RMS) | VICReg-only (RMS) |
+|---|---|---|
+| ST1 | 9.483 | 10.304 |
+| ST2 | 9.699 | 10.281 |
+| ST3 | **11.271** | 10.072 |
+| Max/Min ratio | **1.189** | **1.023** |
+
+**4c — Per-slide covariance eigen-spectra**:
+
+Variance explained by top-5 eigenvectors:
+| Encoder | ST1 | ST2 | ST3 |
+|---|---|---|---|
+| VICReg+NCE | 61.9% | 62.3% | **46.9%** |
+| VICReg-only | 44.0% | 40.7% | 41.8% |
+
+Principal angles between slide subspaces (top-10, mean degrees):
+| Pair | VICReg+NCE | VICReg-only |
+|---|---|---|
+| ST1 vs ST2 | 32.8° | **18.3°** |
+| ST1 vs ST3 | 43.9° | 35.4° |
+| ST2 vs ST3 | 47.1° | 36.0° |
+| **Overall mean** | **41.3°** | **29.9°** |
+
+**4d — Spatial locality** (k=20 kNN):
+| Encoder | emb_kNN physical dist | Physical kNN dist | Overlap |
+|---|---|---|---|
+| VICReg+NCE | 65-66 | 58-61 | **0.67-0.69** |
+| VICReg-only | **625-632** | 58-61 | **0.02** |
+
+### Analysis
+
+**H4 is CONFIRMED — NCE induces slide-specific anisotropy, but it's also essential.**
+
+1. **Both encoders reduce slide separability from input**: Raw PCA = 98.5%, VICReg+NCE = 82.8%, VICReg-only = 77.3%. VICReg's variance/covariance regularization is itself doing significant batch removal (98.5% → 77.3% without any explicit alignment). NCE adds a moderate +5.6% slide signal on top — it contributes to the confound, but is NOT the dominant source (H2's per-gene mean shift is).
+
+2. **NCE creates norm asymmetry — specifically for ST3**: With NCE, ST3 has 19% larger RMS norms than ST1/ST2 (11.27 vs 9.48-9.70). Without NCE, all slides are within 2.3% of each other (10.07-10.30). The `slide_scale_weight=5.0` regularizer is insufficient to counteract NCE's effect on ST3. This suggests ST3 has qualitatively different spatial gradient structure (different zonation pattern, tissue geometry, or edge effects) that NCE amplifies into larger embedding norms.
+
+3. **NCE makes covariance geometry slide-divergent (anisotropy confirmed)**: Mean principal angle between slide subspaces = 41.3° (NCE) vs 29.9° (no-NCE), a +11.4° increase. ST3 is the outlier: with NCE, its top-5 eigenvectors explain only 46.9% of variance (vs 61-62% for ST1/ST2), meaning NCE spreads ST3's embedding variance across more dimensions — a flatter, more isotropic spectrum. Without NCE, all three slides have similar spectral concentration (40-44%). This confirms the "geometry style" hypothesis: NCE causes each slide to develop its own preferred embedding directions, and ST3's spatial structure is sufficiently different to create a distinct covariance shape.
+
+4. **NCE is essential for spatial locality — the critical finding**: Without NCE, embedding kNN have **2% overlap** with physical kNN (essentially random). Embedding neighbors are physically **10x farther apart** (625μm vs 65μm). VICReg alone creates absolutely no spatial structure in the embeddings — it produces a biologically informative but spatially random representation. With NCE, overlap jumps to 67% and embedding neighbors are nearly as close physically (65μm) as true physical neighbors (58-61μm). **NCE is the ONLY component creating spatially meaningful embeddings.**
+
+5. **ST3 as the canary**: ST3 is consistently the outlier across all NCE-related metrics: largest norms (11.27), most divergent subspace (47.1° from ST2), flattest spectrum (46.9% top-5). Without NCE, ST3 looks normal. This means ST3's spatial organization is genuinely different from ST1/ST2, and NCE faithfully encodes this difference — but from the perspective of cross-slide integration, this is a confound.
+
+### The Dilemma and Resolution
+
+NCE is simultaneously:
+- **The only source of spatial structure** (0.67 overlap vs 0.02 without it)
+- **A contributor to slide-specific confounds** (+5.6% slide acc, 1.19x norm ratio, +11.4° subspace divergence)
+
+Removing NCE is not an option — it destroys the spatial signal entirely. The resolution connects back to H2: **per-slide-per-gene mean centering of the INPUT** before the encoder would remove the dominant batch effect (98.5% → 26.3% of slide signal) so that NCE operates on batch-corrected expression gradients. NCE would then create spatial structure from biological gradients (zonation, immune infiltration) rather than batch-confounded gradients. The residual +5.6% NCE-specific slide signal should shrink dramatically if the input is already batch-corrected.
+
+---
+
 ## Key Findings So Far
 
 | # | Finding | Result | Implication |
@@ -151,6 +229,12 @@ H3 shows that H2's per-gene mean shift operates uniformly across all cell types,
 | 9 | Composition contributes to slide separability (Cramer's V=0.617, one-hot acc=0.636) | H3b/3c | Different sections sample different zones |
 | 10 | **Within same cell type, slides are still 93.9% separable** | H3a (KEY) | Per-gene mean shift operates uniformly across ALL cell types |
 | 11 | Mean centering fixes within-type batch too (93.9% → 49.1%) | H3a+H2 | Global mean centering sufficient, no per-type correction needed |
+| 12 | Both encoders reduce slide acc from input (0.985 → 0.77-0.83) | H4a | VICReg's var/cov regularization does batch removal on its own |
+| 13 | NCE adds +5.6% slide separability (0.773 → 0.828) | H4a | NCE contributes to confound, but is secondary to input batch (H2) |
+| 14 | **NCE creates ST3-specific norm inflation** (ratio 1.19 vs 1.02 without) | H4b (KEY) | ST3 has different spatial structure that NCE amplifies |
+| 15 | **NCE is essential for spatial locality** (67% overlap vs 2% without) | H4d (KEY) | Cannot remove NCE — it's the ONLY source of spatial structure |
+| 16 | NCE increases subspace divergence +11.4° between slides | H4c | Per-slide covariance geometry diverges ("geometry style" confirmed) |
+| 17 | **Fix: mean-center input, keep NCE** | H2+H4 synthesis | Remove batch from input so NCE encodes biology not batch |
 
 ---
 
@@ -159,14 +243,15 @@ H3 shows that H2's per-gene mean shift operates uniformly across all cell types,
 - [x] H1: QC covariate leakage — **CONFIRMED** (QC features ~94.6% predictive, Raw PCA 98.5%)
 - [x] H2: Per-gene mean/variance shifts — **STRONGLY CONFIRMED** (mean centering → 26.3%, batch is per-gene location shift)
 - [x] H3: Composition differences — **PARTIALLY CONFIRMED** (composition contributes 63.6%, but within-type batch at 93.9% dominates)
-- [ ] H4: Spatial InfoNCE induces slide-unique anisotropy (NEXT — requires training VICReg-only encoder)
+- [x] H4: Spatial InfoNCE anisotropy — **CONFIRMED** (+5.6% slide acc, 1.19x norm ratio, +11.4° subspace divergence, but NCE is essential for spatial locality)
 
 ---
 
 ## Design Decisions & Notes
 
-- All H1/H2/H3 tests use **expression only** (no spatial coordinates) because the encoder input is expression-only
-- H4 will be the first hypothesis that requires training an encoder (VICReg-only vs VICReg+NCE comparison)
+- H1/H2/H3 tests use **expression only** (no spatial coordinates) because the encoder input is expression-only
+- H4 required training a new encoder (VICReg-only, spatial_nce=0) to isolate NCE's contribution
+- H4 VICReg-only encoder saved at: `gems_liver_crossslide_h4_vicreg_only/encoder_h4_vicreg_only.pt`
 - Kruskal-Wallis chosen over t-test for DE because it's non-parametric and handles >2 groups
 - Gene classification uses mouse naming conventions (mt- for mito, Rpl/Rps for ribo)
 - Ambient/hepatocyte gene list based on known highly-abundant liver markers that dominate ambient RNA
