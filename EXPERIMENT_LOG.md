@@ -470,20 +470,45 @@ Based on H1-H6 diagnostics + GPT-Pro's Design A architecture recommendations, im
 **Math**: x̃_i^g = x_i^g - μ_{s_i}^g + μ^g (remove slide mean, restore global)
 **Code**: Added `mean_center_per_slide()` to `core_models_et_p1.py`
 
-**Results**: *(pending — run Cell 1)*
+**Results**:
+- Slide acc on centered PCA(50): 0.984 → **0.262** (below chance of 0.333) ✓
+- Moran's I deltas: all **-0.000** (spatial structure perfectly preserved) ✓
+
+### Step 0 (added): V3 Baseline Re-verification
+
+**Why**: First v5 attempt used wrong config (lr=1e-3 instead of 1e-4, vicreg_lambda_var=25 instead of 50, etc.), producing overlap=0.239. Re-ran v3 with exact original config to verify baseline.
+
+**Results** (v3 verify):
+| Metric | v3 verify | Original v3 | Match? |
+|--------|-----------|-------------|--------|
+| Slide acc | 0.812 | 0.828 | ✓ |
+| Overlap@20 | 0.682 | 0.680 | ✓ |
+| Norm ratio | 1.203 | 1.189 | ✓ |
+
+Baseline confirmed solid on current codebase.
 
 ### Implementation Step 2: Train v5 Encoder
 
 **What**: Train on mean-centered input. VICReg + NCE only, all alignment losses OFF.
-**Config**: spatial_nce_weight=5.0, all CORAL/MMD/adversary = 0.0
+**Config**: Exact v3 config, only change: `st_gene_expr=st_expr_mc` instead of `st_expr`.
+**Key params**: lr=1e-4, vicreg_lambda_var=50.0, vicreg_inv_warmup_frac=0.3, vicreg_use_projector=False
 
-**Success criteria**:
-| Metric | Target | v3 baseline |
-|--------|--------|-------------|
-| overlap@20 | ≥ 0.65 | 0.680 |
-| slide acc | < 0.50 | 0.828 |
-| norm ratio | < 1.10 | 1.189 |
+**Results**:
+| Metric | v5 | v3 baseline | Target | Status |
+|--------|-----|-------------|--------|--------|
+| Slide acc | **0.400** | 0.812 | < 0.50 | **PASS** |
+| Overlap@20 | **0.672** | 0.682 | ≥ 0.65 | **PASS** |
+| Norm ratio | **1.038** | 1.203 | < 1.10 | **PASS** |
+| Principal angles | 30.5° | 42.1° | — | Improved |
+| Per-dim std min | 0.574 | 0.699 | > 0.01 | **PASS** |
 
-**Results**: *(pending — run Cells 2-3)*
+**Go/no-go**: ✓ ALL CRITERIA MET → Skip Steps 3-4, proceed to Step 5 (SC adapter).
 
-**Go/no-go**: All pass → Step 5 (adapter). Slide acc > 0.6 → Step 3 (canonicalization).
+Steps 3 (in-training canonicalization) and 4 (conditional slide alignment) are **unnecessary** — input mean centering alone fixed slide leakage (0.812 → 0.400) without degrading locality (0.682 → 0.672).
+
+### Implementation Step 5: SC Adapter (next)
+
+**What**: Freeze v5 encoder. Fit SC adapter using linear full-matrix with optimal transport (whitening+coloring) initialization. CORAL + MMD fine-tuning.
+**Math**: g(z) = Wz + b, W₀ = C_ST^{1/2} · C_SC^{-1/2}, b₀ = μ_ST - W₀ · μ_SC
+**Code**: Already implemented in `sc_adapter.py` (mode='linear', init_closed_form=True)
+**Results**: *(pending)*
