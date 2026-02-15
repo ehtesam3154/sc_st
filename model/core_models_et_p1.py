@@ -71,6 +71,36 @@ class SharedEncoder(nn.Module):
         return self.encoder(X)
 
 
+def mean_center_per_slide(
+    X: torch.Tensor,
+    slide_ids: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Per-slide per-gene mean centering of expression data.
+    Removes slide-specific mean shifts while preserving the global mean.
+
+    For each slide s and gene g:
+        X_out[i,g] = X[i,g] - mean(X[slide_s, g]) + mean(X[all, g])
+
+    This removes the dominant batch effect (per-gene location shift) identified
+    in H2, which accounts for 98.5% → 0.6% of slide separability.
+
+    Args:
+        X:         (n, n_genes) expression matrix
+        slide_ids: (n,) integer slide identifiers
+
+    Returns:
+        X_out: (n, n_genes) mean-centered expression
+    """
+    global_mean = X.mean(dim=0, keepdim=True)
+    X_out = X.clone()
+    for s in torch.unique(slide_ids):
+        mask = (slide_ids == s)
+        slide_mean = X[mask].mean(dim=0, keepdim=True)
+        X_out[mask] = X[mask] - slide_mean + global_mean
+    return X_out
+
+
 @torch.no_grad()
 def normalize_embeddings_per_slide(
     z: torch.Tensor,
