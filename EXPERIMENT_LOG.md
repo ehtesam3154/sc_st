@@ -511,4 +511,42 @@ Steps 3 (in-training canonicalization) and 4 (conditional slide alignment) are *
 **What**: Freeze v5 encoder. Fit SC adapter using linear full-matrix with optimal transport (whitening+coloring) initialization. CORAL + MMD fine-tuning.
 **Math**: g(z) = Wz + b, W₀ = C_ST^{1/2} · C_SC^{-1/2}, b₀ = μ_ST - W₀ · μ_SC
 **Code**: Already implemented in `sc_adapter.py` (mode='linear', init_closed_form=True)
-**Results**: *(pending)*
+**Config**: `adapter_mode='linear'`, `init_closed_form=True`, `coral_weight=10.0`, `mmd_weight=10.0`, `identity_weight=1.0`, `n_epochs=500`, `lr=1e-3`
+
+**Results**:
+| Metric | Before adapter | After adapter | Target |
+|--------|---------------|--------------|--------|
+| Domain acc (ST vs SC) | 0.9858 | **0.4418** | ~0.50 (chance) ✓ |
+| CORAL | 0.1868 | **0.0007** | ~0 ✓ |
+| MMD | 0.0579 | **0.0010** | ~0 ✓ |
+| Centroid distance | 4.1111 | **0.0788** | ~0 ✓ |
+| SC embedding norms | 14.045 | **9.310** | ~9.395 (match ST) ✓ |
+| ST overlap@20 | — | **0.672** | unchanged (encoder frozen) ✓ |
+
+**Note**: `st_overlap@20` reports 0.0 in the adapter logs because `phys_knn_idx` was not passed. The actual ST overlap is unchanged at 0.672 since the encoder is frozen — the adapter only transforms SC embeddings.
+
+**Interpretation**: The whitening+coloring OT initialization does most of the alignment work (matching full covariance structure). CORAL+MMD fine-tuning cleans up residuals. Domain classifier accuracy at 0.4418 means ST and SC embeddings are effectively indistinguishable — the adapter successfully maps SC (ST4) into the ST embedding space without disturbing ST's spatial structure.
+
+---
+
+## Design A: Complete Pipeline Summary
+
+The full pipeline is:
+
+1. **Input preprocessing**: `st_expr_mc = mean_center_per_slide(st_expr, slide_ids)` — removes per-gene mean shift batch effect (slide acc 0.984 → 0.262)
+2. **Encoder**: `SharedEncoder(n_genes→512→256→128)` trained with VICReg + Spatial NCE on mean-centered ST1-3. No alignment losses. (slide acc 0.400, overlap 0.672, norm ratio 1.038)
+3. **SC adapter**: `SCAdapter(mode='linear', init_closed_form=True)` maps frozen SC embeddings into ST space via CORAL+MMD. (domain acc 0.44, CORAL ~0)
+
+**Key design decisions** (informed by H1-H6 diagnostics):
+- Input mean centering (not trained alignment) for batch correction — eliminates 99.4% of slide signal safely
+- NCE retained for spatial locality (essential: 67% overlap vs 2% without)
+- No CORAL/MMD in training loss — trained alignment destroys locality (H6: overlap 0.68→0.25)
+- Post-hoc SC adapter instead — preserves ST geometry, only transforms SC domain
+- Steps 3-4 (in-training canonicalization, conditional alignment) skipped — input correction was sufficient
+
+**Files changed**:
+| File | Change |
+|------|--------|
+| `model/core_models_et_p1.py` | Added `mean_center_per_slide()` utility function |
+| `model/sc_adapter.py` | No changes (already had linear+OT mode) |
+| `model/liver_encoder_v2.ipynb` | Training cells for v5 encoder + adapter (user-run) |
