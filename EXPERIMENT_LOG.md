@@ -455,3 +455,35 @@ The six hypotheses paint a clear and consistent picture:
 - **IMPORTANT RULE**: Do NOT edit .ipynb files directly — provide code cells for user to copy-paste. Only edit .py files directly.
 - **Working notebook**: `model/liver_encoder_v2.ipynb` (NOT the older mouse_liver_encoder.ipynb)
 - v3 encoder (VICReg + spatial_nce=5.0, no CORAL/MMD/adversary) is the cleanest baseline for H4 comparison
+
+---
+
+## Implementation Phase: Design A (GPT-Pro Plan)
+
+Based on H1-H6 diagnostics + GPT-Pro's Design A architecture recommendations, implementing a sequence of changes to fix the encoder. Each step has clear success criteria and go/no-go decisions.
+
+**Design A principle**: Don't align ST↔SC in the trunk. Preserve geometry learning, remove slide nuisance via input correction + optional in-training canonicalization + conditional alignment. Ship SC adapter separately.
+
+### Implementation Step 1: Input Mean Centering
+
+**What**: Per-slide-per-gene mean centering of ST expression before training.
+**Math**: x̃_i^g = x_i^g - μ_{s_i}^g + μ^g (remove slide mean, restore global)
+**Code**: Added `mean_center_per_slide()` to `core_models_et_p1.py`
+
+**Results**: *(pending — run Cell 1)*
+
+### Implementation Step 2: Train v5 Encoder
+
+**What**: Train on mean-centered input. VICReg + NCE only, all alignment losses OFF.
+**Config**: spatial_nce_weight=5.0, all CORAL/MMD/adversary = 0.0
+
+**Success criteria**:
+| Metric | Target | v3 baseline |
+|--------|--------|-------------|
+| overlap@20 | ≥ 0.65 | 0.680 |
+| slide acc | < 0.50 | 0.828 |
+| norm ratio | < 1.10 | 1.189 |
+
+**Results**: *(pending — run Cells 2-3)*
+
+**Go/no-go**: All pass → Step 5 (adapter). Slide acc > 0.6 → Step 3 (canonicalization).
