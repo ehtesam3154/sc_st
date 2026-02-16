@@ -474,40 +474,102 @@ Run 4 only tested up to n=384. The training pipeline may use larger minisets. Ve
 
 ---
 
-## Questions for Research Agent
+## Questions for Research Agent — ANSWERED
 
-These questions emerged from the Run 4 results and should be investigated before or during training integration:
+These questions emerged from the Run 4 results. Answers from external research agent (GPT Pro), verified against the current codebase.
 
 ### Q7: Is the ~10% Recall gap to Gram acceptable, or should we pursue hybrid targets?
-F2+F4 achieves Recall 0.89 vs Gram's 0.997 in the direct optimization diagnostic. However:
-- The diagnostic tests pure coordinate recovery from targets alone (no gene expression signal)
-- In training, the diffusion model has gene expression as input, which provides strong inductive bias for spatial arrangement
-- **Question**: In prior work on graph-based spatial reconstruction (e.g., PASTE, SpaGE, novoSpaRc), what Recall@15 levels are considered sufficient? Is 0.89 in a "from-scratch" recovery test likely to translate to >0.95 when the model also has gene expression context?
-- **Alternative**: Should we consider a hybrid approach where Gram loss is used at high noise levels (large σ) and graph-based loss at low noise levels (small σ)?
+
+**Answer**: 0.89–0.90 Recall in direct optimization is borderline acceptable — it's the first point where F2+F4 is "trainable" rather than "mostly ambiguous." The diffusion model will land below this ceiling, so the gap is real.
+
+**Recommendation**: Do NOT reintroduce Gram as part of the main supervision story. Instead:
+- Keep a simple **high-σ scale anchor** (log-RMS or log median kNN distance) to prevent scale collapse — this does not reintroduce Gram.
+- Optional: a very low-weight "shape anchor" (Gram or MDS kernel) at high σ only, treated as a **training trick to ablate away**, not a permanent part of the recipe.
+- At low σ, F2+F4 alone should be strong enough — the gene expression inductive bias will close the remaining gap.
 
 ### Q8: How does adaptive k=15% compare to other graph scaling strategies in the literature?
-We chose `k = max(20, int(0.15 * n))` which maintains ~15% graph connectivity. Questions:
-- Is there theoretical guidance on optimal k scaling for random walk operators on spatial point clouds? (e.g., from spectral graph theory, manifold learning literature)
-- The `4 * sqrt(n)` alternative gives k ∝ √n which is more common in manifold learning (e.g., Isomap). Would this be more principled?
-- At what k does the kNN graph transition from "too sparse to propagate" to "dense enough that RW is uninformative" (all transition probabilities nearly uniform)?
-- **Specific concern**: At n=384, k=57 means each row of the transition matrix has 57 nonzero entries. After 5 RW steps, the effective connectivity may be near-complete, making P^5 close to uniform. Is this happening?
+
+**Answer**: k ∝ n (linear) works empirically but risks over-mixing. The research agent recommends:
+- **Sublinear scaling** for RW: `k_rw = clamp(k_min, ceil(k_0 + a*sqrt(n)), k_max)` — keeps the operator informative longer as n increases. k ∝ √n is more standard in manifold learning (Isomap, etc.).
+- **Mixing diagnostic**: Instead of choosing RW steps by n, compute on GT:
+  - Average row entropy of P^s, OR
+  - `||P^s - π·1^T||_F` (distance from stationarity)
+  - Pick s where the distribution is "not too local but clearly non-uniform"
+- **Lazy random walk**: `P ← α·I + (1-α)·P` with α ≈ 0.1–0.3 to slow mixing and make multi-step targets less sensitive to k/edge noise.
+
+**Codebase verification**: `compute_rw_transition_matrix()` at `utils_et.py:3684` does NOT currently support lazy RW — there is no alpha parameter. Would need to be added.
 
 ### Q9: Should the stress loss (F4) use the same adaptive k, or a different edge set?
-F4 (normalized stress) operates on a multiscale edge set: kNN + ring negatives + landmark edges. With adaptive k:
-- kNN edges scale as O(n·k) = O(0.15·n²) — this becomes a lot of edges at large n
-- Ring negatives (rank k+1 to 3k) also scale proportionally
-- **Question**: Should stress use a sparser edge set than RW? For example, keep stress edges at fixed k=20 for local + landmarks for global, while RW uses adaptive k? Or does stress also need the dense graph?
+
+**Answer**: **NO — decouple stress edges from RW edges.**
+- If k_rw = 0.15n, using that for stress makes the stress graph approach dense as n grows, changing stress from "light global regularizer" into "dominant objective."
+- **Recommended**: Keep stress k small and mostly fixed, e.g. `k_stress ∈ [8, 24]` (maybe mild √n growth). Keep landmark/ring/long-edge additions for global rigidity — that's where stress helps most.
+- This means `build_miniset_geometric_targets()` may need separate k parameters for RW vs stress edge construction.
 
 ### Q10: What is the computational cost scaling of adaptive k in the training pipeline?
-- `build_miniset_geometric_targets()` computes kNN, RW transitions (dense matrix powers), and stress targets
-- With adaptive k, at n=384, k=57: the dense transition matrix P is 384×384, and P^5 requires 5 matrix multiplications
-- At n=512, k=76: P is 512×512
-- **Question**: Is the O(n²·k) cost of building these targets acceptable during training (computed per-miniset in the dataloader)? Should we consider sparse matrix powers instead of dense? What's the wall-clock overhead per batch?
+
+**Answer**: The main bottleneck is dense matrix powers for RW targets.
+
+**Codebase verification** — current implementation is ALL DENSE:
+- `compute_rw_transition_matrix()` (`utils_et.py:3684`): builds dense `W = torch.zeros(n, n)` and dense `P = W / deg`
+- `compute_multistep_rw_targets()` (`utils_et.py:3735`): computes `P_s = P_s @ P1` via dense matmul in a loop
+- At n=384: 384×384 × 5 matmuls = fine (< 1ms)
+- At n=768: 768×768 × 5 matmuls = still fine (~5ms CPU)
+- **NOT a bottleneck for current sizes.** Dense is OK up to ~n=1024.
+
+**Research agent's optimization suggestion for future scale**:
+- Move heavy targets to **Stage B** (per-slide precomputation). Existing utilities:
+  - `precompute_st_graph_fixed()` (`utils_et.py:2459`) — builds full-slide kNN graph
+  - `extract_miniset_fixed_graph()` (`utils_et.py:2514`) — extracts induced subgraph for a miniset
+  - These already exist and are unused by geometric target construction. Could be wired in.
+- For RW at very large n: compute P^s only for landmark rows using sparse matmuls: maintain X ∈ R^{n×L}, repeatedly do X ← P·X. Cost = O(s · nnz(P) · L), no dense matrix power.
+- Move multi-step propagation to GPU loss computation (after collation) rather than CPU dataloader.
 
 ### Q11: Should we tune the RW step weights or keep exponential decay?
-Current scheme: `step_weights = {s: 0.5^(s-1) for s in rw_steps}` (1.0, 0.5, 0.25, 0.125, 0.0625).
-- Run 4 results are good with this scheme but we haven't tested alternatives
-- **Question**: Is equal weighting better for longer-range structure? Is there theory on optimal step weighting for graph-based distance recovery? Does the spectral gap of the kNN graph suggest how many steps are actually informative vs redundant?
+
+**Answer**: The research agent did not strongly recommend changing from exponential decay. However:
+- The **mixing diagnostic** from Q8 should inform which steps are actually informative vs redundant
+- If P^5 is already near-uniform (detectable by entropy), that step adds noise rather than signal — down-weight or skip it
+- Consider choosing steps adaptively based on spectral gap rather than hardcoding by n
+
+---
+
+## Additional Research Agent Recommendations
+
+### R1: σ-weighting schedule for training (from Q11 follow-up)
+Use a σ-gated auxiliary weight for operator losses:
+```python
+λ_geo(σ) = λ₀ · min(1, (σ_cut / σ)^p)    # p ∈ [2, 4]
+```
+- RW + stress (geometry-identifying): strong at low σ, decay quickly above σ_cut
+- Overlap consistency: same or stricter gating — only at low σ
+- At high σ, keep ONLY: (a) a scale prior (log-RMS anchor), (b) optionally weak centering/variance constraint
+- Choose σ_cut around where the model transitions from "shape recoverable" to "mostly noise"
+
+### R2: Lazy random walk for stability
+Add a lazy RW option to `compute_rw_transition_matrix()`:
+```python
+P = (1 - alpha) * P + alpha * I    # alpha ≈ 0.1–0.3
+```
+This slows mixing and makes multi-step targets less sensitive to edge noise. Low-priority but could help if training shows RW instability.
+
+---
+
+## Code Consistency Check (Verified 2026-02-16)
+
+The research agent flagged that the production code doesn't match the diagnostic recipe. **This is correct. Current state:**
+
+| What | Diagnostic (notebook) | Production (`core_models_et_p1.py`) | Action needed |
+|------|----------------------|-------------------------------------|---------------|
+| `compute_families` | `[1, 2, 4, 5]` | `[1, 2, 3, 5]` (lines 2784, 3294) | Change to `[2, 4]` |
+| `knn_k` | Adaptive (`max(20, 0.15n)`) | Fixed `self.knn_k` (hardcoded) | Wire adaptive function |
+| `rw_steps` | Adaptive per n | Fixed `[1, 2, 3]` | Wire adaptive function |
+| `n_landmarks` | Adaptive (`n//16`) | Fixed `min(8, n//4)` | Wire adaptive function |
+| `V_target` (Gram) | Not used | Still primary diffusion target (lines 2739, 3254) | Keep for now, add F2+F4 losses |
+| `geo_targets` | Consumed in loss | Flows through collate as `List[Dict]` but **unused in loss** | Wire into `core_models_et_p2.py` |
+| Adaptive functions | Used in notebook | **Do not exist** in `utils_et.py` | Add to `utils_et.py` |
+| Lazy RW | Not tested | Not implemented (no alpha param) | Optional future addition |
+| Stage B graph utils | N/A | `precompute_st_graph_fixed()` and `extract_miniset_fixed_graph()` exist but unused | Consider for optimization |
 
 ---
 
