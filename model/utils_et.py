@@ -4089,6 +4089,56 @@ def compute_normalized_stress_targets(
     return d_norm
 
 
+def _merge_knn_with_fallback(
+    knn_fullslide: torch.Tensor,
+    knn_subset: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    """
+    Merge full-slide kNN (mapped to local indices, with -1 for missing nodes)
+    with subset-only kNN as fallback.
+
+    For each node, takes valid full-slide neighbors first (preserving true
+    spatial structure), then fills remaining slots from subset kNN.
+
+    Args:
+        knn_fullslide: (n, k_full) full-slide kNN in local indices (-1 = not in miniset)
+        knn_subset: (n, k_sub) subset-only kNN (all valid)
+        k: desired number of neighbors per node
+
+    Returns:
+        merged: (n, k) merged kNN indices
+    """
+    n = knn_subset.shape[0]
+    device = knn_subset.device
+    merged = torch.full((n, k), -1, dtype=torch.long, device=device)
+
+    for i in range(n):
+        valid_full = knn_fullslide[i][knn_fullslide[i] >= 0]
+        valid_sub = knn_subset[i][knn_subset[i] >= 0]
+
+        seen = set()
+        idx = 0
+        # Priority: full-slide neighbors (true spatial structure)
+        for j in valid_full.tolist():
+            if idx >= k:
+                break
+            if j not in seen:
+                merged[i, idx] = j
+                seen.add(j)
+                idx += 1
+        # Fallback: subset-only neighbors (fill gaps)
+        for j in valid_sub.tolist():
+            if idx >= k:
+                break
+            if j not in seen:
+                merged[i, idx] = j
+                seen.add(j)
+                idx += 1
+
+    return merged
+
+
 def build_miniset_geometric_targets(
     coords: torch.Tensor,
     knn_k: int = 20,
@@ -4099,6 +4149,7 @@ def build_miniset_geometric_targets(
     n_landmarks: int = 8,
     lle_ridge: float = 1e-3,
     compute_families: list = None,
+    knn_spatial_local: torch.Tensor = None,
 ) -> dict:
     """
     One-call function to build all geometric targets for a miniset.
@@ -4117,6 +4168,10 @@ def build_miniset_geometric_targets(
         lle_ridge: ridge regularization for LLE
         compute_families: list of families to compute, e.g. [1, 2, 3, 5]
                          None = compute all
+        knn_spatial_local: (n, k) optional full-slide spatial kNN mapped to local
+                          indices (-1 for neighbors not in miniset). When provided,
+                          these true spatial neighbors take priority over subset-only
+                          kNN, reducing noise from sampling artifacts.
 
     Returns:
         dict with all computed targets (keys vary by family)
@@ -4129,8 +4184,29 @@ def build_miniset_geometric_targets(
     n = coords.shape[0]
     device = coords.device
 
-    # Build local kNN (always needed)
-    knn_local = build_knn_local(coords, k=knn_k)
+    # ------------------------------------------------------------------
+    # FIX 1: Normalize coords to unit-RMS gauge
+    # All targets (sigma, fuzzy mu, RW transitions) are built in this
+    # normalized space. This ensures they match the gauge that predicted
+    # coordinates are normalized to before loss computation.
+    # ------------------------------------------------------------------
+    coords = coords.clone()  # don't mutate caller's tensor
+    coords = coords - coords.mean(dim=0, keepdim=True)
+    rms = coords.pow(2).sum(dim=1).mean().sqrt().clamp(min=1e-6)
+    coords = coords / rms
+
+    # Build subset-only kNN (always needed as fallback)
+    knn_subset = build_knn_local(coords, k=knn_k)
+
+    # ------------------------------------------------------------------
+    # FIX 3: Use full-slide kNN when available
+    # Full-slide kNN preserves true spatial neighborhood structure,
+    # avoiding false neighbors from sampling artifacts in the subset.
+    # ------------------------------------------------------------------
+    if knn_spatial_local is not None:
+        knn_local = _merge_knn_with_fallback(knn_spatial_local, knn_subset, knn_k)
+    else:
+        knn_local = knn_subset
 
     # Compute local bandwidths (always needed)
     sigma = compute_local_bandwidths(coords, knn_local)
@@ -4138,7 +4214,7 @@ def build_miniset_geometric_targets(
     result = {
         'knn_local': knn_local,       # (n, k)
         'sigma_local': sigma,          # (n,)
-        'coords': coords,             # (n, 2)
+        'coords': coords,             # (n, 2) — in unit-RMS gauge
     }
 
     # Family 1: Fuzzy Neighborhood Graph

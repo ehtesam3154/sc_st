@@ -2782,6 +2782,7 @@ class STSetDataset(Dataset):
             n_landmarks=min(8, n_nodes // 4),
             lle_ridge=1e-3,
             compute_families=[1, 2, 3, 5],
+            knn_spatial_local=knn_spatial_local,
         )
 
         # ------------------------------------------------------------------
@@ -3291,6 +3292,7 @@ class STPairSetDataset(Dataset):
             n_landmarks=min(8, n_total // 4),
             lle_ridge=1e-3,
             compute_families=[1, 2, 3, 5],
+            knn_spatial_local=knn_spatial_local,
         )
 
         # Global UIDs
