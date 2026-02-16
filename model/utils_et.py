@@ -3468,12 +3468,733 @@ class ShapeSpectrumLoss(nn.Module):
                 # Log-ratio penalty (scale-invariant)
                 loss_b = (torch.log(r_pred) - torch.log(r_target)) ** 2
                 loss_per_batch.append(loss_b)
-                
+
             except Exception as e:
                 # Skip if eigendecomposition fails
                 continue
-        
+
         if len(loss_per_batch) == 0:
             return torch.tensor(0.0, device=device)
-        
+
         return torch.stack(loss_per_batch).mean()
+
+
+# ==============================================================================
+# NEW TARGET FAMILIES: Sparse, Scale-Free Geometric Targets
+# ==============================================================================
+# These replace dense Gram matrix supervision with relational losses that are:
+# - Translation/rotation/reflection invariant (distance-based)
+# - Weakly scale-dependent (local bandwidth normalization)
+# - Robust to density variation (self-tuning bandwidth)
+# - Sparse and efficient: O(n*k) instead of O(n^2)
+# ==============================================================================
+
+def compute_local_bandwidths(
+    coords: torch.Tensor,
+    knn_indices: torch.Tensor,
+    k_sigma: int = -1,
+) -> torch.Tensor:
+    """
+    Compute self-tuned local bandwidth sigma_i for each node.
+    sigma_i = distance to the k_sigma-th spatial neighbor.
+
+    This removes global pixel scale dependence and adapts to local density.
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        knn_indices: (n, k) spatial kNN indices (0-indexed within this set)
+        k_sigma: which neighbor to use for bandwidth (default: last column = k-th neighbor)
+
+    Returns:
+        sigma: (n,) local bandwidth per node
+    """
+    n = coords.shape[0]
+    k = knn_indices.shape[1]
+
+    if k_sigma < 0:
+        k_sigma = k - 1  # Use the k-th (furthest) neighbor
+    k_sigma = min(k_sigma, k - 1)
+
+    # Get the k_sigma-th neighbor for each node
+    kth_neighbor_idx = knn_indices[:, k_sigma]  # (n,)
+
+    # Handle invalid indices (padded with -1)
+    valid_mask = kth_neighbor_idx >= 0
+
+    sigma = torch.ones(n, device=coords.device, dtype=coords.dtype)
+
+    if valid_mask.any():
+        valid_nodes = torch.where(valid_mask)[0]
+        valid_kth = kth_neighbor_idx[valid_mask]
+
+        # Distance from each node to its k_sigma-th neighbor
+        dists = torch.norm(coords[valid_nodes] - coords[valid_kth], dim=1)  # (n_valid,)
+        sigma[valid_nodes] = dists.clamp(min=1e-8)
+
+    return sigma
+
+
+def compute_fuzzy_membership_on_edges(
+    coords: torch.Tensor,
+    edge_src: torch.Tensor,
+    edge_dst: torch.Tensor,
+    sigma: torch.Tensor,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """
+    Compute fuzzy membership strengths mu_{ij} for given edges.
+
+    mu_{ij} = exp(-|p_i - p_j|^2 / (sigma_i * sigma_j + eps))
+
+    This is the core of Family 1 (UMAP/SNE-style fuzzy graph alignment).
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        edge_src: (E,) source node indices
+        edge_dst: (E,) destination node indices
+        sigma: (n,) local bandwidths
+        eps: numerical stability
+
+    Returns:
+        mu: (E,) fuzzy membership strengths in [0, 1]
+    """
+    diff = coords[edge_src] - coords[edge_dst]  # (E, 2)
+    dist_sq = (diff * diff).sum(dim=1)  # (E,)
+
+    sigma_prod = sigma[edge_src] * sigma[edge_dst] + eps  # (E,)
+
+    mu = torch.exp(-dist_sq / sigma_prod)  # (E,)
+    return mu
+
+
+def build_fuzzy_target_edges(
+    coords: torch.Tensor,
+    knn_indices: torch.Tensor,
+    sigma: torch.Tensor,
+    n_neg_per_node: int = 5,
+    ring_outer_k: int = 60,
+    eps: float = 1e-10,
+) -> dict:
+    """
+    Build complete sparse edge set with positive and negative edges for
+    fuzzy neighborhood graph alignment (Family 1).
+
+    Positive edges: kNN edges from spatial graph
+    Negative edges: "ring" negatives (outside kNN, within ring_outer_k) + random
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        knn_indices: (n, k) spatial kNN indices (local indexing, 0 to n-1)
+        sigma: (n,) local bandwidths
+        n_neg_per_node: number of negative edges per node
+        ring_outer_k: outer boundary for ring negatives
+        eps: numerical stability
+
+    Returns:
+        dict with:
+            'edges_pos_src': (E_pos,) positive edge source indices
+            'edges_pos_dst': (E_pos,) positive edge destination indices
+            'mu_pos': (E_pos,) target memberships on positive edges
+            'edges_neg_src': (E_neg,) negative edge source indices
+            'edges_neg_dst': (E_neg,) negative edge destination indices
+            'mu_neg': (E_neg,) target memberships on negatives (near 0)
+    """
+    n = coords.shape[0]
+    k = knn_indices.shape[1]
+    device = coords.device
+
+    # --- Positive edges: all kNN edges ---
+    src_pos = torch.arange(n, device=device).unsqueeze(1).expand(-1, k).reshape(-1)
+    dst_pos = knn_indices.reshape(-1)
+
+    # Filter out invalid edges (padded with -1)
+    valid_pos = dst_pos >= 0
+    src_pos = src_pos[valid_pos]
+    dst_pos = dst_pos[valid_pos]
+
+    mu_pos = compute_fuzzy_membership_on_edges(coords, src_pos, dst_pos, sigma, eps)
+
+    # --- Negative edges: ring + random (vectorized) ---
+    # Build kNN membership set per node for fast lookup
+    knn_mask = torch.zeros(n, n, device=device, dtype=torch.bool)
+    for i in range(n):
+        valid_nbrs = knn_indices[i][knn_indices[i] >= 0]
+        if valid_nbrs.numel() > 0:
+            knn_mask[i, valid_nbrs] = True
+    knn_mask.fill_diagonal_(True)  # exclude self
+
+    # non-neighbor mask
+    non_neighbor_mask = ~knn_mask  # (n, n)
+
+    # Compute distances for ring selection
+    D_full = torch.cdist(coords, coords)  # (n, n)
+
+    neg_src_list = []
+    neg_dst_list = []
+
+    for i in range(n):
+        candidates = torch.where(non_neighbor_mask[i])[0]
+        if candidates.numel() == 0:
+            continue
+
+        n_neg_actual = min(n_neg_per_node, candidates.numel())
+
+        # Mix: half ring (closest non-neighbors), half random
+        n_ring = max(1, n_neg_actual // 2)
+        n_rand = n_neg_actual - n_ring
+
+        dists_to_candidates = D_full[i, candidates]
+        _, sorted_idx = torch.sort(dists_to_candidates)
+
+        # Ring negatives (closest non-neighbors — hardest negatives)
+        ring_sel = candidates[sorted_idx[:n_ring]]
+        neg_src_list.append(torch.full((ring_sel.numel(),), i, dtype=torch.long, device=device))
+        neg_dst_list.append(ring_sel)
+
+        # Random negatives from remaining
+        if n_rand > 0 and sorted_idx.numel() > n_ring:
+            remaining_idx = sorted_idx[n_ring:]
+            if remaining_idx.numel() > n_rand:
+                perm = torch.randperm(remaining_idx.numel(), device=device)[:n_rand]
+                rand_sel = candidates[remaining_idx[perm]]
+            else:
+                rand_sel = candidates[remaining_idx]
+            neg_src_list.append(torch.full((rand_sel.numel(),), i, dtype=torch.long, device=device))
+            neg_dst_list.append(rand_sel)
+
+    if len(neg_src_list) > 0:
+        src_neg = torch.cat(neg_src_list)
+        dst_neg = torch.cat(neg_dst_list)
+        mu_neg = compute_fuzzy_membership_on_edges(coords, src_neg, dst_neg, sigma, eps)
+    else:
+        src_neg = torch.zeros(0, dtype=torch.long, device=device)
+        dst_neg = torch.zeros(0, dtype=torch.long, device=device)
+        mu_neg = torch.zeros(0, dtype=coords.dtype, device=device)
+
+    return {
+        'edges_pos_src': src_pos,
+        'edges_pos_dst': dst_pos,
+        'mu_pos': mu_pos,
+        'edges_neg_src': src_neg,
+        'edges_neg_dst': dst_neg,
+        'mu_neg': mu_neg,
+    }
+
+
+def compute_rw_transition_matrix(
+    coords: torch.Tensor,
+    knn_indices: torch.Tensor,
+    sigma: torch.Tensor,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """
+    Compute 1-step random-walk transition matrix P = D^{-1} W on a kNN graph.
+    W_{ij} = exp(-|p_i - p_j|^2 / (sigma_i * sigma_j + eps)) for j in kNN(i).
+
+    Returns dense matrix since minisets are small (n ~ 64-256).
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        knn_indices: (n, k) spatial kNN indices (local indexing)
+        sigma: (n,) local bandwidths
+        eps: numerical stability
+
+    Returns:
+        P: (n, n) row-stochastic transition matrix
+    """
+    n = coords.shape[0]
+    k = knn_indices.shape[1]
+    device = coords.device
+
+    # Build weight matrix W (vectorized)
+    src = torch.arange(n, device=device).unsqueeze(1).expand(-1, k).reshape(-1)
+    dst = knn_indices.reshape(-1)
+    valid = dst >= 0
+
+    src_valid = src[valid]
+    dst_valid = dst[valid]
+
+    diff = coords[src_valid] - coords[dst_valid]  # (E, 2)
+    dist_sq = (diff * diff).sum(dim=1)
+    sigma_prod = sigma[src_valid] * sigma[dst_valid] + eps
+    w = torch.exp(-dist_sq / sigma_prod)
+
+    W = torch.zeros(n, n, device=device, dtype=coords.dtype)
+    W[src_valid, dst_valid] = w
+
+    # Symmetrize: W = (W + W^T) / 2 for undirected graph
+    W = 0.5 * (W + W.t())
+
+    # Row-normalize: P = D^{-1} W
+    deg = W.sum(dim=1).clamp(min=eps)  # (n,)
+    P = W / deg.unsqueeze(1)  # (n, n) row-stochastic
+
+    return P
+
+
+def compute_multistep_rw_targets(
+    coords: torch.Tensor,
+    knn_indices: torch.Tensor,
+    sigma: torch.Tensor,
+    steps: list = [1, 2, 3],
+    eps: float = 1e-10,
+) -> dict:
+    """
+    Compute multi-step random-walk transition matrices for Family 2.
+
+    P^(s) = P^s (s-step transition probabilities).
+    These capture meso-scale connectivity beyond 1-hop neighbors.
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        knn_indices: (n, k) spatial kNN indices (local indexing)
+        sigma: (n,) local bandwidths
+        steps: list of step counts [1, 2, 3, ...]
+        eps: numerical stability
+
+    Returns:
+        dict mapping step_count -> (n, n) transition matrix
+    """
+    P1 = compute_rw_transition_matrix(coords, knn_indices, sigma, eps)
+
+    result = {1: P1}
+    P_s = P1.clone()
+    max_step = max(steps)
+    for s in range(2, max_step + 1):
+        P_s = P_s @ P1
+        if s in steps:
+            result[s] = P_s.clone()
+
+    return result
+
+
+def compute_lle_weights(
+    coords: torch.Tensor,
+    knn_indices: torch.Tensor,
+    ridge: float = 1e-3,
+) -> torch.Tensor:
+    """
+    Compute Local Linear Embedding (LLE) reconstruction weights (Family 5).
+
+    For each point i, find weights w_{ij} that reconstruct p_i as an affine
+    combination of its neighbors: min |p_i - sum_j w_{ij} p_j|^2 s.t. sum w_{ij}=1
+
+    These weights are:
+    - Invariant to translation (affine constraint)
+    - Approximately invariant to rotation
+    - Stable under uniform scaling
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        knn_indices: (n, k) kNN indices (local indexing, 0 to n-1)
+        ridge: regularization for local covariance inversion
+
+    Returns:
+        lle_weights: (n, k) reconstruction weights per node (sum to 1 per row)
+    """
+    n = coords.shape[0]
+    k = knn_indices.shape[1]
+    device = coords.device
+    dtype = coords.dtype
+
+    weights = torch.zeros(n, k, device=device, dtype=dtype)
+
+    for i in range(n):
+        neighbors = knn_indices[i]  # (k,)
+        valid = neighbors >= 0
+        n_valid = valid.sum().item()
+
+        if n_valid == 0:
+            continue
+
+        valid_neighbors = neighbors[valid]  # (k_valid,)
+
+        # Local covariance: C_{jl} = (p_i - p_j) . (p_i - p_l)
+        diff = coords[i].unsqueeze(0) - coords[valid_neighbors]  # (k_valid, d)
+        C = diff @ diff.t()  # (k_valid, k_valid)
+
+        # Ridge regularization
+        C = C + ridge * torch.eye(n_valid, device=device, dtype=dtype)
+
+        # Solve: C w = 1, then normalize
+        ones = torch.ones(n_valid, 1, device=device, dtype=dtype)
+        try:
+            w = torch.linalg.solve(C, ones).squeeze(1)  # (k_valid,)
+        except Exception:
+            # Fallback: uniform weights
+            w = torch.ones(n_valid, device=device, dtype=dtype)
+
+        # Normalize to sum to 1
+        w = w / (w.sum() + 1e-10)
+
+        weights[i, :n_valid] = w
+
+    return weights
+
+
+def sample_ring_triplets(
+    coords: torch.Tensor,
+    knn_indices: torch.Tensor,
+    n_triplets: int = 500,
+    near_k: int = 10,
+    mid_k: int = 30,
+    far_k: int = 60,
+) -> torch.Tensor:
+    """
+    Sample multi-scale ring triplets for Family 3 (ordinal/rank geometry).
+
+    Triplets (i, j, k) where:
+    - j is a "near" neighbor (within near_k)
+    - k is a "far" node (outside mid_k, within far_k)
+
+    This preserves ordering: near things should be closer than far things.
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        knn_indices: (n, k_max) spatial kNN indices (local indexing)
+        n_triplets: number of triplets to sample
+        near_k: boundary for "near" neighbors
+        mid_k: inner boundary for "far" ring
+        far_k: outer boundary for "far" ring
+
+    Returns:
+        triplets: (T, 3) triplet indices [anchor, positive(near), negative(far)]
+    """
+    n = coords.shape[0]
+    k = knn_indices.shape[1]
+    device = coords.device
+
+    # Clamp parameters to available k
+    near_k = min(near_k, k)
+    far_k = min(far_k, n - 1)
+
+    # If too few points, fall back
+    if near_k < 2 or n < 4:
+        D = torch.cdist(coords, coords)
+        return sample_ordinal_triplets(D, n_triplets=n_triplets, margin_ratio=0.05)
+
+    # Sort by distance from each node
+    D = torch.cdist(coords, coords)  # (n, n)
+    D_noself = D.clone()
+    D_noself.fill_diagonal_(float('inf'))
+    _, sorted_indices = torch.sort(D_noself, dim=1)  # (n, n-1 effective)
+
+    triplet_list = []
+    max_attempts = n_triplets * 5
+    attempts = 0
+
+    while len(triplet_list) < n_triplets and attempts < max_attempts:
+        batch_size = min(500, n_triplets - len(triplet_list))
+        anchors = torch.randint(0, n, (batch_size,), device=device)
+
+        for b in range(batch_size):
+            i = anchors[b].item()
+
+            # Near neighbor: from top near_k
+            j_idx = torch.randint(0, near_k, (1,)).item()
+            j = sorted_indices[i, j_idx].item()
+
+            # Far neighbor: from ring [mid_k, far_k]
+            far_start = min(mid_k, n - 2)
+            far_end = min(far_k, n - 1)
+            if far_start >= far_end:
+                far_start = max(near_k, 1)
+                far_end = min(n - 1, far_start + 10)
+
+            if far_start < far_end:
+                k_idx = torch.randint(far_start, far_end, (1,)).item()
+                k_val = sorted_indices[i, k_idx].item()
+
+                if i != j and i != k_val and j != k_val:
+                    triplet_list.append([i, j, k_val])
+
+        attempts += batch_size
+
+    if len(triplet_list) == 0:
+        D = torch.cdist(coords, coords)
+        return sample_ordinal_triplets(D, n_triplets=n_triplets, margin_ratio=0.05)
+
+    triplets = torch.tensor(triplet_list[:n_triplets], dtype=torch.long, device=device)
+    return triplets
+
+
+def build_multiscale_edges(
+    coords: torch.Tensor,
+    knn_indices: torch.Tensor,
+    n_ring_per_node: int = 10,
+    n_landmarks: int = 8,
+    ring_lo_pct: float = 0.2,
+    ring_hi_pct: float = 0.6,
+) -> torch.Tensor:
+    """
+    Build multi-scale sparse edge set: kNN + ring + landmark edges.
+
+    This recovers much of Gram's "all pairs" constraint while staying O(n*k).
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        knn_indices: (n, k) spatial kNN indices
+        n_ring_per_node: number of ring (mid-range) edges per node
+        n_landmarks: number of farthest-point landmarks
+        ring_lo_pct: lower percentile for ring distance band
+        ring_hi_pct: upper percentile for ring distance band
+
+    Returns:
+        edges: (E, 2) edge list [src, dst] for multi-scale supervision
+    """
+    n = coords.shape[0]
+    k = knn_indices.shape[1]
+    device = coords.device
+
+    edge_list = []
+
+    # 1. kNN edges (local)
+    src_knn = torch.arange(n, device=device).unsqueeze(1).expand(-1, k).reshape(-1)
+    dst_knn = knn_indices.reshape(-1)
+    valid = dst_knn >= 0
+    edge_list.append(torch.stack([src_knn[valid], dst_knn[valid]], dim=1))
+
+    # 2. Ring edges (mid-range)
+    D = torch.cdist(coords, coords)  # (n, n)
+    D_noself = D.clone()
+    D_noself.fill_diagonal_(float('inf'))
+
+    triu_mask = torch.triu(torch.ones(n, n, device=device, dtype=torch.bool), diagonal=1)
+    all_dists = D[triu_mask]
+    if all_dists.numel() > 0:
+        lo_dist = torch.quantile(all_dists, ring_lo_pct).item()
+        hi_dist = torch.quantile(all_dists, ring_hi_pct).item()
+    else:
+        lo_dist, hi_dist = 0.0, float('inf')
+
+    for i in range(n):
+        dists_i = D_noself[i]
+        in_ring = (dists_i >= lo_dist) & (dists_i <= hi_dist)
+        ring_candidates = torch.where(in_ring)[0]
+
+        if ring_candidates.numel() > 0:
+            n_sample = min(n_ring_per_node, ring_candidates.numel())
+            perm = torch.randperm(ring_candidates.numel(), device=device)[:n_sample]
+            selected = ring_candidates[perm]
+            ring_edges = torch.stack([
+                torch.full((selected.numel(),), i, dtype=torch.long, device=device),
+                selected,
+            ], dim=1)
+            edge_list.append(ring_edges)
+
+    # 3. Landmark edges (global)
+    if n_landmarks > 0 and n > n_landmarks:
+        landmark_idx = _farthest_point_sample(coords, n_landmarks)
+        landmark_t = torch.tensor(landmark_idx, dtype=torch.long, device=device)
+
+        # Connect each non-landmark node to its nearest landmark
+        for i in range(n):
+            if i in landmark_idx:
+                continue
+            dists_to_landmarks = D[i, landmark_t]
+            nearest = torch.argmin(dists_to_landmarks).item()
+            edge_list.append(torch.tensor([[i, landmark_idx[nearest]]], dtype=torch.long, device=device))
+
+    if len(edge_list) == 0:
+        return torch.zeros(0, 2, dtype=torch.long, device=device)
+
+    all_edges = torch.cat(edge_list, dim=0)
+
+    # Deduplicate: sort each edge and then unique
+    all_edges_sorted = torch.sort(all_edges, dim=1)[0]
+    edges_unique = torch.unique(all_edges_sorted, dim=0)
+
+    return edges_unique
+
+
+def _farthest_point_sample(coords: torch.Tensor, n_samples: int) -> list:
+    """Simple farthest point sampling for landmark selection."""
+    n = coords.shape[0]
+    device = coords.device
+
+    if n <= n_samples:
+        return list(range(n))
+
+    selected = [torch.randint(0, n, (1,)).item()]
+    min_dists = torch.full((n,), float('inf'), device=device)
+
+    for _ in range(n_samples - 1):
+        last = selected[-1]
+        dists = torch.norm(coords - coords[last].unsqueeze(0), dim=1)
+        min_dists = torch.minimum(min_dists, dists)
+        min_dists[selected] = -1  # Already selected
+        next_idx = torch.argmax(min_dists).item()
+        selected.append(next_idx)
+
+    return selected
+
+
+def build_knn_local(
+    coords: torch.Tensor,
+    k: int = 20,
+) -> torch.Tensor:
+    """
+    Build kNN indices within a miniset (local indexing 0 to n-1).
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        k: number of neighbors
+
+    Returns:
+        knn_indices: (n, k) local kNN indices
+    """
+    n = coords.shape[0]
+    k = min(k, n - 1)
+
+    if k <= 0:
+        return torch.zeros(n, 1, dtype=torch.long, device=coords.device)
+
+    D = torch.cdist(coords, coords)  # (n, n)
+    D.fill_diagonal_(float('inf'))
+
+    _, knn_idx = torch.topk(D, k, dim=1, largest=False)  # (n, k)
+    return knn_idx
+
+
+def compute_normalized_stress_targets(
+    coords: torch.Tensor,
+    edge_src: torch.Tensor,
+    edge_dst: torch.Tensor,
+    sigma: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Compute locally-normalized target distances for Family 4 (scale-free stress).
+
+    d_norm_{ij} = |p_i - p_j| / (R_k(i) + eps)
+
+    where R_k(i) = sigma_i (local bandwidth / kNN radius).
+
+    Args:
+        coords: (n, 2) spatial coordinates
+        edge_src: (E,) source indices
+        edge_dst: (E,) destination indices
+        sigma: (n,) local bandwidths (kNN radii)
+        eps: numerical stability
+
+    Returns:
+        d_norm: (E,) locally-normalized distances
+    """
+    diff = coords[edge_src] - coords[edge_dst]  # (E, 2)
+    dists = torch.norm(diff, dim=1)  # (E,)
+
+    # Normalize by source node's local scale
+    d_norm = dists / (sigma[edge_src] + eps)
+
+    return d_norm
+
+
+def build_miniset_geometric_targets(
+    coords: torch.Tensor,
+    knn_k: int = 20,
+    n_neg_per_node: int = 5,
+    rw_steps: list = None,
+    n_ring_triplets: int = 500,
+    n_ring_edges_per_node: int = 10,
+    n_landmarks: int = 8,
+    lle_ridge: float = 1e-3,
+    compute_families: list = None,
+) -> dict:
+    """
+    One-call function to build all geometric targets for a miniset.
+
+    This is the main entry point called from STSetDataset.__getitem__()
+    and STPairSetDataset._build_miniset_dict().
+
+    Args:
+        coords: (n, 2) miniset spatial coordinates (already subset from slide)
+        knn_k: number of spatial neighbors
+        n_neg_per_node: negative edges per node for fuzzy loss
+        rw_steps: random-walk step counts for Family 2 (default [1, 2, 3])
+        n_ring_triplets: number of ring triplets for Family 3
+        n_ring_edges_per_node: ring edges per node for multi-scale edges
+        n_landmarks: number of landmarks for global edges
+        lle_ridge: ridge regularization for LLE
+        compute_families: list of families to compute, e.g. [1, 2, 3, 5]
+                         None = compute all
+
+    Returns:
+        dict with all computed targets (keys vary by family)
+    """
+    if compute_families is None:
+        compute_families = [1, 2, 3, 5]
+    if rw_steps is None:
+        rw_steps = [1, 2, 3]
+
+    n = coords.shape[0]
+    device = coords.device
+
+    # Build local kNN (always needed)
+    knn_local = build_knn_local(coords, k=knn_k)
+
+    # Compute local bandwidths (always needed)
+    sigma = compute_local_bandwidths(coords, knn_local)
+
+    result = {
+        'knn_local': knn_local,       # (n, k)
+        'sigma_local': sigma,          # (n,)
+        'coords': coords,             # (n, 2)
+    }
+
+    # Family 1: Fuzzy Neighborhood Graph
+    if 1 in compute_families:
+        fuzzy = build_fuzzy_target_edges(
+            coords, knn_local, sigma,
+            n_neg_per_node=n_neg_per_node,
+        )
+        result['fuzzy_edges_pos_src'] = fuzzy['edges_pos_src']
+        result['fuzzy_edges_pos_dst'] = fuzzy['edges_pos_dst']
+        result['fuzzy_mu_pos'] = fuzzy['mu_pos']
+        result['fuzzy_edges_neg_src'] = fuzzy['edges_neg_src']
+        result['fuzzy_edges_neg_dst'] = fuzzy['edges_neg_dst']
+        result['fuzzy_mu_neg'] = fuzzy['mu_neg']
+
+    # Family 2: Random-Walk Transition Matrices
+    if 2 in compute_families:
+        rw_targets = compute_multistep_rw_targets(
+            coords, knn_local, sigma, steps=rw_steps,
+        )
+        result['rw_transitions'] = rw_targets  # dict: step -> (n, n) matrix
+
+    # Family 3: Multi-scale Ring Triplets
+    if 3 in compute_families:
+        near_k = min(knn_k // 2, n - 1)
+        mid_k = min(knn_k, n - 1)
+        far_k = min(knn_k * 3, n - 1)
+
+        ring_triplets = sample_ring_triplets(
+            coords, knn_local,
+            n_triplets=n_ring_triplets,
+            near_k=max(near_k, 1),
+            mid_k=max(mid_k, 2),
+            far_k=max(far_k, 3),
+        )
+        result['ring_triplets'] = ring_triplets  # (T, 3)
+
+    # Family 5: LLE Weights
+    if 5 in compute_families:
+        lle_w = compute_lle_weights(coords, knn_local, ridge=lle_ridge)
+        result['lle_weights'] = lle_w  # (n, k)
+
+    # Multi-scale edges (useful for Family 4 / general)
+    if 4 in compute_families:
+        ms_edges = build_multiscale_edges(
+            coords, knn_local,
+            n_ring_per_node=n_ring_edges_per_node,
+            n_landmarks=n_landmarks,
+        )
+        result['multiscale_edges'] = ms_edges  # (E, 2)
+
+        # Family 4: Normalized stress targets on multi-scale edges
+        if ms_edges.shape[0] > 0:
+            stress_targets = compute_normalized_stress_targets(
+                coords, ms_edges[:, 0], ms_edges[:, 1], sigma,
+            )
+            result['stress_targets'] = stress_targets  # (E,)
+
+    return result

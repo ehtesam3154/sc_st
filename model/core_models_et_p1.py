@@ -2093,7 +2093,6 @@ def train_encoder(
 # ==============================================================================
 
 @dataclass
-@dataclass
 class STTargets:
     """Precomputed geometric targets for an ST slide."""
     y_hat: torch.Tensor      # (n, 2) normalized coords
@@ -2108,11 +2107,13 @@ class STTargets:
     scale: float             # normalization scale factor
     knn_indices: torch.Tensor  # (n, k) k-NN indices for each spot
     knn_spatial: torch.Tensor   # (n, k) k-NN indices from SPATIAL coordinates (not embeddings)
-    # NEW: Persistent homology topology info (for full slide)
+    # Persistent homology topology info (for full slide)
     topo_pairs_0: torch.Tensor  # (m0, 2) index pairs for 0D features (connected components)
     topo_dists_0: torch.Tensor  # (m0,) birth distances for 0D features
     topo_pairs_1: torch.Tensor  # (m1, 2) index pairs for 1D features (loops)
     topo_dists_1: torch.Tensor  # (m1,) birth distances for 1D features
+    # NEW: Per-node local bandwidth for new target families
+    sigma_local: torch.Tensor = None   # (n,) self-tuned local bandwidth per node (k-th neighbor distance)
 
 
 
@@ -2313,11 +2314,17 @@ class STStageBPrecomputer:
             _, knn_spatial = torch.topk(D_spatial_noself, k=knn_k, dim=1, largest=False)
             # knn_spatial is (n, k) indices in global slide indexing
 
-            # NEW: Compute persistent homology for topology preservation
+            # Compute persistent homology for topology preservation
             print(f"[Stage B] Computing persistent homology for slide {slide_id}...")
             y_hat_np = y_hat.cpu().numpy()
             topo_info = uet.compute_persistent_pairs(y_hat_np, max_pairs_0d=10, max_pairs_1d=5)
             print(f"[Stage B]   0D pairs: {topo_info['pairs_0'].shape[0]}, 1D pairs: {topo_info['pairs_1'].shape[0]}")
+
+            # NEW: Compute per-node local bandwidths (sigma_i = distance to k-th spatial neighbor)
+            print(f"[Stage B] Computing local bandwidths (sigma_i) for slide {slide_id}...")
+            sigma_local = uet.compute_local_bandwidths(y_hat, knn_spatial)
+            print(f"[Stage B]   sigma stats: min={sigma_local.min():.4f}, "
+                  f"median={sigma_local.median():.4f}, max={sigma_local.max():.4f}")
 
             targets = STTargets(
                 y_hat=y_hat.cpu(),
@@ -2335,7 +2342,8 @@ class STStageBPrecomputer:
                 topo_pairs_0=torch.from_numpy(topo_info['pairs_0']).long(),
                 topo_dists_0=torch.from_numpy(topo_info['dists_0']).float(),
                 topo_pairs_1=torch.from_numpy(topo_info['pairs_1']).long(),
-                topo_dists_1=torch.from_numpy(topo_info['dists_1']).float()
+                topo_dists_1=torch.from_numpy(topo_info['dists_1']).float(),
+                sigma_local=sigma_local.cpu(),
             )
             
             targets_dict[slide_id] = targets
@@ -2762,6 +2770,21 @@ class STSetDataset(Dataset):
         }
 
         # ------------------------------------------------------------------
+        # NEW: Sparse geometric targets for all families (1,2,3,5)
+        # ------------------------------------------------------------------
+        geo_targets = uet.build_miniset_geometric_targets(
+            coords=y_hat_subset,
+            knn_k=self.knn_k,
+            n_neg_per_node=5,
+            rw_steps=[1, 2, 3],
+            n_ring_triplets=min(500, n_nodes),
+            n_ring_edges_per_node=10,
+            n_landmarks=min(8, n_nodes // 4),
+            lle_ridge=1e-3,
+            compute_families=[1, 2, 3, 5],
+        )
+
+        # ------------------------------------------------------------------
         # COMPETITOR DEBUG COUNTERS
         # ------------------------------------------------------------------
         compete_debug = {
@@ -2776,14 +2799,14 @@ class STSetDataset(Dataset):
         # uid = (slide_id << 32) + within_slide_idx (int64)
         # This guarantees cross-slide uniqueness for any future intersection/cache operations.
         # Decode: slide_id = uid >> 32, spot_idx = uid & 0xFFFFFFFF
-        
+
         global_uid = (slide_id << 32) + indices.long()  # (n,) int64 UIDs
         spot_indices = indices  # Keep within-slide indices for targets_dict lookup
-        
+
         overlap_info = {
             'slide_id': slide_id,
             'indices': indices,  # Original within-slide indices
-            'global_uid': global_uid,  # NEW: Globally unique IDs
+            'global_uid': global_uid,  # Globally unique IDs
         }
 
         return {
@@ -2801,14 +2824,16 @@ class STSetDataset(Dataset):
             'knn_indices': knn_local,
             'topo_info': topo_info,
             'knn_spatial': knn_spatial_local,
-            # ========== NEW: Competitor training fields ==========
+            # Competitor training fields
             'anchor_mask': anchor_mask,
-            'global_indices': global_uid,  # ✅ NOW TRULY GLOBAL (int64 UIDs)
-            'spot_indices': spot_indices,  # NEW: Within-slide indices [0, m) for targets_dict
+            'global_indices': global_uid,
+            'spot_indices': spot_indices,
             'compete_debug': compete_debug,
-            # ========== NEW: Anchored training fields ==========
+            # Anchored training fields
             'anchor_cond_mask': anchor_cond_mask,
             'anchor_cond_debug': anchor_cond_debug,
+            # NEW: Sparse geometric targets for new families
+            'geo_targets': geo_targets,
         }
 
             
@@ -2827,7 +2852,8 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     triplets_batch = []
     H_bins_batch = []
     overlap_info_batch = []
-    topo_info_batch = [] 
+    topo_info_batch = []
+    geo_targets_batch = []  # NEW: list of per-miniset geo_targets dicts
 
     #init padded tensors
     Z_batch = torch.zeros(batch_size, n_max, h_dim, device=device)
@@ -2907,10 +2933,13 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         # ========== NEW: Anchored training fields ==========
         if 'anchor_cond_mask' in item:
             anchor_cond_mask_batch[i, :n] = item['anchor_cond_mask'][:n]
-        
+
         if 'anchor_cond_debug' in item:
             anchor_cond_debug_batch.append(item['anchor_cond_debug'])
 
+        # NEW: Collect geo_targets as a list (variable-length per miniset)
+        if 'geo_targets' in item:
+            geo_targets_batch.append(item['geo_targets'])
 
     return {
         'Z_set': Z_batch,
@@ -2934,9 +2963,11 @@ def collate_minisets(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'global_indices': global_indices_batch,  # ✅ int64 UIDs (slide-aware)
         'spot_indices': spot_indices_batch,      # NEW: Within-slide indices for targets_dict
         'compete_debug': compete_debug_batch,
-        # ========== NEW: Anchored training fields ==========
+        # Anchored training fields
         'anchor_cond_mask': anchor_cond_mask_batch,
         'anchor_cond_debug': anchor_cond_debug_batch,
+        # NEW: Sparse geometric targets (list of dicts, variable-length per miniset)
+        'geo_targets': geo_targets_batch,
     }
 
 
@@ -3249,6 +3280,19 @@ class STPairSetDataset(Dataset):
             'dists_1': torch.from_numpy(topo_result['dists_1']).float(),
         }
 
+        # NEW: Sparse geometric targets for all families (1,2,3,5)
+        geo_targets = uet.build_miniset_geometric_targets(
+            coords=y_hat_subset,
+            knn_k=self.knn_k,
+            n_neg_per_node=5,
+            rw_steps=[1, 2, 3],
+            n_ring_triplets=min(500, n_total),
+            n_ring_edges_per_node=10,
+            n_landmarks=min(8, n_total // 4),
+            lle_ridge=1e-3,
+            compute_families=[1, 2, 3, 5],
+        )
+
         # Global UIDs
         global_uid = (slide_id << 32) + indices.long()
 
@@ -3279,6 +3323,8 @@ class STPairSetDataset(Dataset):
             'compete_debug': {},
             'anchor_cond_mask': anchor_cond_mask,
             'anchor_cond_debug': {},
+            # NEW: Sparse geometric targets for new families
+            'geo_targets': geo_targets,
         }
 
     def __getitem__(self, idx):
