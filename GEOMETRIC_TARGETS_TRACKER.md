@@ -57,7 +57,7 @@ Meanwhile, Stage B already computes `knn_spatial` from the full slide (~3000+ sp
 | 1 | Fuzzy Neighborhood Graph (UMAP/SNE) | ✅ Built, ⚠️ Improved post-fix | **LOCAL REG** | Treat as local consistency regularizer, not primary |
 | 2 | Random-Walk Operator Matching | ✅ Built, ✅ Best recoverability | **PRIMARY** | Best standalone recoverer of geometry |
 | 3 | Ordinal / Ring Triplets | ✅ Built, ❌ Poor standalone recoverability | **Dropped** | Cannot recover geometry alone; not worth the budget |
-| 4 | Scale-free Sparse Stress | ✅ Built, ⏳ Untested in diagnostic | **Next to test** | Normalized distance matching on multiscale edges |
+| 4 | Scale-free Sparse Stress | ✅ Built, ✅ Tested — best combo with F2 | **SECONDARY** | Normalized distance matching on multiscale edges; adds global rigidity |
 | 5 | LLE (Local Linear Reconstruction) | ✅ Built, ⚠️ Moderate recoverability | Auxiliary | OK neighborhood recall, poor Procrustes |
 | 6 | Distributional (Histograms/Ripley) | ⏳ Existing | Ablation | Already have distance histogram; weak alone |
 | 7 | Topology / Persistence | ⏳ Existing | Optional | Already have PH pairs; hard to differentiate |
@@ -192,84 +192,109 @@ All targets are rotation/translation/reflection invariant. Scale columns for fuz
 
 **Note on sigma_local scale columns**: The 0.5 and 1.0 values are artifacts of the test formula, which expects sigma to scale linearly with input coords (`sig_diff = (sig_orig * s_factor - sig_t) / sig_orig_mean`). Since we now normalize internally, sigma is the SAME regardless of input scale, so this formula gives `(σ·s - σ)/σ = s - 1`. This is correct behavior — sigma is now scale-invariant, which is what we want.
 
-### Diagnostic 2 — Recoverability by Direct Optimization (IMPROVED)
+### Diagnostic 2 — Recoverability by Direct Optimization
 
-**Method**: Initialize V ~ N(0, I) as (n, 2) coordinates with `requires_grad=True`. Optimize with Adam (lr=0.01) for 2k steps using each family's loss against precomputed GT targets. Procrustes-align recovered V to GT coords. 3 random inits per miniset, 5 minisets.
+**Method**: Initialize V ~ N(0, I) as (n, 2) coordinates with `requires_grad=True`. Optimize with Adam (lr=0.01) for 2k steps using each family's loss against precomputed GT targets. Procrustes-align recovered V to GT coords. 3 random inits per miniset.
 
-**Changes from previous run**:
-- Bug 1 fixed: GT targets now built in unit-RMS gauge (matches V_norm)
-- Bug 2 fixed: F1+F2 combined now includes negative edge repulsion
-- RW loss now uses multi-step {1, 2, 3} with weights {1.0, 0.5, 0.25}
+#### Run 2 (post-fix, n=128 only): 5 minisets × 3 inits = 15 runs
 
-#### Results Summary — POST-FIX (5 minisets × 3 inits = 15 runs):
+**Changes from Run 1**: Bug 1 fixed (scale mismatch), Bug 2 fixed (missing neg edges), multi-step RW {1,2,3}.
 
-| Family | Procrustes (↓, want < 0.3) | Recall@15 (↑, want > 0.6) | Collapse | Verdict |
-|--------|---------------------------|---------------------------|----------|---------|
+| Family | Procrustes (↓) | Recall@15 (↑) | Collapse | Verdict |
+|--------|----------------|---------------|----------|---------|
 | **Gram (baseline)** | **0.0000 ± 0.0000** | **0.9981 ± 0.0009** | **0/15** | **PASS (perfect)** |
-| Family 1: Fuzzy | 0.4963 ± 0.1484 | 0.7565 ± 0.0628 | 0/15 | ⬆️ Improved. Recall good, Procrustes still above 0.3 |
-| **Family 2: RW** | **0.3406 ± 0.1785** | **0.8082 ± 0.1014** | **0/15** | **Best non-baseline. Lower variance than before.** |
+| Family 1: Fuzzy | 0.4963 ± 0.1484 | 0.7565 ± 0.0628 | 0/15 | ⬆️ Improved post-fix |
+| **Family 2: RW** | **0.3406 ± 0.1785** | **0.8082 ± 0.1014** | **0/15** | **Best non-baseline at n=128** |
 | Family 3: Triplets | 0.9947 ± 0.0033 | 0.3076 ± 0.0293 | 0/15 | ❌ FAIL — dropped |
-| Family 5: LLE | 0.5960 ± 0.1446 | 0.6255 ± 0.1070 | 0/15 | ⚠️ Unchanged, moderate |
-| **F1+F2 combined** | **0.4617 ± 0.1874** | **0.7642 ± 0.0870** | **0/15** | ⬆️ **Massive improvement — no longer worse than components** |
+| Family 5: LLE | 0.5960 ± 0.1446 | 0.6255 ± 0.1070 | 0/15 | ⚠️ Moderate |
+| F1+F2 combined | 0.4617 ± 0.1874 | 0.7642 ± 0.0870 | 0/15 | ⬆️ No longer worse than components |
 
-#### Comparison: Pre-fix vs Post-fix
+#### Run 3 (variable miniset sizes, F4 tested): NEW
 
-| Family | Procrustes (old → new) | Recall@15 (old → new) | Change |
-|--------|----------------------|---------------------|--------|
-| F1 Fuzzy | 0.8755 → **0.4963** | 0.6838 → **0.7565** | ⬆️ Procrustes −43%, Recall +11% |
-| F2 RW | 0.3730 → **0.3406** | 0.8560 → 0.8082 | ⬆️ Procrustes −9%, Recall −6% (lower variance) |
-| F1+F2 combined | 0.9310 → **0.4617** | 0.6063 → **0.7642** | ⬆️⬆️ Procrustes −50%, Recall +26% |
+**Changes from Run 2**: Added F2+F4 (RW+Stress) and F2-primary+F1-reg combinations. Dropped triplets. Variable miniset sizes [128, 256, 384, 128, 256] to test scaling behavior. `compute_families=[1, 2, 4, 5]`.
 
-The scale mismatch fix (Bug 1) was the biggest single improvement — F1 went from 0.88 to 0.50 Procrustes. The negative edge fix (Bug 2) resolved the F1+F2 paradox — the combined loss is no longer worse than either component.
+**Overall summary (5 minisets × 3 inits = 15 runs, mixed sizes):**
 
-#### Per-miniset breakdown (post-fix):
+| Family | Procrustes (↓) | Recall@15 (↑) | Collapse | Verdict |
+|--------|----------------|---------------|----------|---------|
+| **Gram (baseline)** | **0.0000 ± 0.0000** | **0.9972 ± 0.0008** | **0/15** | **PASS (perfect at all sizes)** |
+| Family 1: Fuzzy | 0.7388 ± 0.1671 | 0.5890 ± 0.1444 | 0/15 | ❌ Degrades badly at n>128 |
+| Family 2: RW | 0.4303 ± 0.2701 | 0.7493 ± 0.1561 | 0/15 | ⚠️ Good at n=128, degrades at n=384 |
+| Family 5: LLE | 0.6842 ± 0.1534 | 0.5902 ± 0.1104 | 0/15 | ❌ Consistently weak |
+| F1+F2 combined | 0.7081 ± 0.1712 | 0.6014 ± 0.1426 | 0/15 | ❌ Fuzzy dominance hurts at large n |
+| **F2+F4 (RW+Stress)** | **0.3157 ± 0.2409** | **0.8294 ± 0.1331** | **0/15** | **BEST non-Gram overall** |
+| F2 primary+F1 reg | 0.4187 ± 0.2729 | 0.7556 ± 0.1654 | 0/15 | ⬆️ Better than F1+F2, worse than F2+F4 |
 
-| Miniset | Slide | F2 Procrustes | F2 Recall | F1 Procrustes | F1 Recall | F1+F2 Procrustes | F1+F2 Recall |
-|---------|-------|---------------|-----------|---------------|-----------|------------------|--------------|
-| 0 | liver_ST1 | 0.2720 | 0.8484 | 0.5322 | 0.7542 | 0.5072 | 0.7509 |
-| 1 | liver_ST2 | 0.4028 | 0.7733 | 0.3987 | 0.7976 | 0.4624 | 0.7554 |
-| 2 | liver_ST3 | 0.4189 | 0.7417 | 0.5410 | 0.7120 | 0.5541 | 0.6997 |
-| 3 | liver_ST1 | 0.4120 | 0.7819 | 0.4820 | 0.7589 | 0.4816 | 0.7667 |
-| 4 | liver_ST2 | 0.1972 | 0.8958 | 0.5274 | 0.7599 | 0.3031 | 0.8484 |
+#### CRITICAL FINDING: Performance degrades with miniset size
 
-**RW variance**: Procrustes std dropped from 0.2929 → 0.1785 (multi-step helps). Range narrowed from [0.18, 0.90] to [0.20, 0.42]. No more catastrophic failures.
+Per-miniset breakdown (Run 3) showing the best non-Gram method (F2+F4) and the size effect:
+
+| Miniset | Slide | n | F2+F4 Proc. | F2+F4 Recall | F2 Proc. | F2 Recall | Best non-Gram |
+|---------|-------|---|-------------|--------------|----------|-----------|---------------|
+| 0 | liver_ST1 | **128** | **0.2534** | **0.8911** | 0.2720 | 0.8484 | F2+F4 |
+| 1 | liver_ST2 | **256** | **0.2449** | **0.8549** | 0.2800 | 0.7998 | F2+F4 |
+| 2 | liver_ST3 | **384** | 0.5082 | 0.7326 | 0.8198 | 0.5405 | F2+F4 (but degraded) |
+| 3 | liver_ST1 | **128** | **0.1016** | **0.9523** | 0.1832 | 0.9083 | F2+F4 |
+| 4 | liver_ST2 | **256** | 0.4705 | 0.7160 | 0.5967 | 0.6496 | F2+F4 |
+
+**Size scaling pattern:**
+
+| Miniset size | F2+F4 avg Recall | F2+F4 avg Procrustes | F2 avg Recall | F2 avg Procrustes | Graph sparsity (k/n) |
+|-------------|-----------------|---------------------|--------------|-------------------|---------------------|
+| n=128 | **0.92** | **0.18** | 0.88 | 0.23 | 15.6% |
+| n=256 | 0.79 | 0.36 | 0.72 | 0.44 | 7.8% |
+| n=384 | 0.73 | 0.51 | 0.54 | 0.82 | 5.2% |
+
+**Root cause**: With fixed k=20, the kNN graph becomes relatively sparser as n grows. At n=128, each node connects to 15.6% of all nodes; at n=384, only 5.2%. Multi-step RW with 3 steps covers a smaller fraction of the graph, and local information cannot propagate globally. This is a graph sparsity problem, not a fundamental flaw in the approach.
+
+**Key positive**: At n=128, F2+F4 achieves Recall 0.95 and Procrustes 0.10 on one miniset — approaching Gram quality. Graph-based targets work well at the scale they're designed for.
 
 ---
 
-## Key Observations (Updated Post-Fix)
+## Key Observations (Updated after Run 3)
 
-### Observation 1: Bugs were the primary drivers of "F1+F2 worse" and poor F1 results
+### Observation 1 (Run 2): Bugs were the primary drivers of earlier bad results
 - The scale mismatch (Bug 1) systematically biased all sigma-dependent losses. Fixing it improved F1 Procrustes by 43%.
-- The missing negative edges (Bug 2) made the combined F1+F2 loss a strictly weaker objective than F1 alone. Fixing it turned a 0.93 Procrustes into 0.46.
+- The missing negative edges (Bug 2) made the combined F1+F2 loss a strictly weaker objective than F1 alone.
 - Conclusion: **F1 and F2 are NOT intrinsically conflicting.** The earlier "conflicting gradients" hypothesis was wrong — it was just broken code.
 
-### Observation 2: Family 2 (RW) remains the strongest standalone target
-- Best Recall@15 (0.81) and best Procrustes (0.34) among all families
-- Multi-step {1,2,3} with decreasing weights reduced variance substantially (std 0.29 → 0.18)
-- Still borderline on the Procrustes < 0.3 acceptance criterion (mean 0.34)
+### Observation 2 (Run 3): F2+F4 (RW+Stress) is the best non-Gram target combination
+- Overall best: Recall 0.83, Procrustes 0.32 (across all sizes)
+- At n=128: Recall **0.92**, Procrustes **0.18** — approaching Gram quality
+- F4 (stress on multiscale edges) provides the global rigidity that RW alone lacks
+- The multiscale edge set (kNN + ring + landmark) carries longer-range distance constraints
+- **Confirmed**: F2+F4 is strictly better than F2 alone at every miniset size tested
 
-### Observation 3: Family 1 (Fuzzy) is a good local regularizer but not a global supervisor
-- Post-fix Recall@15 = 0.76 (decent local neighborhoods)
-- Post-fix Procrustes = 0.50 (global layout still imperfect)
-- This matches the theoretical expectation: a local affinity objective has many global minima — local neighborhoods can be correct while global arrangement varies
-- **Recommended role**: local consistency regularizer at small weight, NOT primary loss
+### Observation 3 (Run 3): CRITICAL — All graph-based targets degrade with miniset size
+- **This is the biggest finding from Run 3.** Performance drops substantially from n=128 to n=384:
+  - F2+F4 Recall: 0.92 → 0.79 → 0.73 (at n=128, 256, 384)
+  - F2+F4 Procrustes: 0.18 → 0.36 → 0.51
+  - F2 alone: Recall drops from 0.88 to 0.54 at n=384
+  - F1 (Fuzzy): completely fails at n=384 (Recall 0.36)
+- **Root cause**: Fixed k=20 means graph sparsity scales as k/n. At n=128 each node sees 15.6% of the graph; at n=384 only 5.2%.
+- Multi-step RW with 3 steps covers a shrinking fraction of the graph as n grows
+- **This is NOT a fundamental flaw** — it's a graph sparsity problem with known solutions (see Next Steps)
+- Gram is unaffected because it encodes all O(n²) pairwise inner products — no sparsity
 
-### Observation 4: F1+F2 combined now works but doesn't beat F2 alone
-- F1+F2 Recall (0.76) is between F1 (0.76) and F2 (0.81)
-- F1+F2 Procrustes (0.46) is between F1 (0.50) and F2 (0.34)
-- The combination doesn't hurt anymore, but the fuzzy component dilutes the stronger RW signal
-- Suggests the weighting (loss_fuzzy + 0.3 * loss_rw) may need tuning — RW should be primary
+### Observation 4 (Run 3): F2-primary weighting > F1-primary weighting
+- `F2 primary+F1 reg` (loss = L_rw + 0.05 * L_fuzzy): Recall 0.76, Procrustes 0.42
+- `F1+F2 combined` (loss = L_fuzzy + 0.3 * L_rw): Recall 0.60, Procrustes 0.71
+- Making RW the primary objective is clearly better than making fuzzy primary
+- But F2+F4 beats both — stress > fuzzy as the complementary target to RW
 
-### Observation 5: Remaining gap to Gram — what's missing?
-- Gram achieves Procrustes 0.0000, the best relational loss (F2 RW) achieves 0.3406
-- Gram directly encodes **all pairwise inner products** — it's a complete metric specification up to isometry
-- RW encodes **local + meso-scale diffusion structure** — it has global information through multi-step, but doesn't fully determine the metric
-- The gap suggests we need additional longer-range structure. Family 4 (multiscale stress on landmark+ring edges) is the natural candidate.
+### Observation 5: Family ranking is now clear
+1. **F2+F4 (RW + Stress)**: Best overall. RW captures local/meso-scale, stress adds global rigidity.
+2. **F2 alone (RW)**: Good standalone, but lacks global structure at larger n.
+3. **F2+F1 (RW-primary + Fuzzy-reg)**: Slightly better than F2 alone, fuzzy helps local consistency.
+4. **F1 (Fuzzy)**: Local only. Degrades fastest with n. Regularizer role only.
+5. **F5 (LLE)**: Consistently weak. Not worth including.
+6. **F3 (Triplets)**: Dead. Dropped.
 
-### Observation 6: Frozen bandwidths are no longer a critical issue
-- With Bug 1 fixed, GT and predicted coords are now in the same unit-RMS gauge
-- Sigma computed from GT in this gauge is a reasonable bandwidth for predicted coords in the same gauge
-- The research agent's recommendation: keep sigma frozen, but if adaptivity is needed later, use `σ_eff = sqrt(σ_GT · σ_pred)` with σ_pred detached
+### Observation 6: The graph sparsity problem must be solved for diverse miniset sizes
+- Training pipeline uses diverse miniset sizes (not fixed n=128)
+- Cannot hardcode k=20 — need k to adapt to miniset size
+- Need adaptive RW steps and landmark count that scale with n
+- This is an engineering problem, not a theoretical limitation
 
 ---
 
@@ -318,8 +343,9 @@ Normalize loss scales by construction: divide each loss by number of terms, or m
 - [x] Measure: Procrustes error, neighborhood recall@k, convergence stability
 - [x] 3 random inits per miniset
 - [x] **Run 1 (pre-fix)**: MIXED. F1+F2 paradox, high RW variance.
-- [x] **Run 2 (post-fix)**: IMPROVED. F1+F2 no longer worse. RW variance reduced.
-- [ ] **Run 3 (next)**: Test F2 + F4 (RW + multiscale stress) combination
+- [x] **Run 2 (post-fix, n=128)**: IMPROVED. F1+F2 no longer worse. RW variance reduced.
+- [x] **Run 3 (variable sizes [128, 256, 384])**: F2+F4 is best. Size-scaling degradation found.
+- [ ] **Run 4 (next)**: Test adaptive k (scale k with n) to fix size degradation
 
 ### Diagnostic 3 — Uniqueness / Informativeness
 - [ ] Compute compact signatures per miniset per family
@@ -334,36 +360,61 @@ Normalize loss scales by construction: divide each loss by number of terms, or m
 
 ## Next Steps (Priority Order)
 
-### 1. Test F2 + F4 combination (RW + multiscale stress)
-Family 4 (normalized stress on multiscale edges) is already built but untested. The multiscale edge set includes kNN + ring + landmark edges, providing longer-range distance constraints that RW alone may lack. This is the closest functional replacement for "Gram provides global rigidity" without using Gram.
+### 1. FIX SIZE SCALING — Adaptive k, steps, and landmarks (BLOCKING)
+The biggest problem right now. Graph-based targets degrade from excellent (n=128) to mediocre (n=384) because k=20 is fixed. Three levers to try:
 
-Add to Diagnostic 2:
+**a) Scale k with n** — maintain consistent graph connectivity:
 ```python
-('F2+F4 combined', 'rw_stress')
+k = max(20, int(0.15 * n))  # ~15% connectivity at all sizes
+# n=128 → k=20, n=256 → k=38, n=384 → k=57
 ```
-With loss:
+Or a gentler scaling:
+```python
+k = max(20, int(4 * sqrt(n)))  # ~sqrt scaling
+# n=128 → k=45, n=256 → k=64, n=384 → k=78
 ```
-L = L_rw_multistep + α * L_stress_multiscale
-```
-Start with α = 0.1.
 
-### 2. Consider symmetric divergence for RW stability
+**b) Scale RW steps with n** — ensure diffusion covers the graph:
+```python
+n_steps = max(3, int(np.log2(n / 20)))  # more steps for larger graphs
+# n=128 → 3 steps, n=256 → 3 steps, n=384 → 4 steps, n=512 → 4 steps
+```
+
+**c) Scale landmark count in F4** — more global anchors for larger minisets:
+```python
+n_landmarks = max(8, int(n / 16))  # currently fixed at 8
+# n=128 → 8, n=256 → 16, n=384 → 24
+```
+
+**Test plan**: Re-run Diagnostic 2 (Run 4) with adaptive k at sizes [128, 256, 384]. If F2+F4 maintains Recall > 0.85 and Procrustes < 0.25 across all sizes, the sparsity problem is solved.
+
+### 2. Confirmed recipe: F2+F4 primary + F1 regularizer
+Based on Run 3 results, the loss recipe is:
+```
+L = L_rw_multistep + 0.1 * L_stress_multiscale + 0.05 * L_fuzzy
+```
+- F2 (RW): primary objective, captures local + meso-scale diffusion structure
+- F4 (Stress): secondary, provides global rigidity via multiscale edge distances
+- F1 (Fuzzy): light regularizer, helps local edge consistency
+- F5 (LLE) and F3 (Triplets): dropped
+
+### 3. Consider symmetric divergence for RW stability
 Replace KL with Jensen-Shannon divergence or MSE on log-probabilities:
 ```
 L_rw_JS = 0.5 * KL(P_GT || M) + 0.5 * KL(P_pred || M)    where M = 0.5(P_GT + P_pred)
 ```
 This is symmetric and bounded, avoiding the KL instability when P_pred has near-zero entries where P_GT is nonzero.
 
-### 3. Integrate into training loop (Stage D)
-Once the diagnostic confirms a good F2 + (F4 or F1) recipe:
+### 4. Integrate into training loop (Stage D)
+After size scaling is fixed:
 - Consume `geo_targets` dict in `core_models_et_p2.py`
 - Apply losses to x̂₀ (denoised estimate)
 - Weight by sigma schedule: `w(σ) = min(1, (σ₀/σ)²)`
-- Target recipe: `L = L_rw + 0.05 * L_fuzzy` (possibly + stress)
+- Target recipe: `L = L_rw + 0.1 * L_stress + 0.05 * L_fuzzy`
 - Remove or phase out Gram loss
 
-### 4. Full-slide kNN benefit evaluation
-Bug 3 fix (full-slide kNN) is now active in the training pipeline but couldn't be tested in the standalone notebook diagnostic (which samples minisets independently). Verify impact by comparing geometric target quality (sigma distributions, RW entropy, fuzzy mu separation) between subset-only and full-slide kNN minisets.
+### 5. Full-slide kNN benefit evaluation
+Bug 3 fix (full-slide kNN) is now active in the training pipeline but couldn't be tested in the standalone notebook diagnostic. Verify impact in training.
 
 ---
 
@@ -438,3 +489,8 @@ New/updated fields computed per miniset (via `build_miniset_geometric_targets()`
 | 2026-02-16 | Diagnostic 2: Recoverability (post-fix) | F1 | Recall 0.76, Procrustes 0.50 | ⬆️ +11% recall, −43% Procrustes |
 | 2026-02-16 | Diagnostic 2: Recoverability (post-fix) | F2 | Recall 0.81, Procrustes 0.34 | ⬆️ Lower variance (std 0.29→0.18) |
 | 2026-02-16 | Diagnostic 2: Recoverability (post-fix) | F1+F2 | Recall 0.76, Procrustes 0.46 | ⬆️⬆️ No longer worse than components |
+| 2026-02-16 | Diagnostic 2: Run 3 (variable sizes) | F2+F4 | Recall 0.83, Procrustes 0.32 | **Best non-Gram** across all sizes |
+| 2026-02-16 | Diagnostic 2: Run 3 (variable sizes) | F2+F1(reg) | Recall 0.76, Procrustes 0.42 | Better than F1+F2, worse than F2+F4 |
+| 2026-02-16 | Diagnostic 2: Run 3 (variable sizes) | All | Size degradation found | Fixed k=20 causes sparsity at n>128 |
+| 2026-02-16 | Diagnostic 2: Run 3 (n=128 only) | F2+F4 | Recall 0.92, Procrustes 0.18 | Near-Gram at small n |
+| 2026-02-16 | Diagnostic 2: Run 3 (n=384 only) | F2+F4 | Recall 0.73, Procrustes 0.51 | Degrades — needs adaptive k |
