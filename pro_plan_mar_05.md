@@ -544,3 +544,241 @@ Choose $\lambda_c$ so that a **2σ collapse** adds a penalty comparable to (or l
 ---
 
 > **Decisive recommendation:** The combined evidence strongly favors **operator-first** (Option 1 as the backbone), with **Option 3** as the coordinate head if high-fidelity 2D coordinates are required beyond visualization.
+
+---
+
+## 8. Sparse Graphormer: Backbone Specification for OperatorNet
+
+> **Added post-planning:** This section documents the concrete Sparse Graphormer backbone design validated through experiments in our chat. It adapts Microsoft's Graphormer (Ying et al., NeurIPS 2021) from dense molecular-graph attention to sparse kNN candidate graphs for our spatial transcriptomics setting.
+
+### 8.1 How Original Graphormer Works (and Why It Doesn't Directly Apply)
+
+Graphormer was designed for **small molecular graphs** (typically <100 atoms) with **dense $O(n^2)$ attention** over all node pairs. Its three key innovations are structural biases added to attention logits:
+
+1. **Centrality encoding:** Node embeddings augmented with learned degree embeddings: $h_i^{(0)} = x_i + z_{\deg^-(i)}^- + z_{\deg^+(i)}^+$
+
+2. **Spatial encoding (SPD bias):** For every pair $(i,j)$, a learned scalar bias indexed by shortest-path distance: $b_\phi[\text{SPD}(i,j)]$ added to attention logits.
+
+3. **Edge encoding:** For each pair, features aggregated along the shortest path between them.
+
+**Why this doesn't directly apply to our setting:**
+
+| Graphormer (original) | Our setting |
+|---|---|
+| Dense $O(n^2)$ attention | Sparse candidate graph, $k \approx 57$ neighbors per node for $n=384$ |
+| Small graphs ($n < 100$) | Minisets $n \in [128, 384]$ |
+| Full pair enumeration feasible | Only candidate edges computed |
+| SPD varies from 1 to diameter | **If attention restricted to 1-hop candidate edges, SPD is always 1** — useless as a bias |
+| Edge features along shortest paths | Shortest paths are 1-2 hops; path features uninformative |
+
+### 8.2 What We Keep, What We Replace
+
+| Component | Graphormer | Sparse Graphormer (ours) | Rationale |
+|---|---|---|---|
+| Attention support | Dense (all pairs) | Sparse (candidate edges $E_c$ only) | $O(nk)$ vs $O(n^2)$ |
+| Centrality encoding | Degree embedding | **Keep** — degree embedding by buckets | Cheap, calibrates attention |
+| SPD bias | Learned per SPD bucket | **Drop** (always 1 on 1-hop edges) | Validated: useless without multi-hop |
+| Edge encoding (path features) | Aggregate along shortest path | **Replace** with Jaccard/CN structural biases | Validated: Jaccard AUC=0.849 for spatial edge prediction |
+| Content attention | QK dot product | **Keep** with QK-norm (LayerNorm or L2) | Stabilization trick from IPA-Lite |
+| Pair features | N/A | Relative-only: $[\|h_i - h_j\|, h_i \odot h_j, \cos(h_i, h_j)]$ | Validated: relative+topology generalizes better than full features on GT operator prediction |
+
+### 8.3 Validated Experimental Evidence (from this chat)
+
+**Structural feature validation (80 val minisets, slide 2):**
+
+| Feature | Mean AUC for predicting true spatial edges |
+|---|---|
+| Jaccard | 0.8495 |
+| Cosine overlap (CN normalized) | 0.8482 |
+| CN raw | 0.8120 |
+| Cosine similarity | 0.7942 |
+| Dot product | 0.7359 |
+
+- Jaccard alone (0.849) beats cosine alone (0.794) by +5.5 points
+- Adding Jaccard to cosine gives +6.7% AUC (logistic regression combination)
+- Combined (cosine + Jaccard + CosOverlap): AUC = 0.8554
+
+**Slide leakage check (1500 cells pooled equally across 3 slides):**
+
+| Feature | AUC for predicting same-slide (lower = less biased) |
+|---|---|
+| Cosine similarity | 0.6964 |
+| Jaccard | 0.6357 |
+| CN raw | 0.6168 |
+
+Jaccard is **less** slide-biased than cosine. Safe to use.
+
+**Operator probe against GT transitions (100K train edges, 70K val edges):**
+
+| Feature set | Train MSE | Val MSE | Val $r$ |
+|---|---|---|---|
+| Full (abs+rel) | 0.000087 | 0.000167 | 0.6189 |
+| Relative+topology | 0.000099 | 0.000183 | **0.6551** |
+
+Relative+topology features **generalize better** (higher val $r$) for predicting the ground-truth spatial operator $T_\text{ref}^{(1)}$, despite slightly higher MSE. Full features overfit (92% train→val MSE increase vs 85% for relative).
+
+**Conclusion:** Use relative+topology features. Absolute features memorize slide-specific patterns without improving OOD operator prediction.
+
+### 8.4 Full Mathematical Specification
+
+#### Notation
+
+- $n \in [128, 384]$: miniset size
+- $H \in \mathbb{R}^{n \times d}$: frozen encoder embeddings ($d = 128$)
+- $E_c$: candidate edge set from symmetrized cosine-kNN on $H$, $k = \max(20, \lfloor 0.15n \rfloor)$
+- $\mathcal{N}(i) = \{j : (i,j) \in E_c, j \neq i\}$: neighbors of $i$
+- $A \in \{0,1\}^{n \times n}$: adjacency matrix of $E_c$ with $A_{ii} = 0$
+
+#### Step 1: Structural features (precomputed per miniset, no gradients)
+
+**Degree** (bucketed):
+$$\deg(i) = |\mathcal{N}(i)|, \quad b_i = \min(\deg(i), B_{\max})$$
+
+**Common neighbors** (from adjacency without self-loops):
+$$\text{CN}_{ij} = \sum_k A_{ik} A_{kj} = (A^2)_{ij}$$
+
+Computed as one sparse/dense matrix multiply. For $n=384$, $k=57$: microseconds.
+
+**Jaccard overlap** (normalized CN — preferred over raw CN):
+$$\text{Jacc}_{ij} = \frac{\text{CN}_{ij}}{\deg(i) + \deg(j) - \text{CN}_{ij} + \epsilon}$$
+
+Bucketed into $B_J \approx 8$–$16$ bins, or fed as a continuous scalar.
+
+#### Step 2: Input node embeddings with centrality
+
+$$s_i^{(0)} = \text{LN}(W_\text{in} H_i) + e_\text{deg}[\text{bucket}(\deg(i))]$$
+
+where $e_\text{deg} \in \mathbb{R}^{B_{\max} \times c_s}$ is a learned degree embedding table, $c_s$ is hidden dim (e.g., 96).
+
+#### Step 3: Sparse attention layers ($L$ layers, $N_H$ heads)
+
+For layer $\ell = 1, \ldots, L$, head $h = 1, \ldots, N_H$:
+
+**Queries, keys, values** (with QK-norm for stability):
+$$q_i^{(\ell,h)} = \text{LN}_q(W_Q^{(\ell,h)} s_i^{(\ell)}), \quad k_j^{(\ell,h)} = \text{LN}_k(W_K^{(\ell,h)} s_j^{(\ell)}), \quad v_j^{(\ell,h)} = W_V^{(\ell,h)} s_j^{(\ell)}$$
+
+**Attention logits** (only on candidate edges $E_c$):
+$$\ell_{ij}^{(\ell,h)} = \underbrace{\tau^{(\ell)} \langle q_i^{(\ell,h)}, k_j^{(\ell,h)} \rangle}_{\text{content (QK)}} + \underbrace{b_\text{jacc}^{(\ell,h)}[\text{bucket}(\text{Jacc}_{ij})]}_{\text{structural bias}}$$
+
+Set $\ell_{ij} = -\infty$ for $(i,j) \notin E_c$.
+
+**Why Jaccard bias instead of SPD bias:**
+- SPD on 1-hop candidate edges is always 1 (constant, useless as a learned bias)
+- Jaccard encodes "how embedded is this edge in the local topology" — high Jaccard = dense cluster (likely true spatial neighbor), low Jaccard = bridge edge (possibly spurious)
+- This captures **triangle consistency** without the $O(n^2)$ cost of an Evoformer pair stack
+
+**Softmax and aggregation:**
+$$\alpha_{ij}^{(\ell,h)} = \text{softmax}_{j \in \mathcal{N}(i) \cup \{i\}} \left(\ell_{ij}^{(\ell,h)}\right)$$
+
+$$m_i^{(\ell)} = \sum_h W_O^{(\ell,h)} \sum_{j \in \mathcal{N}(i) \cup \{i\}} \alpha_{ij}^{(\ell,h)} v_j^{(\ell,h)}$$
+
+$$s_i^{(\ell+1)} = s_i^{(\ell)} + \text{FFN}(\text{LN}(s_i^{(\ell)} + m_i^{(\ell)}))$$
+
+#### Step 4: Output heads
+
+After $L$ layers, node states $s_i^{(L)}$ encode graph-structure-aware representations.
+
+**Operator head** (for F2 — predicting transition matrix):
+
+Edge features use **relative-only** inputs (validated to generalize better):
+$$u_{ij} = \text{MLP}_T\left([s_i^{(L)} - s_j^{(L)}, \; s_i^{(L)} \odot s_j^{(L)}, \; \text{Jacc}_{ij}, \; \text{CN}_{ij}]\right) \quad \text{for } (i,j) \in E_c$$
+
+Row-stochastic transition:
+$$T_\text{pred}(i,j) = \frac{\exp(u_{ij} / \tau_T)}{\sum_{k \in \mathcal{N}(i)} \exp(u_{ik} / \tau_T)}, \quad j \in \mathcal{N}(i)$$
+
+Multi-step: $P_\text{pred}^{(s)} = T_\text{pred}^s$ via sparse matrix multiplication.
+
+**Distance head** (for F4 — predicting pairwise distances):
+$$\hat{d}_{ij} = \exp\left(\text{MLP}_d\left([s_i^{(L)} - s_j^{(L)}, \; s_i^{(L)} \odot s_j^{(L)}, \; \text{Jacc}_{ij}]\right)\right) \quad \text{for } (i,j) \in E_\text{ms}$$
+
+#### Step 5: Losses
+
+**Fixed supervision (same as all architectures):**
+
+$$L_\text{RW} = \frac{1}{|S|} \sum_{s \in S} \frac{1}{n} \sum_i \text{KL}\left(P_\text{ref}^{(s)}(i, \cdot) \;\|\; P_\text{pred}^{(s)}(i, \cdot)\right)$$
+
+$$L_\text{stress} = \frac{1}{|E_\text{ms}|} \sum_{(i,j) \in E_\text{ms}} w_{ij} \left(\log(\hat{d}_{ij} + \epsilon) - \log(d^\text{ref}_{ij} + \epsilon)\right)^2$$
+
+**Architecture-specific regularizers (from research agent's Option 1):**
+
+Row-entropy calibration:
+$$L_\text{ent} = \frac{1}{n} \sum_i \left(H_i(T_\text{pred}) - H_i(T_\text{ref})\right)^2$$
+
+Detailed balance / reversibility:
+$$L_\text{rev} = \frac{1}{|E_c|} \sum_{(i,j) \in E_c} \left(\pi_i T_\text{pred}(i,j) - \pi_j T_\text{pred}(j,i)\right)^2$$
+
+Triangle inequality on predicted distances:
+$$L_\triangle = \mathbb{E}_{(i,j,k)} \left[\text{ReLU}\left(\hat{d}_{ij} - \hat{d}_{ik} - \hat{d}_{kj}\right)^2\right]$$
+
+**Total:**
+$$L_\text{total} = L_\text{RW} + \lambda_\text{stress} L_\text{stress} + \lambda_\text{ent} L_\text{ent} + \lambda_\text{rev} L_\text{rev} + \lambda_\triangle L_\triangle$$
+
+### 8.5 Complexity
+
+| Operation | Cost | For $n=384, k=57, c_s=96$ |
+|---|---|---|
+| Structural features (CN, Jaccard) | $O(nk^2)$ precompute | ~1.2M ops, microseconds |
+| Attention per layer | $O(n \cdot k \cdot c_s)$ | ~2.1M ops |
+| Total ($L=4$ layers) | $O(L \cdot n \cdot k \cdot c_s)$ | ~8.4M ops |
+| Sparse matrix power $T^s$ | $O(|E_c| \cdot s)$ | ~22K × 5 = 110K ops |
+| **Total per miniset** | | **< 10M ops** (trivial) |
+
+New parameters for structural biases: $L \times N_H \times B_J$ scalars. With $L=4$, $N_H=4$, $B_J=16$: **256 parameters**. Negligible.
+
+### 8.6 Key Differences from IPA-Lite (Why This Avoids the Oversmoothing Ceiling)
+
+| Aspect | IPA-Lite | Sparse Graphormer + OperatorNet |
+|---|---|---|
+| Output | 2D coordinates via iterative update | Transition operator $T$ + distances $\hat{d}$ |
+| Coordinate generation | $X \leftarrow X + \eta \sum_j a_{ij} W_x(x_i - x_j)$ (Laplacian smoothing) | Post-hoc only: diffusion map or stress embedding from $T / \hat{d}$ |
+| Oversmoothing risk | High — provably converges to spectral ring | None during training — no coordinate diffusion loop |
+| Feature type | Full $[h_i, h_j, \|h_i-h_j\|, h_i \odot h_j]$ | Relative+topology $[\|h_i-h_j\|, h_i \odot h_j, \cos, \text{Jacc}, \text{CN}]$ |
+| Memorization | Gate memorizes via absolute features (Phase 25) | Relative features generalize better (operator probe: val $r$ 0.655 vs 0.619) |
+| Structural inductive bias | None (pairwise MLP gate) | Jaccard/CN encodes triangle consistency |
+| Geo bias | $-\gamma\|x_i - x_j\|^2$ (harmful, Phase S6) | Not needed — no coordinates during training |
+
+### 8.7 Official GitHub Anchors for Implementation
+
+| Component | Repo | Key files | What to reuse | What to rewrite |
+|---|---|---|---|---|
+| Graphormer attention + biases | [microsoft/Graphormer](https://github.com/microsoft/Graphormer) | `graphormer/modules/graphormer_graph_encoder.py`, `graphormer_graph_encoder_layer.py` | Attention structure, bias injection pattern, FFN pattern | Replace dense attention with sparse; replace SPD bias with Jaccard bias; remove edge encoding |
+| Sparse attention utilities | [pyg-team/pytorch_geometric](https://github.com/pyg-team/pytorch_geometric) | `torch_geometric/nn/conv/gatv2_conv.py`, `torch_geometric/utils/softmax.py` | Sparse softmax, edge indexing, message passing pattern | Adapt for our candidate mask format |
+| OpenFold (init/norm conventions) | [aqlaboratory/openfold](https://github.com/aqlaboratory/openfold) | `openfold/model/primitives.py` | LayerNorm, zero-init patterns, linear init | Direct reuse |
+
+### 8.8 Implementation Plan
+
+**Build order:**
+
+1. **Structural features module:** Compute CN, Jaccard, degree from candidate mask $M$. Pure tensor ops, no parameters. Test: verify CN matches manual computation on a 10-node toy graph.
+
+2. **Sparse Graphormer encoder:** $L$ layers of sparse attention with Jaccard bias + degree embedding. Test: verify output shapes, check that attention sums to 1 per row, check gradient flow.
+
+3. **Operator head ($T$ prediction) + $L_\text{RW}$:** Predict row-stochastic $T$ from node states. Test: feed GT spatial kNN as candidate graph and verify $L_\text{RW}$ drops to near-zero (oracle consistency check).
+
+4. **Distance head + $L_\text{stress}$:** Predict distances on multiscale edges. Test: same oracle consistency check.
+
+5. **Regularizers** ($L_\text{ent}$, $L_\text{rev}$, $L_\triangle$): Add one at a time, verify each doesn't break training.
+
+6. **Collapse-aware evaluation:** Track $d_\text{eff}$, boundary mass, density correlation, $W_1(\log r_k)$ on any derived coordinates.
+
+**Key hyperparameters to sweep:**
+
+| Parameter | Range | Priority |
+|---|---|---|
+| Transformer layers $L$ | 2, 4, 6 | High |
+| Hidden dim $c_s$ | 64, 96, 128 | High |
+| Heads $N_H$ | 4, 8 | Medium |
+| Operator temperature $\tau_T$ | 0.5, 1.0, 2.0 | High |
+| $\lambda_\text{stress}$ | 0.05, 0.1, 0.3 | High (validated: 0.3 may be better) |
+| $\lambda_\text{ent}$ | 0.01, 0.1 | Medium |
+| $\lambda_\text{rev}$ | 0.001, 0.01 | Low |
+| Jaccard buckets $B_J$ | 8, 16 | Low |
+| Candidate $k$ | 60, 80, 100 | Medium |
+| Learning rate | 1e-4, 3e-4, 1e-3 | High |
+
+**Go/no-go criteria:**
+
+- On val (held-out slide): $L_\text{RW}$ within 15% of oracle $L_\text{RW}$ computed on GT spatial support
+- Collapse-aware composite $E_\text{safe}$ improves over IPA-Lite ($R=5$) baseline
+- Multi-seed stability: std of val $L_\text{RW}$ across 3 seeds < 10% of mean
+- Cross-slide: swap which slide is held out; results should be consistent
